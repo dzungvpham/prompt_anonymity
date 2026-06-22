@@ -3,9 +3,9 @@
 ## Installation
 
 - Clone this repo and cd into it.
-- Set up a new virtual environment and activate it (we used Python 3.12). E.g., `conda create -p ./env python=3.12`.
+- Set up a new virtual environment and activate it (we used Python 3.12). E.g., `conda create -p ./env python=3.12` and `conda activate ./env`
 - Install Stylometrix (follow these steps precisely to avoid issues):
-  - Install spacy with GPU support: https://spacy.io/usage. E.g.: `pip install -U 'spacy[cuda12x]'` for CUDA (make sure to choose the right CUDA version. If you need version 13 instead of 12, omit the `[cuda12x]` option, run `pip install cupy-cuda13x[ctk]` afterwards).
+  - Install spacy with GPU support: https://spacy.io/usage. E.g.: `pip install -U 'spacy[cuda12x]'` for CUDA (make sure to choose the right CUDA version. If you need version 13 instead of 12, omit the `[cuda12x]` option, run `pip install cupy-cuda13x[ctk]` afterwards installing spacy).
   - After spacy is installed, run `python -m spacy download en_core_web_trf` to download the large English model.
   - Clone the StyloMetrix repo at https://github.com/NASK-NLP/StyloMetrix (do not run `pip install stylometrix` because its spacy requirement is broken).
   - Modify the repo's requirements.txt file by removing the version pin for spacy (e.g., remove the ==3.7.2)
