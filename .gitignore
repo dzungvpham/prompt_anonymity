@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+*.whl
+*.npy
+wildchat_preprocessed/
