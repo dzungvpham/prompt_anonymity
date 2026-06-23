@@ -223,3 +223,5 @@ wildchat_preprocessed/
 
 # Data Protection
 *.csv
+data/
+datasets/
