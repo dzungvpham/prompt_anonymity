@@ -387,11 +387,17 @@ class QwenRewriter:
 
     def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
                  system_prompt=REWRITE_PROMPT_HEADER, n_ctx=4096,
-                 n_threads=None, max_tokens=1024):
+                 n_threads=None, max_tokens=1024, n_gpu_layers=-1):
         from llama_cpp import Llama
 
         self.system_prompt = system_prompt
         self.max_tokens = max_tokens
+        # n_gpu_layers=-1 offloads ALL transformer layers to the GPU. This is the
+        # single biggest speed lever: without it llama.cpp keeps everything on CPU.
+        # It only takes effect if llama-cpp-python was built with CUDA support
+        # (llama_cpp.llama_supports_gpu_offload() must be True) — otherwise it is a
+        # harmless no-op and inference stays on CPU. Qwen2.5-3B q4 (~2GB) fits the
+        # 3070's 8GB VRAM with room to spare.
         print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp)...")
         # from_pretrained downloads+caches the GGUF via huggingface_hub; n_threads
         #=None lets llama.cpp pick a sensible count from the available cores.
@@ -400,6 +406,7 @@ class QwenRewriter:
             filename=filename,
             n_ctx=n_ctx,
             n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers,
             verbose=False,
         )
 
