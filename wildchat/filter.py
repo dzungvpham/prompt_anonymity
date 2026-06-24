@@ -65,7 +65,7 @@ for i in tqdm(range(320)):
     batches.append(shard)
 
 # Keep only IDs with more than two models
-df_filtered = pd.concat(batches, ignore_index=True).sort_values(["hashed_ip", "timestamp"])
+df = pd.concat(batches, ignore_index=True).sort_values(["hashed_ip", "timestamp"])
 df_filtered = df[df.groupby(["hashed_ip", "accept_language", "device_info"])["model"]
     .transform("nunique")
     .ge(2)
