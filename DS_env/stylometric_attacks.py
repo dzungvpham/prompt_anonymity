@@ -81,6 +81,20 @@ REWRITE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rewrite_cache.csv")
 REWRITE_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_known_emb.npz")
 REWRITE_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_unknown_emb.npz")
 
+# --- Qwen round-trip-translation defense config -----------------------------
+# Like the NLLB RTT defense, but the EN->ZH->JA->EN chain is driven by the SAME
+# on-device 4-bit Qwen GGUF as the rewrite defense (GPU-offloaded via llama.cpp).
+# Each hop is a separate, discrete chat completion so the language pivots are
+# explicit and independently inspectable, rather than one fused prompt.
+QWEN_RTT_HOPS = [
+    ("English", "Chinese"),
+    ("Chinese", "Japanese"),
+    ("Japanese", "English"),
+]
+QWEN_RTT_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_qwen_translation_cache.csv")
+QWEN_RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_known_emb.npz")
+QWEN_RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_unknown_emb.npz")
+
 
 # ---------------------------------------------------------------------------
 # Attack functions
@@ -424,6 +438,71 @@ class QwenRewriter:
         return out["choices"][0]["message"]["content"].strip()
 
 
+class QwenTranslator:
+    """Round-trip translator that drives the SAME 4-bit Qwen GGUF as QwenRewriter
+    through an EN->ZH->JA->EN chain, GPU-offloaded via llama.cpp.
+
+    Contract: exposes `.roundtrip(text) -> text`, the same duck-typed interface
+    the other translators use, so it drops straight into `_rtt_defense`.
+
+    Unlike NLLBTranslator (one batched generate per hop), each hop here is a
+    SEPARATE, discrete chat completion: English->Chinese, then Chinese->Japanese,
+    then Japanese->English. The model sees only the previous hop's output, so the
+    three translation steps are explicit and independently inspectable rather than
+    fused into a single prompt. This is the round-trip analogue of the rewrite
+    defense — it perturbs per-user stylometric signal via translationese instead
+    of via style normalization.
+    """
+
+    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
+                 hops=QWEN_RTT_HOPS, n_ctx=4096, n_threads=None,
+                 max_tokens=1024, n_gpu_layers=-1):
+        from llama_cpp import Llama
+
+        self.hops = hops
+        self.max_tokens = max_tokens
+        # n_gpu_layers=-1 offloads ALL transformer layers to the GPU, exactly as
+        # QwenRewriter does; it is a harmless no-op if llama.cpp lacks CUDA. The
+        # ~2GB q4 model fits the 3070's 8GB VRAM with room to spare.
+        print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp) for RTT...")
+        self.llm = Llama.from_pretrained(
+            repo_id=repo_id,
+            filename=filename,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            n_gpu_layers=n_gpu_layers,
+            verbose=False,
+        )
+
+    def _translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
+        # One discrete hop. temperature=0 -> greedy/deterministic so re-runs and
+        # cache hits are reproducible. The guardrails keep the model from
+        # answering, commenting, or adding anything but the translation.
+        system_prompt = (
+            f"You are a professional translation engine. Translate the user's "
+            f"message from {src_lang} to {tgt_lang}.\n"
+            f"Rules:\n"
+            f"- Preserve ALL information, intent, code, names, numbers, and quotations.\n"
+            f"- Do NOT answer, explain, or comment on the message.\n"
+            f"- Output ONLY the {tgt_lang} translation and nothing else."
+        )
+        out = self.llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+        )
+        return out["choices"][0]["message"]["content"].strip()
+
+    def roundtrip(self, text: str) -> str:
+        # Walk the chain one discrete hop at a time: EN->ZH->JA->EN.
+        for src_lang, tgt_lang in self.hops:
+            text = self._translate(text, src_lang, tgt_lang)
+        return text
+
+
 def _save_cache(cache, cache_csv):
     pd.DataFrame(
         {"source": list(cache.keys()), "translated": list(cache.values())}
@@ -582,6 +661,13 @@ def rewrite_qwen_defense(df, known, unknown, known_emb, unknown_emb):
     return _rtt_defense(df, QwenRewriter(), REWRITE_CACHE_CSV, REWRITE_EMB_KNOWN_NPZ, REWRITE_EMB_UNKNOWN_NPZ)
 
 
+def rtt_qwen_defense(df, known, unknown, known_emb, unknown_emb):
+    """RTT via the on-device 4-bit Qwen GGUF, driven through EN->ZH->JA->EN as
+    three discrete translation steps (GPU-offloaded). Reuses the RTT pipeline
+    since QwenTranslator exposes the same .roundtrip(text)->text contract."""
+    return _rtt_defense(df, QwenTranslator(), QWEN_RTT_CACHE_CSV, QWEN_RTT_EMB_KNOWN_NPZ, QWEN_RTT_EMB_UNKNOWN_NPZ)
+
+
 # ---------------------------------------------------------------------------
 # Registries — the one place to plug in new modules. Add an entry to either
 # dict and it is automatically listed in the menu and runnable. Keys are the
@@ -597,6 +683,7 @@ DEFENSES = {
     "None": no_defense,
     "RTT (Argos)": rtt_argos_defense,
     "RTT (NLLB)": rtt_nllb_defense,
+    "RTT (Qwen 4-bit)": rtt_qwen_defense,
     "Rewrite (Qwen 4-bit)": rewrite_qwen_defense,
 }
 
