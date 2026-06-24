@@ -226,3 +226,4 @@ wildchat_preprocessed/
 *.npz
 data/
 datasets/
+.claude/

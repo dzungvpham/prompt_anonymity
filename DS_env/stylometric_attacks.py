@@ -1,6 +1,7 @@
 import hashlib
 import os
 import random
+import re
 
 import numpy as np
 import pandas as pd
@@ -11,9 +12,9 @@ from tqdm import tqdm
 LANG = ("English", "en")
 KNOWN_MODEL = "gpt-4o-2024-08-06"
 UNKNOWN_MODEL = "gpt-4.1-mini-2025-04-14"
+# Shared inputs live in DS_env/ root (also consumed by analyze_wildchat.ipynb).
 DATA_CSV = "wildchat_filtered_4o20240806_41mini20250414_device_deduped.csv"
 EMBEDDINGS_CSV = f"wildchat_filtered_{LANG[1]}_2048_stylometrix.csv"
-OUTPUT_CSV = "wildchat_analysis_stylometrix_results.csv"
 N_SIM = 100
 SAMPLE_STEP = 25
 RANDOM_SEED = 47
@@ -21,10 +22,64 @@ RANDOM_SEED = 47
 # --- Round-trip-translation (RTT) defense config ---
 MAX_LEN = 2048                        # char truncation, matches wildchat/stylometrix.py
 STYLO_LANGCODE = "en"                 # final text is English -> embed with the English model
-RTT_CACHE_CSV = "wildchat_rtt_translation_cache.csv"    # source -> translated, shared & resumable
-RTT_OUTPUT_CSV = "wildchat_analysis_euclidean_rtt.csv"  # defended attack results
-RTT_EMB_KNOWN_NPZ = "wildchat_rtt_known_emb.npz"        # cached StyloMetrix embeddings (known, translated)
-RTT_EMB_UNKNOWN_NPZ = "wildchat_rtt_unknown_emb.npz"    # cached StyloMetrix embeddings (unknown, translated)
+
+# Defense-generated artifacts are organized under defense_data/{cache,embeddings,output}.
+DEFENSE_DATA_DIR = "defense_data"
+CACHE_DIR = os.path.join(DEFENSE_DATA_DIR, "cache")
+EMB_DIR = os.path.join(DEFENSE_DATA_DIR, "embeddings")
+OUTPUT_DIR = os.path.join(DEFENSE_DATA_DIR, "output")
+for _d in (CACHE_DIR, EMB_DIR, OUTPUT_DIR):
+    os.makedirs(_d, exist_ok=True)  # ensure dirs exist on a fresh checkout
+
+OUTPUT_CSV = os.path.join(OUTPUT_DIR, "wildchat_analysis_stylometrix_results.csv")
+
+# Argos backend caches (source -> translated CSV, plus re-embedded .npz per side).
+RTT_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_translation_cache.csv")
+RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_known_emb.npz")
+RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_unknown_emb.npz")
+
+# NLLB backend gets its own cache files so it never clobbers the Argos results.
+NLLB_MODEL = "facebook/nllb-200-distilled-600M"         # ~600M params; fits an 8GB GPU in fp16
+NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb_translation_cache.csv")
+NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb_known_emb.npz")
+NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb_unknown_emb.npz")
+
+# --- Rewrite defense config -------------------------------------------------
+# Threat model: a USER's own writing style fingerprints them across queries.
+# This defense rewrites every prompt into ONE fixed target style locally (4-bit
+# Qwen via llama.cpp) BEFORE it is ever sent to a chatbot provider, so prompts
+# from different users converge to a shared, indistinguishable stylometric
+# identity while keeping each query's content intact.
+
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ EDIT ME — this is the style every prompt is forced into ("rewrite like X").│
+# │ Tweak the instructions to experiment with different convergence targets.   │
+# │ KEEP the "preserve all info / output only the rewrite" guardrails, or the  │
+# │ rewritten prompt will drift from what the user actually asked.             │
+# └──────────────────────────────────────────────────────────────────────────┘
+REWRITE_PROMPT_HEADER = """You are a prompt-rewriting filter. Rewrite the user's message into a single, neutral, standardized style so that messages written by different people become stylistically indistinguishable.
+Rules:
+- Preserve ALL information, intent, constraints, and any code, names, numbers, or quotations exactly as given.
+- Write in plain, formal English: complete declarative sentences, no slang, no contractions, no emoji, no personal asides or filler.
+- Keep the same language as the input message.
+- Use active voice and subject-verb-object order only. Do not use passive voice, fronted clauses, cleft constructions ("It is X that..."), or inversions.
+- Express every request as a direct imperative beginning with a verb (e.g., 'Write...', 'Summarize...', 'Fix...'). Do not use politeness framings ('Could you', 'I'd like you to', 'Please') or question forms for requests.
+- One idea per sentence. Split compound or multi-clause sentences.
+- Order the content canonically: (1) the task, (2) constraints and requirements, (3) supporting context or examples.
+- Remove hedges and intensifiers ('really', 'very', 'basically', 'just', etc).
+- Use only periods and commas. Do not use em dashes, semicolons, colons for asides, ellipses, or parentheticals; rewrite the content into separate sentences instead.
+- Use digits for all numbers.
+- Do NOT substitute technical terms, domain verbs, or proper nouns for synonyms. Normalize register and grammar only, never denotation.
+- Do NOT answer, explain, or comment on the message. Output ONLY the rewritten message and nothing else."""
+
+# Qwen 4-bit GGUF, auto-downloaded from the Hugging Face Hub on first use and
+# cached locally (offline thereafter), mirroring the Argos/NLLB download pattern.
+# Swap to "...1.5b..." for slower phones or "...7b..." on a laptop for fidelity.
+QWEN_GGUF_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"        # on-device rewriter
+QWEN_GGUF_FILE = "qwen2.5-3b-instruct-q4_k_m.gguf"      # ~2GB, 4-bit, CPU-friendly
+REWRITE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rewrite_cache.csv")
+REWRITE_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_known_emb.npz")
+REWRITE_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_unknown_emb.npz")
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +323,100 @@ class ArgosTranslator:
         return text
 
 
+class NLLBTranslator:
+    """Round-trip translator using Meta's NLLB-200 (HuggingFace transformers).
+
+    Unlike Argos, NLLB is many-to-many, so zh->ja is a *real* direct hop with no
+    English pivot — the chain is a true EN->ZH->JA->EN. Higher quality than Argos
+    at the cost of a heavier model. Runs on GPU if one is visible, else CPU.
+
+    HOPS use FLORES-200 language codes. Text is split into sentences and
+    translated in a single batched generate() call per hop, both to stay within
+    the model's context window and to keep the GPU busy.
+    """
+
+    HOPS = [("eng_Latn", "zho_Hans"), ("zho_Hans", "jpn_Jpan"), ("jpn_Jpan", "eng_Latn")]
+    # Sentence terminators across the languages we pass through (Latin + CJK).
+    _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
+
+    def __init__(self, model_name=NLLB_MODEL, max_length=512):
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        self._torch = torch
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.max_length = max_length
+        print(f"Loading NLLB model '{model_name}' on {self.device}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
+
+    def _split(self, text):
+        parts = [p for p in self._SENT_SPLIT.split(text) if p.strip()]
+        return parts or [text]  # always translate at least the whole string
+
+    def _translate(self, sentences, src, tgt):
+        self.tokenizer.src_lang = src
+        inputs = self.tokenizer(
+            sentences, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length
+        ).to(self.device)
+        bos = self.tokenizer.convert_tokens_to_ids(tgt)  # forced target-language BOS
+        with self._torch.no_grad():
+            out = self.model.generate(**inputs, forced_bos_token_id=bos, max_length=self.max_length)
+        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
+
+    def roundtrip(self, text: str) -> str:
+        sentences = self._split(text)
+        for src, tgt in self.HOPS:
+            sentences = self._translate(sentences, src, tgt)
+        return " ".join(sentences)
+
+
+class QwenRewriter:
+    """On-device prompt-rewriting defense backed by a 4-bit Qwen GGUF via
+    llama-cpp-python (CPU-friendly; runs on a slow laptop or phone).
+
+    Contract: exposes `.roundtrip(text) -> text`, the SAME duck-typed interface
+    the translators use, so it drops straight into `_rtt_defense` with no other
+    changes. Here the "roundtrip" is a style-normalizing rewrite: every prompt is
+    rewritten into one fixed target style (REWRITE_PROMPT_HEADER), collapsing
+    per-user stylometric signal toward a shared identity while preserving content.
+
+    The model is auto-downloaded from the HF Hub on first use (cached offline
+    afterwards), the same first-run-only cost the Argos/NLLB backends pay.
+    """
+
+    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
+                 system_prompt=REWRITE_PROMPT_HEADER, n_ctx=4096,
+                 n_threads=None, max_tokens=1024):
+        from llama_cpp import Llama
+
+        self.system_prompt = system_prompt
+        self.max_tokens = max_tokens
+        print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp)...")
+        # from_pretrained downloads+caches the GGUF via huggingface_hub; n_threads
+        #=None lets llama.cpp pick a sensible count from the available cores.
+        self.llm = Llama.from_pretrained(
+            repo_id=repo_id,
+            filename=filename,
+            n_ctx=n_ctx,
+            n_threads=n_threads,
+            verbose=False,
+        )
+
+    def roundtrip(self, text: str) -> str:
+        # temperature=0 -> greedy/deterministic. Same model + same prompt + greedy
+        # decoding is exactly what drives every user's text to converge in style.
+        out = self.llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.0,
+            max_tokens=self.max_tokens,
+        )
+        return out["choices"][0]["message"]["content"].strip()
+
+
 def _save_cache(cache, cache_csv):
     pd.DataFrame(
         {"source": list(cache.keys()), "translated": list(cache.values())}
@@ -367,60 +516,100 @@ def _model_texts(df, model, max_len=MAX_LEN):
     return sub["conversation"].str[:max_len].tolist()
 
 
-def run_rtt_defense(
-    attack_fn=euclidean_style_attack,
-    defend_known=True,
-    defend_unknown=True,
-    translator=None,
-    output_csv=RTT_OUTPUT_CSV,
-):
-    """Apply the round-trip-translation defense, then run the linkage attack.
+# ---------------------------------------------------------------------------
+# Defenses
+#
+# A defense takes the loaded data + the original (undefended) embeddings and
+# returns the (known_emb, unknown_emb) the attack should run against. Keeping
+# this signature uniform is what makes defenses pluggable: register one in the
+# DEFENSES dict below and it shows up in the menu automatically.
+#   signature: (df, known, unknown, known_emb, unknown_emb)
+#              -> (known_emb, unknown_emb)
+# ---------------------------------------------------------------------------
 
-    defend_known / defend_unknown toggle which side is translated:
-      - both True (default) -> realistic "everyone runs the extension" deployment
-      - defend_unknown only -> worst case: attacker holds a pristine reference set
+def no_defense(df, known, unknown, known_emb, unknown_emb):
+    """Baseline: attack the original embeddings, unchanged."""
+    return known_emb, unknown_emb
 
-    Compare the resulting CSV against the undefended baseline (main()): a working
-    defense lowers top-1/top-5 id_acc toward the random_id column.
+
+def _rtt_defense(df, translator, cache_csv, known_npz, unknown_npz):
+    """Round-trip-translation defense: BOTH sets are translated and re-embedded.
+
+    Defending known and unknown together is the point — it models the real
+    deployment where every prompt passes through the defense before it leaves
+    the client. Each side's prompts are translated EN->ZH->JA->EN and re-embedded
+    with StyloMetrix. Translations and embeddings are cached to disk (per-backend
+    files), so the run is resumable and only the first pass pays the full cost.
+
+    `translator` is any object with a `.roundtrip(text) -> text` method, which is
+    what lets the Argos and NLLB backends share this exact pipeline.
     """
-    print("Loading data...")
-    df = load_data()
-
-    print("Loading embeddings...")
-    known, unknown, known_emb, unknown_emb = load_embeddings(df)
-
-    # Original feature column order, used to validate the re-embeddings.
     reference_columns = pd.read_csv(EMBEDDINGS_CSV, nrows=0).drop(columns="text").columns
 
-    if translator is None:
-        translator = ArgosTranslator()
+    print("Defending KNOWN set (translate -> embed)...")
+    known_trans = round_trip_translate(_model_texts(df, KNOWN_MODEL), translator, cache_csv=cache_csv, label="KNOWN")
+    known_emb = cached_embed(known_trans, reference_columns, known_npz)
 
-    # Re-embed each defended side from its translated text. Sides that are not
-    # defended keep their original embeddings loaded above. round_trip_translate
-    # reports its own cached-vs-to-translate counts, so no misleading print here.
-    if defend_known:
-        print("Defending KNOWN set (translate -> embed)...")
-        known_trans = round_trip_translate(_model_texts(df, KNOWN_MODEL), translator, label="KNOWN")
-        known_emb = cached_embed(known_trans, reference_columns, RTT_EMB_KNOWN_NPZ)
+    print("Defending UNKNOWN set (translate -> embed)...")
+    unknown_trans = round_trip_translate(_model_texts(df, UNKNOWN_MODEL), translator, cache_csv=cache_csv, label="UNKNOWN")
+    unknown_emb = cached_embed(unknown_trans, reference_columns, unknown_npz)
 
-    if defend_unknown:
-        print("Defending UNKNOWN set (translate -> embed)...")
-        unknown_trans = round_trip_translate(_model_texts(df, UNKNOWN_MODEL), translator, label="UNKNOWN")
-        unknown_emb = cached_embed(unknown_trans, reference_columns, RTT_EMB_UNKNOWN_NPZ)
+    return known_emb, unknown_emb
 
-    run_experiment(
-        attack_fn=attack_fn,
-        known=known,
-        unknown=unknown,
-        known_emb=known_emb,
-        unknown_emb=unknown_emb,
-        output_csv=output_csv,
-    )
+
+def rtt_argos_defense(df, known, unknown, known_emb, unknown_emb):
+    """RTT via Argos (offline, fast CPU; zh->ja silently pivots through English)."""
+    return _rtt_defense(df, ArgosTranslator(), RTT_CACHE_CSV, RTT_EMB_KNOWN_NPZ, RTT_EMB_UNKNOWN_NPZ)
+
+
+def rtt_nllb_defense(df, known, unknown, known_emb, unknown_emb):
+    """RTT via NLLB-200 (higher quality, true direct zh->ja; wants a GPU)."""
+    return _rtt_defense(df, NLLBTranslator(), NLLB_CACHE_CSV, NLLB_EMB_KNOWN_NPZ, NLLB_EMB_UNKNOWN_NPZ)
+
+
+def rewrite_qwen_defense(df, known, unknown, known_emb, unknown_emb):
+    """Style-convergence defense: rewrite every prompt on-device with a 4-bit
+    Qwen into one fixed style (REWRITE_PROMPT_HEADER), then re-embed. Reuses the
+    RTT pipeline since QwenRewriter exposes the same .roundtrip(text)->text
+    contract as the translators."""
+    return _rtt_defense(df, QwenRewriter(), REWRITE_CACHE_CSV, REWRITE_EMB_KNOWN_NPZ, REWRITE_EMB_UNKNOWN_NPZ)
 
 
 # ---------------------------------------------------------------------------
-# Entry point — swap attack_fn here to test a different attack
+# Registries — the one place to plug in new modules. Add an entry to either
+# dict and it is automatically listed in the menu and runnable. Keys are the
+# human-readable names shown to the user.
 # ---------------------------------------------------------------------------
+
+ATTACKS = {
+    "Euclidean Style": euclidean_style_attack,
+    "Cosine Style": cosine_style_attack,
+}
+
+DEFENSES = {
+    "None": no_defense,
+    "RTT (Argos)": rtt_argos_defense,
+    "RTT (NLLB)": rtt_nllb_defense,
+    "Rewrite (Qwen 4-bit)": rewrite_qwen_defense,
+}
+
+
+# ---------------------------------------------------------------------------
+# Entry point — interactive menu driven by the registries above
+# ---------------------------------------------------------------------------
+
+def choose(title, options):
+    """Print a numbered menu for `options` (a dict) and return the chosen key."""
+    keys = list(options)
+    print(f"\n{title}\n")
+    for i, key in enumerate(keys, 1):
+        print(f"  {i}. {key}")
+    while True:
+        raw = input("> ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(keys):
+            return keys[int(raw) - 1]
+        print(f"Please enter a number from 1 to {len(keys)}.")
+
 
 def main():
     print("Loading data...")
@@ -429,33 +618,27 @@ def main():
     print("Loading embeddings...")
     known, unknown, known_emb, unknown_emb = load_embeddings(df)
 
+    defense_name = choose("What defense do you want?", DEFENSES)
+    attack_name = choose("What attack?", ATTACKS)
+
+    # Apply the chosen defense (may translate + re-embed), then run the attack.
+    known_emb, unknown_emb = DEFENSES[defense_name](df, known, unknown, known_emb, unknown_emb)
+
+    # Encode both choices in the filename so runs don't overwrite each other.
+    def slug(name):
+        return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+    output_csv = os.path.join(OUTPUT_DIR, f"wildchat_analysis_{slug(attack_name)}_{slug(defense_name)}.csv")
+    print(f"\nRunning [{attack_name}] attack with [{defense_name}] defense -> {output_csv}")
     run_experiment(
-        attack_fn=euclidean_style_attack,
+        attack_fn=ATTACKS[attack_name],
         known=known,
         unknown=unknown,
         known_emb=known_emb,
         unknown_emb=unknown_emb,
+        output_csv=output_csv,
     )
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Stylometric linkage attack / RTT defense")
-    parser.add_argument(
-        "--defense",
-        action="store_true",
-        help="run the round-trip-translation defense instead of the undefended baseline",
-    )
-    parser.add_argument(
-        "--defend-side",
-        choices=["both", "unknown"],
-        default="both",
-        help="which set to translate: both (default, deployment model) or unknown-only (worst case)",
-    )
-    args = parser.parse_args()
-
-    if args.defense:
-        run_rtt_defense(defend_known=(args.defend_side == "both"), defend_unknown=True)
-    else:
-        main()
+    main()
