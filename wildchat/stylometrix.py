@@ -6,7 +6,9 @@ MAX_LEN = 2048
 lang = "English"
 langcode = "en"
 
-assert spacy.require_gpu(), "Spacy cannot use GPU!"
+# Use the GPU if spaCy can reach one; otherwise fall back to CPU (much slower).
+if not spacy.prefer_gpu():
+    print("WARNING: spaCy could not find a GPU; StyloMetrix will run on CPU and may take a very long time.", flush=True)
 
 df = pd.read_csv("wildchat_filtered_4o20240806_41mini20250414_device_deduped.csv")
 df = df[df["language"] == lang]
