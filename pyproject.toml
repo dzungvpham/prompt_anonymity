@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prompt-anonymity"
+version = "0.1.0"
+description = "Experiment code for re-identification attacks on anonymous chatbot/agent prompts."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    "datasets",
+    "huggingface-hub",
+    "python-dotenv",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+
+[tool.setuptools.packages.find]
+where = ["src"]
