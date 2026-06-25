@@ -474,16 +474,50 @@ class QwenTranslator:
             verbose=False,
         )
 
+    # Conversational preambles the model adds despite the guardrail, e.g.
+    # "Here's the text in English:" or the Chinese/Japanese equivalents the
+    # intermediate hops emit. Anchored at the start and required to both carry a
+    # translation/language keyword AND end in a colon, so a legitimate leading
+    # clause without that shape is left untouched. Stripped at EVERY hop so an
+    # intermediate-language preamble does not compound down the chain.
+    _PREAMBLE_RE = re.compile(
+        r"^\s*"
+        r"(?:sure|certainly|of course|okay|ok)?[,!.]?\s*"          # optional filler opener
+        r"(?:here(?:'s| is| are)|here you go|below is|the following is|"
+        r"the\s+\w+\s+translation\s+is|"
+        r"以下は|以下が|これは|翻訳は|日本語訳|"                     # Japanese lead-ins
+        r"以下是|这是|翻译如下|中文翻译|英文翻译|英语翻译)"        # Chinese lead-ins
+        r"[^\n:：]*[:：]\s*",                                       # rest of clause + colon
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _strip_preamble(cls, text: str) -> str:
+        text = text.strip()
+        # Unwrap a fully fenced ```...``` block if the model wrapped the output.
+        fence = re.match(r"^```[^\n]*\n(.*)\n```$", text, re.DOTALL)
+        if fence:
+            text = fence.group(1).strip()
+        # Drop a leading "Here's the text in English:"-style preamble.
+        text = cls._PREAMBLE_RE.sub("", text, count=1).strip()
+        # Strip a single pair of wrapping quotes the model sometimes adds.
+        if len(text) >= 2 and text[0] in "\"'“「" and text[-1] in "\"'”」":
+            text = text[1:-1].strip()
+        return text
+
     def _translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
         # One discrete hop. temperature=0 -> greedy/deterministic so re-runs and
-        # cache hits are reproducible. The guardrails keep the model from
-        # answering, commenting, or adding anything but the translation.
+        # cache hits are reproducible. The guardrails reduce (but never fully
+        # eliminate) conversational preambles, so _strip_preamble cleans up the
+        # output afterward.
         system_prompt = (
             f"You are a professional translation engine. Translate the user's "
             f"message from {src_lang} to {tgt_lang}.\n"
             f"Rules:\n"
             f"- Preserve ALL information, intent, code, names, numbers, and quotations.\n"
             f"- Do NOT answer, explain, or comment on the message.\n"
+            f"- Do NOT add any preamble, prefix, label, or note such as "
+            f"'Here is the translation:'. Begin directly with the translated text.\n"
             f"- Output ONLY the {tgt_lang} translation and nothing else."
         )
         out = self.llm.create_chat_completion(
@@ -494,7 +528,7 @@ class QwenTranslator:
             temperature=0.0,
             max_tokens=self.max_tokens,
         )
-        return out["choices"][0]["message"]["content"].strip()
+        return self._strip_preamble(out["choices"][0]["message"]["content"])
 
     def roundtrip(self, text: str) -> str:
         # Walk the chain one discrete hop at a time: EN->ZH->JA->EN.
