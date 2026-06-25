@@ -95,6 +95,18 @@ QWEN_RTT_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_qwen_translation_cach
 QWEN_RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_known_emb.npz")
 QWEN_RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_unknown_emb.npz")
 
+# Lower-distortion alternative: a single EN->ZH->EN round trip. Halving the chain
+# (vs the EN->ZH->JA->EN above) compounds far less translation error, so it
+# preserves fidelity — e.g. questions stay questions — at the cost of a milder
+# stylometric perturbation. Same Qwen GGUF, separate cache/embedding files.
+QWEN_RTT_HOPS_ZH = [
+    ("English", "Chinese"),
+    ("Chinese", "English"),
+]
+QWEN_RTT_ZH_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_qwen_zh_translation_cache.csv")
+QWEN_RTT_ZH_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_zh_known_emb.npz")
+QWEN_RTT_ZH_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_zh_unknown_emb.npz")
+
 
 # ---------------------------------------------------------------------------
 # Attack functions
@@ -702,6 +714,19 @@ def rtt_qwen_defense(df, known, unknown, known_emb, unknown_emb):
     return _rtt_defense(df, QwenTranslator(), QWEN_RTT_CACHE_CSV, QWEN_RTT_EMB_KNOWN_NPZ, QWEN_RTT_EMB_UNKNOWN_NPZ)
 
 
+def rtt_qwen_zh_defense(df, known, unknown, known_emb, unknown_emb):
+    """Lower-distortion alternative to rtt_qwen_defense: a single EN->ZH->EN round
+    trip (two discrete Qwen hops, no Japanese pivot). Halving the chain preserves
+    fidelity at the cost of a milder perturbation. Same GPU-offloaded GGUF."""
+    return _rtt_defense(
+        df,
+        QwenTranslator(hops=QWEN_RTT_HOPS_ZH),
+        QWEN_RTT_ZH_CACHE_CSV,
+        QWEN_RTT_ZH_EMB_KNOWN_NPZ,
+        QWEN_RTT_ZH_EMB_UNKNOWN_NPZ,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registries — the one place to plug in new modules. Add an entry to either
 # dict and it is automatically listed in the menu and runnable. Keys are the
@@ -718,6 +743,7 @@ DEFENSES = {
     "RTT (Argos)": rtt_argos_defense,
     "RTT (NLLB)": rtt_nllb_defense,
     "RTT (Qwen 4-bit)": rtt_qwen_defense,
+    "RTT (Qwen 4-bit, EN-ZH-EN)": rtt_qwen_zh_defense,
     "Rewrite (Qwen 4-bit)": rewrite_qwen_defense,
 }
 
