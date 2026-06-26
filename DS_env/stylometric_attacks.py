@@ -39,10 +39,13 @@ RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_known_emb.npz")
 RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_unknown_emb.npz")
 
 # NLLB backend gets its own cache files so it never clobbers the Argos results.
-NLLB_MODEL = "facebook/nllb-200-distilled-600M"         # ~600M params; fits an 8GB GPU in fp16
-NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb_translation_cache.csv")
-NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb_known_emb.npz")
-NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb_unknown_emb.npz")
+NLLB_MODEL = "facebook/nllb-200-distilled-1.3B"         # ~1.3B params; ~2.6GB in fp16 on an 8GB GPU
+# Cache/embedding files are versioned by the chain+model below ("13b_enzhen"):
+# the translation cache is keyed by SOURCE TEXT ONLY, so changing the model or
+# hops MUST use fresh files or it would serve stale results for the same prompt.
+NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb13b_enzhen_translation_cache.csv")
+NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enzhen_known_emb.npz")
+NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enzhen_unknown_emb.npz")
 
 # --- Rewrite defense config -------------------------------------------------
 # Threat model: a USER's own writing style fingerprints them across queries.
@@ -361,11 +364,16 @@ class NLLBTranslator:
     the model's context window and to keep the GPU busy.
     """
 
-    HOPS = [("eng_Latn", "zho_Hans"), ("zho_Hans", "jpn_Jpan"), ("jpn_Jpan", "eng_Latn")]
+    # Single EN->ZH->EN round trip. The distant Chinese pivot is what strips
+    # per-user style (English form cannot survive in Chinese, so the decoder
+    # regenerates canonical English); a strong model + beam search is what keeps
+    # the content. The Japanese hop was dropped: it mostly compounds fidelity
+    # loss for little extra style scrub.
+    HOPS = [("eng_Latn", "zho_Hans"), ("zho_Hans", "eng_Latn")]
     # Sentence terminators across the languages we pass through (Latin + CJK).
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
-    def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=32,
+    def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=16,
                  max_new_tokens=512):
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -411,9 +419,8 @@ class NLLBTranslator:
                 gen = self.model.generate(
                     **inputs,
                     forced_bos_token_id=bos,
-                    num_beams=1,                 # greedy: translationese is fine
+                    num_beams=5,                 # mode-seeking: adequacy + canonical style
                     do_sample=False,
-                    no_repeat_ngram_size=3,      # break degenerate repeat loops
                     max_new_tokens=self.max_new_tokens,
                 )
             for j, dec in zip(idx, self.tokenizer.batch_decode(gen, skip_special_tokens=True)):
