@@ -46,6 +46,10 @@ NLLB_MODEL = "facebook/nllb-200-distilled-1.3B"         # ~1.3B params; ~2.6GB i
 NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb13b_enesen_translation_cache.csv")
 NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enesen_known_emb.npz")
 NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enesen_unknown_emb.npz")
+# Speed/quality dial for NLLB translation (beam-search width). 5 = best fidelity
+# but slowest; 3 is nearly identical quality for ~1.7x the speed; 1 = greedy,
+# fastest and roughest. Runtime scales ~linearly with this.
+NLLB_NUM_BEAMS = 3
 
 # --- Rewrite defense config -------------------------------------------------
 # Threat model: a USER's own writing style fingerprints them across queries.
@@ -375,7 +379,7 @@ class NLLBTranslator:
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
     def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=16,
-                 max_new_tokens=512):
+                 max_new_tokens=512, num_beams=NLLB_NUM_BEAMS):
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -384,6 +388,7 @@ class NLLBTranslator:
         self.max_length = max_length
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size  # sentences per generate() call
+        self.num_beams = num_beams    # beam-search width; see NLLB_NUM_BEAMS
         # fp16 on GPU is the comment's original intent: ~2x faster and half the
         # VRAM of fp32. Stay fp32 on CPU, where fp16 is unsupported / slower.
         dtype = torch.float16 if self.device == "cuda" else torch.float32
@@ -424,7 +429,7 @@ class NLLBTranslator:
                 gen = self.model.generate(
                     **inputs,
                     forced_bos_token_id=bos,
-                    num_beams=5,                 # mode-seeking: adequacy + canonical style
+                    num_beams=self.num_beams,    # mode-seeking: adequacy + canonical style
                     do_sample=False,
                     max_new_tokens=self.max_new_tokens,
                 )
