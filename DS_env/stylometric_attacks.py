@@ -365,36 +365,78 @@ class NLLBTranslator:
     # Sentence terminators across the languages we pass through (Latin + CJK).
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
-    def __init__(self, model_name=NLLB_MODEL, max_length=512):
+    def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=32,
+                 max_new_tokens=512):
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         self._torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_length = max_length
-        print(f"Loading NLLB model '{model_name}' on {self.device}...")
+        self.max_new_tokens = max_new_tokens
+        self.batch_size = batch_size  # sentences per generate() call
+        # fp16 on GPU is the comment's original intent: ~2x faster and half the
+        # VRAM of fp32. Stay fp32 on CPU, where fp16 is unsupported / slower.
+        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        print(f"Loading NLLB model '{model_name}' on {self.device} ({dtype})...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(self.device)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, torch_dtype=dtype
+        ).to(self.device)
+        self.model.eval()
 
     def _split(self, text):
         parts = [p for p in self._SENT_SPLIT.split(text) if p.strip()]
         return parts or [text]  # always translate at least the whole string
 
-    def _translate(self, sentences, src, tgt):
+    def _translate_batch(self, sentences, src, tgt):
+        """Translate a flat list of sentences src->tgt in length-sorted GPU
+        batches. Sorting by length keeps each padded sub-batch uniform, so a
+        long/degenerate sentence can't drag short ones to max_new_tokens, and
+        padding waste is minimized."""
+        if not sentences:
+            return []
         self.tokenizer.src_lang = src
-        inputs = self.tokenizer(
-            sentences, return_tensors="pt", padding=True, truncation=True, max_length=self.max_length
-        ).to(self.device)
-        bos = self.tokenizer.convert_tokens_to_ids(tgt)  # forced target-language BOS
-        with self._torch.no_grad():
-            out = self.model.generate(**inputs, forced_bos_token_id=bos, max_length=self.max_length)
-        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
+        bos = self.tokenizer.convert_tokens_to_ids(tgt)  # forced target-lang BOS
+        order = sorted(range(len(sentences)), key=lambda i: len(sentences[i]))
+        out = [None] * len(sentences)
+        for i in range(0, len(order), self.batch_size):
+            idx = order[i:i + self.batch_size]
+            batch = [sentences[j] for j in idx]
+            inputs = self.tokenizer(
+                batch, return_tensors="pt", padding=True,
+                truncation=True, max_length=self.max_length,
+            ).to(self.device)
+            with self._torch.no_grad():
+                gen = self.model.generate(
+                    **inputs,
+                    forced_bos_token_id=bos,
+                    num_beams=1,                 # greedy: translationese is fine
+                    do_sample=False,
+                    no_repeat_ngram_size=3,      # break degenerate repeat loops
+                    max_new_tokens=self.max_new_tokens,
+                )
+            for j, dec in zip(idx, self.tokenizer.batch_decode(gen, skip_special_tokens=True)):
+                out[j] = dec
+        return out
+
+    def roundtrip_batch(self, texts):
+        """Round-trip many prompts at once. All prompts' sentences are flattened
+        into one stream so each hop runs in large GPU batches across prompt
+        boundaries, then re-grouped back to per-prompt strings."""
+        sent_lists = [self._split(t) for t in texts]
+        counts = [len(s) for s in sent_lists]
+        flat = [s for lst in sent_lists for s in lst]
+        for src, tgt in self.HOPS:
+            flat = self._translate_batch(flat, src, tgt)
+        results, pos = [], 0
+        for n in counts:
+            results.append(" ".join(flat[pos:pos + n]))
+            pos += n
+        return results
 
     def roundtrip(self, text: str) -> str:
-        sentences = self._split(text)
-        for src, tgt in self.HOPS:
-            sentences = self._translate(sentences, src, tgt)
-        return " ".join(sentences)
+        return self.roundtrip_batch([text])[0]
 
 
 class QwenRewriter:
@@ -577,10 +619,27 @@ def round_trip_translate(texts, translator, cache_csv=RTT_CACHE_CSV, label="", f
     # Honest accounting: say how many were served from cache vs. actually run.
     print(f"  {label or 'RTT'}: {len(unique) - len(pending)} cached, {len(pending)} to translate")
 
-    for i, src in enumerate(tqdm(pending, desc=f"  RTT translate {label}".rstrip(), leave=False), 1):
-        cache[src] = translator.roundtrip(src)
-        if cache_csv and i % flush_every == 0:
-            _save_cache(cache, cache_csv)  # incremental flush -> crash-safe
+    desc = f"  RTT translate {label}".rstrip()
+    batch_fn = getattr(translator, "roundtrip_batch", None)
+    if batch_fn is not None:
+        # Batched backend (e.g. NLLB): translate a chunk of prompts per call so
+        # each hop runs in large GPU batches across prompt boundaries. Flush
+        # after every chunk, keeping the same crash-safety guarantee.
+        chunk = max(flush_every, getattr(translator, "batch_size", 32))
+        with tqdm(total=len(pending), desc=desc, leave=False) as bar:
+            for i in range(0, len(pending), chunk):
+                group = pending[i:i + chunk]
+                for src, res in zip(group, batch_fn(group)):
+                    cache[src] = res
+                if cache_csv:
+                    _save_cache(cache, cache_csv)  # incremental flush -> crash-safe
+                bar.update(len(group))
+    else:
+        # Per-prompt backend (Argos, Qwen): one roundtrip at a time.
+        for i, src in enumerate(tqdm(pending, desc=desc, leave=False), 1):
+            cache[src] = translator.roundtrip(src)
+            if cache_csv and i % flush_every == 0:
+                _save_cache(cache, cache_csv)  # incremental flush -> crash-safe
 
     if cache_csv and pending:
         _save_cache(cache, cache_csv)  # final flush for the remainder
