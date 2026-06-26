@@ -43,9 +43,9 @@ NLLB_MODEL = "facebook/nllb-200-distilled-1.3B"         # ~1.3B params; ~2.6GB i
 # Cache/embedding files are versioned by the chain+model below ("13b_enzhen"):
 # the translation cache is keyed by SOURCE TEXT ONLY, so changing the model or
 # hops MUST use fresh files or it would serve stale results for the same prompt.
-NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb13b_enzhen_translation_cache.csv")
-NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enzhen_known_emb.npz")
-NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enzhen_unknown_emb.npz")
+NLLB_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_nllb13b_enesen_translation_cache.csv")
+NLLB_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enesen_known_emb.npz")
+NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enesen_unknown_emb.npz")
 
 # --- Rewrite defense config -------------------------------------------------
 # Threat model: a USER's own writing style fingerprints them across queries.
@@ -364,12 +364,13 @@ class NLLBTranslator:
     the model's context window and to keep the GPU busy.
     """
 
-    # Single EN->ZH->EN round trip. The distant Chinese pivot is what strips
-    # per-user style (English form cannot survive in Chinese, so the decoder
-    # regenerates canonical English); a strong model + beam search is what keeps
-    # the content. The Japanese hop was dropped: it mostly compounds fidelity
-    # loss for little extra style scrub.
-    HOPS = [("eng_Latn", "zho_Hans"), ("zho_Hans", "eng_Latn")]
+    # Single EN->ES->EN round trip. Spanish is the pivot because its obligatory
+    # ¿...? marking makes questions survive the round trip (Chinese drops the
+    # optional 吗 particle, turning questions into statements), and EN<->ES is one
+    # of NLLB's highest-quality pairs. The pivot still regenerates canonical
+    # English, so per-user style is normalized while content and sentence type
+    # are preserved. A strong model + beam search keeps the content.
+    HOPS = [("eng_Latn", "spa_Latn"), ("spa_Latn", "eng_Latn")]
     # Sentence terminators across the languages we pass through (Latin + CJK).
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
@@ -392,6 +393,10 @@ class NLLBTranslator:
             model_name, torch_dtype=dtype
         ).to(self.device)
         self.model.eval()
+        # NLLB ships a default generation_config.max_length (200); leaving it set
+        # while we pass max_new_tokens makes transformers warn on every call that
+        # the two conflict. Clear it so max_new_tokens is the sole length control.
+        self.model.generation_config.max_length = None
 
     def _split(self, text):
         parts = [p for p in self._SENT_SPLIT.split(text) if p.strip()]
