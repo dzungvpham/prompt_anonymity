@@ -221,6 +221,12 @@ __marimo__/
 *.npy
 wildchat_preprocessed/
 
+# Cached (regenerable) expensive transforms: defense rewrites + featurizer vectors
+experiments/.cache/
+experiments/.defense_cache/
+# Regenerable experiment outputs (CSVs + plots)
+experiments/results/
+
 # Data Protection
 *.csv
 *.npz

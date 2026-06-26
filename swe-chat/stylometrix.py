@@ -11,7 +11,9 @@ langcode = "en"
 INPUT_PATH = "swe_chat_sessions.csv"
 OUTPUT_PATH = f"swe_chat_stylometrix_{langcode}_{MAX_LEN}.csv"
 
-assert spacy.require_gpu(), "Spacy cannot use GPU!"
+# Use the GPU if spaCy can reach one; otherwise fall back to CPU (much slower).
+if not spacy.prefer_gpu():
+    print("WARNING: spaCy could not find a GPU; StyloMetrix will run on CPU and may take a very long time.", flush=True)
 
 sessions = pd.read_csv(INPUT_PATH)
 sessions["content"] = sessions["content"].fillna("").astype(str)
