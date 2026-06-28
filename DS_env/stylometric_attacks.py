@@ -29,8 +29,19 @@ DEFENSE_DATA_DIR = "defense_data"
 CACHE_DIR = os.path.join(DEFENSE_DATA_DIR, "cache")
 EMB_DIR = os.path.join(DEFENSE_DATA_DIR, "embeddings")
 OUTPUT_DIR = os.path.join(DEFENSE_DATA_DIR, "output")
-for _d in (CACHE_DIR, EMB_DIR, OUTPUT_DIR):
+FIDELITY_DIR = os.path.join(DEFENSE_DATA_DIR, "fidelity")
+for _d in (CACHE_DIR, EMB_DIR, OUTPUT_DIR, FIDELITY_DIR):
     os.makedirs(_d, exist_ok=True)  # ensure dirs exist on a fresh checkout
+
+# Fidelity scoring — how much of a prompt's MEANING survives a text-rewriting
+# defense. We embed the original and defended prompt with a general semantic
+# model and take their cosine similarity (1.0 = meaning fully preserved).
+# Deliberately a DIFFERENT representation from StyloMetrix: StyloMetrix is the
+# attack's *style* space, so scoring fidelity in a separate *semantic* space
+# keeps the privacy axis and the utility axis independent. BGE-large's 512-token
+# window comfortably covers a MAX_LEN(=2048)-char prompt, and inputs are
+# truncated to MAX_LEN so we score the exact text the attack saw.
+FIDELITY_MODEL = "BAAI/bge-large-en-v1.5"
 
 OUTPUT_CSV = os.path.join(OUTPUT_DIR, "wildchat_analysis_stylometrix_results.csv")
 
@@ -203,6 +214,12 @@ OPENANON_TEMPERATURE = 0.0                    # greedy -> deterministic, reprodu
 OPENANON_TOP_P = 1.0
 OPENANON_MAX_TOKENS = 2048
 OPENANON_OUTPUT_TAG = "scrubbed_prompt"       # block the model is told to return
+# Requests are I/O-bound (network), so fan them out across threads instead of
+# going one-by-one. Tune MAX_WORKERS up for throughput / down if the provider
+# rate-limits (429s are retried with backoff regardless). BATCH_SIZE is the
+# cache-flush granularity: a crash loses at most this many in-flight rewrites.
+OPENANON_MAX_WORKERS = 8
+OPENANON_BATCH_SIZE = 64
 
 OPENANON_SYSTEM_PROMPT = """
 You are PrivacyScrubber, a privacy-preserving prompt rewrite model.
@@ -974,7 +991,8 @@ class OpenAnonymityRewriter:
     def __init__(self, model=OPENANON_MODEL, base_url=OPENANON_BASE_URL,
                  system_prompt=OPENANON_SYSTEM_PROMPT, api_key_env=OPENANON_API_KEY_ENV,
                  temperature=OPENANON_TEMPERATURE, top_p=OPENANON_TOP_P,
-                 max_tokens=OPENANON_MAX_TOKENS, timeout=120, max_retries=4):
+                 max_tokens=OPENANON_MAX_TOKENS, timeout=120, max_retries=4,
+                 max_workers=OPENANON_MAX_WORKERS, batch_size=OPENANON_BATCH_SIZE):
         # Imported lazily so the rest of this module runs without these deps.
         import requests
         from dotenv import load_dotenv
@@ -988,6 +1006,10 @@ class OpenAnonymityRewriter:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.max_retries = max_retries
+        # round_trip_translate reads .batch_size to size its flush chunk, and calls
+        # .roundtrip_batch (below) when present -> requests fan out concurrently.
+        self.max_workers = max_workers
+        self.batch_size = batch_size
 
         # load_dotenv walks up from the cwd to find a .env, so the key can live in
         # DS_env/.env or the repo root. Fail fast if it is missing.
@@ -1034,6 +1056,27 @@ class OpenAnonymityRewriter:
                 if attempt < self.max_retries - 1:
                     time.sleep(2 ** attempt)
         raise RuntimeError(f"OpenRouter request failed after {self.max_retries} attempts: {last_err}")
+
+    def roundtrip_batch(self, texts):
+        """Rewrite a batch of prompts concurrently, preserving input order.
+
+        round_trip_translate auto-uses this path (over per-prompt .roundtrip) when
+        it exists, so the OpenAnonymity defense fans requests out to OpenRouter
+        instead of going one-at-a-time. The calls are network I/O-bound, so a
+        thread pool gives near-linear speedup despite the GIL. Each worker runs the
+        same per-request retry/backoff as .roundtrip; a prompt that still fails
+        after max_retries raises, aborting the batch (same contract as before).
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        texts = list(texts)
+        if not texts:
+            return []
+        # No point spawning more threads than prompts in this chunk.
+        workers = max(1, min(self.max_workers, len(texts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # pool.map preserves order and re-raises the first worker exception.
+            return list(pool.map(self.roundtrip, texts))
 
 
 def renderTemplate(template, values):
@@ -1315,6 +1358,84 @@ def styleremix_defense(df, known, unknown, known_emb, unknown_emb,
 
 
 # ---------------------------------------------------------------------------
+# Fidelity scoring
+#
+# A defense is only useful if the rewritten prompt still means what the user
+# wrote. Every text-rewriting defense above stores its work as a {source,
+# translated} round-trip cache (see round_trip_translate), which is exactly an
+# (original, defended) pair per unique prompt -- so we can score fidelity
+# straight from those caches, with no attack run required.
+# ---------------------------------------------------------------------------
+
+_BGE_MODEL = None  # process-wide singleton; the model is ~1.3GB to load.
+
+
+def _bge_model(model_name=FIDELITY_MODEL):
+    """Lazy-load the BGE sentence-transformer once, on GPU if one is present."""
+    global _BGE_MODEL
+    if _BGE_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"  loading fidelity model {model_name} on {device}...")
+        _BGE_MODEL = SentenceTransformer(model_name, device=device)
+    return _BGE_MODEL
+
+
+def bge_embed(texts, max_len=MAX_LEN, batch_size=64):
+    """L2-normalized BGE embeddings of texts, each truncated to max_len chars to
+    match the text the attack saw. Normalized so a row-wise dot product equals
+    cosine similarity. BGE is symmetric for sentence similarity, so we add NO
+    'query:'/'passage:' retrieval prefix -- the two prompts are peers."""
+    model = _bge_model()
+    return model.encode(
+        [str(t)[:max_len] for t in texts],
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+    )
+
+
+def fidelity_from_cache(cache_csv, label="", out_dir=FIDELITY_DIR, max_len=MAX_LEN):
+    """Semantic fidelity of a text-rewriting defense, read from its round-trip
+    cache. For each unique (original, defended) prompt pair we embed both sides
+    with BGE and take their cosine similarity: 1.0 = meaning fully preserved,
+    lower = more semantic drift. Writes a per-prompt CSV and prints a summary.
+
+    Caveat for redaction defenses (e.g. OpenAnonymity, which replaces names with
+    [PERSON_n] on purpose): they score lower here BY DESIGN, because removing
+    identifying content is genuine semantic change. Read their number as a floor
+    on utility, not a failure -- and compare it against a paraphrase defense,
+    where any drop below 1.0 really is loss.
+    """
+    if not os.path.exists(cache_csv):
+        raise FileNotFoundError(
+            f"No round-trip cache for this defense yet: {cache_csv}\n"
+            "Run the defense once (it builds the cache) before scoring fidelity."
+        )
+    pairs = pd.read_csv(cache_csv).dropna(subset=["source"])
+    pairs["translated"] = pairs["translated"].fillna("")
+
+    src = bge_embed(pairs["source"].tolist(), max_len=max_len)
+    dst = bge_embed(pairs["translated"].tolist(), max_len=max_len)
+    cos = np.sum(src * dst, axis=1)  # both L2-normalized -> dot product is cosine
+    pairs = pairs.assign(fidelity=cos)
+
+    slug = re.sub(r"[^a-z0-9]+", "_", (label or os.path.basename(cache_csv)).lower()).strip("_")
+    out_csv = os.path.join(out_dir, f"fidelity_{slug}.csv")
+    pairs.sort_values("fidelity").to_csv(out_csv, index=False)  # worst pairs first
+
+    print(f"\nFidelity [{label or os.path.basename(cache_csv)}]  n={len(cos)} unique prompts")
+    print(f"  mean    {cos.mean():.4f}")
+    print(f"  median  {np.median(cos):.4f}")
+    print(f"  p10     {np.percentile(cos, 10):.4f}   (worst-preserved decile)")
+    print(f"  min     {cos.min():.4f}")
+    print(f"  -> {out_csv}  (sorted worst-first for spot checks)")
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # Registries — the one place to plug in new modules. Add an entry to either
 # dict and it is automatically listed in the menu and runnable. Keys are the
 # human-readable names shown to the user.
@@ -1348,6 +1469,18 @@ SIDES = {
     "Neither (baseline)": (False, False),
 }
 
+# Defense -> its round-trip cache, so fidelity_from_cache() can score any
+# text-rewriting defense by name. ("None" has no rewrite, hence no cache.)
+FIDELITY_CACHES = {
+    "RTT (Argos)": RTT_CACHE_CSV,
+    "RTT (NLLB)": NLLB_CACHE_CSV,
+    "RTT (Qwen 4-bit)": QWEN_RTT_CACHE_CSV,
+    "RTT (Qwen 4-bit, EN-ZH-EN)": QWEN_RTT_ZH_CACHE_CSV,
+    "Rewrite (Qwen 4-bit)": REWRITE_CACHE_CSV,
+    "StyleRemix (Llama-3-8B LoRA)": STYLEREMIX_CACHE_CSV,
+    "OpenAnonymity (OpenRouter scrubber)": OPENANON_CACHE_CSV,
+}
+
 
 # ---------------------------------------------------------------------------
 # Entry point — interactive menu driven by the registries above
@@ -1366,7 +1499,22 @@ def choose(title, options):
         print(f"Please enter a number from 1 to {len(keys)}.")
 
 
+def fidelity_menu():
+    """Score how much prompt meaning a defense preserves, straight from its cache."""
+    defense_name = choose("Fidelity for which defense?", FIDELITY_CACHES)
+    fidelity_from_cache(FIDELITY_CACHES[defense_name], label=defense_name)
+
+
 def main():
+    # Two independent things you can run: the privacy attack, or the fidelity
+    # score for a defense. Fidelity reads from the defense's cache and needs
+    # neither the dataset nor the StyloMetrix embeddings, so branch before loading.
+    mode = choose("What do you want to run?",
+                  {"Attack experiment": None, "Fidelity score": None})
+    if mode == "Fidelity score":
+        fidelity_menu()
+        return
+
     print("Loading data...")
     df = load_data()
 
