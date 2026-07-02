@@ -24,6 +24,15 @@ RANDOM_SEED = 47
 MAX_LEN = 2048                        # char truncation, matches wildchat/stylometrix.py
 STYLO_LANGCODE = "en"                 # final text is English -> embed with the English model
 
+# A conversation cell concatenates a user's turns (user inputs only) joined by
+# this literal ESCAPED delimiter — real newlines were stored as the two-char
+# sequence "\n", so the on-disk separator is the literal string "\n===\n" (see
+# wildchat/preprocess.py and wildchat_turn_split.py), NOT real newlines. Defenses
+# split on it to rewrite each turn independently, then re-join with it (see
+# round_trip_translate_by_turn), so the backend never sees the delimiter and each
+# user message is defended on its own.
+TURN_DELIM = "\\n===\\n"
+
 # Defense-generated artifacts are organized under defense_data/{cache,embeddings,output}.
 DEFENSE_DATA_DIR = "defense_data"
 CACHE_DIR = os.path.join(DEFENSE_DATA_DIR, "cache")
@@ -533,8 +542,9 @@ def run_experiment(attack_fn, known, unknown, known_emb, unknown_emb, output_csv
 # hop is auto-pivoted through English by the library. The *effective* path is
 # therefore EN -> ZH -> (EN) -> JA -> EN. This is still a strong multi-hop
 # translationese perturbation; it is just not a "true" cross-lingual zh->ja hop.
-# The Translator backend is swappable so a future NLLBTranslator (facebook/
-# nllb-200, which supports a genuine zh->ja) can drop in without other changes.
+# The Translator backend is swappable: NLLBTranslator (facebook/nllb-200) below
+# is many-to-many and pivots directly, and other backends (Qwen, rewrite/scrubber
+# defenses) drop in through the same .roundtrip() interface without other changes.
 # ---------------------------------------------------------------------------
 
 
@@ -582,9 +592,10 @@ class ArgosTranslator:
 class NLLBTranslator:
     """Round-trip translator using Meta's NLLB-200 (HuggingFace transformers).
 
-    Unlike Argos, NLLB is many-to-many, so zh->ja is a *real* direct hop with no
-    English pivot — the chain is a true EN->ZH->JA->EN. Higher quality than Argos
-    at the cost of a heavier model. Runs on GPU if one is visible, else CPU.
+    NLLB is many-to-many, so it can pivot through any language directly with no
+    intermediate English hop (unlike Argos). The chain here is a single EN->ES->EN
+    round trip (see HOPS below). Higher quality than Argos at the cost of a heavier
+    model. Runs on GPU if one is visible, else CPU.
 
     HOPS use FLORES-200 language codes. Text is split into sentences and
     translated in a single batched generate() call per hop, both to stay within
@@ -598,7 +609,9 @@ class NLLBTranslator:
     # English, so per-user style is normalized while content and sentence type
     # are preserved. A strong model + beam search keeps the content.
     HOPS = [("eng_Latn", "spa_Latn"), ("spa_Latn", "eng_Latn")]
-    # Sentence terminators across the languages we pass through (Latin + CJK).
+    # Sentence terminators. Latin (.!?) covers the EN/ES chain above; the CJK
+    # marks (。！？) are kept so the splitter still works if HOPS is repointed
+    # through a CJK pivot.
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
     def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=16,
@@ -679,36 +692,30 @@ class NLLBTranslator:
         return self.roundtrip_batch([text])[0]
 
 
-class QwenRewriter:
-    """On-device prompt-rewriting defense backed by a 4-bit Qwen GGUF via
-    llama-cpp-python (CPU-friendly; runs on a slow laptop or phone).
+class _QwenGGUF:
+    """Shared on-device 4-bit Qwen GGUF backend (llama-cpp-python; CPU-friendly,
+    GPU-offloaded when available). Owns the model load and one greedy
+    chat-completion helper; subclasses add the task-specific prompting (style
+    rewrite vs. translation). The model is auto-downloaded from the HF Hub on
+    first use (cached offline afterwards), the same first-run-only cost the
+    Argos/NLLB backends pay.
 
-    Contract: exposes `.roundtrip(text) -> text`, the SAME duck-typed interface
-    the translators use, so it drops straight into `_rtt_defense` with no other
-    changes. Here the "roundtrip" is a style-normalizing rewrite: every prompt is
-    rewritten into one fixed target style (REWRITE_PROMPT_HEADER), collapsing
-    per-user stylometric signal toward a shared identity while preserving content.
-
-    The model is auto-downloaded from the HF Hub on first use (cached offline
-    afterwards), the same first-run-only cost the Argos/NLLB backends pay.
+    n_gpu_layers=-1 offloads ALL transformer layers to the GPU. This is the
+    single biggest speed lever: without it llama.cpp keeps everything on CPU. It
+    only takes effect if llama-cpp-python was built with CUDA support
+    (llama_cpp.llama_supports_gpu_offload() must be True) — otherwise it is a
+    harmless no-op and inference stays on CPU. Qwen2.5-3B q4 (~2GB) fits the
+    3070's 8GB VRAM with room to spare.
     """
 
-    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
-                 system_prompt=REWRITE_PROMPT_HEADER, n_ctx=4096,
-                 n_threads=None, max_tokens=1024, n_gpu_layers=-1):
+    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE, n_ctx=4096,
+                 n_threads=None, max_tokens=1024, n_gpu_layers=-1, load_note=""):
         from llama_cpp import Llama
 
-        self.system_prompt = system_prompt
         self.max_tokens = max_tokens
-        # n_gpu_layers=-1 offloads ALL transformer layers to the GPU. This is the
-        # single biggest speed lever: without it llama.cpp keeps everything on CPU.
-        # It only takes effect if llama-cpp-python was built with CUDA support
-        # (llama_cpp.llama_supports_gpu_offload() must be True) — otherwise it is a
-        # harmless no-op and inference stays on CPU. Qwen2.5-3B q4 (~2GB) fits the
-        # 3070's 8GB VRAM with room to spare.
-        print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp)...")
+        print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp){load_note}...")
         # from_pretrained downloads+caches the GGUF via huggingface_hub; n_threads
-        #=None lets llama.cpp pick a sensible count from the available cores.
+        # =None lets llama.cpp pick a sensible count from the available cores.
         self.llm = Llama.from_pretrained(
             repo_id=repo_id,
             filename=filename,
@@ -718,21 +725,48 @@ class QwenRewriter:
             verbose=False,
         )
 
-    def roundtrip(self, text: str) -> str:
-        # temperature=0 -> greedy/deterministic. Same model + same prompt + greedy
-        # decoding is exactly what drives every user's text to converge in style.
+    def _complete(self, system_prompt: str, user_text: str) -> str:
+        # temperature=0 -> greedy/deterministic: same model + same prompt always
+        # yields the same output, which is what drives style convergence and makes
+        # re-runs / cache hits reproducible. Returns the raw content; callers do
+        # their own post-processing (.strip() / preamble stripping).
         out = self.llm.create_chat_completion(
             messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": text},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
             ],
             temperature=0.0,
             max_tokens=self.max_tokens,
         )
-        return out["choices"][0]["message"]["content"].strip()
+        return out["choices"][0]["message"]["content"]
 
 
-class QwenTranslator:
+class QwenRewriter(_QwenGGUF):
+    """On-device prompt-rewriting defense backed by a 4-bit Qwen GGUF via
+    llama-cpp-python (CPU-friendly; runs on a slow laptop or phone).
+
+    Contract: exposes `.roundtrip(text) -> text`, the SAME duck-typed interface
+    the translators use, so it drops straight into `_rtt_defense` with no other
+    changes. Here the "roundtrip" is a style-normalizing rewrite: every prompt is
+    rewritten into one fixed target style (REWRITE_PROMPT_HEADER), collapsing
+    per-user stylometric signal toward a shared identity while preserving content.
+    """
+
+    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
+                 system_prompt=REWRITE_PROMPT_HEADER, n_ctx=4096,
+                 n_threads=None, max_tokens=1024, n_gpu_layers=-1):
+        super().__init__(repo_id=repo_id, filename=filename, n_ctx=n_ctx,
+                         n_threads=n_threads, max_tokens=max_tokens,
+                         n_gpu_layers=n_gpu_layers)
+        self.system_prompt = system_prompt
+
+    def roundtrip(self, text: str) -> str:
+        # Greedy rewrite into the fixed target style drives every user's text to
+        # converge stylistically.
+        return self._complete(self.system_prompt, text).strip()
+
+
+class QwenTranslator(_QwenGGUF):
     """Round-trip translator that drives the SAME 4-bit Qwen GGUF as QwenRewriter
     through an EN->ZH->JA->EN chain, GPU-offloaded via llama.cpp.
 
@@ -751,22 +785,10 @@ class QwenTranslator:
     def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
                  hops=QWEN_RTT_HOPS, n_ctx=4096, n_threads=None,
                  max_tokens=1024, n_gpu_layers=-1):
-        from llama_cpp import Llama
-
+        super().__init__(repo_id=repo_id, filename=filename, n_ctx=n_ctx,
+                         n_threads=n_threads, max_tokens=max_tokens,
+                         n_gpu_layers=n_gpu_layers, load_note=" for RTT")
         self.hops = hops
-        self.max_tokens = max_tokens
-        # n_gpu_layers=-1 offloads ALL transformer layers to the GPU, exactly as
-        # QwenRewriter does; it is a harmless no-op if llama.cpp lacks CUDA. The
-        # ~2GB q4 model fits the 3070's 8GB VRAM with room to spare.
-        print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp) for RTT...")
-        self.llm = Llama.from_pretrained(
-            repo_id=repo_id,
-            filename=filename,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            n_gpu_layers=n_gpu_layers,
-            verbose=False,
-        )
 
     # Conversational preambles the model adds despite the guardrail, e.g.
     # "Here's the text in English:" or the Chinese/Japanese equivalents the
@@ -814,15 +836,7 @@ class QwenTranslator:
             f"'Here is the translation:'. Begin directly with the translated text.\n"
             f"- Output ONLY the {tgt_lang} translation and nothing else."
         )
-        out = self.llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.0,
-            max_tokens=self.max_tokens,
-        )
-        return self._strip_preamble(out["choices"][0]["message"]["content"])
+        return self._strip_preamble(self._complete(system_prompt, text))
 
     def roundtrip(self, text: str) -> str:
         # Walk the chain one discrete hop at a time: EN->ZH->JA->EN.
@@ -1100,6 +1114,12 @@ def extractTaggedOutput(raw_text, tag_name):
     return raw_text.strip()
 
 
+def _slug(name):
+    """Lowercase `name` to a filename-safe token: non-alphanumerics collapse to
+    single underscores, with no leading/trailing underscore."""
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
 def _save_cache(cache, cache_csv):
     pd.DataFrame(
         {"source": list(cache.keys()), "translated": list(cache.values())}
@@ -1156,6 +1176,43 @@ def round_trip_translate(texts, translator, cache_csv=RTT_CACHE_CSV, label="", f
     return [cache[t] for t in texts]
 
 
+def round_trip_translate_by_turn(texts, translator, cache_csv=RTT_CACHE_CSV, label="", flush_every=25):
+    """Defend each conversation PER TURN, then re-combine.
+
+    Per lead guidance: a conversation cell is a user's turns joined by TURN_DELIM
+    (user inputs only). The backend should see one turn at a time, not the whole
+    delimiter-joined conversation, so we (1) split every conversation into its
+    turns, (2) flatten all turns across all conversations into one stream and run
+    the defense (translate / rewrite) on that stream via round_trip_translate, and
+    (3) re-group the defended turns back per conversation and re-join them with
+    TURN_DELIM. The re-joined conversation is embedded exactly as the undefended
+    baseline is, so rows stay aligned — only the defense granularity changes.
+
+    Flattening means round_trip_translate caches and (for batched backends)
+    batches at TURN granularity, so identical turns shared across conversations
+    translate once. Blank turns (e.g. from a trailing delimiter) pass through
+    untouched so the backend is never handed an empty message.
+    """
+    turn_lists = [str(t).split(TURN_DELIM) for t in texts]
+    counts = [len(turns) for turns in turn_lists]
+    flat = [turn for turns in turn_lists for turn in turns]
+
+    defend_idx = [i for i, turn in enumerate(flat) if turn.strip()]
+    defended = round_trip_translate(
+        [flat[i] for i in defend_idx], translator,
+        cache_csv=cache_csv, label=label, flush_every=flush_every,
+    )
+    defended_flat = list(flat)
+    for i, d in zip(defend_idx, defended):
+        defended_flat[i] = d
+
+    results, pos = [], 0
+    for n in counts:
+        results.append(TURN_DELIM.join(defended_flat[pos:pos + n]))
+        pos += n
+    return results
+
+
 def embed_texts(texts, reference_columns, langcode=STYLO_LANGCODE, max_len=MAX_LEN):
     """Re-embed text with StyloMetrix, matching the original embedding pipeline
     (English model, 2048-char truncation — see wildchat/stylometrix.py).
@@ -1208,12 +1265,21 @@ def cached_embed(texts, reference_columns, npz_path):
     return emb
 
 
-def _model_texts(df, model, max_len=MAX_LEN):
+def _model_texts(df, model, max_len=None):
     """Conversation text for one model's rows, in the SAME order load_embeddings
-    uses (df[mask].reset_index), truncated to match the embedding pipeline. This
-    ordering is what keeps the re-embeddings row-aligned with the identities."""
+    uses (df[mask].reset_index). This ordering is what keeps the re-embeddings
+    row-aligned with the identities.
+
+    Translation defenses run on the FULL prompt (max_len=None, uncapped) so the
+    backend sees the whole conversation. The downstream StyloMetrix and BGE
+    embeddings still truncate to MAX_LEN, keeping the attack/fidelity scoring
+    aligned with the precomputed 2048-char reference corpus; pass an explicit
+    max_len only to reinstate an input cap."""
     sub = df[df["model"] == model].reset_index(drop=True)
-    return sub["conversation"].str[:max_len].tolist()
+    texts = sub["conversation"]
+    if max_len is not None:
+        texts = texts.str[:max_len]
+    return texts.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +1308,9 @@ def no_defense(df, known, unknown, known_emb, unknown_emb,
 def _rtt_defense(df, translator, cache_csv, known_npz, unknown_npz,
                  known_emb, unknown_emb, defend_known=True, defend_unknown=True):
     """Round-trip-translation defense: the selected set(s) are translated and
-    re-embedded.
+    re-embedded. Each conversation is defended PER TURN (split on TURN_DELIM,
+    every user turn rewritten independently, then re-joined) so the backend sees
+    one user message at a time — see round_trip_translate_by_turn.
 
     Defending known and unknown together models the real deployment where every
     prompt passes through the defense before it leaves the client. The side
@@ -1250,9 +1318,11 @@ def _rtt_defense(df, translator, cache_csv, known_npz, unknown_npz,
     (e.g. the user defends their own prompts but the attacker's reference corpus
     is undefended). An undefended side keeps its original embedding untouched.
 
-    Each defended side's prompts are translated EN->ZH->JA->EN and re-embedded
-    with StyloMetrix. Translations and embeddings are cached to disk (per-backend
-    files), so the run is resumable and only the first pass pays the full cost.
+    Each defended side's prompts are rewritten by the backend (a translation
+    round trip or a style/privacy rewrite, depending on `translator`) and
+    re-embedded with StyloMetrix. Translations and embeddings are cached to disk
+    (per-backend files), so the run is resumable and only the first pass pays the
+    full cost.
 
     `translator` is any object with a `.roundtrip(text) -> text` method, which is
     what lets the Argos and NLLB backends share this exact pipeline.
@@ -1260,15 +1330,15 @@ def _rtt_defense(df, translator, cache_csv, known_npz, unknown_npz,
     reference_columns = pd.read_csv(EMBEDDINGS_CSV, nrows=0).drop(columns="text").columns
 
     if defend_known:
-        print("Defending KNOWN set (translate -> embed)...")
-        known_trans = round_trip_translate(_model_texts(df, KNOWN_MODEL), translator, cache_csv=cache_csv, label="KNOWN")
+        print("Defending KNOWN set (split turns -> translate -> re-join -> embed)...")
+        known_trans = round_trip_translate_by_turn(_model_texts(df, KNOWN_MODEL), translator, cache_csv=cache_csv, label="KNOWN")
         known_emb = cached_embed(known_trans, reference_columns, known_npz)
     else:
         print("KNOWN set left undefended (original embeddings).")
 
     if defend_unknown:
-        print("Defending UNKNOWN set (translate -> embed)...")
-        unknown_trans = round_trip_translate(_model_texts(df, UNKNOWN_MODEL), translator, cache_csv=cache_csv, label="UNKNOWN")
+        print("Defending UNKNOWN set (split turns -> translate -> re-join -> embed)...")
+        unknown_trans = round_trip_translate_by_turn(_model_texts(df, UNKNOWN_MODEL), translator, cache_csv=cache_csv, label="UNKNOWN")
         unknown_emb = cached_embed(unknown_trans, reference_columns, unknown_npz)
     else:
         print("UNKNOWN set left undefended (original embeddings).")
@@ -1276,85 +1346,81 @@ def _rtt_defense(df, translator, cache_csv, known_npz, unknown_npz,
     return known_emb, unknown_emb
 
 
-def rtt_argos_defense(df, known, unknown, known_emb, unknown_emb,
-                      defend_known=True, defend_unknown=True):
-    """RTT via Argos (offline, fast CPU; zh->ja silently pivots through English)."""
-    return _rtt_defense(df, ArgosTranslator(), RTT_CACHE_CSV, RTT_EMB_KNOWN_NPZ, RTT_EMB_UNKNOWN_NPZ,
-                        known_emb, unknown_emb, defend_known, defend_unknown)
+# Every text-rewriting / translation defense is the SAME pipeline (_rtt_defense)
+# differing only in (a) which backend does the rewrite and (b) which on-disk
+# cache/embedding files it uses. This one table captures both, so each defense's
+# wiring lives in exactly one place; it drives DEFENSES (the menu) and
+# FIDELITY_CACHES (fidelity scoring) below.
+#   name -> {factory, cache_csv, known_npz, unknown_npz, doc}
+# `factory` is a zero-arg callable returning a `.roundtrip(text)->text` backend.
+# It is called LAZILY (only when the defense actually runs) so a backend's heavy
+# model deps are never imported at module load.
+DEFENSE_SPECS = {
+    "RTT (Argos)": {
+        "factory": ArgosTranslator,
+        "cache_csv": RTT_CACHE_CSV,
+        "known_npz": RTT_EMB_KNOWN_NPZ,
+        "unknown_npz": RTT_EMB_UNKNOWN_NPZ,
+        "doc": "RTT via Argos (offline, fast CPU; zh->ja silently pivots through English).",
+    },
+    "RTT (NLLB)": {
+        "factory": NLLBTranslator,
+        "cache_csv": NLLB_CACHE_CSV,
+        "known_npz": NLLB_EMB_KNOWN_NPZ,
+        "unknown_npz": NLLB_EMB_UNKNOWN_NPZ,
+        "doc": "RTT via NLLB-200 (higher quality, single EN->ES->EN pivot; wants a GPU).",
+    },
+    "RTT (Qwen 4-bit)": {
+        "factory": QwenTranslator,
+        "cache_csv": QWEN_RTT_CACHE_CSV,
+        "known_npz": QWEN_RTT_EMB_KNOWN_NPZ,
+        "unknown_npz": QWEN_RTT_EMB_UNKNOWN_NPZ,
+        "doc": "RTT via the on-device 4-bit Qwen GGUF, EN->ZH->JA->EN as three discrete hops (GPU-offloaded).",
+    },
+    "RTT (Qwen 4-bit, EN-ZH-EN)": {
+        "factory": lambda: QwenTranslator(hops=QWEN_RTT_HOPS_ZH),
+        "cache_csv": QWEN_RTT_ZH_CACHE_CSV,
+        "known_npz": QWEN_RTT_ZH_EMB_KNOWN_NPZ,
+        "unknown_npz": QWEN_RTT_ZH_EMB_UNKNOWN_NPZ,
+        "doc": "Lower-distortion Qwen RTT: a single EN->ZH->EN round trip (two hops, no Japanese pivot).",
+    },
+    "Rewrite (Qwen 4-bit)": {
+        "factory": QwenRewriter,
+        "cache_csv": REWRITE_CACHE_CSV,
+        "known_npz": REWRITE_EMB_KNOWN_NPZ,
+        "unknown_npz": REWRITE_EMB_UNKNOWN_NPZ,
+        "doc": "Style-convergence rewrite: on-device 4-bit Qwen rewrites every prompt into one fixed style (REWRITE_PROMPT_HEADER).",
+    },
+    "StyleRemix (Llama-3-8B LoRA)": {
+        "factory": StyleRemixRewriter,
+        "cache_csv": STYLEREMIX_CACHE_CSV,
+        "known_npz": STYLEREMIX_EMB_KNOWN_NPZ,
+        "unknown_npz": STYLEREMIX_EMB_UNKNOWN_NPZ,
+        "doc": "Style-convergence via StyleRemix: steer every prompt toward one fixed style (STYLEREMIX_SLIDERS) with Llama-3-8B + per-axis LoRA.",
+    },
+    "OpenAnonymity (OpenRouter scrubber)": {
+        "factory": OpenAnonymityRewriter,
+        "cache_csv": OPENANON_CACHE_CSV,
+        "known_npz": OPENANON_EMB_KNOWN_NPZ,
+        "unknown_npz": OPENANON_EMB_UNKNOWN_NPZ,
+        "doc": "Privacy-scrubber rewrite via a remote OpenRouter model (redact identifiers + de-identify style). Needs OPENROUTER_API_KEY.",
+    },
+}
 
 
-def rtt_nllb_defense(df, known, unknown, known_emb, unknown_emb,
-                     defend_known=True, defend_unknown=True):
-    """RTT via NLLB-200 (higher quality, true direct zh->ja; wants a GPU)."""
-    return _rtt_defense(df, NLLBTranslator(), NLLB_CACHE_CSV, NLLB_EMB_KNOWN_NPZ, NLLB_EMB_UNKNOWN_NPZ,
-                        known_emb, unknown_emb, defend_known, defend_unknown)
-
-
-def rewrite_qwen_defense(df, known, unknown, known_emb, unknown_emb,
-                         defend_known=True, defend_unknown=True):
-    """Style-convergence defense: rewrite every prompt on-device with a 4-bit
-    Qwen into one fixed style (REWRITE_PROMPT_HEADER), then re-embed. Reuses the
-    RTT pipeline since QwenRewriter exposes the same .roundtrip(text)->text
-    contract as the translators."""
-    return _rtt_defense(df, QwenRewriter(), REWRITE_CACHE_CSV, REWRITE_EMB_KNOWN_NPZ, REWRITE_EMB_UNKNOWN_NPZ,
-                        known_emb, unknown_emb, defend_known, defend_unknown)
-
-
-def rtt_qwen_defense(df, known, unknown, known_emb, unknown_emb,
-                     defend_known=True, defend_unknown=True):
-    """RTT via the on-device 4-bit Qwen GGUF, driven through EN->ZH->JA->EN as
-    three discrete translation steps (GPU-offloaded). Reuses the RTT pipeline
-    since QwenTranslator exposes the same .roundtrip(text)->text contract."""
-    return _rtt_defense(df, QwenTranslator(), QWEN_RTT_CACHE_CSV, QWEN_RTT_EMB_KNOWN_NPZ, QWEN_RTT_EMB_UNKNOWN_NPZ,
-                        known_emb, unknown_emb, defend_known, defend_unknown)
-
-
-def rtt_qwen_zh_defense(df, known, unknown, known_emb, unknown_emb,
-                        defend_known=True, defend_unknown=True):
-    """Lower-distortion alternative to rtt_qwen_defense: a single EN->ZH->EN round
-    trip (two discrete Qwen hops, no Japanese pivot). Halving the chain preserves
-    fidelity at the cost of a milder perturbation. Same GPU-offloaded GGUF."""
-    return _rtt_defense(
-        df,
-        QwenTranslator(hops=QWEN_RTT_HOPS_ZH),
-        QWEN_RTT_ZH_CACHE_CSV,
-        QWEN_RTT_ZH_EMB_KNOWN_NPZ,
-        QWEN_RTT_ZH_EMB_UNKNOWN_NPZ,
-        known_emb, unknown_emb, defend_known, defend_unknown,
-    )
-
-
-def openanon_defense(df, known, unknown, known_emb, unknown_emb,
-                     defend_known=True, defend_unknown=True):
-    """Privacy-scrubber rewrite defense via a remote OpenRouter model: rewrite
-    every prompt to redact identifiers behind stable placeholders and strip the
-    writing-style fingerprint (OPENANON_SYSTEM_PROMPT), then re-embed. Reuses the
-    RTT pipeline since OpenAnonymityRewriter exposes the same .roundtrip(text)->
-    text contract. Needs an OPENROUTER_API_KEY in .env."""
-    return _rtt_defense(
-        df,
-        OpenAnonymityRewriter(),
-        OPENANON_CACHE_CSV,
-        OPENANON_EMB_KNOWN_NPZ,
-        OPENANON_EMB_UNKNOWN_NPZ,
-        known_emb, unknown_emb, defend_known, defend_unknown,
-    )
-
-
-def styleremix_defense(df, known, unknown, known_emb, unknown_emb,
-                       defend_known=True, defend_unknown=True):
-    """Style-convergence defense via StyleRemix: steer every prompt toward one
-    fixed target style (STYLEREMIX_SLIDERS) with Llama-3-8B + per-axis LoRA
-    adapters, then re-embed. Reuses the RTT pipeline since StyleRemixRewriter
-    exposes the same .roundtrip(text)->text contract as the translators."""
-    return _rtt_defense(
-        df,
-        StyleRemixRewriter(),
-        STYLEREMIX_CACHE_CSV,
-        STYLEREMIX_EMB_KNOWN_NPZ,
-        STYLEREMIX_EMB_UNKNOWN_NPZ,
-        known_emb, unknown_emb, defend_known, defend_unknown,
-    )
+def _make_defense(spec):
+    """Turn a DEFENSE_SPECS entry into a defense callable with the uniform
+    signature. The backend is instantiated lazily inside the call (only when the
+    defense runs), so picking it in the menu never triggers a model download."""
+    def defense(df, known, unknown, known_emb, unknown_emb,
+                defend_known=True, defend_unknown=True):
+        return _rtt_defense(
+            df, spec["factory"](),
+            spec["cache_csv"], spec["known_npz"], spec["unknown_npz"],
+            known_emb, unknown_emb, defend_known, defend_unknown,
+        )
+    defense.__doc__ = spec.get("doc")
+    return defense
 
 
 # ---------------------------------------------------------------------------
@@ -1422,7 +1488,7 @@ def fidelity_from_cache(cache_csv, label="", out_dir=FIDELITY_DIR, max_len=MAX_L
     cos = np.sum(src * dst, axis=1)  # both L2-normalized -> dot product is cosine
     pairs = pairs.assign(fidelity=cos)
 
-    slug = re.sub(r"[^a-z0-9]+", "_", (label or os.path.basename(cache_csv)).lower()).strip("_")
+    slug = _slug(label or os.path.basename(cache_csv))
     out_csv = os.path.join(out_dir, f"fidelity_{slug}.csv")
     pairs.sort_values("fidelity").to_csv(out_csv, index=False)  # worst pairs first
 
@@ -1447,15 +1513,11 @@ ATTACKS = {
     "Random Guess": random_guess_attack,
 }
 
+# "None" is the only special case (no backend); every other defense is built
+# from its DEFENSE_SPECS entry, so the menu and the registry never drift apart.
 DEFENSES = {
     "None": no_defense,
-    "RTT (Argos)": rtt_argos_defense,
-    "RTT (NLLB)": rtt_nllb_defense,
-    "RTT (Qwen 4-bit)": rtt_qwen_defense,
-    "RTT (Qwen 4-bit, EN-ZH-EN)": rtt_qwen_zh_defense,
-    "Rewrite (Qwen 4-bit)": rewrite_qwen_defense,
-    "StyleRemix (Llama-3-8B LoRA)": styleremix_defense,
-    "OpenAnonymity (OpenRouter scrubber)": openanon_defense,
+    **{name: _make_defense(spec) for name, spec in DEFENSE_SPECS.items()},
 }
 
 # Which side(s) of the known/unknown pair the chosen defense is applied to. The
@@ -1470,16 +1532,9 @@ SIDES = {
 }
 
 # Defense -> its round-trip cache, so fidelity_from_cache() can score any
-# text-rewriting defense by name. ("None" has no rewrite, hence no cache.)
-FIDELITY_CACHES = {
-    "RTT (Argos)": RTT_CACHE_CSV,
-    "RTT (NLLB)": NLLB_CACHE_CSV,
-    "RTT (Qwen 4-bit)": QWEN_RTT_CACHE_CSV,
-    "RTT (Qwen 4-bit, EN-ZH-EN)": QWEN_RTT_ZH_CACHE_CSV,
-    "Rewrite (Qwen 4-bit)": REWRITE_CACHE_CSV,
-    "StyleRemix (Llama-3-8B LoRA)": STYLEREMIX_CACHE_CSV,
-    "OpenAnonymity (OpenRouter scrubber)": OPENANON_CACHE_CSV,
-}
+# text-rewriting defense by name. Derived from DEFENSE_SPECS so the cache paths
+# live in exactly one place. ("None" has no rewrite, hence no cache.)
+FIDELITY_CACHES = {name: spec["cache_csv"] for name, spec in DEFENSE_SPECS.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1539,12 +1594,9 @@ def main():
     # Encode the choices in the filename so runs don't overwrite each other. The
     # side slug is included only when a defense is active, keeping None-defense
     # filenames stable.
-    def slug(name):
-        return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
-
-    parts = [slug(attack_name), slug(defense_name)]
+    parts = [_slug(attack_name), _slug(defense_name)]
     if defense_name != "None":
-        parts.append(slug(side_name))
+        parts.append(_slug(side_name))
     output_csv = os.path.join(OUTPUT_DIR, "wildchat_analysis_" + "_".join(parts) + ".csv")
     print(f"\nRunning [{attack_name}] attack with [{defense_name}] defense "
           f"({side_name}) -> {output_csv}")
