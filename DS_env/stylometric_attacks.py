@@ -71,6 +71,11 @@ NLLB_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_nllb13b_enesen_unknow
 # but slowest; 3 is nearly identical quality for ~1.7x the speed; 1 = greedy,
 # fastest and roughest. Runtime scales ~linearly with this.
 NLLB_NUM_BEAMS = 3
+# Sentences per generate() call. The default (16) was tuned for an 8GB GPU; on an
+# A100 that leaves the card mostly idle, so default high here and let a smaller
+# GPU dial it back via env. Larger batches = better GPU utilization until VRAM
+# limits (remember num_beams multiplies the effective width).
+NLLB_BATCH_SIZE = int(os.environ.get("NLLB_BATCH_SIZE", "64"))
 
 # --- Rewrite defense config -------------------------------------------------
 # Threat model: a USER's own writing style fingerprints them across queries.
@@ -105,9 +110,30 @@ Rules:
 # Swap to "...1.5b..." for slower phones or "...7b..." on a laptop for fidelity.
 QWEN_GGUF_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"        # on-device rewriter
 QWEN_GGUF_FILE = "qwen2.5-3b-instruct-q4_k_m.gguf"      # ~2GB, 4-bit, CPU-friendly
-REWRITE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rewrite_cache.csv")
-REWRITE_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_known_emb.npz")
-REWRITE_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rewrite_unknown_emb.npz")
+
+# Qwen inference backend. On a GPU cluster (A100/H100) the 4-bit llama.cpp GGUF
+# path is the WRONG tool: it decodes one prompt at a time and its q4 kernels do
+# not use the card's bf16 tensor cores, so an A100 sits mostly idle. "vllm" runs
+# the same model in bf16 through vLLM (continuous batching + PagedAttention) and
+# BATCHES the whole corpus, which is 1-2 orders of magnitude more throughput on
+# an A100. Set QWEN_BACKEND=llama_cpp to fall back to the laptop/phone path.
+QWEN_BACKEND = os.environ.get("QWEN_BACKEND", "vllm").lower()   # "vllm" | "llama_cpp"
+QWEN_HF_REPO = os.environ.get("QWEN_HF_REPO", "Qwen/Qwen2.5-3B-Instruct")  # unquantized, for vLLM
+QWEN_VLLM_DTYPE = os.environ.get("QWEN_VLLM_DTYPE", "bfloat16")            # A100/H100 native
+QWEN_VLLM_GPU_MEM_UTIL = float(os.environ.get("QWEN_VLLM_GPU_MEM_UTIL", "0.90"))
+QWEN_VLLM_MAX_MODEL_LEN = int(os.environ.get("QWEN_VLLM_MAX_MODEL_LEN", "4096"))
+# Prompts handed to vLLM per flush chunk. vLLM schedules them internally, so
+# bigger = better utilization; this only bounds crash-recovery granularity.
+QWEN_VLLM_CHUNK = int(os.environ.get("QWEN_VLLM_CHUNK", "512"))
+# vLLM (bf16) and the GGUF (q4) produce different text for the same source, and
+# the round-trip cache is keyed by SOURCE TEXT ONLY — so the two backends MUST
+# NOT share cache/embedding files or one would serve the other's stale results.
+# Suffix the vLLM files; the GGUF paths keep their original (unsuffixed) names.
+_QWEN_SUFFIX = "_vllm" if QWEN_BACKEND == "vllm" else ""
+
+REWRITE_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_rewrite{_QWEN_SUFFIX}_cache.csv")
+REWRITE_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rewrite{_QWEN_SUFFIX}_known_emb.npz")
+REWRITE_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rewrite{_QWEN_SUFFIX}_unknown_emb.npz")
 
 # --- Qwen round-trip-translation defense config -----------------------------
 # Like the NLLB RTT defense, but the EN->ZH->JA->EN chain is driven by the SAME
@@ -119,9 +145,9 @@ QWEN_RTT_HOPS = [
     ("Chinese", "Japanese"),
     ("Japanese", "English"),
 ]
-QWEN_RTT_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_qwen_translation_cache.csv")
-QWEN_RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_known_emb.npz")
-QWEN_RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_unknown_emb.npz")
+QWEN_RTT_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_rtt_qwen{_QWEN_SUFFIX}_translation_cache.csv")
+QWEN_RTT_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rtt_qwen{_QWEN_SUFFIX}_known_emb.npz")
+QWEN_RTT_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rtt_qwen{_QWEN_SUFFIX}_unknown_emb.npz")
 
 # Lower-distortion alternative: a single EN->ZH->EN round trip. Halving the chain
 # (vs the EN->ZH->JA->EN above) compounds far less translation error, so it
@@ -131,9 +157,9 @@ QWEN_RTT_HOPS_ZH = [
     ("English", "Chinese"),
     ("Chinese", "English"),
 ]
-QWEN_RTT_ZH_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_rtt_qwen_zh_translation_cache.csv")
-QWEN_RTT_ZH_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_zh_known_emb.npz")
-QWEN_RTT_ZH_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_rtt_qwen_zh_unknown_emb.npz")
+QWEN_RTT_ZH_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_rtt_qwen_zh{_QWEN_SUFFIX}_translation_cache.csv")
+QWEN_RTT_ZH_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rtt_qwen_zh{_QWEN_SUFFIX}_known_emb.npz")
+QWEN_RTT_ZH_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, f"wildchat_rtt_qwen_zh{_QWEN_SUFFIX}_unknown_emb.npz")
 
 # --- StyleRemix authorship-obfuscation defense config -----------------------
 # StyleRemix (Fisher et al., EMNLP 2024; https://github.com/jfisher52/StyleRemix)
@@ -186,9 +212,15 @@ STYLEREMIX_SLIDERS = {
     "expository": 0.0,
 }
 STYLEREMIX_MAX_NEW_TOKENS = 1024
-# Llama-3-8B in fp16 is ~16GB — too big for an 8GB GPU. 4-bit (bitsandbytes)
-# fits it in ~6GB; the LoRA adapters stay fp16. Set False for full precision.
-STYLEREMIX_LOAD_IN_4BIT = True
+# Llama-3-8B in fp16 is ~16GB — too big for an 8GB GPU, but trivial for an A100.
+# On the cluster we default to fp16: 4-bit bitsandbytes is actually SLOWER on an
+# A100 (dequant overhead) and only exists to fit small cards. Set STYLEREMIX_4BIT=1
+# to reload it in ~6GB 4-bit on a memory-constrained GPU (LoRA adapters stay fp16).
+STYLEREMIX_LOAD_IN_4BIT = os.environ.get("STYLEREMIX_4BIT", "0") == "1"
+# Prompts per batched generate() call. The old path ran one prompt at a time,
+# which wastes an A100; batch them (left-padded) to keep the card busy. Dial down
+# for a smaller GPU or up on an 80GB A100.
+STYLEREMIX_BATCH_SIZE = int(os.environ.get("STYLEREMIX_BATCH_SIZE", "8"))
 STYLEREMIX_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_styleremix_cache.csv")
 STYLEREMIX_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_known_emb.npz")
 STYLEREMIX_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_unknown_emb.npz")
@@ -589,6 +621,18 @@ class ArgosTranslator:
         return text
 
 
+def _gpu_dtype(torch, prefer_bf16=True):
+    """Best generation dtype for the visible device: bf16 on Ampere+ (A100/H100 —
+    same throughput as fp16 but no overflow, so numerically safer), fp16 on older
+    GPUs, fp32 on CPU. This is why the cluster path is both faster and steadier
+    than the laptop fp16 default."""
+    if not torch.cuda.is_available():
+        return torch.float32
+    if prefer_bf16 and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
 class NLLBTranslator:
     """Round-trip translator using Meta's NLLB-200 (HuggingFace transformers).
 
@@ -614,7 +658,7 @@ class NLLBTranslator:
     # through a CJK pivot.
     _SENT_SPLIT = re.compile(r"(?<=[.!?。！？])\s*")
 
-    def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=16,
+    def __init__(self, model_name=NLLB_MODEL, max_length=512, batch_size=NLLB_BATCH_SIZE,
                  max_new_tokens=512, num_beams=NLLB_NUM_BEAMS):
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -623,11 +667,11 @@ class NLLBTranslator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_length = max_length
         self.max_new_tokens = max_new_tokens
-        self.batch_size = batch_size  # sentences per generate() call
+        self.batch_size = batch_size  # sentences per generate() call; see NLLB_BATCH_SIZE
         self.num_beams = num_beams    # beam-search width; see NLLB_NUM_BEAMS
-        # fp16 on GPU is the comment's original intent: ~2x faster and half the
-        # VRAM of fp32. Stay fp32 on CPU, where fp16 is unsupported / slower.
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
+        # bf16 on Ampere+ (A100), fp16 on older GPUs, fp32 on CPU: ~2x faster and
+        # half the VRAM of fp32, and bf16 avoids the fp16 overflow risk on the A100.
+        dtype = _gpu_dtype(torch)
         print(f"Loading NLLB model '{model_name}' on {self.device} ({dtype})...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -766,6 +810,21 @@ class QwenRewriter(_QwenGGUF):
         return self._complete(self.system_prompt, text).strip()
 
 
+def _qwen_translate_system_prompt(src_lang: str, tgt_lang: str) -> str:
+    """System prompt for one Qwen translation hop, shared by the GGUF and vLLM
+    translators so both backends translate with identical instructions."""
+    return (
+        f"You are a professional translation engine. Translate the user's "
+        f"message from {src_lang} to {tgt_lang}.\n"
+        f"Rules:\n"
+        f"- Preserve ALL information, intent, code, names, numbers, and quotations.\n"
+        f"- Do NOT answer, explain, or comment on the message.\n"
+        f"- Do NOT add any preamble, prefix, label, or note such as "
+        f"'Here is the translation:'. Begin directly with the translated text.\n"
+        f"- Output ONLY the {tgt_lang} translation and nothing else."
+    )
+
+
 class QwenTranslator(_QwenGGUF):
     """Round-trip translator that drives the SAME 4-bit Qwen GGUF as QwenRewriter
     through an EN->ZH->JA->EN chain, GPU-offloaded via llama.cpp.
@@ -826,16 +885,7 @@ class QwenTranslator(_QwenGGUF):
         # cache hits are reproducible. The guardrails reduce (but never fully
         # eliminate) conversational preambles, so _strip_preamble cleans up the
         # output afterward.
-        system_prompt = (
-            f"You are a professional translation engine. Translate the user's "
-            f"message from {src_lang} to {tgt_lang}.\n"
-            f"Rules:\n"
-            f"- Preserve ALL information, intent, code, names, numbers, and quotations.\n"
-            f"- Do NOT answer, explain, or comment on the message.\n"
-            f"- Do NOT add any preamble, prefix, label, or note such as "
-            f"'Here is the translation:'. Begin directly with the translated text.\n"
-            f"- Output ONLY the {tgt_lang} translation and nothing else."
-        )
+        system_prompt = _qwen_translate_system_prompt(src_lang, tgt_lang)
         return self._strip_preamble(self._complete(system_prompt, text))
 
     def roundtrip(self, text: str) -> str:
@@ -843,6 +893,108 @@ class QwenTranslator(_QwenGGUF):
         for src_lang, tgt_lang in self.hops:
             text = self._translate(text, src_lang, tgt_lang)
         return text
+
+
+class _QwenVLLM:
+    """Cluster-optimized Qwen backend using vLLM (continuous batching +
+    PagedAttention). Drop-in replacement for _QwenGGUF on a real GPU (A100/H100).
+
+    The GGUF path decodes ONE prompt at a time and its q4 kernels ignore the
+    card's bf16 tensor cores, so an A100 sits ~idle. This runs the same model in
+    bf16 and, crucially, exposes BATCH completion so a whole corpus of prompts is
+    scheduled together — 1-2 orders of magnitude more throughput on an A100. vLLM
+    is imported lazily so the module still loads without it (e.g. laptop runs).
+
+    Subclasses add the task prompting (rewrite vs. translation) and expose the
+    duck-typed `.roundtrip`/`.roundtrip_batch` the pipeline dispatches on.
+    """
+
+    def __init__(self, model_id=QWEN_HF_REPO, max_tokens=1024,
+                 dtype=QWEN_VLLM_DTYPE, gpu_memory_utilization=QWEN_VLLM_GPU_MEM_UTIL,
+                 max_model_len=QWEN_VLLM_MAX_MODEL_LEN, load_note=""):
+        from vllm import LLM, SamplingParams
+
+        # round_trip_translate reads .batch_size to size its flush chunk and calls
+        # .roundtrip_batch (below) since it exists -> vLLM gets many prompts/call.
+        self.batch_size = QWEN_VLLM_CHUNK
+        print(f"Loading Qwen (vLLM) '{model_id}' ({dtype}){load_note}...")
+        self.llm = LLM(
+            model=model_id,
+            dtype=dtype,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+        )
+        # temperature=0 -> greedy/deterministic, matching the GGUF backend so
+        # results and cache hits stay reproducible across a run.
+        self.sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens)
+
+    def _complete_batch(self, system_prompt, user_texts):
+        """Batched chat completion with ONE shared system prompt (the rewrite
+        header, or a single translation hop) across every user message. Returns
+        outputs in input order (vLLM preserves ordering)."""
+        conversations = [
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": ut}]
+            for ut in user_texts
+        ]
+        # llm.chat applies the model's chat template for us; use_tqdm=False keeps
+        # round_trip_translate's own progress bar the single source of truth.
+        outs = self.llm.chat(conversations, self.sampling, use_tqdm=False)
+        return [o.outputs[0].text for o in outs]
+
+
+class QwenRewriterVLLM(_QwenVLLM):
+    """vLLM equivalent of QwenRewriter: rewrites every prompt into one fixed style
+    (REWRITE_PROMPT_HEADER), the whole batch sharing that single system prompt."""
+
+    def __init__(self, system_prompt=REWRITE_PROMPT_HEADER, **kwargs):
+        super().__init__(**kwargs)
+        self.system_prompt = system_prompt
+
+    def roundtrip_batch(self, texts):
+        return [t.strip() for t in self._complete_batch(self.system_prompt, list(texts))]
+
+    def roundtrip(self, text: str) -> str:
+        return self.roundtrip_batch([text])[0]
+
+
+class QwenTranslatorVLLM(_QwenVLLM):
+    """vLLM equivalent of QwenTranslator. Each hop is one batched completion over
+    the ENTIRE chunk of prompts (like NLLB's per-hop batching) instead of a
+    separate call per prompt, so the language chain still runs discretely and
+    inspectably while keeping the A100 saturated. Reuses QwenTranslator's preamble
+    stripping so both backends clean model chatter identically."""
+
+    def __init__(self, hops=QWEN_RTT_HOPS, **kwargs):
+        super().__init__(load_note=" for RTT", **kwargs)
+        self.hops = hops
+
+    def roundtrip_batch(self, texts):
+        texts = list(texts)
+        for src_lang, tgt_lang in self.hops:
+            system_prompt = _qwen_translate_system_prompt(src_lang, tgt_lang)
+            outs = self._complete_batch(system_prompt, texts)
+            texts = [QwenTranslator._strip_preamble(o) for o in outs]
+        return texts
+
+    def roundtrip(self, text: str) -> str:
+        return self.roundtrip_batch([text])[0]
+
+
+def make_qwen_rewriter():
+    """Qwen rewrite backend for the current QWEN_BACKEND (vLLM on cluster, GGUF on
+    laptop). Instantiated lazily by the defense factory, so no model loads until
+    the defense actually runs."""
+    if QWEN_BACKEND == "vllm":
+        return QwenRewriterVLLM()
+    return QwenRewriter()
+
+
+def make_qwen_translator(hops=QWEN_RTT_HOPS):
+    """Qwen round-trip translator for the current QWEN_BACKEND."""
+    if QWEN_BACKEND == "vllm":
+        return QwenTranslatorVLLM(hops=hops)
+    return QwenTranslator(hops=hops)
 
 
 class StyleRemixRewriter:
@@ -879,13 +1031,14 @@ class StyleRemixRewriter:
 
     def __init__(self, base_model=STYLEREMIX_BASE_MODEL, adapters=STYLEREMIX_ADAPTERS,
                  sliders=STYLEREMIX_SLIDERS, load_in_4bit=STYLEREMIX_LOAD_IN_4BIT,
-                 max_new_tokens=STYLEREMIX_MAX_NEW_TOKENS):
+                 max_new_tokens=STYLEREMIX_MAX_NEW_TOKENS, batch_size=STYLEREMIX_BATCH_SIZE):
         import torch
         from peft import PeftModel
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self._torch = torch
         self.max_new_tokens = max_new_tokens
+        self.batch_size = batch_size  # prompts per batched generate(); see STYLEREMIX_BATCH_SIZE
 
         # Resolve sliders -> {adapter_name: weight}. Sign picks the +/- adapter;
         # the merge weight is the magnitude. Mirrors the paper's remix() mapping.
@@ -916,13 +1069,13 @@ class StyleRemixRewriter:
             from transformers import BitsAndBytesConfig
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=_gpu_dtype(torch),
                 bnb_4bit_quant_type="nf4",
             )
         else:
-            load_kwargs["torch_dtype"] = (
-                torch.float16 if self.device == "cuda" else torch.float32
-            )
+            # fp16 on GPU is ~2x faster than 4-bit on an A100 (no dequant overhead);
+            # bf16 on Ampere+ for numerical headroom. fp32 on CPU.
+            load_kwargs["torch_dtype"] = _gpu_dtype(torch)
         base = AutoModelForCausalLM.from_pretrained(base_model, **load_kwargs)
         base.resize_token_embeddings(len(self.tokenizer))
         if not load_in_4bit or self.device != "cuda":
@@ -964,26 +1117,40 @@ class StyleRemixRewriter:
             active[adapter] = abs(value)
         return active
 
+    def roundtrip_batch(self, texts):
+        """Rewrite a batch of prompts at once. Prompts are LEFT-padded (the
+        tokenizer is configured padding_side='left' in __init__), so every row's
+        generated span starts at the same offset and can be sliced uniformly.
+        Internally sub-batches by self.batch_size to bound VRAM. round_trip_translate
+        auto-uses this path over per-prompt .roundtrip, keeping the A100 busy."""
+        texts = list(texts)
+        results = []
+        for i in range(0, len(texts), self.batch_size):
+            chunk = texts[i:i + self.batch_size]
+            # Same "### Original: ... ### Rewrite:" template the LoRA adapters were
+            # trained on. Greedy decode (do_sample=False) so the same prompt always
+            # maps to the same rewrite — deterministic convergence.
+            prompts = [f"### Original: {t}\n ### Rewrite:" for t in chunk]
+            inputs = self.tokenizer(
+                prompts, return_tensors="pt", max_length=2048,
+                truncation=True, padding=True,
+            ).to(self.model.device)
+            input_length = inputs.input_ids.shape[1]
+            with self._torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+            for row in outputs[:, input_length:]:
+                results.append(
+                    self.tokenizer.decode(row, skip_special_tokens=True).strip()
+                )
+        return results
+
     def roundtrip(self, text: str) -> str:
-        # Same "### Original: ... ### Rewrite:" template the LoRA adapters were
-        # trained on. Greedy decode (do_sample=False) so the same prompt always
-        # maps to the same rewrite — deterministic convergence, like the other
-        # on-device defenses.
-        prompt = f"### Original: {text}\n ### Rewrite:"
-        inputs = self.tokenizer(
-            prompt, return_tensors="pt", max_length=2048, truncation=True
-        ).to(self.model.device)
-        input_length = inputs.input_ids.shape[1]
-        with self._torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-        return self.tokenizer.decode(
-            outputs[0, input_length:], skip_special_tokens=True
-        ).strip()
+        return self.roundtrip_batch([text])[0]
 
 
 class OpenAnonymityRewriter:
@@ -1371,25 +1538,25 @@ DEFENSE_SPECS = {
         "doc": "RTT via NLLB-200 (higher quality, single EN->ES->EN pivot; wants a GPU).",
     },
     "RTT (Qwen 4-bit)": {
-        "factory": QwenTranslator,
+        "factory": make_qwen_translator,
         "cache_csv": QWEN_RTT_CACHE_CSV,
         "known_npz": QWEN_RTT_EMB_KNOWN_NPZ,
         "unknown_npz": QWEN_RTT_EMB_UNKNOWN_NPZ,
-        "doc": "RTT via the on-device 4-bit Qwen GGUF, EN->ZH->JA->EN as three discrete hops (GPU-offloaded).",
+        "doc": "RTT via Qwen2.5-3B, EN->ZH->JA->EN as three discrete hops (vLLM bf16 batched on cluster; 4-bit GGUF fallback via QWEN_BACKEND=llama_cpp).",
     },
     "RTT (Qwen 4-bit, EN-ZH-EN)": {
-        "factory": lambda: QwenTranslator(hops=QWEN_RTT_HOPS_ZH),
+        "factory": lambda: make_qwen_translator(hops=QWEN_RTT_HOPS_ZH),
         "cache_csv": QWEN_RTT_ZH_CACHE_CSV,
         "known_npz": QWEN_RTT_ZH_EMB_KNOWN_NPZ,
         "unknown_npz": QWEN_RTT_ZH_EMB_UNKNOWN_NPZ,
         "doc": "Lower-distortion Qwen RTT: a single EN->ZH->EN round trip (two hops, no Japanese pivot).",
     },
     "Rewrite (Qwen 4-bit)": {
-        "factory": QwenRewriter,
+        "factory": make_qwen_rewriter,
         "cache_csv": REWRITE_CACHE_CSV,
         "known_npz": REWRITE_EMB_KNOWN_NPZ,
         "unknown_npz": REWRITE_EMB_UNKNOWN_NPZ,
-        "doc": "Style-convergence rewrite: on-device 4-bit Qwen rewrites every prompt into one fixed style (REWRITE_PROMPT_HEADER).",
+        "doc": "Style-convergence rewrite: Qwen2.5-3B rewrites every prompt into one fixed style (REWRITE_PROMPT_HEADER); vLLM bf16 batched on cluster.",
     },
     "StyleRemix (Llama-3-8B LoRA)": {
         "factory": StyleRemixRewriter,
