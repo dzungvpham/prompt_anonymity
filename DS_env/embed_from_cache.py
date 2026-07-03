@@ -14,12 +14,16 @@ them straight from cache. Run it in an env with a spacy-transformers-compatible
 transformers (e.g. transformers<4.37) plus `en_core_web_trf` installed.
 
 Usage:
-    python embed_from_cache.py "StyleRemix (Llama-3-8B LoRA)"
-    python embed_from_cache.py            # lists the available defense names
+    python embed_from_cache.py "StyleRemix (Llama-3-8B LoRA)"            # both sides
+    python embed_from_cache.py "StyleRemix (Llama-3-8B LoRA)" unknown   # unknown only
+    python embed_from_cache.py "StyleRemix (Llama-3-8B LoRA)" known
+    python embed_from_cache.py                                          # list defenses
 
-Prereq: the defense's translation must be COMPLETE for both sides. Any turn that
-is missing from the cache aborts with an error (nothing is silently re-translated
-here — this script never loads a model).
+Pick the side(s) you actually ran the defense on. An undefended side keeps its
+ORIGINAL embeddings at attack time (see _rtt_defense), so it needs no cache and
+should be skipped here. Only translation for the chosen side must be COMPLETE:
+any turn missing from the cache aborts with an error (nothing is silently
+re-translated here — this script never loads a model).
 """
 
 import sys
@@ -41,16 +45,25 @@ class _CacheOnlyTranslator:
         )
 
 
-def embed_defense(name):
+# side keyword -> which (model, npz-key) pairs to embed.
+_SIDES = {
+    "both": [("known", "known_npz"), ("unknown", "unknown_npz")],
+    "known": [("known", "known_npz")],
+    "unknown": [("unknown", "unknown_npz")],
+}
+_MODELS = {"known": s.KNOWN_MODEL, "unknown": s.UNKNOWN_MODEL}
+
+
+def embed_defense(name, side="both"):
     spec = s.DEFENSE_SPECS[name]
     df = s.load_data()
     reference_columns = pd.read_csv(s.EMBEDDINGS_CSV, nrows=0).drop(columns="text").columns
 
-    for model, npz in [(s.KNOWN_MODEL, spec["known_npz"]),
-                       (s.UNKNOWN_MODEL, spec["unknown_npz"])]:
-        print(f"\n=== {name} :: {model} ===")
-        # All turns are already cached, so the stand-in translator is never called;
-        # this only re-joins the cached turns back into conversations.
+    for which, npz_key in _SIDES[side]:
+        model, npz = _MODELS[which], spec[npz_key]
+        print(f"\n=== {name} :: {which} ({model}) ===")
+        # All turns for this side are already cached, so the stand-in translator is
+        # never called; this only re-joins the cached turns back into conversations.
         joined = s.round_trip_translate_by_turn(
             s._model_texts(df, model), _CacheOnlyTranslator(),
             cache_csv=spec["cache_csv"], label=model,
@@ -60,12 +73,16 @@ def embed_defense(name):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in s.DEFENSE_SPECS:
-        print("Pick one defense to embed from its cache:\n")
+    args = sys.argv[1:]
+    name = args[0] if args else None
+    side = args[1].lower() if len(args) > 1 else "both"
+    if name not in s.DEFENSE_SPECS or side not in _SIDES:
+        print("Usage: python embed_from_cache.py <defense> [both|known|unknown]\n")
+        print("Defenses:")
         for n in s.DEFENSE_SPECS:
             print(f"  {n!r}")
         sys.exit(1)
-    embed_defense(sys.argv[1])
+    embed_defense(name, side)
 
 
 if __name__ == "__main__":
