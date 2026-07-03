@@ -125,6 +125,11 @@ QWEN_VLLM_MAX_MODEL_LEN = int(os.environ.get("QWEN_VLLM_MAX_MODEL_LEN", "4096"))
 # Prompts handed to vLLM per flush chunk. vLLM schedules them internally, so
 # bigger = better utilization; this only bounds crash-recovery granularity.
 QWEN_VLLM_CHUNK = int(os.environ.get("QWEN_VLLM_CHUNK", "512"))
+# vLLM's startup compile (torch.compile + CUDA-graph capture) needs the CUDA
+# toolkit (nvcc). On a node without it you get "Could not find nvcc". Set
+# QWEN_VLLM_ENFORCE_EAGER=1 to skip that compile: a bit slower at decode, but it
+# runs with only the CUDA runtime the vLLM wheel already bundles (no nvcc).
+QWEN_VLLM_ENFORCE_EAGER = os.environ.get("QWEN_VLLM_ENFORCE_EAGER", "0") == "1"
 # vLLM (bf16) and the GGUF (q4) produce different text for the same source, and
 # the round-trip cache is keyed by SOURCE TEXT ONLY — so the two backends MUST
 # NOT share cache/embedding files or one would serve the other's stale results.
@@ -923,6 +928,7 @@ class _QwenVLLM:
             dtype=dtype,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
+            enforce_eager=QWEN_VLLM_ENFORCE_EAGER,  # =True avoids the nvcc-dependent compile
         )
         # temperature=0 -> greedy/deterministic, matching the GGUF backend so
         # results and cache hits stay reproducible across a run.
