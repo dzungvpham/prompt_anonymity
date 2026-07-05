@@ -373,6 +373,27 @@ OPENANON_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_openanon_cache.csv")
 OPENANON_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_openanon_known_emb.npz")
 OPENANON_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_openanon_unknown_emb.npz")
 
+# --- Combined StyleRemix + OpenAnonymity defense config ---------------------
+# Chains the two existing rewrite backends into one defense (see ChainedRewriter):
+# StyleRemix first steers every prompt toward the fixed STYLEREMIX_SLIDERS target
+# style, THEN the OpenAnonymity scrubber redacts identifiers and de-identifies any
+# residual style on the restyled text. Order rationale: style-convergence first,
+# identifier redaction LAST, so OA's [PERSON_1]/[ORG_1] placeholders survive
+# intact rather than being reworded by StyleRemix's Llama rewrite.
+#
+# Stage 1 runs against STYLEREMIX_CACHE_CSV (keyed by the ORIGINAL prompt), so a
+# combined run reuses StyleRemix rewrites already computed by the standalone
+# StyleRemix defense and never re-runs Llama for a prompt it has already restyled.
+# Stage 2 (OA) sees stage-1 output — novel text — so it always runs on a combined-
+# cache miss; the OA API is the paid part, so keep the combined cache below.
+STYLEREMIX_OPENANON_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_styleremix_openanon_cache.csv")
+STYLEREMIX_OPENANON_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_openanon_known_emb.npz")
+STYLEREMIX_OPENANON_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_openanon_unknown_emb.npz")
+# Outer-loop batch/flush granularity for the combined defense. Kept modest so the
+# combined cache flushes often (each chunk is one OA fan-out); stage 1 re-batches
+# internally at STYLEREMIX_BATCH_SIZE and stage 2 fans out at OPENANON_MAX_WORKERS.
+STYLEREMIX_OPENANON_BATCH_SIZE = int(os.environ.get("STYLEREMIX_OPENANON_BATCH_SIZE", "64"))
+
 
 # ---------------------------------------------------------------------------
 # Attack functions
@@ -1411,6 +1432,68 @@ def round_trip_translate_by_turn(texts, translator, cache_csv=RTT_CACHE_CSV, lab
     return results
 
 
+class ChainedRewriter:
+    """Compose two rewrite backends into ONE `.roundtrip`/`.roundtrip_batch`
+    backend, applying them in sequence (stage 1 -> stage 2). Because it exposes
+    the same duck-typed interface as every other backend, it drops straight into
+    `_rtt_defense` via a DEFENSE_SPECS entry with no other changes — the combined
+    defense is just another menu pick.
+
+    Stage 1 is run through `round_trip_translate` against its OWN standalone cache
+    (`stage1_cache_csv`): stage-1 input is the original prompt, so its cache keys
+    line up with the standalone stage-1 defense and already-computed rewrites are
+    reused (no re-running of stage 1's model). Stage 2 sees stage-1 OUTPUT — novel
+    text with no standalone cache — so it always runs on a combined-cache miss;
+    the outer `round_trip_translate` caches original -> final in the combined cache
+    so stage 2 is paid once per unique prompt.
+
+    Both sub-backends are wrapped in `_LazyBackend`, so a fully-cached combined run
+    (combined cache complete) never calls `roundtrip_batch` at all and loads
+    NEITHER model — matching the laziness of the single-backend defenses.
+    """
+
+    def __init__(self, stage1_factory, stage2_factory, stage1_cache_csv,
+                 batch_size=STYLEREMIX_OPENANON_BATCH_SIZE, label="chain"):
+        self._stage1 = _LazyBackend(stage1_factory)
+        self._stage2 = _LazyBackend(stage2_factory)
+        self._stage1_cache_csv = stage1_cache_csv
+        self._label = label
+        # Read by the outer round_trip_translate to size its chunk; a plain int so
+        # touching it never forces either lazy backend to build.
+        self.batch_size = batch_size
+
+    def roundtrip_batch(self, texts):
+        texts = list(texts)
+        # Stage 1: restyle, reusing the standalone stage-1 cache (keyed by the
+        # original prompt). round_trip_translate short-circuits fully-cached inputs
+        # without building stage 1's model, and flushes stage1_cache_csv itself.
+        stage1 = round_trip_translate(
+            texts, self._stage1, cache_csv=self._stage1_cache_csv,
+            label=f"{self._label} stage1",
+        )
+        # Stage 2: redact/de-identify the restyled text. This input is novel, so it
+        # is not stage-cached; the outer round_trip_translate caches the final
+        # original->stage2 result in the combined cache, so stage 2 runs once per
+        # unique prompt. Uses the batched path (OA fans out concurrently).
+        return self._stage2.roundtrip_batch(stage1)
+
+    def roundtrip(self, text: str) -> str:
+        return self.roundtrip_batch([text])[0]
+
+
+def make_styleremix_openanon():
+    """Combined defense backend: StyleRemix restyle -> OpenAnonymity redact.
+    Called lazily by the defense factory; each stage's heavy backend (Llama-3-8B /
+    the OpenRouter client) is built only when that stage first runs on a cache
+    miss, so picking this defense never loads a model on a fully-cached run."""
+    return ChainedRewriter(
+        stage1_factory=StyleRemixRewriter,
+        stage2_factory=OpenAnonymityRewriter,
+        stage1_cache_csv=STYLEREMIX_CACHE_CSV,
+        label="StyleRemix->OpenAnonymity",
+    )
+
+
 def embed_texts(texts, reference_columns, langcode=STYLO_LANGCODE, max_len=MAX_LEN):
     """Re-embed text with StyloMetrix, matching the original embedding pipeline
     (English model, 2048-char truncation — see wildchat/stylometrix.py).
@@ -1602,6 +1685,13 @@ DEFENSE_SPECS = {
         "known_npz": OPENANON_EMB_KNOWN_NPZ,
         "unknown_npz": OPENANON_EMB_UNKNOWN_NPZ,
         "doc": "Privacy-scrubber rewrite via a remote OpenRouter model (redact identifiers + de-identify style). Needs OPENROUTER_API_KEY.",
+    },
+    "StyleRemix + OpenAnonymity": {
+        "factory": make_styleremix_openanon,
+        "cache_csv": STYLEREMIX_OPENANON_CACHE_CSV,
+        "known_npz": STYLEREMIX_OPENANON_EMB_KNOWN_NPZ,
+        "unknown_npz": STYLEREMIX_OPENANON_EMB_UNKNOWN_NPZ,
+        "doc": "Combined defense: StyleRemix restyle (fixed STYLEREMIX_SLIDERS) THEN OpenAnonymity scrubber (redact identifiers + de-identify style). Reuses the StyleRemix stage cache; needs OPENROUTER_API_KEY. Llama-3-8B GPU + OpenRouter.",
     },
 }
 
