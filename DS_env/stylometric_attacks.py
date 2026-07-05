@@ -393,6 +393,35 @@ STYLEREMIX_OPENANON_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_styleremix_ope
 STYLEREMIX_OPENANON_EMB_KNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_openanon_known_emb.npz")
 STYLEREMIX_OPENANON_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix_openanon_unknown_emb.npz")
 
+# --- Euclidean + LLM-judge attack config ------------------------------------
+# Plain euclidean_style_attack usually puts the true author somewhere in its
+# top-5 nearest known rows but is a much weaker at picking out WHICH of those 5
+# is actually correct (that's exactly the top-1 vs. top-5 accuracy gap). This
+# attack hands the local Qwen instruct model (the same one used by the
+# rewrite/RTT defenses; see make_qwen_rewriter) the unknown text plus its
+# top-5 euclidean candidates and asks it to judge authorship directly from
+# writing style. Only the WITHIN-top-5 ordering can change: which known rows
+# land in the top-5 (and hence top-5/top-10 accuracy) is left exactly as
+# euclidean found it, so this isolates whatever extra signal the LLM adds on
+# top of the embedding distance at rank 1.
+EUCLIDEAN_LLM_TOP_K = 5
+# Chars of each conversation shown to the judge, per text. Kept well below
+# MAX_LEN(=2048) so 1 query + 5 candidates + instructions comfortably fits
+# inside QWEN_VLLM_MAX_MODEL_LEN (4096 tokens) with room to spare, rather than
+# matching the StyloMetrix truncation exactly.
+EUCLIDEAN_LLM_SNIPPET_CHARS = 800
+# The judge only ever needs to emit one digit, so keep generation short.
+EUCLIDEAN_LLM_MAX_NEW_TOKENS = 8
+EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT = """You are an authorship-verification judge. You will be shown one QUERY text and up to five CANDIDATE texts, labeled 1 through 5.
+Task:
+Decide which CANDIDATE, if any, was written by the SAME author as the QUERY.
+Judge ONLY writing style -- word choice, sentence structure, punctuation habits, register, verbosity, quirks of phrasing -- and IGNORE topic, subject matter, or what task each text asks for.
+Rules:
+- Respond with ONLY the single digit (1-5) of the candidate whose style is the closest match to the query.
+- If none of the candidates seem stylistically written by the same author, respond with 0.
+- Output ONLY the digit and nothing else -- no words, no punctuation, no explanation."""
+EUCLIDEAN_LLM_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_euclidean_llm_judge_cache.csv")
+
 
 # ---------------------------------------------------------------------------
 # Attack functions
@@ -1801,6 +1830,137 @@ def fidelity_from_cache(cache_csv, label="", out_dir=FIDELITY_DIR, max_len=MAX_L
 
 
 # ---------------------------------------------------------------------------
+# Euclidean + LLM-judge attack
+#
+# Unlike the other ATTACKS entries, this one needs the raw conversation TEXT
+# (to show the judge), not just the embeddings -- so it can't be a plain
+# attack_fn(known_emb, unknown_emb) built ahead of time. Instead
+# make_euclidean_llm_attack(known_texts, unknown_texts) closes over the text
+# and returns an attack_fn with the standard signature; main() builds it right
+# after known/unknown are loaded (see ATTACK_TEXT_FACTORIES below).
+# ---------------------------------------------------------------------------
+
+class QwenJudge(_QwenGGUF):
+    """On-device authorship judge backed by the same 4-bit Qwen GGUF used by
+    QwenRewriter/QwenTranslator (llama-cpp-python).
+
+    Contract: exposes `.roundtrip(text) -> text`, the SAME duck-typed interface
+    every other Qwen/translator backend uses, so it drops straight into
+    round_trip_translate -- here "roundtrip" maps a judge PROMPT (query text +
+    up to 5 labeled candidates) to the model's raw digit response, reusing that
+    function's on-disk caching, dedup, and crash-safe incremental flush with no
+    other changes.
+    """
+
+    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
+                 system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT, n_ctx=4096,
+                 n_threads=None, max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS, n_gpu_layers=-1):
+        super().__init__(repo_id=repo_id, filename=filename, n_ctx=n_ctx,
+                         n_threads=n_threads, max_tokens=max_tokens,
+                         n_gpu_layers=n_gpu_layers, load_note=" for authorship judging")
+        self.system_prompt = system_prompt
+
+    def roundtrip(self, text: str) -> str:
+        return self._complete(self.system_prompt, text).strip()
+
+
+class QwenJudgeVLLM(_QwenVLLM):
+    """vLLM equivalent of QwenJudge: batches the ENTIRE chunk of judge prompts
+    through one shared system prompt per _complete_batch call, matching
+    QwenRewriterVLLM's batching so a whole corpus of judgments saturates the
+    A100 instead of running one prompt at a time."""
+
+    def __init__(self, system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT,
+                 max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS, **kwargs):
+        super().__init__(max_tokens=max_tokens, load_note=" for authorship judging", **kwargs)
+        self.system_prompt = system_prompt
+
+    def roundtrip_batch(self, texts):
+        return [t.strip() for t in self._complete_batch(self.system_prompt, list(texts))]
+
+    def roundtrip(self, text: str) -> str:
+        return self.roundtrip_batch([text])[0]
+
+
+def make_qwen_judge():
+    """Qwen judge backend for the current QWEN_BACKEND (vLLM on cluster, GGUF
+    on laptop) -- mirrors make_qwen_rewriter/make_qwen_translator."""
+    if QWEN_BACKEND == "vllm":
+        return QwenJudgeVLLM()
+    return QwenJudge()
+
+
+def _judge_prompt(query_text: str, candidate_texts: list) -> str:
+    """One judge prompt: a QUERY plus its labeled CANDIDATE texts."""
+    lines = [f"QUERY:\n{query_text}"]
+    for i, cand in enumerate(candidate_texts, 1):
+        lines.append(f"\nCANDIDATE {i}:\n{cand}")
+    lines.append("\nWhich CANDIDATE shares an author with the QUERY? Respond with only the digit.")
+    return "\n".join(lines)
+
+
+_JUDGE_DIGIT_RE = re.compile(r"[0-9]")
+
+
+def _parse_judge_choice(raw: str) -> int:
+    """First digit the judge emitted, or 0 (no match) if it emitted none /
+    garbage. Digits above the candidate count are treated as no-match by the
+    caller, which only ever indexes 1..len(candidates)."""
+    match = _JUDGE_DIGIT_RE.search(raw or "")
+    return int(match.group()) if match else 0
+
+
+def make_euclidean_llm_attack(known_texts, unknown_texts,
+                               top_k=EUCLIDEAN_LLM_TOP_K,
+                               snippet_chars=EUCLIDEAN_LLM_SNIPPET_CHARS,
+                               cache_csv=EUCLIDEAN_LLM_JUDGE_CACHE_CSV):
+    """Build an attack_fn(known_emb, unknown_emb) -> similarity that reranks
+    euclidean_style_attack's top-K per unknown row with a local LLM judge.
+
+    `known_texts`/`unknown_texts` must be plain lists of conversation strings,
+    aligned row-for-row with known_emb/unknown_emb (i.e. known["conversation"]
+    .tolist() / unknown["conversation"].tolist(), straight from load_embeddings
+    -- same row order load_embeddings and _model_texts already rely on).
+
+    For each unknown row: take its top-K known rows by euclidean distance,
+    build a judge prompt (query + K labeled candidates, each capped to
+    snippet_chars), and ask the Qwen judge which candidate (if any) shares an
+    author with the query. If the judge picks one, that candidate's score is
+    bumped just above the row's current max so it sorts first; every other
+    score -- including which known rows are in the top-K at all -- is left
+    untouched. So this can only move TOP-1 accuracy relative to plain
+    euclidean_style_attack; top-5/top-10 accuracy are identical by construction.
+    """
+    judge = _LazyBackend(make_qwen_judge)
+
+    def attack_fn(known_emb, unknown_emb):
+        k = min(top_k, known_emb.shape[0])
+        similarity = -cdist(unknown_emb, known_emb, metric="euclidean")
+        order = np.argsort(-similarity, axis=1)
+        top_idx = order[:, :k]
+
+        prompts = [
+            _judge_prompt(
+                str(unknown_texts[i])[:snippet_chars],
+                [str(known_texts[j])[:snippet_chars] for j in top_idx[i]],
+            )
+            for i in range(unknown_emb.shape[0])
+        ]
+        raw_choices = round_trip_translate(prompts, judge, cache_csv=cache_csv, label="LLM judge")
+
+        boosted = similarity.copy()
+        row_max = similarity.max(axis=1)
+        for i, raw in enumerate(raw_choices):
+            choice = _parse_judge_choice(raw)
+            if 1 <= choice <= len(top_idx[i]):
+                boosted[i, top_idx[i][choice - 1]] = row_max[i] + 1.0
+        return boosted
+
+    attack_fn.__name__ = "euclidean_llm_attack"
+    return attack_fn
+
+
+# ---------------------------------------------------------------------------
 # Registries — the one place to plug in new modules. Add an entry to either
 # dict and it is automatically listed in the menu and runnable. Keys are the
 # human-readable names shown to the user.
@@ -1810,6 +1970,14 @@ ATTACKS = {
     "Euclidean Style": euclidean_style_attack,
     "Cosine Style": cosine_style_attack,
     "Random Guess": random_guess_attack,
+}
+
+# Attacks that need the raw conversation TEXT (not just embeddings) supply a
+# factory(known_texts, unknown_texts) -> attack_fn here instead of a plain
+# attack_fn, since the text is only available after known/unknown are loaded
+# (see main(), which builds these lazily right before running the attack).
+ATTACK_TEXT_FACTORIES = {
+    "Euclidean + LLM Judge (Qwen)": make_euclidean_llm_attack,
 }
 
 # "None" is the only special case (no backend); every other defense is built
@@ -1883,7 +2051,24 @@ def main():
     else:
         side_name = choose("Which side(s) to defend?", SIDES)
         defend_known, defend_unknown = SIDES[side_name]
-    attack_name = choose("What attack?", ATTACKS)
+    attack_name = choose("What attack?", {**ATTACKS, **ATTACK_TEXT_FACTORIES})
+
+    if attack_name in ATTACK_TEXT_FACTORIES:
+        # DEFENSES only returns (re-)embeddings, not the defended TEXT, so a
+        # text-based judge attack can only see the ORIGINAL conversation text
+        # below. Under a defense other than "None" that text no longer matches
+        # what the (defended) embeddings represent -- flag it loudly rather
+        # than silently letting the judge see through the defense.
+        if defense_name != "None":
+            print(f"\nWARNING: [{attack_name}] shows the judge the ORIGINAL "
+                  f"conversation text, not the [{defense_name}]-defended text "
+                  "used for the embeddings. Results may overstate attack "
+                  "strength under this defense; pick 'None' for a clean read.")
+        attack_fn = ATTACK_TEXT_FACTORIES[attack_name](
+            known["conversation"].tolist(), unknown["conversation"].tolist()
+        )
+    else:
+        attack_fn = ATTACKS[attack_name]
 
     # Apply the chosen defense (may translate + re-embed), then run the attack.
     known_emb, unknown_emb = DEFENSES[defense_name](
@@ -1900,7 +2085,7 @@ def main():
     print(f"\nRunning [{attack_name}] attack with [{defense_name}] defense "
           f"({side_name}) -> {output_csv}")
     run_experiment(
-        attack_fn=ATTACKS[attack_name],
+        attack_fn=attack_fn,
         known=known,
         unknown=unknown,
         known_emb=known_emb,
