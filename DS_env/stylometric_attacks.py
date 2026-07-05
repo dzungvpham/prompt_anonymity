@@ -2027,6 +2027,43 @@ def fidelity_menu():
     fidelity_from_cache(FIDELITY_CACHES[defense_name], label=defense_name)
 
 
+def defended_model_texts(defense_name, df, model, defend_side):
+    """The conversation text each embedding row for `model` actually represents,
+    so a text-based attack (the LLM judge) sees the SAME text the embeddings do.
+
+    - Undefended side (or the "None" defense): the original conversation text.
+    - Defended side: the DEFENDED text, reconstructed by re-running the defense's
+      exact text pipeline against its on-disk cache. This must be called AFTER
+      the defense has run (main() does), so every prompt is already cached and
+      round_trip_translate short-circuits on the cache -- no model loads, no API
+      calls, it just reads the rewrites the defense already produced.
+
+    Rows come back in _model_texts order, which is load_embeddings' row order, so
+    they stay aligned with known_emb/unknown_emb.
+    """
+    original = _model_texts(df, model)
+    if not defend_side or defense_name == "None":
+        return original
+
+    spec = DEFENSE_SPECS[defense_name]
+    if "apply" in spec:
+        # StyleRemix + OpenAnonymity combo: same two stages as
+        # _styleremix_openanon_defense (restyle per turn -> cap -> redact per
+        # conversation), so we land on the exact text that got embedded.
+        styled = round_trip_translate_by_turn(
+            original, _LazyBackend(StyleRemixRewriter),
+            cache_csv=STYLEREMIX_CACHE_CSV, label=f"{model} restyle")
+        styled = [t[:MAX_LEN] for t in styled]
+        return round_trip_translate(
+            styled, _LazyBackend(OpenAnonymityRewriter),
+            cache_csv=spec["cache_csv"], label=f"{model} redact")
+
+    # Standard single-backend rewrite/RTT defense: defended per turn, re-joined.
+    return round_trip_translate_by_turn(
+        original, _LazyBackend(spec["factory"]),
+        cache_csv=spec["cache_csv"], label=model)
+
+
 def main():
     # Two independent things you can run: the privacy attack, or the fidelity
     # score for a defense. Fidelity reads from the defense's cache and needs
@@ -2053,27 +2090,22 @@ def main():
         defend_known, defend_unknown = SIDES[side_name]
     attack_name = choose("What attack?", {**ATTACKS, **ATTACK_TEXT_FACTORIES})
 
-    if attack_name in ATTACK_TEXT_FACTORIES:
-        # DEFENSES only returns (re-)embeddings, not the defended TEXT, so a
-        # text-based judge attack can only see the ORIGINAL conversation text
-        # below. Under a defense other than "None" that text no longer matches
-        # what the (defended) embeddings represent -- flag it loudly rather
-        # than silently letting the judge see through the defense.
-        if defense_name != "None":
-            print(f"\nWARNING: [{attack_name}] shows the judge the ORIGINAL "
-                  f"conversation text, not the [{defense_name}]-defended text "
-                  "used for the embeddings. Results may overstate attack "
-                  "strength under this defense; pick 'None' for a clean read.")
-        attack_fn = ATTACK_TEXT_FACTORIES[attack_name](
-            known["conversation"].tolist(), unknown["conversation"].tolist()
-        )
-    else:
-        attack_fn = ATTACKS[attack_name]
-
-    # Apply the chosen defense (may translate + re-embed), then run the attack.
+    # Apply the chosen defense (may translate + re-embed) FIRST. This fully
+    # populates the defense's text cache, which a text-based attack reads below
+    # to see exactly the text the defended embeddings represent.
     known_emb, unknown_emb = DEFENSES[defense_name](
         df, known, unknown, known_emb, unknown_emb, defend_known, defend_unknown
     )
+
+    if attack_name in ATTACK_TEXT_FACTORIES:
+        # Show the judge the SAME text the (defended) embeddings represent:
+        # defended text on a defended side, original text otherwise. Read from
+        # the defense's cache the call above just built, so no model reloads.
+        known_texts = defended_model_texts(defense_name, df, KNOWN_MODEL, defend_known)
+        unknown_texts = defended_model_texts(defense_name, df, UNKNOWN_MODEL, defend_unknown)
+        attack_fn = ATTACK_TEXT_FACTORIES[attack_name](known_texts, unknown_texts)
+    else:
+        attack_fn = ATTACKS[attack_name]
 
     # Encode the choices in the filename so runs don't overwrite each other. The
     # side slug is included only when a defense is active, keeping None-defense
