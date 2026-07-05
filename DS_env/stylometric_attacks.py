@@ -1299,6 +1299,26 @@ def _save_cache(cache, cache_csv):
     ).to_csv(cache_csv, index=False)
 
 
+class _LazyBackend:
+    """Defers constructing a defense backend (which may load a multi-GB model)
+    until its first actual use. round_trip_translate returns early when every
+    prompt for a side is already cached (see below), never touching the translator,
+    so wrapping the factory here means a fully-cached run pays NO model-load cost.
+    The one-time build is triggered by the first attribute access (`.roundtrip`,
+    `.roundtrip_batch`, `.batch_size`)."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._backend = None
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for names not already on the instance, so the two
+        # attrs set in __init__ resolve normally and never recurse through here.
+        if self._backend is None:
+            self._backend = self._factory()
+        return getattr(self._backend, name)
+
+
 def round_trip_translate(texts, translator, cache_csv=RTT_CACHE_CSV, label="", flush_every=25):
     """Translate a list of texts through the translator, preserving order.
 
@@ -1320,6 +1340,11 @@ def round_trip_translate(texts, translator, cache_csv=RTT_CACHE_CSV, label="", f
     pending = [t for t in unique if t not in cache]
     # Honest accounting: say how many were served from cache vs. actually run.
     print(f"  {label or 'RTT'}: {len(unique) - len(pending)} cached, {len(pending)} to translate")
+
+    # Nothing to translate -> return before touching `translator`, so a lazily
+    # wrapped backend (see _LazyBackend) never loads its model on a fully-cached run.
+    if not pending:
+        return [cache[t] for t in texts]
 
     desc = f"  RTT translate {label}".rstrip()
     batch_fn = getattr(translator, "roundtrip_batch", None)
@@ -1583,12 +1608,15 @@ DEFENSE_SPECS = {
 
 def _make_defense(spec):
     """Turn a DEFENSE_SPECS entry into a defense callable with the uniform
-    signature. The backend is instantiated lazily inside the call (only when the
-    defense runs), so picking it in the menu never triggers a model download."""
+    signature. The backend is wrapped in _LazyBackend so it is built only on first
+    actual use: picking it in the menu never triggers a model download, and a run
+    whose translation + embedding caches are both complete loads NO model at all
+    (round_trip_translate short-circuits on the translation cache, cached_embed on
+    the embedding npz) — it just runs the attack on the cached embeddings."""
     def defense(df, known, unknown, known_emb, unknown_emb,
                 defend_known=True, defend_unknown=True):
         return _rtt_defense(
-            df, spec["factory"](),
+            df, _LazyBackend(spec["factory"]),
             spec["cache_csv"], spec["known_npz"], spec["unknown_npz"],
             known_emb, unknown_emb, defend_known, defend_unknown,
         )

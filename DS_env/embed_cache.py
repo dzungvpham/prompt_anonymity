@@ -159,6 +159,12 @@ def main():
     ap = argparse.ArgumentParser(description="Embed a defense's cached defended text with StyloMetrix.")
     ap.add_argument("cache_csv", help="per-turn {source, translated} cache CSV "
                                        "(bare name is resolved under defense_data/cache/)")
+    ap.add_argument("--sides", choices=["unknown", "known", "both"], default="unknown",
+                    help="which side(s) the defense was actually run on, i.e. which to embed. "
+                         "Default 'unknown'. Only these sides are written; the other keeps its "
+                         "original precomputed embedding. This is EXPLICIT on purpose: trivial "
+                         "turns ('hi', 'thanks') collide across sides, so cache hits alone cannot "
+                         "tell a defended side from incidental overlap.")
     args = ap.parse_args()
 
     cache_csv = args.cache_csv
@@ -172,10 +178,13 @@ def main():
     # null translated -> "") so a complete cache reproduces the attack's own texts.
     cache = pd.read_csv(cache_csv).dropna(subset=["source"])
     lut = dict(zip(cache["source"], cache["translated"].fillna("")))
-    print(f"{os.path.basename(cache_csv)}: {len(lut)} defended turns")
-    print(f"  -> {known_npz}\n  -> {unknown_npz}")
+    print(f"{os.path.basename(cache_csv)}: {len(lut)} defended turns | sides={args.sides}")
 
-    for model, npz in [(KNOWN_MODEL, known_npz), (UNKNOWN_MODEL, unknown_npz)]:
+    todo = {"unknown": [(UNKNOWN_MODEL, unknown_npz)],
+            "known": [(KNOWN_MODEL, known_npz)],
+            "both": [(KNOWN_MODEL, known_npz), (UNKNOWN_MODEL, unknown_npz)]}[args.sides]
+
+    for model, npz in todo:
         texts, hit = rebuild(model, lut)
         if hit == 0:
             print(f"  -> no cached turns for {model}; skipping (side not defended).")
