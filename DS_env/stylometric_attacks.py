@@ -1600,7 +1600,14 @@ def _styleremix_openanon_defense(df, spec, known_emb, unknown_emb,
         styled = round_trip_translate_by_turn(
             _model_texts(df, model), restyle,
             cache_csv=STYLEREMIX_CACHE_CSV, label=f"{label} restyle")
-        # Stage 2: redact each fully-joined conversation once (per-conversation OA).
+        # Cap each joined conversation to MAX_LEN before OA. The downstream embedding
+        # (embed_texts) truncates to MAX_LEN anyway, so anything past it is discarded
+        # by the attack — redacting it is pure waste. More importantly, uncapped
+        # conversations reach ~10^5+ tokens (p99 ~145k), which stalls/times out the
+        # per-conversation OA call and blocks its whole 64-chunk. Capping matches the
+        # original scrubber, whose inputs were likewise bounded at MAX_LEN.
+        styled = [t[:MAX_LEN] for t in styled]
+        # Stage 2: redact each fully-joined (capped) conversation once (per-conversation OA).
         print(f"Defending {label} set, stage 2/2 — OpenAnonymity redact (per conversation)...")
         redacted = round_trip_translate(
             styled, redact, cache_csv=spec["cache_csv"], label=f"{label} redact")
