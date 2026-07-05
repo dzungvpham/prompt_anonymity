@@ -3,6 +3,7 @@
 # dependencies = [
 #   "numpy",
 #   "pandas",
+#   "click",
 #   "transformers>=4.36,<4.37",
 #   "spacy>=3.8,<3.9",
 #   "spacy-transformers>=1.3.4,<1.4",
