@@ -136,12 +136,22 @@ def embed_texts(texts, reference_columns, langcode=STYLO_LANGCODE, max_len=MAX_L
     return emb.to_numpy()
 
 
+def load_lut(cache_csv):
+    """{source -> translated} lookup from a defense cache, loaded exactly as the
+    attack does: drop null-source rows, map null translated -> ""."""
+    cache = pd.read_csv(cache_csv).dropna(subset=["source"])
+    return dict(zip(cache["source"], cache["translated"].fillna("")))
+
+
 def rebuild(model, lut):
     """Recombine each conversation from its DEFENDED turns, in load_data() order so
     rows stay aligned with the identities. Splits the original conversation on
     TURN_DELIM, swaps in the cached defended turn per part (keeping the original
     when a turn is absent from the cache), then re-joins with TURN_DELIM so the
-    result is one whole conversation string ready to embed."""
+    result is one whole conversation string ready to embed.
+
+    This yields one row PER CONVERSATION (not per unique cache entry) so the row
+    count and order match what the attack digests."""
     texts, hit, miss = [], 0, 0
     for conv in model_texts(load_data(), model):
         parts = []
@@ -151,8 +161,35 @@ def rebuild(model, lut):
             else:
                 parts.append(turn); miss += 1 if turn.strip() else 0
         texts.append(TURN_DELIM.join(parts))  # <- turns recombined before embedding
-    print(f"  {model}: {hit} turns from cache, {miss} non-empty turns missing (kept original)")
+    print(f"  {model}: {len(texts)} conversations | {hit} turns from cache, {miss} non-empty turns missing (kept original)")
     return texts, hit
+
+
+def rebuild_two_stage(model, turn_lut, conv_lut, max_len=MAX_LEN):
+    """Reproduce a MIXED-granularity combo defense (e.g. StyleRemix + OpenAnonymity,
+    see _styleremix_openanon_defense) so the resulting texts — and their digest —
+    equal what the attack builds:
+      stage 1 (per turn): swap each turn via `turn_lut`, re-join with TURN_DELIM,
+      then CAP the joined conversation to `max_len` (the attack caps before OA),
+      stage 2 (per conversation): swap the whole capped conversation via `conv_lut`.
+    One row PER CONVERSATION, in load_data() order — this is the 1494-vs-1485 fix:
+    it does NOT emit one row per unique cache entry."""
+    texts, s1_hit, s2_hit, s2_miss = [], 0, 0, 0
+    for conv in model_texts(load_data(), model):
+        parts = []
+        for turn in str(conv).split(TURN_DELIM):
+            if turn in turn_lut:
+                parts.append(turn_lut[turn]); s1_hit += 1
+            else:
+                parts.append(turn)
+        styled = TURN_DELIM.join(parts)[:max_len]   # cap before stage 2, as the attack does
+        if styled in conv_lut:
+            texts.append(conv_lut[styled]); s2_hit += 1
+        else:
+            texts.append(styled); s2_miss += 1 if styled.strip() else 0
+    print(f"  {model}: {len(texts)} conversations | stage1 {s1_hit} turns restyled | "
+          f"stage2 {s2_hit} redacted, {s2_miss} missing (kept styled)")
+    return texts, s2_hit
 
 
 def main():
@@ -165,27 +202,38 @@ def main():
                          "original precomputed embedding. This is EXPLICIT on purpose: trivial "
                          "turns ('hi', 'thanks') collide across sides, so cache hits alone cannot "
                          "tell a defended side from incidental overlap.")
+    ap.add_argument("--stage1-turn-cache", default=None,
+                    help="for a MIXED-granularity combo defense (e.g. StyleRemix + OpenAnonymity): "
+                         "a per-turn cache applied FIRST. When given, the positional cache_csv is "
+                         "treated as the per-CONVERSATION stage-2 cache keyed by the styled+capped "
+                         "conversation. Omit for single-stage defenses.")
     args = ap.parse_args()
 
-    cache_csv = args.cache_csv
-    if not os.path.exists(cache_csv):
-        cache_csv = os.path.join(CACHE_DIR, os.path.basename(cache_csv))
+    resolve = lambda p: p if os.path.exists(p) else os.path.join(CACHE_DIR, os.path.basename(p))
+    cache_csv = resolve(args.cache_csv)
     known_npz, unknown_npz = npz_paths_for(cache_csv)
 
     ref_cols = pd.read_csv(EMBEDDINGS_CSV, nrows=0).drop(columns="text").columns
 
-    # turn -> defended turn, loaded exactly as the attack does (drop null source,
-    # null translated -> "") so a complete cache reproduces the attack's own texts.
-    cache = pd.read_csv(cache_csv).dropna(subset=["source"])
-    lut = dict(zip(cache["source"], cache["translated"].fillna("")))
-    print(f"{os.path.basename(cache_csv)}: {len(lut)} defended turns | sides={args.sides}")
+    # {source -> defended} luts, loaded exactly as the attack does, so a complete
+    # cache reproduces the attack's own texts (and thus its digest).
+    conv_lut = load_lut(cache_csv)
+    turn_lut = load_lut(resolve(args.stage1_turn_cache)) if args.stage1_turn_cache else None
+    if turn_lut is None:
+        print(f"{os.path.basename(cache_csv)}: {len(conv_lut)} defended turns | sides={args.sides}")
+    else:
+        print(f"combo: stage1 {len(turn_lut)} restyled turns -> stage2 {len(conv_lut)} redacted "
+              f"conversations ({os.path.basename(cache_csv)}) | sides={args.sides}")
 
     todo = {"unknown": [(UNKNOWN_MODEL, unknown_npz)],
             "known": [(KNOWN_MODEL, known_npz)],
             "both": [(KNOWN_MODEL, known_npz), (UNKNOWN_MODEL, unknown_npz)]}[args.sides]
 
     for model, npz in todo:
-        texts, hit = rebuild(model, lut)
+        if turn_lut is None:
+            texts, hit = rebuild(model, conv_lut)
+        else:
+            texts, hit = rebuild_two_stage(model, turn_lut, conv_lut)
         if hit == 0:
             print(f"  -> no cached turns for {model}; skipping (side not defended).")
             continue
