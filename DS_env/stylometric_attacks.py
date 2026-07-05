@@ -412,14 +412,13 @@ EUCLIDEAN_LLM_TOP_K = 5
 EUCLIDEAN_LLM_SNIPPET_CHARS = 800
 # The judge only ever needs to emit one digit, so keep generation short.
 EUCLIDEAN_LLM_MAX_NEW_TOKENS = 8
-EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT = """You are an authorship-verification judge. You will be shown one QUERY text and up to five CANDIDATE texts, labeled 1 through 5.
+EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT = """You are an authorship-attribution judge. You will be shown one QUERY text and five CANDIDATE texts, labeled 1 through 5.
 Task:
-Decide which CANDIDATE, if any, was written by the SAME author as the QUERY.
-Judge ONLY writing style -- word choice, sentence structure, punctuation habits, register, verbosity, quirks of phrasing -- and IGNORE topic, subject matter, or what task each text asks for.
+Choose the ONE candidate most likely written by the SAME author as the QUERY.
+Base the decision on writing style -- word choice, sentence structure, punctuation habits, register, verbosity, quirks of phrasing -- and weight style over topic or subject matter.
 Rules:
-- Respond with ONLY the single digit (1-5) of the candidate whose style is the closest match to the query.
-- If none of the candidates seem stylistically written by the same author, respond with 0.
-- Output ONLY the digit and nothing else -- no words, no punctuation, no explanation."""
+- This is a forced choice: you MUST pick exactly one candidate, the single closest stylistic match. Even if none is an obvious match, pick the best of the five. Do NOT refuse and do NOT answer 0.
+- Output ONLY the single digit (1-5) of your choice and nothing else -- no words, no punctuation, no explanation."""
 EUCLIDEAN_LLM_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_euclidean_llm_judge_cache.csv")
 
 
@@ -1895,7 +1894,8 @@ def _judge_prompt(query_text: str, candidate_texts: list) -> str:
     lines = [f"QUERY:\n{query_text}"]
     for i, cand in enumerate(candidate_texts, 1):
         lines.append(f"\nCANDIDATE {i}:\n{cand}")
-    lines.append("\nWhich CANDIDATE shares an author with the QUERY? Respond with only the digit.")
+    lines.append("\nWhich candidate is the closest stylistic match to the QUERY, i.e. most "
+                 "likely written by the same author? You MUST pick one. Answer with a single digit 1-5.")
     return "\n".join(lines)
 
 
@@ -1903,9 +1903,10 @@ _JUDGE_DIGIT_RE = re.compile(r"[0-9]")
 
 
 def _parse_judge_choice(raw: str) -> int:
-    """First digit the judge emitted, or 0 (no match) if it emitted none /
-    garbage. Digits above the candidate count are treated as no-match by the
-    caller, which only ever indexes 1..len(candidates)."""
+    """First digit the judge emitted, or 0 if it emitted none / garbage. The
+    judge is asked for a forced choice 1-5, so 0 (or an out-of-range digit) means
+    it disobeyed and refused; the caller treats that as "no boost", leaving
+    euclidean's own #1 in place as the safe fallback."""
     match = _JUDGE_DIGIT_RE.search(raw or "")
     return int(match.group()) if match else 0
 
