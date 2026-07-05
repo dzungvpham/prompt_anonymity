@@ -419,7 +419,23 @@ Base the decision on writing style -- word choice, sentence structure, punctuati
 Rules:
 - This is a forced choice: you MUST pick exactly one candidate, the single closest stylistic match. Even if none is an obvious match, pick the best of the five. Do NOT refuse and do NOT answer 0.
 - Output ONLY the single digit (1-5) of your choice and nothing else -- no words, no punctuation, no explanation."""
-EUCLIDEAN_LLM_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, "wildchat_euclidean_llm_judge_cache.csv")
+# Judge model, SEPARATE from the rewrite/RTT Qwen (QWEN_HF_REPO). A 3B judge
+# can't out-discriminate the StyloMetrix k-NN, so the judge defaults to the
+# larger Qwen2.5-14B-Instruct. Toggle it with the env vars below (e.g.
+# QWEN_JUDGE_HF_REPO=Qwen/Qwen2.5-7B-Instruct, or back to ...-3B-Instruct).
+# 14B in bf16 is ~28GB — comfortable on an A100, too big for an 8GB card, so the
+# GGUF fallback gets its own repo/file knob for the laptop path.
+QWEN_JUDGE_HF_REPO = os.environ.get("QWEN_JUDGE_HF_REPO", "Qwen/Qwen2.5-14B-Instruct")        # vLLM judge
+QWEN_JUDGE_GGUF_REPO = os.environ.get("QWEN_JUDGE_GGUF_REPO", "Qwen/Qwen2.5-14B-Instruct-GGUF")
+QWEN_JUDGE_GGUF_FILE = os.environ.get("QWEN_JUDGE_GGUF_FILE", "qwen2.5-14b-instruct-q4_k_m.gguf")
+# The judge cache is keyed by PROMPT TEXT ONLY, so it must not be shared across
+# different judge models — a toggled model would otherwise be served the prior
+# model's cached digits. Version the cache filename by the active judge model
+# (and backend) so every toggle gets its own file, mirroring _QWEN_SUFFIX and
+# the per-backend RTT/NLLB cache naming elsewhere in this module.
+_JUDGE_MODEL = QWEN_JUDGE_HF_REPO if QWEN_BACKEND == "vllm" else QWEN_JUDGE_GGUF_REPO
+_JUDGE_TAG = re.sub(r"[^a-z0-9]+", "_", _JUDGE_MODEL.split("/")[-1].lower()).strip("_")
+EUCLIDEAN_LLM_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_euclidean_llm_judge_{_JUDGE_TAG}_cache.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -1851,7 +1867,7 @@ class QwenJudge(_QwenGGUF):
     other changes.
     """
 
-    def __init__(self, repo_id=QWEN_GGUF_REPO, filename=QWEN_GGUF_FILE,
+    def __init__(self, repo_id=QWEN_JUDGE_GGUF_REPO, filename=QWEN_JUDGE_GGUF_FILE,
                  system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT, n_ctx=4096,
                  n_threads=None, max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS, n_gpu_layers=-1):
         super().__init__(repo_id=repo_id, filename=filename, n_ctx=n_ctx,
@@ -1883,10 +1899,12 @@ class QwenJudgeVLLM(_QwenVLLM):
 
 def make_qwen_judge():
     """Qwen judge backend for the current QWEN_BACKEND (vLLM on cluster, GGUF
-    on laptop) -- mirrors make_qwen_rewriter/make_qwen_translator."""
+    on laptop) -- mirrors make_qwen_rewriter/make_qwen_translator. Uses the
+    dedicated, larger judge model (QWEN_JUDGE_HF_REPO / QWEN_JUDGE_GGUF_*),
+    NOT the smaller rewrite/RTT Qwen."""
     if QWEN_BACKEND == "vllm":
-        return QwenJudgeVLLM()
-    return QwenJudge()
+        return QwenJudgeVLLM(model_id=QWEN_JUDGE_HF_REPO)
+    return QwenJudge(repo_id=QWEN_JUDGE_GGUF_REPO, filename=QWEN_JUDGE_GGUF_FILE)
 
 
 def _judge_prompt(query_text: str, candidate_texts: list) -> str:
