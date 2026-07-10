@@ -405,6 +405,24 @@ STYLEREMIX_OPENANON_EMB_UNKNOWN_NPZ = os.path.join(EMB_DIR, "wildchat_styleremix
 # euclidean found it, so this isolates whatever extra signal the LLM adds on
 # top of the embedding distance at rank 1.
 EUCLIDEAN_LLM_TOP_K = 5
+# Ambiguity gate. The judge's rerank is applied ONLY to the most ambiguous rows:
+# those whose euclidean top-1 vs top-2 similarity margin is at or below this
+# quantile of all rows' margins. On confident rows (a clear nearest neighbour)
+# euclidean's own #1 is kept, so the judge can only act where euclidean was
+# unsure -- bounding its downside to close calls. 1.0 = apply to every row
+# (ungated, the original behavior); smaller = only the closest calls; 0.0 = off.
+# Retuning this needs NO recache: it only changes which cached judgments get
+# applied, never the prompts sent to the judge, so sweeping it is free.
+EUCLIDEAN_LLM_MARGIN_QUANTILE = float(os.environ.get("EUCLIDEAN_LLM_MARGIN_QUANTILE", "0.5"))
+# LLM judges over-pick the LAST option shown (position/recency bias). Feeding the
+# candidates in euclidean-rank order then systematically promotes euclidean's
+# WORST top-K candidate to rank 1 -- the observed 5>4>3>2>1 pick distribution and
+# the sub-euclidean accuracy. Shuffle each row's candidate presentation order
+# (seeded by RANDOM_SEED, so it is reproducible and the judge cache stays stable
+# across runs) to decouple presented position from euclidean rank; the judge's
+# positional pick is mapped back to the real known row afterward. Changing this
+# changes the prompts, so it needs a fresh judge cache.
+EUCLIDEAN_LLM_SHUFFLE_CANDIDATES = os.environ.get("EUCLIDEAN_LLM_SHUFFLE_CANDIDATES", "1") == "1"
 # Chars of each conversation shown to the judge, per text. Kept well below
 # MAX_LEN(=2048) so 1 query + 5 candidates + instructions comfortably fits
 # inside QWEN_VLLM_MAX_MODEL_LEN (4096 tokens) with room to spare, rather than
@@ -1932,7 +1950,9 @@ def _parse_judge_choice(raw: str) -> int:
 def make_euclidean_llm_attack(known_texts, unknown_texts,
                                top_k=EUCLIDEAN_LLM_TOP_K,
                                snippet_chars=EUCLIDEAN_LLM_SNIPPET_CHARS,
-                               cache_csv=EUCLIDEAN_LLM_JUDGE_CACHE_CSV):
+                               cache_csv=EUCLIDEAN_LLM_JUDGE_CACHE_CSV,
+                               margin_quantile=EUCLIDEAN_LLM_MARGIN_QUANTILE,
+                               shuffle_candidates=EUCLIDEAN_LLM_SHUFFLE_CANDIDATES):
     """Build an attack_fn(known_emb, unknown_emb) -> similarity that reranks
     euclidean_style_attack's top-K per unknown row with a local LLM judge.
 
@@ -1943,36 +1963,88 @@ def make_euclidean_llm_attack(known_texts, unknown_texts,
 
     For each unknown row: take its top-K known rows by euclidean distance,
     build a judge prompt (query + K labeled candidates, each capped to
-    snippet_chars), and ask the Qwen judge which candidate (if any) shares an
-    author with the query. If the judge picks one, that candidate's score is
-    bumped just above the row's current max so it sorts first; every other
-    score -- including which known rows are in the top-K at all -- is left
-    untouched. So this can only move TOP-1 accuracy relative to plain
-    euclidean_style_attack; top-5/top-10 accuracy are identical by construction.
+    snippet_chars), and ask the Qwen judge which candidate shares an author with
+    the query. If the judge picks one, that candidate's score is bumped just
+    above the row's current max so it sorts first; every other score -- including
+    which known rows are in the top-K at all -- is left untouched. So this can
+    only move TOP-1 accuracy relative to plain euclidean_style_attack;
+    top-5/top-10 accuracy are identical by construction.
+
+    Ambiguity gate (margin_quantile): the boost is applied ONLY on rows whose
+    euclidean top-1/top-2 margin is at or below the `margin_quantile` quantile of
+    all rows' margins -- i.e. the closest calls, where euclidean was least sure.
+    Confident rows keep euclidean's own #1, bounding the judge's downside to the
+    ambiguous rows it can actually help. EVERY row is still judged (so the cache
+    is complete and the quantile can be re-swept with no new LLM calls); only the
+    boost APPLICATION is gated. margin_quantile=1.0 reproduces the ungated attack.
     """
     judge = _LazyBackend(make_qwen_judge)
 
     def attack_fn(known_emb, unknown_emb):
+        n = unknown_emb.shape[0]
         k = min(top_k, known_emb.shape[0])
         similarity = -cdist(unknown_emb, known_emb, metric="euclidean")
         order = np.argsort(-similarity, axis=1)
         top_idx = order[:, :k]
 
+        # Per-row euclidean top-1 vs top-2 similarity margin (>= 0; small = the
+        # two nearest are near-tied = ambiguous). gate_thresh is that margin's
+        # `margin_quantile` quantile, so ~that fraction of the closest calls pass.
+        row_sorted = np.take_along_axis(similarity, order, axis=1)
+        margins = row_sorted[:, 0] - row_sorted[:, 1]
+        gate_thresh = np.quantile(margins, margin_quantile)
+
+        # Presentation order of each row's K candidates. Shuffling (seeded ->
+        # reproducible, so the judge cache stays stable) decouples the slot a
+        # candidate is shown in from its euclidean rank, cancelling the judge's
+        # position/recency bias; without it, feeding candidates in rank order
+        # makes that bias promote euclidean's worst top-K row. `present[i]` holds
+        # the real known indices in the order the judge sees them, so a positional
+        # pick maps straight back through it.
+        rng = np.random.default_rng(RANDOM_SEED)
+        k_cols = top_idx.shape[1]
+        # perms[i] = euclidean ranks (0=nearest) in the order the judge sees them,
+        # so present[i] = the real known indices in that presented order, and a
+        # positional pick `c` maps to euclidean rank perms[i][c-1].
+        if shuffle_candidates:
+            perms = [rng.permutation(k_cols) for _ in range(n)]
+        else:
+            perms = [np.arange(k_cols) for _ in range(n)]
+        present = [top_idx[i][perms[i]] for i in range(n)]
+
         prompts = [
             _judge_prompt(
                 str(unknown_texts[i])[:snippet_chars],
-                [str(known_texts[j])[:snippet_chars] for j in top_idx[i]],
+                [str(known_texts[j])[:snippet_chars] for j in present[i]],
             )
-            for i in range(unknown_emb.shape[0])
+            for i in range(n)
         ]
         raw_choices = round_trip_translate(prompts, judge, cache_csv=cache_csv, label="LLM judge")
 
         boosted = similarity.copy()
         row_max = similarity.max(axis=1)
-        for i, raw in enumerate(raw_choices):
-            choice = _parse_judge_choice(raw)
-            if 1 <= choice <= len(top_idx[i]):
-                boosted[i, top_idx[i][choice - 1]] = row_max[i] + 1.0
+        choices = [_parse_judge_choice(raw) for raw in raw_choices]
+        # Euclidean rank (0 = nearest) of each valid pick, over ALL judged rows.
+        # This is the SIGNAL axis: mass on ranks 0-1 means the judge lands on the
+        # true-author-heavy nearest neighbours; a flat spread means no style
+        # signal. Preserved under shuffling -- a good judge picks the true author
+        # in whatever slot it appears, which maps back here to rank 0-1.
+        rank_picks = [int(perms[i][c - 1]) for i, c in enumerate(choices) if 1 <= c <= k_cols]
+        applied = 0
+        for i, choice in enumerate(choices):
+            if margins[i] > gate_thresh:
+                continue  # confident row: keep euclidean's own #1 untouched
+            if 1 <= choice <= k_cols:
+                boosted[i, present[i][choice - 1]] = row_max[i] + 1.0
+                applied += 1
+        # Position axis (presented slot): with shuffling on, ~uniform => the
+        # position/recency bias is gone; a skew toward K => it persists.
+        pos_dist = {p: choices.count(p) for p in range(k_cols + 1)}
+        rank_dist = {r: rank_picks.count(r) for r in range(k_cols)}
+        print(f"  LLM judge: positional picks {pos_dist} (0=refused; want ~uniform if unbiased)")
+        print(f"  LLM judge: euclidean-rank of picks {rank_dist} (0=nearest; want mass on 0-1 if real signal)")
+        print(f"  LLM judge: boost applied to {applied}/{len(raw_choices)} rows "
+              f"(margin_quantile={margin_quantile}, gate<= {gate_thresh:.4g})")
         return boosted
 
     attack_fn.__name__ = "euclidean_llm_attack"
