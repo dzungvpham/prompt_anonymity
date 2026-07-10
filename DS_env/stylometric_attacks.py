@@ -264,8 +264,13 @@ OPENANON_OUTPUT_TAG = "scrubbed_prompt"       # block the model is told to retur
 # going one-by-one. Tune MAX_WORKERS up for throughput / down if the provider
 # rate-limits (429s are retried with backoff regardless). BATCH_SIZE is the
 # cache-flush granularity: a crash loses at most this many in-flight rewrites.
-OPENANON_MAX_WORKERS = 8
-OPENANON_BATCH_SIZE = 64
+# Env-tunable so a long paid run can be sped up without editing code; concurrency
+# has NO effect on the rewrites (temperature 0, cache keyed by source text only),
+# so raising these never invalidates an in-progress cache. Real parallelism per
+# chunk is min(MAX_WORKERS, BATCH_SIZE), so keep BATCH_SIZE >= MAX_WORKERS or the
+# extra workers idle.
+OPENANON_MAX_WORKERS = int(os.environ.get("OPENANON_MAX_WORKERS", "8"))
+OPENANON_BATCH_SIZE = int(os.environ.get("OPENANON_BATCH_SIZE", "64"))
 
 OPENANON_SYSTEM_PROMPT = """
 You are PrivacyScrubber, a privacy-preserving prompt rewrite model.
@@ -437,15 +442,24 @@ Base the decision on writing style -- word choice, sentence structure, punctuati
 Rules:
 - This is a forced choice: you MUST pick exactly one candidate, the single closest stylistic match. Even if none is an obvious match, pick the best of the five. Do NOT refuse and do NOT answer 0.
 - Output ONLY the single digit (1-5) of your choice and nothing else -- no words, no punctuation, no explanation."""
-# Judge model, SEPARATE from the rewrite/RTT Qwen (QWEN_HF_REPO). A 3B judge
-# can't out-discriminate the StyloMetrix k-NN, so the judge defaults to the
-# larger Qwen2.5-14B-Instruct. Toggle it with the env vars below (e.g.
-# QWEN_JUDGE_HF_REPO=Qwen/Qwen2.5-7B-Instruct, or back to ...-3B-Instruct).
-# 14B in bf16 is ~28GB — comfortable on an A100, too big for an 8GB card, so the
-# GGUF fallback gets its own repo/file knob for the laptop path.
-QWEN_JUDGE_HF_REPO = os.environ.get("QWEN_JUDGE_HF_REPO", "Qwen/Qwen2.5-14B-Instruct")        # vLLM judge
-QWEN_JUDGE_GGUF_REPO = os.environ.get("QWEN_JUDGE_GGUF_REPO", "Qwen/Qwen2.5-14B-Instruct-GGUF")
-QWEN_JUDGE_GGUF_FILE = os.environ.get("QWEN_JUDGE_GGUF_FILE", "qwen2.5-14b-instruct-q4_k_m.gguf")
+# Judge model, SEPARATE from the rewrite/RTT Qwen (QWEN_HF_REPO). A small judge
+# can't out-discriminate the StyloMetrix k-NN, so the judge defaults to the large
+# Qwen3.6-27B. Toggle it with the env vars below (e.g. back to Qwen/Qwen2.5-14B-
+# Instruct). On the cluster this model is pre-downloaded in HF-hub-cache layout at
+# /datasets/ai/qwen3/hub/models--Qwen--Qwen3.6-27B, so exporting
+# HF_HUB_CACHE=/datasets/ai/qwen3/hub (or HF_HOME) lets vLLM resolve the repo id
+# below from that cache with no download — no code change needed. 27B in bf16 is
+# ~54GB — fits an 80GB A100, too big for an 8GB card, so the GGUF fallback gets its
+# own repo/file knob for the laptop path.
+#
+# Qwen3.x NOTE: its chat template enables a <think>...</think> reasoning preamble by
+# default. The judge is asked for a single digit under a tiny max_tokens, so that
+# preamble would swallow the whole budget and never emit the answer. _QwenVLLM
+# disables thinking for the judge (chat_template_kwargs enable_thinking=False), and
+# _parse_judge_choice reads the LAST digit as a belt-and-suspenders fallback.
+QWEN_JUDGE_HF_REPO = os.environ.get("QWEN_JUDGE_HF_REPO", "Qwen/Qwen3.6-27B")        # vLLM judge
+QWEN_JUDGE_GGUF_REPO = os.environ.get("QWEN_JUDGE_GGUF_REPO", "Qwen/Qwen3.6-27B-GGUF")
+QWEN_JUDGE_GGUF_FILE = os.environ.get("QWEN_JUDGE_GGUF_FILE", "qwen3.6-27b-q4_k_m.gguf")
 # The judge cache is keyed by PROMPT TEXT ONLY, so it must not be shared across
 # different judge models — a toggled model would otherwise be served the prior
 # model's cached digits. Version the cache filename by the active judge model
@@ -454,6 +468,53 @@ QWEN_JUDGE_GGUF_FILE = os.environ.get("QWEN_JUDGE_GGUF_FILE", "qwen2.5-14b-instr
 _JUDGE_MODEL = QWEN_JUDGE_HF_REPO if QWEN_BACKEND == "vllm" else QWEN_JUDGE_GGUF_REPO
 _JUDGE_TAG = re.sub(r"[^a-z0-9]+", "_", _JUDGE_MODEL.split("/")[-1].lower()).strip("_")
 EUCLIDEAN_LLM_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_euclidean_llm_judge_{_JUDGE_TAG}_cache.csv")
+
+# --- LSOD tournament attack config (Algorithm 1: LLM confidence sorting) ------
+# Port of "Algorithm 1 LLM-based confidence sorting" from *Large-scale online
+# deanonymization with LLMs* (arXiv 2602.16800). Where the Euclidean + LLM Judge
+# attack (EUCLIDEAN_LLM_* above) asks ONE 5-way forced choice per unknown row,
+# this ranks each row's euclidean top-K candidates with a Bradley-Terry / Swiss-
+# system TOURNAMENT of pairwise LLM comparisons: candidates are rated, paired each
+# round against similarly-rated candidates, the judge picks the more plausible
+# same-author match, and ratings update online. Scope is PER QUERY (each unknown
+# row's candidate set is ranked independently), which is what the framework's
+# per-row top-k evaluation needs. Only the WITHIN-top-K order changes, so at K=5
+# top-5/top-10 accuracy equal plain euclidean and only top-1 can move -- directly
+# comparable to the Euclidean + LLM Judge attack.
+EUCLIDEAN_BT_TOP_K = 5
+# N in Algorithm 1: Swiss rounds. With K=5, each round plays 2 matches (+1 bye), so
+# a candidate plays up to N matches. 4 rounds settles the top-1 without excess LLM
+# calls. Env-tunable for a cost/quality sweep.
+EUCLIDEAN_BT_ROUNDS = int(os.environ.get("EUCLIDEAN_BT_ROUNDS", "4"))
+# Online Bradley-Terry (Elo-style) step size, in logistic/natural units:
+# rA += K*(S_A - E_A), E_A = sigmoid(rA - rB). Larger = ratings move faster per
+# comparison (more decisive, noisier); smaller = smoother, needs more rounds.
+EUCLIDEAN_BT_ELO_K = float(os.environ.get("EUCLIDEAN_BT_ELO_K", "0.4"))
+# Chars of each conversation shown to the judge, per text -- as in the 5-way judge,
+# kept well below MAX_LEN so QUERY + 2 candidates + instructions fit the context.
+EUCLIDEAN_BT_SNIPPET_CHARS = 800
+# The judge emits one digit (1 or 2); keep generation short. A hair more than the
+# 5-way judge's budget as headroom in case a Qwen3 <think> token slips the guard.
+EUCLIDEAN_BT_MAX_NEW_TOKENS = 8
+# Ambiguity gate, analogous to EUCLIDEAN_LLM_MARGIN_QUANTILE: run the tournament
+# ONLY on rows whose euclidean top-1/top-2 margin is at or below this quantile
+# (the closest calls); confident rows keep euclidean's order. 1.0 = tournament
+# every row (default). NOTE: unlike the 5-way judge's gate (which judges every row
+# and gates only the boost APPLICATION, so re-sweeping is free), this gates
+# EXECUTION to save LLM calls -- so lowering it and re-raising it later needs new
+# comparisons for the newly-included rows.
+EUCLIDEAN_BT_MARGIN_QUANTILE = float(os.environ.get("EUCLIDEAN_BT_MARGIN_QUANTILE", "1.0"))
+EUCLIDEAN_BT_JUDGE_SYSTEM_PROMPT = """You are an authorship-attribution judge. You will be shown one QUERY text and two CANDIDATE texts, labeled 1 and 2.
+Task:
+Choose the ONE candidate more likely written by the SAME author as the QUERY.
+Base the decision on writing style -- word choice, sentence structure, punctuation habits, register, verbosity, quirks of phrasing -- and weight style over topic or subject matter.
+Rules:
+- This is a forced choice: you MUST pick exactly one candidate, the closer stylistic match. Even if neither is an obvious match, pick the better of the two. Do NOT refuse and do NOT answer 0.
+- Output ONLY the single digit (1 or 2) of your choice and nothing else -- no words, no punctuation, no explanation."""
+# Pairwise-judge cache, keyed by PROMPT TEXT ONLY and versioned by the active judge
+# model like EUCLIDEAN_LLM_JUDGE_CACHE_CSV, so it never mixes with the 5-way judge's
+# cache or another model's digits. Swiss rematches of the same pair hit this cache.
+EUCLIDEAN_BT_JUDGE_CACHE_CSV = os.path.join(CACHE_DIR, f"wildchat_euclidean_bt_judge_{_JUDGE_TAG}_cache.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -998,12 +1059,18 @@ class _QwenVLLM:
 
     def __init__(self, model_id=QWEN_HF_REPO, max_tokens=1024,
                  dtype=QWEN_VLLM_DTYPE, gpu_memory_utilization=QWEN_VLLM_GPU_MEM_UTIL,
-                 max_model_len=QWEN_VLLM_MAX_MODEL_LEN, load_note=""):
+                 max_model_len=QWEN_VLLM_MAX_MODEL_LEN, load_note="",
+                 chat_template_kwargs=None):
         from vllm import LLM, SamplingParams
 
         # round_trip_translate reads .batch_size to size its flush chunk and calls
         # .roundtrip_batch (below) since it exists -> vLLM gets many prompts/call.
         self.batch_size = QWEN_VLLM_CHUNK
+        # Extra kwargs forwarded to the chat template. The judge sets
+        # {"enable_thinking": False} here to suppress Qwen3.x's <think>...</think>
+        # reasoning preamble, which would otherwise consume its tiny answer budget
+        # before it emits a digit. Left None for the Qwen2.5 rewrite/translate paths.
+        self.chat_template_kwargs = chat_template_kwargs
         print(f"Loading Qwen (vLLM) '{model_id}' ({dtype}){load_note}...")
         self.llm = LLM(
             model=model_id,
@@ -1026,8 +1093,13 @@ class _QwenVLLM:
             for ut in user_texts
         ]
         # llm.chat applies the model's chat template for us; use_tqdm=False keeps
-        # round_trip_translate's own progress bar the single source of truth.
-        outs = self.llm.chat(conversations, self.sampling, use_tqdm=False)
+        # round_trip_translate's own progress bar the single source of truth. Only
+        # pass chat_template_kwargs when set, so the Qwen2.5 templates (which don't
+        # take enable_thinking) are called exactly as before.
+        chat_kwargs = {}
+        if self.chat_template_kwargs:
+            chat_kwargs["chat_template_kwargs"] = self.chat_template_kwargs
+        outs = self.llm.chat(conversations, self.sampling, use_tqdm=False, **chat_kwargs)
         return [o.outputs[0].text for o in outs]
 
 
@@ -1905,7 +1977,11 @@ class QwenJudgeVLLM(_QwenVLLM):
 
     def __init__(self, system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT,
                  max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS, **kwargs):
-        super().__init__(max_tokens=max_tokens, load_note=" for authorship judging", **kwargs)
+        # enable_thinking=False suppresses Qwen3.x's <think> preamble so the judge
+        # spends its tiny token budget on the answer digit, not on reasoning. Harmless
+        # for the Qwen2.5 judge (the template just ignores the unused variable).
+        super().__init__(max_tokens=max_tokens, load_note=" for authorship judging",
+                         chat_template_kwargs={"enable_thinking": False}, **kwargs)
         self.system_prompt = system_prompt
 
     def roundtrip_batch(self, texts):
@@ -1915,14 +1991,21 @@ class QwenJudgeVLLM(_QwenVLLM):
         return self.roundtrip_batch([text])[0]
 
 
-def make_qwen_judge():
+def make_qwen_judge(system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT,
+                    max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS):
     """Qwen judge backend for the current QWEN_BACKEND (vLLM on cluster, GGUF
     on laptop) -- mirrors make_qwen_rewriter/make_qwen_translator. Uses the
     dedicated, larger judge model (QWEN_JUDGE_HF_REPO / QWEN_JUDGE_GGUF_*),
-    NOT the smaller rewrite/RTT Qwen."""
+    NOT the smaller rewrite/RTT Qwen.
+
+    `system_prompt`/`max_tokens` default to the 5-way forced-choice judge used by
+    the Euclidean + LLM Judge attack; the BT tournament passes its own pairwise
+    prompt (EUCLIDEAN_BT_JUDGE_SYSTEM_PROMPT) instead."""
     if QWEN_BACKEND == "vllm":
-        return QwenJudgeVLLM(model_id=QWEN_JUDGE_HF_REPO)
-    return QwenJudge(repo_id=QWEN_JUDGE_GGUF_REPO, filename=QWEN_JUDGE_GGUF_FILE)
+        return QwenJudgeVLLM(model_id=QWEN_JUDGE_HF_REPO,
+                             system_prompt=system_prompt, max_tokens=max_tokens)
+    return QwenJudge(repo_id=QWEN_JUDGE_GGUF_REPO, filename=QWEN_JUDGE_GGUF_FILE,
+                     system_prompt=system_prompt, max_tokens=max_tokens)
 
 
 def _judge_prompt(query_text: str, candidate_texts: list) -> str:
@@ -1935,16 +2018,33 @@ def _judge_prompt(query_text: str, candidate_texts: list) -> str:
     return "\n".join(lines)
 
 
+def _pairwise_judge_prompt(query_text: str, cand_a_text: str, cand_b_text: str) -> str:
+    """One pairwise judge prompt for the BT tournament: a QUERY plus exactly two
+    labeled CANDIDATE texts. Mirrors _judge_prompt but forces a 1-vs-2 choice."""
+    return (
+        f"QUERY:\n{query_text}\n"
+        f"\nCANDIDATE 1:\n{cand_a_text}\n"
+        f"\nCANDIDATE 2:\n{cand_b_text}\n"
+        "\nWhich candidate is the closer stylistic match to the QUERY, i.e. more "
+        "likely written by the same author? You MUST pick one. Answer with a single digit, 1 or 2."
+    )
+
+
 _JUDGE_DIGIT_RE = re.compile(r"[0-9]")
 
 
 def _parse_judge_choice(raw: str) -> int:
-    """First digit the judge emitted, or 0 if it emitted none / garbage. The
-    judge is asked for a forced choice 1-5, so 0 (or an out-of-range digit) means
-    it disobeyed and refused; the caller treats that as "no boost", leaving
-    euclidean's own #1 in place as the safe fallback."""
-    match = _JUDGE_DIGIT_RE.search(raw or "")
-    return int(match.group()) if match else 0
+    """The LAST digit the judge emitted, or 0 if it emitted none / garbage. The
+    judge is asked for a forced choice (1-5 for the 5-way judge, 1-2 for the BT
+    tournament's pairwise judge), so 0 (or an out-of-range digit) means it
+    disobeyed and refused; callers treat that as "no boost"/"draw", leaving
+    euclidean's own order in place as the safe fallback.
+
+    Last (not first) digit: with a bare "3" the two are identical, but if a model
+    leaks any preamble before the answer (e.g. a Qwen3 <think> span that slips past
+    the thinking guard, or "answer: 2"), the decision digit is the trailing one."""
+    matches = _JUDGE_DIGIT_RE.findall(raw or "")
+    return int(matches[-1]) if matches else 0
 
 
 def make_euclidean_llm_attack(known_texts, unknown_texts,
@@ -2051,6 +2151,130 @@ def make_euclidean_llm_attack(known_texts, unknown_texts,
     return attack_fn
 
 
+def make_euclidean_bt_attack(known_texts, unknown_texts,
+                             top_k=EUCLIDEAN_BT_TOP_K,
+                             rounds=EUCLIDEAN_BT_ROUNDS,
+                             elo_k=EUCLIDEAN_BT_ELO_K,
+                             snippet_chars=EUCLIDEAN_BT_SNIPPET_CHARS,
+                             cache_csv=EUCLIDEAN_BT_JUDGE_CACHE_CSV,
+                             margin_quantile=EUCLIDEAN_BT_MARGIN_QUANTILE):
+    """Build an attack_fn(known_emb, unknown_emb) -> similarity implementing
+    Algorithm 1 (LLM-based confidence sorting) from arXiv 2602.16800, PER QUERY.
+
+    Same text-factory contract as make_euclidean_llm_attack: `known_texts`/
+    `unknown_texts` are plain lists of conversation strings, aligned row-for-row
+    with known_emb/unknown_emb.
+
+    For each unknown row we retrieve its euclidean top-K known candidates, then run
+    a Bradley-Terry / Swiss-system TOURNAMENT over those K candidates instead of the
+    single 5-way forced choice: over `rounds` (N) rounds we pair candidates of
+    similar rating, ask the Qwen judge which of the two is the more plausible
+    same-author match, and update online BT (Elo-style) ratings. The candidates are
+    finally reranked by rating and boosted above all non-top-K scores. Only the
+    WITHIN-top-K order changes, so at top_k=5 top-5/top-10 accuracy are identical to
+    plain euclidean_style_attack and only top-1 can move.
+
+    Batching/caching: rounds are SEQUENTIAL (round r's pairings depend on round r-1's
+    ratings), but within a round every active row contributes its comparisons to ONE
+    round_trip_translate call, so the judge runs in large batches and each round is
+    cached + crash-safe. The pairwise-judge cache is keyed by prompt text, so Swiss
+    rematches of the same pair (same presentation) are free on re-encounter.
+
+    Ambiguity gate (margin_quantile): only rows whose euclidean top-1/top-2 margin is
+    at or below the quantile are tournamented; confident rows keep euclidean's order.
+    Unlike the 5-way judge's gate, this gates EXECUTION (skips the LLM calls), so a
+    lower quantile is cheaper but re-widening it later needs fresh comparisons.
+    """
+    judge = _LazyBackend(lambda: make_qwen_judge(
+        system_prompt=EUCLIDEAN_BT_JUDGE_SYSTEM_PROMPT,
+        max_tokens=EUCLIDEAN_BT_MAX_NEW_TOKENS,
+    ))
+
+    def attack_fn(known_emb, unknown_emb):
+        n = unknown_emb.shape[0]
+        k = min(top_k, known_emb.shape[0])
+        similarity = -cdist(unknown_emb, known_emb, metric="euclidean")
+        if k < 2:
+            return similarity  # need >=2 candidates to hold a match; nothing to sort
+
+        order = np.argsort(-similarity, axis=1)
+        top_idx = order[:, :k]              # (n, k) real known indices; slot 0 = nearest
+        row_max = similarity.max(axis=1)    # == similarity at slot 0
+
+        # Ambiguity gate: tournament only the closest calls (small top-1/top-2 margin).
+        row_sorted = np.take_along_axis(similarity, order, axis=1)
+        margins = row_sorted[:, 0] - row_sorted[:, 1]
+        gate_thresh = np.quantile(margins, margin_quantile)
+        active = margins <= gate_thresh
+
+        # BT ratings, (n, k), in logistic units. Seed a TINY euclidean-rank prior
+        # (nearest slot highest) so round-1 Swiss pairing is deterministic (pairs the
+        # 1st vs 2nd nearest, 3rd vs 4th, ...) while being small enough that a single
+        # upset (step ~elo_k) flips it -- the tournament, not the prior, decides.
+        ratings = np.tile(((k - 1 - np.arange(k)) * 1e-3).astype(float), (n, 1))
+
+        rng = np.random.default_rng(RANDOM_SEED)  # seeds candidate-order flips; reproducible
+        pos_picks = {0: 0, 1: 0, 2: 0}            # judge's presented-slot pick distribution
+        total_cmp = 0
+        active_rows = np.where(active)[0]
+
+        for r in range(rounds):
+            # Build this round's Swiss pairings across every active row. meta[t] =
+            # (row, slot_shown_as_1, slot_shown_as_2) for prompts[t].
+            prompts, meta = [], []
+            for i in active_rows:
+                slot_order = np.argsort(-ratings[i], kind="stable")  # best-rated first; ties keep euclidean order
+                for p in range(0, k - 1, 2):                         # adjacent pairs; odd last slot = bye
+                    a, b = int(slot_order[p]), int(slot_order[p + 1])
+                    # Randomize which candidate is shown as 1 vs 2 to cancel the judge's
+                    # position bias (same rationale as EUCLIDEAN_LLM_SHUFFLE_CANDIDATES).
+                    first, second = (b, a) if rng.integers(2) else (a, b)
+                    prompts.append(_pairwise_judge_prompt(
+                        str(unknown_texts[i])[:snippet_chars],
+                        str(known_texts[top_idx[i, first]])[:snippet_chars],
+                        str(known_texts[top_idx[i, second]])[:snippet_chars],
+                    ))
+                    meta.append((int(i), first, second))
+            if not prompts:
+                break
+
+            raw = round_trip_translate(prompts, judge, cache_csv=cache_csv,
+                                       label=f"BT round {r + 1}/{rounds}")
+            for (i, s1, s2), rawout in zip(meta, raw):
+                choice = _parse_judge_choice(rawout)
+                pos_picks[choice if choice in (1, 2) else 0] += 1
+                s_first = 1.0 if choice == 1 else 0.0 if choice == 2 else 0.5  # refusal -> draw
+                expected_first = 1.0 / (1.0 + np.exp(-(ratings[i, s1] - ratings[i, s2])))
+                delta = elo_k * (s_first - expected_first)
+                ratings[i, s1] += delta
+                ratings[i, s2] -= delta
+            total_cmp += len(meta)
+
+        # Rerank each active row's top-K by final rating and boost them above every
+        # non-top-K score (all <= row_max), so top-K membership is unchanged and only
+        # the internal order (hence top-1) follows the tournament.
+        boosted = similarity.copy()
+        changed_top1 = 0
+        for i in active_rows:
+            final_order = np.argsort(-ratings[i], kind="stable")  # best slot first
+            for pos, slot in enumerate(final_order):
+                boosted[i, top_idx[i, slot]] = row_max[i] + (k - pos)
+            if final_order[0] != 0:  # euclidean's nearest is no longer this row's #1
+                changed_top1 += 1
+
+        print(f"  BT tournament: {len(active_rows)}/{n} rows tournamented "
+              f"(margin_quantile={margin_quantile}, gate<= {gate_thresh:.4g}), "
+              f"{rounds} rounds, {total_cmp} pairwise comparisons")
+        print(f"  BT tournament: presented-slot picks {pos_picks} "
+              f"(0=refused/draw; want ~equal 1 vs 2 if position bias cancelled)")
+        print(f"  BT tournament: top-1 changed vs euclidean on {changed_top1}/{len(active_rows)} "
+              f"tournamented rows")
+        return boosted
+
+    attack_fn.__name__ = "euclidean_bt_attack"
+    return attack_fn
+
+
 # ---------------------------------------------------------------------------
 # Registries — the one place to plug in new modules. Add an entry to either
 # dict and it is automatically listed in the menu and runnable. Keys are the
@@ -2069,6 +2293,7 @@ ATTACKS = {
 # (see main(), which builds these lazily right before running the attack).
 ATTACK_TEXT_FACTORIES = {
     "Euclidean + LLM Judge (Qwen)": make_euclidean_llm_attack,
+    "LSOD Tournament (Qwen 3.6)": make_euclidean_bt_attack,
 }
 
 # "None" is the only special case (no backend); every other defense is built
