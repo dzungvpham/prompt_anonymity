@@ -19,8 +19,13 @@ from typing import Callable, Union
 
 from ..caching import TransformCache, logic_hash, params_hash, source_digest
 from ..core import AttackData
+from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
+from .openanonymity import OpenAnonymityDefense
+from .qwen_rewrite import QwenRewriteDefense
+from .styleremix import StyleRemixDefense
+from .styleremix_openanon import StyleRemixOpenAnonymityDefense
 
 # A defense is a plain callable or a (callable) CachedDefense instance.
 Defense = Union[Callable[[AttackData], AttackData], CachedDefense]
@@ -31,12 +36,19 @@ def no_defense(data: AttackData) -> AttackData:
     return data
 
 
-# Registry of ready-to-use defenses, selectable by name (e.g. from a CLI argument).
-# RoundTripTranslationDefense is intentionally absent: it needs a translation model supplied
-# by the caller, so it cannot be a zero-config registry entry.
+# Registry of ready-to-use defenses, selectable by name (e.g. from a CLI argument). The
+# model-backed defenses build their (heavy) backend lazily on first use, so registering them here
+# is free -- selecting one never loads a model, and a fully-cached run loads none either.
+# RoundTripTranslationDefense is intentionally absent: it needs a translation model supplied by the
+# caller, so it cannot be a zero-config registry entry.
 DEFENSES: dict[str, Defense] = {
     "none": no_defense,
     "example_normalization": ExampleTextNormalizationDefense(),
+    "rtt_argos": ArgosRTTDefense(),
+    "qwen_rewrite": QwenRewriteDefense(),
+    "styleremix": StyleRemixDefense(),
+    "openanonymity": OpenAnonymityDefense(),
+    "styleremix_openanon": StyleRemixOpenAnonymityDefense(),
 }
 
 
@@ -75,4 +87,9 @@ __all__ = [
     "source_digest",
     "ExampleTextNormalizationDefense",
     "RoundTripTranslationDefense",
+    "ArgosRTTDefense",
+    "QwenRewriteDefense",
+    "StyleRemixDefense",
+    "OpenAnonymityDefense",
+    "StyleRemixOpenAnonymityDefense",
 ]

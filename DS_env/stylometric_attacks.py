@@ -271,6 +271,22 @@ OPENANON_OUTPUT_TAG = "scrubbed_prompt"       # block the model is told to retur
 # extra workers idle.
 OPENANON_MAX_WORKERS = int(os.environ.get("OPENANON_MAX_WORKERS", "8"))
 OPENANON_BATCH_SIZE = int(os.environ.get("OPENANON_BATCH_SIZE", "64"))
+# gpt-oss-120b's context window. A rare WildChat turn (e.g. a pasted multi-hundred-
+# KB log) exceeds this once the system prompt + reserved output are added, which
+# OpenRouter rejects with a hard 400. Rather than truncate (which would make the
+# defended turn SHORTER than the original and bias downstream stylometry), the
+# rewriter token-chunks such a turn into windows that fit, scrubs each, and rejoins
+# — so all content is preserved and still scrubbed. MARGIN covers the o200k_base
+# vs the model's exact harmony tokenizer drift plus the <input_prompt> wrapper.
+OPENANON_CONTEXT_LIMIT = int(os.environ.get("OPENANON_CONTEXT_LIMIT", "131072"))
+OPENANON_TOKEN_MARGIN = int(os.environ.get("OPENANON_TOKEN_MARGIN", "1024"))
+# Transient transport hiccups (dropped TLS connections, read timeouts, 5xx, 429)
+# are expected on a long, highly-concurrent paid run and should NOT abort it. Retry
+# them with jittered exponential backoff: more attempts + a backoff CAP so a blip
+# costs seconds not minutes, and JITTER so N concurrent workers don't retry in
+# lockstep and re-collide. Env-tunable for a flaky network without editing code.
+OPENANON_MAX_RETRIES = int(os.environ.get("OPENANON_MAX_RETRIES", "8"))
+OPENANON_BACKOFF_CAP = float(os.environ.get("OPENANON_BACKOFF_CAP", "30"))
 
 OPENANON_SYSTEM_PROMPT = """
 You are PrivacyScrubber, a privacy-preserving prompt rewrite model.
@@ -444,20 +460,23 @@ Rules:
 - Output ONLY the single digit (1-5) of your choice and nothing else -- no words, no punctuation, no explanation."""
 # Judge model, SEPARATE from the rewrite/RTT Qwen (QWEN_HF_REPO). A small judge
 # can't out-discriminate the StyloMetrix k-NN, so the judge defaults to the large
-# Qwen3.6-27B. Toggle it with the env vars below (e.g. back to Qwen/Qwen2.5-14B-
-# Instruct). On the cluster this model is pre-downloaded in HF-hub-cache layout at
-# /datasets/ai/qwen3/hub/models--Qwen--Qwen3.6-27B, so exporting
-# HF_HUB_CACHE=/datasets/ai/qwen3/hub (or HF_HOME) lets vLLM resolve the repo id
-# below from that cache with no download — no code change needed. 27B in bf16 is
-# ~54GB — fits an 80GB A100, too big for an 8GB card, so the GGUF fallback gets its
-# own repo/file knob for the laptop path.
+# Qwen3.6-27B. On the cluster this model is pre-downloaded at the ABSOLUTE PATH
+# below, so we point vLLM straight at it: a local path skips huggingface_hub repo
+# resolution entirely, so there is no cache-var (HF_HUB_CACHE/HF_HOME) to get wrong
+# and NO way for it to silently re-download. _resolve_local_model() below turns an
+# HF-hub cache dir (…/models--Org--Name) into the actual snapshot dir that holds
+# config.json, so either the cache root or a plain model dir works. Override with
+# QWEN_JUDGE_HF_REPO (a path or a bare repo id both work). 27B in bf16 is ~54GB —
+# fits an 80GB A100, too big for an 8GB card, so the GGUF fallback gets its own
+# repo/file knob for the laptop path.
 #
 # Qwen3.x NOTE: its chat template enables a <think>...</think> reasoning preamble by
 # default. The judge is asked for a single digit under a tiny max_tokens, so that
 # preamble would swallow the whole budget and never emit the answer. _QwenVLLM
 # disables thinking for the judge (chat_template_kwargs enable_thinking=False), and
 # _parse_judge_choice reads the LAST digit as a belt-and-suspenders fallback.
-QWEN_JUDGE_HF_REPO = os.environ.get("QWEN_JUDGE_HF_REPO", "Qwen/Qwen3.6-27B")        # vLLM judge
+QWEN_JUDGE_HF_REPO = os.environ.get(
+    "QWEN_JUDGE_HF_REPO", "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.6-27B")        # vLLM judge (local path)
 QWEN_JUDGE_GGUF_REPO = os.environ.get("QWEN_JUDGE_GGUF_REPO", "Qwen/Qwen3.6-27B-GGUF")
 QWEN_JUDGE_GGUF_FILE = os.environ.get("QWEN_JUDGE_GGUF_FILE", "qwen3.6-27b-q4_k_m.gguf")
 # The judge cache is keyed by PROMPT TEXT ONLY, so it must not be shared across
@@ -1329,11 +1348,21 @@ class OpenAnonymityRewriter:
     is loaded in __init__ so a missing key fails fast, before any translation.
     """
 
+    class ContextTooLong(RuntimeError):
+        """A fragment was rejected for exceeding the model's context window even
+        though our tiktoken estimate said it would fit — o200k_base under-counts
+        gpt-oss's serving tokenizer for some pathological text (e.g. pasted logs).
+        Caught by roundtrip, which re-splits the fragment smaller and retries."""
+
+    _UNSET = object()  # sentinel: tokenizer not yet lazily loaded
+
     def __init__(self, model=OPENANON_MODEL, base_url=OPENANON_BASE_URL,
                  system_prompt=OPENANON_SYSTEM_PROMPT, api_key_env=OPENANON_API_KEY_ENV,
                  temperature=OPENANON_TEMPERATURE, top_p=OPENANON_TOP_P,
-                 max_tokens=OPENANON_MAX_TOKENS, timeout=120, max_retries=4,
-                 max_workers=OPENANON_MAX_WORKERS, batch_size=OPENANON_BATCH_SIZE):
+                 max_tokens=OPENANON_MAX_TOKENS, timeout=120, max_retries=OPENANON_MAX_RETRIES,
+                 max_workers=OPENANON_MAX_WORKERS, batch_size=OPENANON_BATCH_SIZE,
+                 context_limit=OPENANON_CONTEXT_LIMIT, token_margin=OPENANON_TOKEN_MARGIN,
+                 backoff_cap=OPENANON_BACKOFF_CAP):
         # Imported lazily so the rest of this module runs without these deps.
         import requests
         from dotenv import load_dotenv
@@ -1347,10 +1376,36 @@ class OpenAnonymityRewriter:
         self.max_tokens = max_tokens
         self.timeout = timeout
         self.max_retries = max_retries
+        self.backoff_cap = backoff_cap
         # round_trip_translate reads .batch_size to size its flush chunk, and calls
         # .roundtrip_batch (below) when present -> requests fan out concurrently.
         self.max_workers = max_workers
         self.batch_size = batch_size
+
+        # The tiktoken tokenizer (o200k_base, the gpt-4o/gpt-oss BPE) is only needed
+        # to precisely split the RARE oversized turn, and loading it downloads a
+        # vocab file on first use — a startup cost (and a potential stall on a
+        # locked-down network) we don't want to pay when no turn is oversized. So
+        # it is loaded lazily on first real need (see _get_encoder); _UNSET marks
+        # "not yet attempted". The budget below therefore uses a cheap char-based
+        # estimate for the fixed system-prompt/wrapper overhead instead of tokenizing.
+        self._encoder = self._UNSET
+        # Token budget for the *raw turn text* in one request: the context window
+        # minus the reserved output, the (constant) system prompt, the input
+        # template wrapper, and a safety margin. A turn over this budget is chunked.
+        # _estimate_tokens OVER-counts the fixed overhead (chars/3 > real BPE), so
+        # the budget is conservative — the safe direction (never accidentally 400).
+        wrapper = renderTemplate(OPENANON_INPUT_TEMPLATE, {"INPUT_PROMPT": ""})
+        self.text_token_budget = (
+            context_limit - max_tokens - self._estimate_tokens(system_prompt)
+            - self._estimate_tokens(wrapper) - token_margin
+        )
+        if self.text_token_budget <= 0:
+            raise RuntimeError(
+                f"OpenAnonymity token budget is non-positive ({self.text_token_budget}); "
+                f"context_limit={context_limit} is too small for max_tokens={max_tokens} "
+                f"plus the system prompt."
+            )
 
         # load_dotenv walks up from the cwd to find a .env, so the key can live in
         # DS_env/.env or the repo root. Fail fast if it is missing.
@@ -1363,7 +1418,104 @@ class OpenAnonymityRewriter:
             )
         print(f"OpenAnonymity rewriter using OpenRouter model '{model}'.")
 
+    def _backoff(self, attempt: int) -> None:
+        """Sleep before the next retry: exponential (2**attempt) capped at
+        backoff_cap, plus full jitter in [0, delay]. Jitter de-synchronizes the
+        concurrent workers so a shared blip (rate-limit, dropped TLS) doesn't have
+        them all retry at the same instant and re-collide."""
+        delay = min(self.backoff_cap, 2 ** attempt)
+        time.sleep(random.uniform(0, delay))
+
+    @staticmethod
+    def _estimate_tokens(s: str) -> int:
+        """Cheap upper-bound token estimate (chars/3) with no tokenizer. ~3 chars/
+        token OVER-counts real BPE, so callers that size budgets stay conservative."""
+        return -(-len(s) // 3)
+
+    def _get_encoder(self):
+        """Lazily load tiktoken's o200k_base on first real need (a genuinely
+        oversized turn), so the common run never pays the vocab download. Returns
+        None if tiktoken is missing / the download fails -> callers fall back to
+        the char heuristic. Cached after the first attempt."""
+        if self._encoder is self._UNSET:
+            try:
+                import tiktoken
+                self._encoder = tiktoken.get_encoding("o200k_base")
+            except Exception:  # noqa: BLE001 - missing dep or download failure -> heuristic
+                self._encoder = None
+        return self._encoder
+
+    def _ntokens(self, s: str) -> int:
+        """Exact token count under the model's tokenizer, or the chars/3 estimate
+        if tiktoken is unavailable. Loads the tokenizer lazily, so only call this
+        once a turn is already known (by char length) to be near the budget."""
+        enc = self._get_encoder()
+        return len(enc.encode_ordinary(s)) if enc is not None else self._estimate_tokens(s)
+
+    def _split_to_budget(self, text: str, budget: int):
+        """Split `text` into >=2 contiguous pieces that each hold at most `budget`
+        tokens. Token-exact when tiktoken is present (slice the id stream and decode
+        each window), else a proportional char split. Pieces concatenate back to the
+        original, so no content is dropped. `budget` is clamped below the text's own
+        token count so a split always makes progress (never returns a single piece)."""
+        enc = self._get_encoder()
+        if enc is not None:
+            ids = enc.encode_ordinary(text)
+            budget = max(1, min(budget, len(ids) - 1))
+            return [
+                enc.decode(ids[i:i + budget])
+                for i in range(0, len(ids), budget)
+            ]
+        char_window = max(1, min(budget * 3, len(text) - 1))  # mirror _estimate_tokens
+        return [text[i:i + char_window] for i in range(0, len(text), char_window)]
+
     def roundtrip(self, text: str) -> str:
+        # An empty / whitespace-only prompt has nothing to scrub and makes some
+        # providers 400 ("messages content required"), so short-circuit it: return
+        # it unchanged rather than paying an API call that would abort the run.
+        if not text.strip():
+            return text
+        return self._scrub_within_budget(text, self.text_token_budget)
+
+    def _scrub_within_budget(self, text: str, budget: int) -> str:
+        """Scrub `text` as one request if it fits `budget` tokens, else split it
+        into budget-sized windows, scrub each, and rejoin — preserving all content
+        instead of truncating. Because o200k_base can under-count gpt-oss's serving
+        tokenizer, a fragment we *thought* fit can still be rejected for length; we
+        catch that (ContextTooLong), shrink the budget below the fragment's measured
+        size, and recurse. This is guaranteed to terminate: each retry uses a strictly
+        smaller budget, so the fragment is eventually split (or reaches one token)."""
+        # Fast char gate: a token is >=1 char for typical text, so a turn with fewer
+        # CHARACTERS than the token budget cannot exceed it -> skip tokenizing (and
+        # skip loading tiktoken) for the overwhelmingly common normal-sized turn.
+        # Only turns long enough to plausibly breach the budget get token-counted;
+        # unicode-dense outliers that still slip through are caught by the
+        # ContextTooLong backstop below.
+        if len(text) > budget and self._ntokens(text) > budget and len(text) > 1:
+            pieces = self._split_to_budget(text, budget)
+            print(
+                f"OpenAnonymity: turn is {len(text)} chars / ~{self._ntokens(text)} tokens "
+                f"(> {budget} budget); scrubbing in {len(pieces)} chunks."
+            )
+            return "".join(self._scrub_within_budget(p, budget) for p in pieces)
+        try:
+            return self._scrub_fragment(text)
+        except self.ContextTooLong:
+            # Our token count was too optimistic. Drop the budget below this
+            # fragment's measured size to force a real split, then recurse.
+            smaller = min(int(budget * 0.8), max(1, self._ntokens(text) - 1))
+            if len(text) <= 1 or smaller >= budget:
+                raise  # cannot reduce further -> genuinely un-scrubbable, surface it
+            print(
+                f"OpenAnonymity: fragment rejected for length at budget {budget}; "
+                f"retrying at {smaller}."
+            )
+            return self._scrub_within_budget(text, smaller)
+
+    def _scrub_fragment(self, text: str) -> str:
+        """Send one prompt fragment (already known to fit the context window) to
+        OpenRouter and return its scrubbed rewrite, or the fragment unchanged if the
+        model returns no tagged block."""
         # temperature=0 -> greedy/deterministic, so re-runs and cache hits are
         # reproducible, exactly like the on-device rewrite defense.
         user_text = renderTemplate(OPENANON_INPUT_TEMPLATE, {"INPUT_PROMPT": text})
@@ -1383,6 +1535,12 @@ class OpenAnonymityRewriter:
         # 5xx, and round_trip_translate is a long sequential loop, so one blip
         # should not abort the whole run. round_trip_translate's incremental cache
         # flush still protects against a final, unrecoverable failure.
+        #
+        # A 4xx (other than 429 rate-limit) is a *client* error — a malformed
+        # payload or a bad model id — so it will fail identically on every retry.
+        # Retrying it just wastes time and buries the cause, so we fail fast AND
+        # attach OpenRouter's JSON error body (raise_for_status only carries the
+        # bare status line), which is the only thing that says *why* it's a 400.
         last_err = None
         for attempt in range(self.max_retries):
             try:
@@ -1392,10 +1550,33 @@ class OpenAnonymityRewriter:
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]
                 return extractTaggedOutput(content, OPENANON_OUTPUT_TAG) or text
+            except self._requests.exceptions.HTTPError as err:
+                status = err.response.status_code
+                body = err.response.text
+                last_err = RuntimeError(f"{status} {err.response.reason}: {body}")
+                # 429 (rate-limit) is transient and retryable; other 4xx are not.
+                # A 4xx that appears partway through a run is data-dependent (one
+                # bad prompt — flagged by moderation, over the provider's input
+                # limit, or otherwise malformed), so surface the offending prompt's
+                # size and a snippet to make it identifiable at a glance.
+                if 400 <= status < 500 and status != 429:
+                    # A context-length rejection is recoverable: the caller re-splits
+                    # this fragment smaller and retries, so signal it distinctly
+                    # rather than aborting the whole run.
+                    if status == 400 and "maximum context length" in body.lower():
+                        raise self.ContextTooLong(body) from err
+                    snippet = text[:200].replace("\n", " ")
+                    raise RuntimeError(
+                        f"OpenRouter rejected the request (HTTP {status}) for model "
+                        f"{self.model!r}; not retrying. Offending fragment: {len(text)} chars, "
+                        f"starts {snippet!r}. Response body: {body}"
+                    ) from err
+                if attempt < self.max_retries - 1:
+                    self._backoff(attempt)
             except Exception as err:  # noqa: BLE001 - network/JSON errors are all retryable
                 last_err = err
                 if attempt < self.max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    self._backoff(attempt)
         raise RuntimeError(f"OpenRouter request failed after {self.max_retries} attempts: {last_err}")
 
     def roundtrip_batch(self, texts):
@@ -1991,18 +2172,43 @@ class QwenJudgeVLLM(_QwenVLLM):
         return self.roundtrip_batch([text])[0]
 
 
+def _resolve_local_model(path):
+    """Turn a local model directory into a path vLLM/transformers can load directly
+    from disk (no huggingface_hub repo resolution, no download). If `path` is an
+    HF-hub cache entry (…/models--Org--Name, containing snapshots/ + refs/), return
+    the snapshot dir that actually holds config.json -- the commit refs/main points
+    at, else the newest snapshot. A plain model dir (already has config.json) or a
+    bare repo id (not a local dir) is returned unchanged."""
+    if not isinstance(path, str) or not os.path.isdir(path):
+        return path  # bare repo id like "Qwen/Qwen3.6-27B" -> leave for the hub
+    snap_dir = os.path.join(path, "snapshots")
+    if not os.path.isdir(snap_dir):
+        return path  # already a plain model dir (config.json at top level)
+    ref = os.path.join(path, "refs", "main")
+    if os.path.isfile(ref):
+        with open(ref) as f:
+            rev = f.read().strip()
+        cand = os.path.join(snap_dir, rev)
+        if os.path.isdir(cand):
+            return cand
+    snaps = [os.path.join(snap_dir, d) for d in os.listdir(snap_dir)]
+    snaps = [d for d in snaps if os.path.isdir(d)]
+    return max(snaps, key=os.path.getmtime) if snaps else path
+
+
 def make_qwen_judge(system_prompt=EUCLIDEAN_LLM_JUDGE_SYSTEM_PROMPT,
                     max_tokens=EUCLIDEAN_LLM_MAX_NEW_TOKENS):
     """Qwen judge backend for the current QWEN_BACKEND (vLLM on cluster, GGUF
     on laptop) -- mirrors make_qwen_rewriter/make_qwen_translator. Uses the
     dedicated, larger judge model (QWEN_JUDGE_HF_REPO / QWEN_JUDGE_GGUF_*),
-    NOT the smaller rewrite/RTT Qwen.
+    NOT the smaller rewrite/RTT Qwen. On vLLM the judge id is passed through
+    _resolve_local_model so an absolute path loads straight from disk.
 
     `system_prompt`/`max_tokens` default to the 5-way forced-choice judge used by
     the Euclidean + LLM Judge attack; the BT tournament passes its own pairwise
     prompt (EUCLIDEAN_BT_JUDGE_SYSTEM_PROMPT) instead."""
     if QWEN_BACKEND == "vllm":
-        return QwenJudgeVLLM(model_id=QWEN_JUDGE_HF_REPO,
+        return QwenJudgeVLLM(model_id=_resolve_local_model(QWEN_JUDGE_HF_REPO),
                              system_prompt=system_prompt, max_tokens=max_tokens)
     return QwenJudge(repo_id=QWEN_JUDGE_GGUF_REPO, filename=QWEN_JUDGE_GGUF_FILE,
                      system_prompt=system_prompt, max_tokens=max_tokens)
