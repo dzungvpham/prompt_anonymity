@@ -32,6 +32,8 @@ from ..core import AttackData
 from .base import Featurizer
 from .character import CharacterStatisticsFeaturizer
 from .stylometrix import StyloMetrixFeaturizer
+from .function_words import FunctionWordFeaturizer
+from .stylometrix_func import StyloFuncFeaturizer
 
 # Registry of featurizer classes, selectable by name (e.g. from a CLI argument). Values are
 # classes (not instances) because a featurizer may need configuration -- e.g. StyloMetrix's
@@ -39,6 +41,8 @@ from .stylometrix import StyloMetrixFeaturizer
 FEATURIZERS: dict[str, type[Featurizer]] = {
     "stylometrix": StyloMetrixFeaturizer,
     "character_statistics": CharacterStatisticsFeaturizer,
+    "function_words": FunctionWordFeaturizer,
+    "stylometrix_func": StyloFuncFeaturizer,
 }
 
 
@@ -132,11 +136,17 @@ def apply_featurizer(
             cache_box.append(featurizer.open_cache(cache_dir))
         return cache_box[0]
 
-    reference_known_texts = None if reference is None else reference.known_texts
-    reference_unknown_texts = None if reference is None else reference.unknown_texts
-    reference_known_embeddings = None if reference is None else reference.known_embeddings
-    reference_unknown_embeddings = None if reference is None else reference.unknown_embeddings
+    # Only reuse committed embeddings when the requested featurizer is the same
+    # feature space as the committed dataset embeddings.
+    reuse_reference = (
+        reference is not None
+        and featurizer.name == "stylometrix"
+    )
 
+    reference_known_texts = reference.known_texts if reuse_reference else None
+    reference_unknown_texts = reference.unknown_texts if reuse_reference else None
+    reference_known_embeddings = reference.known_embeddings if reuse_reference else None
+    reference_unknown_embeddings = reference.unknown_embeddings if reuse_reference else None
     known = _featurize_side(
         featurizer, open_cache, data.known_texts, reference_known_texts, reference_known_embeddings
     )
@@ -155,4 +165,6 @@ __all__ = [
     "FEATURIZERS",
     "get_featurizer",
     "apply_featurizer",
+    "FunctionWordFeaturizer",
+    "StyloFuncFeaturizer",
 ]
