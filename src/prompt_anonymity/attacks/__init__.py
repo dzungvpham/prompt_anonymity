@@ -18,11 +18,9 @@ in ``ATTACKS``.
 """
 
 from __future__ import annotations
-
 from typing import Callable
-
 import pandas as pd
-
+from .two_tower_xgb import run_two_tower_xgb
 from ..core import AttackData
 from .nearest_neighbor import nearest_neighbor_attack
 
@@ -38,6 +36,7 @@ def run_nearest_neighbor(data: AttackData) -> pd.DataFrame:
 # Registry so callers can select an attack by name (e.g. from a CLI argument).
 ATTACKS: dict[str, Attack] = {
     "nearest_neighbor": run_nearest_neighbor,
+    "two_tower_xgb": run_two_tower_xgb,
 }
 
 
@@ -61,4 +60,5 @@ __all__ = [
     "get_attack",
     "run_attack",
     "run_nearest_neighbor",
+    "run_two_tower_xgb",
 ]

@@ -37,7 +37,7 @@ from prompt_anonymity.attacks import ATTACKS, run_attack
 from prompt_anonymity.data import load_dataset
 from prompt_anonymity.defenses import DEFENSES, apply_defense
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy, pool_size_sweep
-from prompt_anonymity.features import apply_featurizer, get_featurizer
+from prompt_anonymity.features import FEATURIZERS, get_featurizer, apply_featurizer
 from prompt_anonymity.viz import plot_headline_topk, plot_pool_size_sweep
 
 # Dataset files live in the repo next to this script; the package itself is path-agnostic
@@ -65,10 +65,7 @@ def build_featurizer(args: argparse.Namespace):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", required=True, choices=sorted(DATA_DIRS), help="Dataset to attack.")
-    parser.add_argument(
-        "--feature", default="stylometrix", choices=["stylometrix"],
-        help="Conversation representation (only StyloMetrix is wired up; Gemini is planned).",
-    )
+    parser.add_argument("--feature", default="stylometrix", choices=sorted(FEATURIZERS), help="Conversation representation (only StyloMetrix is wired up; Gemini is planned).")
     parser.add_argument("--attack", default="nearest_neighbor", choices=sorted(ATTACKS), help="Attack to run.")
     parser.add_argument("--defense", default="none", choices=sorted(DEFENSES), help="Defense applied before the attack.")
     parser.add_argument("--language", default="English", choices=["English", "Russian"], help="WildChat language subset.")
