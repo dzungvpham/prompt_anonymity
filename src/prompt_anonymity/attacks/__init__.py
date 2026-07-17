@@ -23,6 +23,7 @@ import pandas as pd
 from .two_tower_xgb import run_two_tower_xgb
 from ..core import AttackData
 from .nearest_neighbor import nearest_neighbor_attack
+from .euclidean_llm_judge import EuclideanLLMJudgeAttack, euclidean_llm_judge_attack
 
 # An attack maps a loaded dataset to an [n_unknown x n_known] distance matrix.
 Attack = Callable[[AttackData], pd.DataFrame]
@@ -33,10 +34,18 @@ def run_nearest_neighbor(data: AttackData) -> pd.DataFrame:
     return nearest_neighbor_attack(data.known_embeddings, data.unknown_embeddings, metric=data.metric)
 
 
+def run_euclidean_llm_judge(data: AttackData) -> pd.DataFrame:
+    """Rerank the nearest-neighbor top-K with the default LLM judge (uncached; see
+    :func:`~prompt_anonymity.attacks.euclidean_llm_judge_attack` to pass a ``cache_dir`` or
+    tune the judge)."""
+    return euclidean_llm_judge_attack(data)
+
+
 # Registry so callers can select an attack by name (e.g. from a CLI argument).
 ATTACKS: dict[str, Attack] = {
     "nearest_neighbor": run_nearest_neighbor,
     "two_tower_xgb": run_two_tower_xgb,
+    "euclidean_llm_judge": run_euclidean_llm_judge,
 }
 
 
@@ -55,10 +64,13 @@ def run_attack(name: str, data: AttackData) -> pd.DataFrame:
 
 __all__ = [
     "nearest_neighbor_attack",
+    "EuclideanLLMJudgeAttack",
+    "euclidean_llm_judge_attack",
     "Attack",
     "ATTACKS",
     "get_attack",
     "run_attack",
     "run_nearest_neighbor",
     "run_two_tower_xgb",
+    "run_euclidean_llm_judge",
 ]
