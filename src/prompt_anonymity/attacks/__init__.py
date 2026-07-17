@@ -24,6 +24,7 @@ from .two_tower_xgb import run_two_tower_xgb
 from ..core import AttackData
 from .nearest_neighbor import nearest_neighbor_attack
 from .euclidean_llm_judge import EuclideanLLMJudgeAttack, euclidean_llm_judge_attack
+from .bt_tournament import BradleyTerryTournamentAttack, bt_tournament_attack
 
 # An attack maps a loaded dataset to an [n_unknown x n_known] distance matrix.
 Attack = Callable[[AttackData], pd.DataFrame]
@@ -41,11 +42,19 @@ def run_euclidean_llm_judge(data: AttackData) -> pd.DataFrame:
     return euclidean_llm_judge_attack(data)
 
 
+def run_bt_tournament(data: AttackData) -> pd.DataFrame:
+    """Rerank the nearest-neighbor top-K with the default Bradley-Terry pairwise-judge
+    tournament (uncached; see :func:`~prompt_anonymity.attacks.bt_tournament_attack` to pass a
+    ``cache_dir`` or tune the tournament)."""
+    return bt_tournament_attack(data)
+
+
 # Registry so callers can select an attack by name (e.g. from a CLI argument).
 ATTACKS: dict[str, Attack] = {
     "nearest_neighbor": run_nearest_neighbor,
     "two_tower_xgb": run_two_tower_xgb,
     "euclidean_llm_judge": run_euclidean_llm_judge,
+    "bt_tournament": run_bt_tournament,
 }
 
 
@@ -66,6 +75,8 @@ __all__ = [
     "nearest_neighbor_attack",
     "EuclideanLLMJudgeAttack",
     "euclidean_llm_judge_attack",
+    "BradleyTerryTournamentAttack",
+    "bt_tournament_attack",
     "Attack",
     "ATTACKS",
     "get_attack",
@@ -73,4 +84,5 @@ __all__ = [
     "run_nearest_neighbor",
     "run_two_tower_xgb",
     "run_euclidean_llm_judge",
+    "run_bt_tournament",
 ]
