@@ -84,7 +84,7 @@ def _make_training_pairs(embeddings: np.ndarray, labels: np.ndarray, seed: int =
     return X, y
 
 
-def run_two_tower_xgb(data: AttackData, seed: int = 47) -> pd.DataFrame:
+def run_two_tower_xgb(data: AttackData, seed: int = 47, aggregate_by_identity: bool = True) -> pd.DataFrame:
     """Train on known-known pairs, score unknown-vs-known pairs, return a distance matrix."""
     X_train, y_train = _make_training_pairs(data.known_embeddings, data.known_labels, seed=seed)
 
@@ -123,5 +123,16 @@ def run_two_tower_xgb(data: AttackData, seed: int = 47) -> pd.DataFrame:
         )
         same_author_prob = clf.predict_proba(pair_feats)[:, 1]
         distance_matrix[u, :] = 1.0 - same_author_prob  # smaller distance = more likely same author
+
+    # added to aggregate by identity, so that every conversation from the same known identity gets an identical score
+    # only this if block and aggregate_by_identity: bool = True in the class parameter
+    if aggregate_by_identity:
+        # Replace each known conversation's distance with its identity's mean distance,
+        # so every conversation from the same known identity gets an identical score.
+        known_labels = data.known_labels
+        for label in np.unique(known_labels):
+            idx = np.where(known_labels == label)[0]
+            mean_dist = distance_matrix[:, idx].mean(axis=1, keepdims=True)
+            distance_matrix[:, idx] = mean_dist
 
     return pd.DataFrame(distance_matrix)
