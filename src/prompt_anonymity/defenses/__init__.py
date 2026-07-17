@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Callable, Union
 
-from ..caching import TransformCache, logic_hash, params_hash, source_digest
+from ..caching import IndexedRowCache, TransformCache, logic_hash, params_hash, source_digest
 from ..core import AttackData
 from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
@@ -82,6 +82,7 @@ __all__ = [
     "CachedDefense",
     "CachedTextRewriteDefense",
     "TransformCache",
+    "IndexedRowCache",
     "logic_hash",
     "params_hash",
     "source_digest",

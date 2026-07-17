@@ -23,7 +23,7 @@ from dataclasses import replace
 
 import numpy as np
 
-from ..caching import TransformCache
+from ..caching import IndexedRowCache
 from ..core import AttackData
 from .base import CachedDefense
 
@@ -47,6 +47,37 @@ def join_turns(turns: list[str]) -> str:
     return TURN_DELIM.join(turns)
 
 
+def defend_conversations_per_turn(conversations: list[str], rewrite_batch) -> list[str]:
+    """Defend whole conversations one user turn at a time, then re-join.
+
+    Splits each conversation on :data:`TURN_DELIM`, flattens every turn into one stream, rewrites the
+    distinct non-blank turns in a single ``rewrite_batch`` call (blanks pass through untouched), then
+    re-groups and re-joins one string per conversation -- so identical turns shared across
+    conversations are computed once and turn structure (and count) is preserved.
+
+    Shared by :class:`PerTurnBatchRewriteDefense` and the combined StyleRemix+OpenAnonymity defense
+    so both scrub per turn identically; ``rewrite_batch`` is the backend's list-in/list-out op.
+    """
+    turn_lists = [split_turns(c) for c in conversations]
+    counts = [len(turns) for turns in turn_lists]
+    flat = [turn for turns in turn_lists for turn in turns]
+
+    # Distinct non-blank turns, first-appearance order -> one backend call, no repeated work.
+    distinct: dict = {}
+    for turn in flat:
+        if turn.strip():
+            distinct.setdefault(turn, None)
+    rewritten = rewrite_batch(list(distinct)) if distinct else []
+    mapping = dict(zip(distinct, rewritten))
+    out_flat = [mapping[turn] if turn.strip() else turn for turn in flat]
+
+    results, pos = [], 0
+    for n in counts:
+        results.append(join_turns(out_flat[pos:pos + n]))
+        pos += n
+    return results
+
+
 def gpu_dtype(torch, *, prefer_bf16: bool = True):
     """Best generation dtype for the visible device: bf16 on Ampere+ (A100/H100 -- same throughput
     as fp16 with no overflow risk), fp16 on older GPUs, fp32 on CPU."""
@@ -62,14 +93,18 @@ class PerTurnBatchRewriteDefense(CachedDefense):
 
     A subclass implements :meth:`rewrite_batch` -- the expensive op over a *list* of turns -- plus
     :attr:`name`, an optional :attr:`version`, and :meth:`params`. This base handles everything
-    else: splitting each conversation on :data:`TURN_DELIM`, flattening all turns across all
-    conversations into one stream, running that stream through :meth:`TransformCache.apply_batch`
-    (so duplicate turns are computed once and only cache misses reach the backend), then re-grouping
-    and re-joining. Blank turns pass through untouched, so the backend is never handed an empty
-    message.
+    else, at two levels:
 
-    Batching plus caching means a fully-cached side never calls :meth:`rewrite_batch` at all, so a
-    lazily-built backend (see the subclasses) loads no model on a cached run.
+    * **Caching** is per CONVERSATION, keyed by the row's index in the reference dataset (see
+      :class:`~prompt_anonymity.caching.IndexedRowCache`): the on-disk cache is an ordered
+      ``index, source, output`` table, one defended conversation per source row.
+    * **Compute** for the cache-missing conversations is per TURN: each missing conversation is
+      split on :data:`TURN_DELIM`, all their turns are flattened into one stream (deduped, blanks
+      passed through untouched) and rewritten in one :meth:`rewrite_batch` call so a GPU/vLLM
+      backend stays saturated, then re-grouped and re-joined.
+
+    A fully-cached side never calls :meth:`rewrite_batch`, so a lazily-built backend (see the
+    subclasses) loads no model on a cached run.
 
     Like :class:`~prompt_anonymity.defenses.base.CachedTextRewriteDefense`, only the anonymous
     *unknown* side is rewritten unless :attr:`rewrite_known` is set. Embeddings are left stale for
@@ -85,34 +120,24 @@ class PerTurnBatchRewriteDefense(CachedDefense):
         subclasses; called only on the cache-missing, de-duplicated, non-blank turns."""
         raise NotImplementedError
 
-    def transform(self, data: AttackData, cache: TransformCache) -> AttackData:
+    def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
-        changes = {"unknown_texts": self._rewrite_side(data.unknown_texts, cache)}
+        changes = {"unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache)}
         if self.rewrite_known:
             if data.known_texts is None:
                 raise ValueError(f"defense {self.name!r} has rewrite_known=True but no known_texts.")
-            changes["known_texts"] = self._rewrite_side(data.known_texts, cache)
-        # Only text changes; replace() re-validates row counts so a rewrite that drops/adds turns is
-        # caught (join_turns keeps the row count fixed regardless).
+            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache)
+        # Only text changes; replace() re-validates row counts so a rewrite that drops/adds rows is
+        # caught (defended conversations stay row-aligned to the reference).
         return replace(data, **changes)
 
-    def _rewrite_side(self, texts, cache: TransformCache) -> np.ndarray:
-        turn_lists = [split_turns(t) for t in texts]
-        counts = [len(turns) for turns in turn_lists]
-        flat = [turn for turns in turn_lists for turn in turns]
+    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache) -> np.ndarray:
+        # Cache per conversation (index-keyed); the compute for cache-missing conversations runs the
+        # backend per turn across all of them at once.
+        outputs = cache.apply(label, [str(t) for t in texts], self._defend_conversations)
+        return np.asarray(outputs, dtype=object)
 
-        # Defend only non-blank turns; blanks (e.g. from a trailing delimiter) pass through so the
-        # backend never sees an empty message. apply_batch dedupes identical turns and skips the
-        # backend entirely when nothing is missing.
-        defend_idx = [i for i, turn in enumerate(flat) if turn.strip()]
-        defended = cache.apply_batch([flat[i] for i in defend_idx], self.rewrite_batch)
-        out_flat = list(flat)
-        for i, value in zip(defend_idx, defended):
-            out_flat[i] = value
-
-        results, pos = [], 0
-        for n in counts:
-            results.append(join_turns(out_flat[pos:pos + n]))
-            pos += n
-        return np.asarray(results, dtype=object)
+    def _defend_conversations(self, conversations: list[str]) -> list[str]:
+        """Defend a list of whole conversations, per turn (see :func:`defend_conversations_per_turn`)."""
+        return defend_conversations_per_turn(conversations, self.rewrite_batch)

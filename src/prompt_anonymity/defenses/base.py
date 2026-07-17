@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..caching import TransformCache, logic_hash, params_hash
+from ..caching import IndexedRowCache, logic_hash, params_hash
 from ..core import AttackData
 
 
@@ -48,9 +48,9 @@ class CachedDefense:
         """
         return {}
 
-    def transform(self, data: AttackData, cache: TransformCache) -> AttackData:
+    def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         """Produce the defended :class:`AttackData`, using ``cache`` for the expensive work
-        (typically ``cache.apply(items, expensive_fn)``). Implemented by subclasses."""
+        (typically ``cache.apply(label, sources, compute)`` per side). Implemented by subclasses."""
         raise NotImplementedError
 
     def _logic_hash(self) -> str:
@@ -60,10 +60,11 @@ class CachedDefense:
         return logic_hash(classes, version=self.version)
 
     def __call__(self, data: AttackData, *, cache_dir) -> AttackData:
-        """Apply the defense, caching under ``<cache_dir>/defenses``."""
+        """Apply the defense, caching under ``<cache_dir>/defenses`` as an ordered, index-keyed
+        table per side (see :class:`~prompt_anonymity.caching.IndexedRowCache`)."""
         if not self.name:
             raise ValueError(f"{type(self).__name__} must set a non-empty class attribute `name`.")
-        cache = TransformCache(
+        cache = IndexedRowCache(
             Path(cache_dir) / "defenses", self.name, self._logic_hash(), params_hash(self.params())
         )
         return self.transform(data, cache)
@@ -72,9 +73,10 @@ class CachedDefense:
 class CachedTextRewriteDefense(CachedDefense):
     """Convenience base for defenses that rewrite each conversation's text (e.g. translation).
 
-    The subclass implements just :meth:`rewrite_text` -- the expensive per-text op, which is
-    cached per item. By default only the anonymous *unknown* side is rewritten (the *known*
-    side is the adversary's untouched reference); set :attr:`rewrite_known` to rewrite both.
+    The subclass implements just :meth:`rewrite_text` -- the expensive per-text op, cached per row
+    (by index, source-verified) in an ordered table aligned to the reference dataset. By default
+    only the anonymous *unknown* side is rewritten (the *known* side is the adversary's untouched
+    reference); set :attr:`rewrite_known` to rewrite both.
 
     A defense does **not** featurize. After it runs, the returned :class:`AttackData` carries
     the rewritten text but its embeddings are stale, so the rewritten side must be
@@ -90,14 +92,20 @@ class CachedTextRewriteDefense(CachedDefense):
         """The expensive per-conversation transformation (e.g. a translation call). Cached."""
         raise NotImplementedError
 
-    def transform(self, data: AttackData, cache: TransformCache) -> AttackData:
+    def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
-        changes = {"unknown_texts": np.asarray(cache.apply(list(data.unknown_texts), self.rewrite_text), dtype=object)}
+        changes = {"unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache)}
         if self.rewrite_known:
             if data.known_texts is None:
                 raise ValueError(f"defense {self.name!r} has rewrite_known=True but no known_texts.")
-            changes["known_texts"] = np.asarray(cache.apply(list(data.known_texts), self.rewrite_text), dtype=object)
+            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache)
         # Only text changes; embeddings are intentionally left stale for the featurize stage to
         # recompute (replace() re-validates lengths so a rewrite that drops rows is caught).
         return replace(data, **changes)
+
+    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache) -> np.ndarray:
+        def compute(missing):
+            return [self.rewrite_text(text) for text in missing]
+
+        return np.asarray(cache.apply(label, [str(t) for t in texts], compute), dtype=object)

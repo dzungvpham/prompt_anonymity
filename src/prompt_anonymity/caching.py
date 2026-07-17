@@ -28,6 +28,7 @@ new StyloMetrix release) -- bump ``version`` for those.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import inspect
 import json
@@ -254,9 +255,130 @@ class TransformCache:
         return outputs
 
 
+class IndexedRowCache:
+    """Ordered, index-keyed cache for a defense's per-row (per-conversation) outputs.
+
+    Where :class:`TransformCache` is content-addressed (a pile of hash-named entries, deduped and
+    unordered), a *defense* caches one row per source conversation, aligned to the reference
+    dataset's row order. This stores one CSV table per labeled side (e.g. ``unknown.csv`` /
+    ``known.csv``) with columns ``index, source, output`` written in index order, so the cache is
+    human-readable and row-aligned to the reference. A row is reused only when its stored ``source``
+    still matches the current input at that index, so an edited (or reordered) row recomputes while
+    unchanged rows -- and whole re-runs -- are served from disk.
+
+    Namespaced by ``name`` + logic version + params exactly like :class:`TransformCache` (the cache
+    lives at ``root/name/logic_hash/params_hash/``), with the same stale-logic-version pruning.
+    After a call, ``self.hits`` / ``self.misses`` report reuse for the last side.
+    """
+
+    def __init__(self, root, name, logic_hash, params_hash, *, prune_stale: bool = True):
+        self.name = name
+        self.logic_hash = logic_hash
+        self.params_hash = params_hash
+        self._logic_dir = Path(root) / name / logic_hash
+        self.dir = self._logic_dir / params_hash
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.misses = 0
+        _atomic_write_json(
+            self.dir / "meta.json",
+            {"name": self.name, "logic_hash": self.logic_hash, "params_hash": self.params_hash,
+             "created_at": time.time()},
+        )
+        if prune_stale:
+            # Mirror TransformCache: drop sibling logic-version namespaces (unreachable anyway).
+            producer_dir = self._logic_dir.parent
+            for child in producer_dir.iterdir() if producer_dir.exists() else []:
+                if child.is_dir() and child.name != self.logic_hash:
+                    shutil.rmtree(child, ignore_errors=True)
+
+    def _table_path(self, label: str) -> Path:
+        return self.dir / f"{label}.csv"
+
+    def _read_table(self, path: Path) -> dict:
+        """Return ``{index: (source, output)}`` from a table, or ``{}`` if missing/unreadable."""
+        if not path.exists():
+            return {}
+        rows: dict = {}
+        try:
+            with open(path, newline="", encoding="utf-8") as handle:
+                for record in csv.DictReader(handle):
+                    try:
+                        idx = int(record["index"])
+                    except (KeyError, TypeError, ValueError):
+                        continue  # skip a malformed row rather than crash
+                    rows[idx] = (record.get("source") or "", record.get("output") or "")
+        except (OSError, csv.Error):
+            return {}  # unreadable table -> recompute everything (never a crash, never a partial read)
+        return rows
+
+    def _write_table(self, path: Path, sources: list, outputs: list) -> None:
+        """Atomically (temp file + rename) write the ``index, source, output`` table in index order."""
+        fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["index", "source", "output"])
+                for index, (source, output) in enumerate(zip(sources, outputs)):
+                    writer.writerow([index, source, "" if output is None else output])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)  # atomic; readers see the old or the new file, never a partial one
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def apply(self, label: str, sources, compute) -> list:
+        """Return one output per source (in order), recomputing only rows whose ``source`` changed.
+
+        Parameters
+        ----------
+        label : str
+            Table name for this side (e.g. ``"unknown"`` / ``"known"``); its own CSV under this
+            cache's namespace.
+        sources : sequence of str
+            The reference-ordered source rows (e.g. conversation texts); ``index`` is position here.
+        compute : callable
+            ``compute(missing_sources) -> outputs`` over the DISTINCT cache-missing sources, in
+            order, one text output each. Called at most once, and not at all when every row is
+            cached. Duplicate missing sources are computed once.
+        """
+        sources = [str(s) for s in sources]
+        cached = self._read_table(self._table_path(label))
+
+        outputs: list = [None] * len(sources)
+        missing_positions: list = []
+        for i, source in enumerate(sources):
+            row = cached.get(i)
+            if row is not None and row[0] == source:
+                outputs[i] = row[1]
+            else:
+                missing_positions.append(i)
+
+        # Compute distinct missing sources once, preserving first-appearance order.
+        distinct: dict = {}
+        for i in missing_positions:
+            distinct.setdefault(sources[i], None)
+        if distinct:
+            results = list(compute(list(distinct)))
+            if len(results) != len(distinct):
+                raise ValueError(
+                    f"compute returned {len(results)} outputs for {len(distinct)} distinct sources."
+                )
+            computed = dict(zip(distinct, results))
+            for i in missing_positions:
+                outputs[i] = str(computed[sources[i]])
+
+        self.misses = len(distinct)                         # distinct rows actually computed
+        self.hits = len(sources) - len(missing_positions)   # rows served from disk
+        self._write_table(self._table_path(label), sources, outputs)
+        return outputs
+
+
 __all__ = [
     "source_digest",
     "logic_hash",
     "params_hash",
     "TransformCache",
+    "IndexedRowCache",
 ]
