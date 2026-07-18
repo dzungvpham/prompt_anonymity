@@ -95,17 +95,23 @@ class CachedTextRewriteDefense(CachedDefense):
     def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
-        changes = {"unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache)}
+        changes = {
+            "unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache, data.unknown_ids)
+        }
         if self.rewrite_known:
             if data.known_texts is None:
                 raise ValueError(f"defense {self.name!r} has rewrite_known=True but no known_texts.")
-            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache)
+            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache, data.known_ids)
         # Only text changes; embeddings are intentionally left stale for the featurize stage to
         # recompute (replace() re-validates lengths so a rewrite that drops rows is caught).
         return replace(data, **changes)
 
-    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache) -> np.ndarray:
+    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache, ids=None) -> np.ndarray:
         def compute(missing):
             return [self.rewrite_text(text) for text in missing]
 
-        return np.asarray(cache.apply(label, [str(t) for t in texts], compute), dtype=object)
+        # `ids` are the originating dataset's row identifiers (SWE-chat session_id, WildChat idx);
+        # the cache falls back to row position when the loader carries none.
+        return np.asarray(
+            cache.apply(label, [str(t) for t in texts], compute, ids=ids), dtype=object
+        )

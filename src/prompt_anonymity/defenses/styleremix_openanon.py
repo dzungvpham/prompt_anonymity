@@ -84,22 +84,25 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
     def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
-        changes = {"unknown_texts": self._redact_side("unknown", data.unknown_texts, cache)}
+        changes = {
+            "unknown_texts": self._redact_side("unknown", data.unknown_texts, cache, data.unknown_ids)
+        }
         if self.rewrite_known:
             if data.known_texts is None:
                 raise ValueError(f"defense {self.name!r} has rewrite_known=True but no known_texts.")
-            changes["known_texts"] = self._redact_side("known", data.known_texts, cache)
+            changes["known_texts"] = self._redact_side("known", data.known_texts, cache, data.known_ids)
         return replace(data, **changes)
 
-    def _redact_side(self, label: str, texts, cache: IndexedRowCache) -> np.ndarray:
+    def _redact_side(self, label: str, texts, cache: IndexedRowCache, ids=None) -> np.ndarray:
         # Scrub each styled conversation PER TURN (split on TURN_DELIM -> scrub the distinct turns in
-        # bulk -> re-join), so turn structure is preserved, cached per conversation by its
-        # reference-row index. The OpenAnonymity backend token-chunks any oversized turn, so no length
-        # cap is needed (matching the other per-turn defenses; the featurize stage truncates later).
+        # bulk -> re-join), so turn structure is preserved, cached per conversation by the originating
+        # dataset's row id (SWE-chat session_id, WildChat idx). The OpenAnonymity backend token-chunks
+        # any oversized turn, so no length cap is needed (matching the other per-turn defenses; the
+        # featurize stage truncates later).
         redactor = self._get_redactor()
 
         def scrub_per_turn(conversations):
             return defend_conversations_per_turn(conversations, redactor.rewrite_batch)
 
-        redacted = cache.apply(label, [str(t) for t in texts], scrub_per_turn)
+        redacted = cache.apply(label, [str(t) for t in texts], scrub_per_turn, ids=ids)
         return np.asarray(redacted, dtype=object)

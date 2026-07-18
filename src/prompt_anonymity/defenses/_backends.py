@@ -123,19 +123,22 @@ class PerTurnBatchRewriteDefense(CachedDefense):
     def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
-        changes = {"unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache)}
+        changes = {
+            "unknown_texts": self._rewrite_side("unknown", data.unknown_texts, cache, data.unknown_ids)
+        }
         if self.rewrite_known:
             if data.known_texts is None:
                 raise ValueError(f"defense {self.name!r} has rewrite_known=True but no known_texts.")
-            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache)
+            changes["known_texts"] = self._rewrite_side("known", data.known_texts, cache, data.known_ids)
         # Only text changes; replace() re-validates row counts so a rewrite that drops/adds rows is
         # caught (defended conversations stay row-aligned to the reference).
         return replace(data, **changes)
 
-    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache) -> np.ndarray:
-        # Cache per conversation (index-keyed); the compute for cache-missing conversations runs the
-        # backend per turn across all of them at once.
-        outputs = cache.apply(label, [str(t) for t in texts], self._defend_conversations)
+    def _rewrite_side(self, label: str, texts, cache: IndexedRowCache, ids=None) -> np.ndarray:
+        # Cache per conversation, keyed by the originating dataset's row id (SWE-chat session_id,
+        # WildChat idx); the compute for cache-missing conversations runs the backend per turn
+        # across all of them at once.
+        outputs = cache.apply(label, [str(t) for t in texts], self._defend_conversations, ids=ids)
         return np.asarray(outputs, dtype=object)
 
     def _defend_conversations(self, conversations: list[str]) -> list[str]:

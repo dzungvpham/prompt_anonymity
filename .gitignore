@@ -235,4 +235,3 @@ datasets/
 .claude/
 
 !wildchat_filtered_en_2048_stylometrix.csv
-DS_env/defense_data/cache/caches.zip

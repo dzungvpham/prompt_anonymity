@@ -261,10 +261,15 @@ class IndexedRowCache:
     Where :class:`TransformCache` is content-addressed (a pile of hash-named entries, deduped and
     unordered), a *defense* caches one row per source conversation, aligned to the reference
     dataset's row order. This stores one CSV table per labeled side (e.g. ``unknown.csv`` /
-    ``known.csv``) with columns ``index, source, output`` written in index order, so the cache is
-    human-readable and row-aligned to the reference. A row is reused only when its stored ``source``
-    still matches the current input at that index, so an edited (or reordered) row recomputes while
-    unchanged rows -- and whole re-runs -- are served from disk.
+    ``known.csv``) with columns ``id, source, output``, so the cache is human-readable and each row
+    traces back to the dataset it came from.
+
+    ``id`` is the identifier the *original* dataset gives the row -- ``session_id`` for SWE-chat,
+    ``idx`` for WildChat -- passed in by the caller; it falls back to the row's position when a
+    loader supplies no ids. Keying on the dataset's own identifier (rather than on position in this
+    particular split) means a cached rewrite still hits after the pool is re-ordered or re-subsetted.
+    A row is reused only when its stored ``source`` still matches the current input, so an edited row
+    always recomputes while unchanged rows -- and whole re-runs -- are served from disk.
 
     Namespaced by ``name`` + logic version + params exactly like :class:`TransformCache` (the cache
     lives at ``root/name/logic_hash/params_hash/``), with the same stale-logic-version pruning.
@@ -295,32 +300,41 @@ class IndexedRowCache:
     def _table_path(self, label: str) -> Path:
         return self.dir / f"{label}.csv"
 
-    def _read_table(self, path: Path) -> dict:
-        """Return ``{index: (source, output)}`` from a table, or ``{}`` if missing/unreadable."""
+    def _read_table(self, path: Path) -> tuple[dict, dict]:
+        """Return ``({id: (source, output)}, {position: (source, output)})`` from a table, or two
+        empty dicts if it is missing/unreadable.
+
+        The second (positional) map lets tables written before rows carried dataset ids -- whose
+        ``id`` column held the row's position -- keep serving hits. Both maps are only ever consulted
+        alongside a ``source`` equality check, so a stale positional match can never be reused.
+        """
         if not path.exists():
-            return {}
-        rows: dict = {}
+            return {}, {}
+        by_id: dict = {}
+        by_position: dict = {}
         try:
             with open(path, newline="", encoding="utf-8") as handle:
-                for record in csv.DictReader(handle):
-                    try:
-                        idx = int(record["index"])
-                    except (KeyError, TypeError, ValueError):
+                for position, record in enumerate(csv.DictReader(handle)):
+                    # "index" is the legacy column name for the same field.
+                    row_id = record.get("id", record.get("index"))
+                    if row_id is None:
                         continue  # skip a malformed row rather than crash
-                    rows[idx] = (record.get("source") or "", record.get("output") or "")
+                    row = (record.get("source") or "", record.get("output") or "")
+                    by_id[str(row_id)] = row
+                    by_position[position] = row
         except (OSError, csv.Error):
-            return {}  # unreadable table -> recompute everything (never a crash, never a partial read)
-        return rows
+            return {}, {}  # unreadable table -> recompute everything (never a crash, never a partial read)
+        return by_id, by_position
 
-    def _write_table(self, path: Path, sources: list, outputs: list) -> None:
-        """Atomically (temp file + rename) write the ``index, source, output`` table in index order."""
+    def _write_table(self, path: Path, ids: list, sources: list, outputs: list) -> None:
+        """Atomically (temp file + rename) write the ``id, source, output`` table in row order."""
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(["index", "source", "output"])
-                for index, (source, output) in enumerate(zip(sources, outputs)):
-                    writer.writerow([index, source, "" if output is None else output])
+                writer.writerow(["id", "source", "output"])
+                for row_id, source, output in zip(ids, sources, outputs):
+                    writer.writerow([row_id, source, "" if output is None else output])
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)  # atomic; readers see the old or the new file, never a partial one
@@ -328,7 +342,7 @@ class IndexedRowCache:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
-    def apply(self, label: str, sources, compute) -> list:
+    def apply(self, label: str, sources, compute, *, ids=None) -> list:
         """Return one output per source (in order), recomputing only rows whose ``source`` changed.
 
         Parameters
@@ -337,19 +351,28 @@ class IndexedRowCache:
             Table name for this side (e.g. ``"unknown"`` / ``"known"``); its own CSV under this
             cache's namespace.
         sources : sequence of str
-            The reference-ordered source rows (e.g. conversation texts); ``index`` is position here.
+            The reference-ordered source rows (e.g. conversation texts).
         compute : callable
             ``compute(missing_sources) -> outputs`` over the DISTINCT cache-missing sources, in
             order, one text output each. Called at most once, and not at all when every row is
             cached. Duplicate missing sources are computed once.
+        ids : sequence, optional
+            The originating dataset's identifier for each row (SWE-chat ``session_id``, WildChat
+            ``idx``), used as the cache key and written to the table's ``id`` column. Defaults to
+            each row's position when the loader carries no ids.
         """
         sources = [str(s) for s in sources]
-        cached = self._read_table(self._table_path(label))
+        ids = [str(i) for i in ids] if ids is not None else [str(i) for i in range(len(sources))]
+        if len(ids) != len(sources):
+            raise ValueError(f"ids has {len(ids)} entries but sources has {len(sources)}.")
+        cached_by_id, cached_by_position = self._read_table(self._table_path(label))
 
         outputs: list = [None] * len(sources)
         missing_positions: list = []
         for i, source in enumerate(sources):
-            row = cached.get(i)
+            # Prefer the dataset id; fall back to position so pre-id tables still hit. Either way
+            # the stored source must still match, so a wrong match degrades to a recompute.
+            row = cached_by_id.get(ids[i]) or cached_by_position.get(i)
             if row is not None and row[0] == source:
                 outputs[i] = row[1]
             else:
@@ -371,7 +394,7 @@ class IndexedRowCache:
 
         self.misses = len(distinct)                         # distinct rows actually computed
         self.hits = len(sources) - len(missing_positions)   # rows served from disk
-        self._write_table(self._table_path(label), sources, outputs)
+        self._write_table(self._table_path(label), ids, sources, outputs)
         return outputs
 
 

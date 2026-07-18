@@ -19,6 +19,7 @@ dependencies = [
     "huggingface-hub",
     "python-dotenv",
     "tqdm",
+    "xgboost>=3.3.0",
 ]
 
 [project.optional-dependencies]

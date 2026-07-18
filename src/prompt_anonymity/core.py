@@ -40,6 +40,13 @@ class AttackData:
     known_texts, unknown_texts : np.ndarray of str or None
         Optional raw prompt text per conversation, carried for inspection and for
         future text-level defenses; ``None`` when the loader does not provide it.
+    known_ids, unknown_ids : np.ndarray or None
+        Optional stable row identifier from the *original* dataset -- ``session_id`` for
+        SWE-chat, ``idx`` for WildChat -- one per conversation. Carried so downstream
+        artifacts (notably the defense cache tables) are keyed by the dataset's own row
+        identity rather than by position in this split, which makes a cached rewrite
+        survive re-ordering or re-subsetting of the pool. ``None`` when the loader does
+        not provide it, in which case position is used as the identifier.
     """
 
     known_embeddings: np.ndarray
@@ -49,6 +56,8 @@ class AttackData:
     metric: str = "euclidean"
     known_texts: np.ndarray | None = None
     unknown_texts: np.ndarray | None = None
+    known_ids: np.ndarray | None = None
+    unknown_ids: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         # Coerce to arrays and validate alignment up front, so every downstream stage
@@ -77,15 +86,17 @@ class AttackData:
                 f"unknown_labels ({len(self.unknown_labels)}) must match unknown_embeddings "
                 f"rows ({len(self.unknown_embeddings)})."
             )
-        for name, texts, n in [
+        for name, values, n in [
             ("known_texts", self.known_texts, len(self.known_labels)),
             ("unknown_texts", self.unknown_texts, len(self.unknown_labels)),
+            ("known_ids", self.known_ids, len(self.known_labels)),
+            ("unknown_ids", self.unknown_ids, len(self.unknown_labels)),
         ]:
-            if texts is not None:
-                texts = np.asarray(texts)
-                if len(texts) != n:
-                    raise ValueError(f"{name} has {len(texts)} entries but expected {n}.")
-                setattr(self, name, texts)
+            if values is not None:
+                values = np.asarray(values)
+                if len(values) != n:
+                    raise ValueError(f"{name} has {len(values)} entries but expected {n}.")
+                setattr(self, name, values)
 
     @property
     def n_known(self) -> int:
