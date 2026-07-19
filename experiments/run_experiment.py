@@ -44,29 +44,46 @@ from prompt_anonymity.viz import plot_headline_topk, plot_pool_size_sweep
 # and takes the directory as an argument.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIRS = {"wildchat": REPO_ROOT / "wildchat", "swe-chat": REPO_ROOT / "swe-chat"}
-FEATURE_LABELS = {"stylometrix": "StyloMetrix"}  # legend name for the attack/feature series
+FEATURE_LABELS = {  # legend name per feature; a combined run joins these with " + "
+    "stylometrix": "StyloMetrix",
+    "function_words": "Function Words",
+    "character_statistics": "Character Stats",
+}
 # StyloMetrix language model code per WildChat language subset (SWE-chat is English-only).
 STYLOMETRIX_LANGUAGE_CODES = {"English": "en", "Russian": "ru"}
 
 
-def build_featurizer(args: argparse.Namespace):
-    """Construct the featurizer for this run, configured to match the loaded feature space.
+def build_featurizers(args: argparse.Namespace) -> list:
+    """Construct the featurizer(s) for this run, configured to match the loaded feature space.
 
-    The featurizer must produce vectors in the same space as the loaded dataset's committed
-    features (its ``reference``), so StyloMetrix is built with the matching language code.
+    ``--feature`` may name several featurizers to combine; this returns one built instance per
+    name, in order. Each must produce vectors in the same space as the loaded dataset's committed
+    features (its ``reference``), so StyloMetrix is built with the matching language code; the
+    others take no configuration.
     """
-    options = {}
-    if args.feature == "stylometrix":
-        language = args.language if args.dataset == "wildchat" else "English"
-        options["language_code"] = STYLOMETRIX_LANGUAGE_CODES[language]
-    return get_featurizer(args.feature, **options)
+    featurizers = []
+    for name in args.feature:
+        options = {}
+        if name == "stylometrix":
+            language = args.language if args.dataset == "wildchat" else "English"
+            options["language_code"] = STYLOMETRIX_LANGUAGE_CODES[language]
+        featurizers.append(get_featurizer(name, **options))
+    return featurizers
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dataset", required=True, choices=sorted(DATA_DIRS), help="Dataset to attack.")
-    parser.add_argument("--feature", default="stylometrix", choices=sorted(FEATURIZERS), help="Conversation representation (only StyloMetrix is wired up; Gemini is planned).")
+    parser.add_argument(
+        "--feature", nargs="+", default=["stylometrix"], choices=sorted(FEATURIZERS),
+        help="Conversation representation(s); name several to concatenate their feature vectors.",
+    )
     parser.add_argument("--attack", default="nearest_neighbor", choices=sorted(ATTACKS), help="Attack to run.")
+    parser.add_argument(
+        "--metric", default="cosine",
+        help="Distance metric the attack uses to compare vectors, e.g. 'cosine' (default) or "
+             "'euclidean' (any scipy cdist metric).",
+    )
     parser.add_argument("--defense", default="none", choices=sorted(DEFENSES), help="Defense applied before the attack.")
     parser.add_argument("--language", default="English", choices=["English", "Russian"], help="WildChat language subset.")
     parser.add_argument(
@@ -89,37 +106,46 @@ def parse_args() -> argparse.Namespace:
 
 def output_tag(args: argparse.Namespace) -> str:
     """Short, self-describing directory name for this run's outputs."""
+    feature = "+".join(args.feature)  # combined runs list every feature, e.g. "stylometrix+function_words"
     if args.dataset == "wildchat":
-        scope = f"wildchat_{args.feature}_{args.language.lower()}"
+        scope = f"wildchat_{feature}_{args.language.lower()}"
     else:
         owner = "" if args.model_owner.lower() == "all" else f"_{args.model_owner.lower()}"
-        scope = f"swe-chat_{args.feature}{owner}"
+        scope = f"swe-chat_{feature}{owner}"
     defense = "" if args.defense == "none" else f"_{args.defense}"
-    return f"{scope}_{args.attack}{defense}"
+    metric = "" if args.metric == "cosine" else f"_{args.metric}"  # only a non-default metric gets a suffix
+    return f"{scope}_{args.attack}{metric}{defense}"
 
 
 def main() -> None:
     args = parse_args()
 
-    # Dataset-specific loader options; everything after loading is dataset-agnostic.
-    options = {"feature": args.feature}
+    # Dataset-specific loader options; everything after loading is dataset-agnostic. The loader
+    # returns committed reference features for a single feature space (StyloMetrix today), so
+    # pass the first requested feature -- the one whose committed vectors a featurizer can reuse.
+    options = {"feature": args.feature[0]}
     if args.dataset == "wildchat":
         options["language"] = args.language
     else:
         options["model_owner"] = args.model_owner
 
     # Load (text + committed reference features) -> defense (rewrites text) -> featurize.
-    # `reference` is the loader's features for the ORIGINAL text; the featurizer reuses them
-    # wherever the defense left text unchanged and recomputes/caches only the rewritten text.
+    # `reference` is the loader's features for the ORIGINAL text; each featurizer reuses them
+    # wherever the defense left text unchanged (only the one matching the committed space) and
+    # recomputes/caches only the rewritten text. Multiple --feature values are concatenated.
     data = load_dataset(args.dataset, DATA_DIRS[args.dataset], **options)
     reference = data
     data = apply_defense(args.defense, data, cache_dir=args.cache_dir)
-    featurizer = build_featurizer(args)
-    data = apply_featurizer(featurizer, data, cache_dir=args.cache_dir, reference=reference)
+    featurizers = build_featurizers(args)
+    data = apply_featurizer(featurizers, data, cache_dir=args.cache_dir, reference=reference)
+    # The distance metric is an attack-level choice, decoupled from the featurizer: set it here
+    # so every featurizer (single or combined) feeds the same, caller-chosen metric to the attack.
+    data.metric = args.metric
     print(
         f"[{args.dataset}] {data.n_identities} identities | "
         f"{data.n_known} known + {data.n_unknown} unknown conversations | "
-        f"attack={args.attack} defense={args.defense} feature={featurizer.name} metric={data.metric}"
+        f"attack={args.attack} defense={args.defense} "
+        f"feature={'+'.join(f.name for f in featurizers)} metric={data.metric}"
     )
 
     # Attack -> distance matrix -> ranking reused by both the headline table and sweep.
@@ -143,7 +169,7 @@ def main() -> None:
     headline.to_csv(output_dir / "headline_results.csv", index=False)
     sweep.to_csv(output_dir / "sweep_results.csv", index=False)
 
-    method_label = FEATURE_LABELS.get(args.feature, args.feature)
+    method_label = " + ".join(FEATURE_LABELS.get(f, f) for f in args.feature)
     plot_headline_topk(headline, method_label, output_dir / "topk_accuracy.pdf")
     plot_pool_size_sweep(sweep, method_label, args.sweep_top_k, output_dir / f"poolsize_sweep_top{args.sweep_top_k}.pdf")
 

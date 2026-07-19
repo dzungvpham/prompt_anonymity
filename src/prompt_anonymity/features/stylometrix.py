@@ -50,7 +50,6 @@ class StyloMetrixFeaturizer(Featurizer):
 
     name = "stylometrix"
     version = "1"
-    metric = "euclidean"
 
     def __init__(self, *, language_code: str = "en"):
         self.language_code = language_code

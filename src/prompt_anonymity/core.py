@@ -34,9 +34,10 @@ class AttackData:
     known_labels, unknown_labels : np.ndarray, shape (n,)
         Identity (true author) of each known / unknown conversation.
     metric : str
-        Distance metric the attack should use for these features -- "euclidean" for
-        StyloMetrix, "cosine" for L2-normalizable embeddings, or any
-        ``scipy.spatial.distance.cdist`` metric.
+        Distance metric the attack uses to compare these vectors (smaller = more
+        similar). A property of the *attack*, not of the featurizer: chosen at the
+        experiment level (default "cosine") and settable to any
+        ``scipy.spatial.distance.cdist`` metric name -- e.g. "cosine" or "euclidean".
     known_texts, unknown_texts : np.ndarray of str or None
         Optional raw prompt text per conversation, carried for inspection and for
         future text-level defenses; ``None`` when the loader does not provide it.
@@ -53,7 +54,7 @@ class AttackData:
     unknown_embeddings: np.ndarray
     known_labels: np.ndarray
     unknown_labels: np.ndarray
-    metric: str = "euclidean"
+    metric: str = "cosine"
     known_texts: np.ndarray | None = None
     unknown_texts: np.ndarray | None = None
     known_ids: np.ndarray | None = None

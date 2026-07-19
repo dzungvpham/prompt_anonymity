@@ -230,8 +230,6 @@ experiments/results/
 # Data Protection
 *.csv
 *.npz
-data/
-datasets/
 .claude/
 
 !wildchat_filtered_en_2048_stylometrix.csv

@@ -23,7 +23,6 @@ class CharacterStatisticsFeaturizer(Featurizer):
 
     name = "character_statistics"
     version = "1"
-    metric = "euclidean"
 
     def featurize(self, texts) -> np.ndarray:
         rows = []

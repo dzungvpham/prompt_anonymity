@@ -14,7 +14,6 @@ FUNCTION_WORDS = ["the","a","an","and","but","or","if","because","of","to","in",
 class FunctionWordFeaturizer(Featurizer):
     name = "function_words"
     version = "1"
-    metric = "cosine" # cosine similarity is used a lot for comparing text feature vectors
 
     def featurize(self, texts) -> np.ndarray:
         rows = []

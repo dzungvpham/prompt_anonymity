@@ -1,12 +1,12 @@
 """Base class for featurizers: turning conversation text into attack-ready feature vectors.
 
 A *featurizer* runs **after** any defense, so it always sees the current (possibly rewritten)
-text and produces the vectors the attack compares. Featurization is the natural place for the
-distance metric to be decided -- it is a property of the representation, not the dataset --
-so a featurizer also declares the ``metric`` its vectors call for.
+text and produces the vectors the attack compares. The distance metric used to compare those
+vectors is **not** a featurizer concern -- it is carried on the :class:`AttackData` and chosen
+at the experiment level (see ``--metric``), so any featurizer can be paired with any metric.
 
-A developer adds a featurizer by subclassing :class:`Featurizer`, setting :attr:`name`,
-:attr:`metric` and (optionally) :attr:`version`, overriding :meth:`params` for any
+A developer adds a featurizer by subclassing :class:`Featurizer`, setting :attr:`name` and
+(optionally) :attr:`version`, overriding :meth:`params` for any
 output-affecting configuration, and implementing :meth:`featurize` -- a **batch** transform
 that turns a list of texts into a 2-D array. Expensive results are cached on disk,
 content-addressed by text, with the same automatic, safe invalidation as defenses (see
@@ -25,8 +25,8 @@ from ..caching import TransformCache, logic_hash, params_hash
 class Featurizer:
     """Maps conversation text to fixed-length feature vectors, with automatic caching.
 
-    Subclasses set :attr:`name` (required) and :attr:`metric`, optionally :attr:`version`,
-    may override :meth:`params`, and implement :meth:`featurize`. The cache auto-invalidates
+    Subclasses set :attr:`name` (required), optionally :attr:`version`, may override
+    :meth:`params`, and implement :meth:`featurize`. The cache auto-invalidates
     whenever the subclass's (or a base class's) source code, :attr:`version`, or :meth:`params`
     change.
     """
@@ -36,10 +36,6 @@ class Featurizer:
     #: Manual logic version. Bump it when behavior changes in a way source hashing cannot see
     #: (e.g. an upgraded StyloMetrix / spaCy model that shifts the feature columns).
     version: str = ""
-    #: Distance metric the produced vectors call for ("euclidean" for StyloMetrix, "cosine"
-    #: for L2-normalizable embeddings); written onto the :class:`AttackData` by the featurize
-    #: step so the attack uses the right metric.
-    metric: str = "euclidean"
 
     def params(self) -> dict:
         """Configuration that affects the output (e.g. ``{"language_code": "ru"}``).

@@ -23,7 +23,7 @@ def nearest_neighbor_attack(
     known_embeddings,
     unknown_embeddings,
     *,
-    metric: str = "euclidean",
+    metric: str = "cosine",
 ) -> pd.DataFrame:
     """Score every unknown conversation against every known conversation by distance.
 
@@ -36,16 +36,14 @@ def nearest_neighbor_attack(
     unknown_embeddings : array-like of shape (n_unknown, n_features)
         One vector per *unknown* (anonymous) conversation to re-identify. Must have
         the same number of features as ``known_embeddings``.
-    metric : str or callable, default ``"euclidean"``
-        Distance metric forwarded to :func:`scipy.spatial.distance.cdist`. Use
-        ``"euclidean"`` for StyloMetrix features and ``"cosine"`` for semantic
-        embeddings (e.g. Gemini); these reproduce, respectively, the
-        negative-Euclidean and L2-normalized dot-product rankings used in the
-        WildChat and SWE-chat analyses. (Cosine distance is invariant to vector
-        norm, so it matches the normalize-then-dot-product path without normalizing
-        first.) Any cdist-compatible metric name or a custom callable works, but it
-        must be a *distance* -- smaller meaning more similar -- because the metrics
-        rank candidates in ascending order.
+    metric : str or callable, default ``"cosine"``
+        Distance metric forwarded to :func:`scipy.spatial.distance.cdist`; it must be a
+        *distance* -- smaller meaning more similar -- because the metrics rank candidates
+        in ascending order. The choice is the caller's and is not tied to the featurizer:
+        ``"cosine"`` is the default and works well for both StyloMetrix features and
+        L2-normalizable embeddings (cosine distance is invariant to vector norm, matching a
+        normalize-then-dot-product ranking without normalizing first). Pass ``"euclidean"``
+        -- or any cdist-compatible metric name or custom callable -- to override.
 
     Returns
     -------
