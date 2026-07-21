@@ -74,4 +74,5 @@ def load_wildchat(data_dir, *, feature: str = "stylometrix", language: str = "En
         role=role,
         embeddings=embeddings,
         texts=frame["conversation"].to_numpy(),
+        ids=frame["idx"].to_numpy(),  # original-dataset row id, used as the defense cache key
     )

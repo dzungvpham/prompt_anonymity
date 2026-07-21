@@ -105,4 +105,5 @@ def load_swe_chat(data_dir, *, feature: str = "stylometrix", model_owner: str = 
         role=role,
         embeddings=embeddings,
         texts=data["content"].to_numpy(),
+        ids=data["session_id"].to_numpy(),  # original-dataset row id, used as the defense cache key
     )

@@ -28,10 +28,11 @@ A linkage experiment runs in stages, one subpackage each:
     Stateless scoring of an attack's output: :func:`~prompt_anonymity.metrics.top_k_accuracy`
     and the chance baseline :func:`~prompt_anonymity.metrics.random_guessing_accuracy`.
 ``fidelity``
-    The utility axis complementing the privacy metrics: :func:`~prompt_anonymity.fidelity.utility_fidelity`
-    scores whether a defended prompt still yields an equally-useful answer, using the paper's
-    LLM-as-a-judge PASS/FAIL predicate over a response model's answers to the original vs. defended
-    prompt (compares the defended split against the pre-defense ``reference``).
+    The utility axis complementing the privacy metrics, via
+    :func:`~prompt_anonymity.fidelity.run_fidelity`: ``utility`` scores whether a defended prompt
+    still yields an equally-useful answer (the paper's PASS/FAIL predicate over a response model's
+    answers), and ``conversation`` scores 1-5 how much of the whole conversation survives. Both
+    compare the defended split against the pre-defense ``reference``.
 ``evaluation``
     Rank once and reuse it: :class:`~prompt_anonymity.evaluation.LinkageRanking`, the
     headline table, and the candidate-pool-size sweep.

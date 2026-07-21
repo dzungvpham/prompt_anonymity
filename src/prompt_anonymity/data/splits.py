@@ -69,20 +69,25 @@ def attackable_mask(identities, role) -> np.ndarray:
     return np.isin(identities, list(attackable))
 
 
-def build_attack_data(*, identities, role, embeddings, metric="cosine", texts=None) -> AttackData:
+def build_attack_data(*, identities, role, embeddings, metric="cosine", texts=None, ids=None) -> AttackData:
     """Assemble positionally aligned per-conversation arrays into an :class:`AttackData`.
 
-    ``identities``, ``role``, ``embeddings`` (and optional ``texts``) must all be in the
-    same row order. Identities without a counterpart on both sides are dropped via
+    ``identities``, ``role``, ``embeddings`` (and optional ``texts``/``ids``) must all be in
+    the same row order. Identities without a counterpart on both sides are dropped via
     :func:`attackable_mask`; the rest are partitioned into the known and unknown sides.
 
     ``metric`` is the distance the attack will use to compare vectors; it is an attack-level
     choice (default "cosine"), not a property of the features, so loaders need not set it.
+
+    ``ids`` is the originating dataset's stable row identifier (WildChat ``idx``, SWE-chat
+    ``session_id``); it is partitioned by the same selectors so the defense cache can key each
+    row by dataset identity instead of by position in this split.
     """
     identities = np.asarray(identities)
     role = np.asarray(role)
     embeddings = np.asarray(embeddings)
     texts = None if texts is None else np.asarray(texts)
+    ids = None if ids is None else np.asarray(ids)
 
     attackable = attackable_mask(identities, role)
     known_selector = attackable & (role == KNOWN)
@@ -95,4 +100,6 @@ def build_attack_data(*, identities, role, embeddings, metric="cosine", texts=No
         metric=metric,
         known_texts=None if texts is None else texts[known_selector],
         unknown_texts=None if texts is None else texts[unknown_selector],
+        known_ids=None if ids is None else ids[known_selector],
+        unknown_ids=None if ids is None else ids[unknown_selector],
     )

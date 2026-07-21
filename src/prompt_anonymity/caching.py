@@ -34,10 +34,31 @@ import inspect
 import json
 import os
 import shutil
+import sys
 import tempfile
 import textwrap
 import time
 from pathlib import Path
+
+
+def _raise_csv_field_limit() -> None:
+    """Lift csv's per-field size cap (default 131072) as high as this platform's C long allows.
+
+    A defense caches whole conversations in the ``source``/``output`` columns, which routinely
+    exceed the default limit. Without this, ``csv.reader`` raises ``field larger than field
+    limit`` on a long row -- which :meth:`IndexedRowCache._read_table` catches and treats as an
+    unreadable table, silently recomputing (re-billing) the entire cache on every run.
+    """
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:  # too big for the platform's C long; back off and retry
+            limit //= 10
+
+
+_raise_csv_field_limit()
 
 # Length (hex chars) of the short hashes used for directory names; 16 = 64 bits, ample to
 # avoid accidental collisions while keeping paths readable.

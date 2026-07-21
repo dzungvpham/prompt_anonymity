@@ -10,8 +10,11 @@ Selects a dataset, an optional defense, and an attack -- all by name -- using th
 
 Pipeline (identical regardless of dataset/attack/defense)::
 
-    load_dataset -> apply_defense -> apply_featurizer -> run_attack -> LinkageRanking
+    load_dataset -> apply_defense -> [--fidelity] -> apply_featurizer -> run_attack -> LinkageRanking
                  -> headline_accuracy + pool_size_sweep -> CSVs + plots
+
+``--fidelity`` optionally scores how much of the prompt the defense preserved (a utility axis
+orthogonal to the attack) before featurizing; see ``prompt_anonymity.fidelity``.
 
 Features are (re)computed *after* the defense, so a defense that rewrites text is reflected in
 the vectors. The loaded dataset's committed features are passed as the featurizer ``reference``,
@@ -25,7 +28,8 @@ read straight from them, so registering a new attack or defense makes it selecta
 no change to this script.
 
 Outputs (under ``--output-dir``): ``headline_results.csv``, ``sweep_results.csv``,
-``topk_accuracy.pdf``, ``poolsize_sweep_top{k}.pdf``.
+``topk_accuracy.pdf``, ``poolsize_sweep_top{k}.pdf``, and ``fidelity_{metric}.csv`` when
+``--fidelity`` is set.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ from prompt_anonymity.data import load_dataset
 from prompt_anonymity.defenses import DEFENSES, apply_defense
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy, pool_size_sweep
 from prompt_anonymity.features import FEATURIZERS, get_featurizer, apply_featurizer
+from prompt_anonymity.fidelity import FIDELITY_METRICS, run_fidelity
 from prompt_anonymity.viz import plot_headline_topk, plot_pool_size_sweep
 
 # Dataset files live in the repo next to this script; the package itself is path-agnostic
@@ -85,6 +90,29 @@ def parse_args() -> argparse.Namespace:
              "'euclidean' (any scipy cdist metric).",
     )
     parser.add_argument("--defense", default="none", choices=sorted(DEFENSES), help="Defense applied before the attack.")
+    parser.add_argument(
+        "--fidelity", default="none", choices=["none", *sorted(FIDELITY_METRICS)],
+        help="Score defense utility preservation before the attack: 'utility' (per-turn PASS/FAIL "
+             "on generated answers) or 'conversation' (whole-conversation 1-5). 'none' (default) "
+             "skips it and makes no API calls. Ignored when --defense none (nothing to score).",
+    )
+    parser.add_argument(
+        "--fidelity-model", default=None,
+        help="OpenRouter judge model for --fidelity (default: the metric's own -- gpt-4o for "
+             "'utility', Sonnet for 'conversation').",
+    )
+    parser.add_argument(
+        "--fidelity-side", default="unknown", choices=["unknown", "known"],
+        help="Which side --fidelity scores (default: 'unknown', the side a defense rewrites).",
+    )
+    parser.add_argument(
+        "--fidelity-limit", type=int, default=None,
+        help="Score only a seeded random sample of this many CONVERSATIONS -- for calibrating a "
+             "rubric cheaply before a full run. Counts conversations, not API calls: 'conversation' "
+             "makes ~1 call each (so ~50 for 50 calls), 'utility' makes ~3 per changed turn (~18 "
+             "per conversation, so ~3 for 50 calls). Uses --seed; writes to a *_sample<N>.csv so it "
+             "never clobbers a full run.",
+    )
     parser.add_argument("--language", default="English", choices=["English", "Russian"], help="WildChat language subset.")
     parser.add_argument(
         "--model-owner", default="Anthropic",
@@ -136,6 +164,20 @@ def main() -> None:
     data = load_dataset(args.dataset, DATA_DIRS[args.dataset], **options)
     reference = data
     data = apply_defense(args.defense, data, cache_dir=args.cache_dir)
+
+    # Fidelity (optional) runs on the defended text vs. the pre-defense `reference`, before
+    # featurization -- so a bad API key or an over-long input fails fast, before the GPU work. Held
+    # in a variable and written alongside the attack outputs below. Skipped with --defense none:
+    # nothing was rewritten, so every conversation is trivially faithful.
+    fidelity_result = None
+    if args.fidelity != "none" and args.defense != "none":
+        fidelity_kwargs = {"judge_model": args.fidelity_model} if args.fidelity_model else {}
+        fidelity_result = run_fidelity(
+            args.fidelity, data, cache_dir=args.cache_dir, reference=reference,
+            side=args.fidelity_side, limit=args.fidelity_limit, **fidelity_kwargs,
+        )
+        print(f"\n{fidelity_result.summary()}")
+
     featurizers = build_featurizers(args)
     data = apply_featurizer(featurizers, data, cache_dir=args.cache_dir, reference=reference)
     # The distance metric is an attack-level choice, decoupled from the featurizer: set it here
@@ -169,13 +211,24 @@ def main() -> None:
     headline.to_csv(output_dir / "headline_results.csv", index=False)
     sweep.to_csv(output_dir / "sweep_results.csv", index=False)
 
+    fidelity_csv = None
+    if fidelity_result is not None:
+        # A sampled (--fidelity-limit) run goes to its own file so a quick calibration pass never
+        # overwrites a full run's table in the same output dir.
+        suffix = f"_sample{args.fidelity_limit}" if args.fidelity_limit is not None else ""
+        fidelity_csv = output_dir / f"fidelity_{args.fidelity}{suffix}.csv"
+        fidelity_result.to_csv(fidelity_csv)
+
     method_label = " + ".join(FEATURE_LABELS.get(f, f) for f in args.feature)
     plot_headline_topk(headline, method_label, output_dir / "topk_accuracy.pdf")
     plot_pool_size_sweep(sweep, method_label, args.sweep_top_k, output_dir / f"poolsize_sweep_top{args.sweep_top_k}.pdf")
 
     print(f"\nWrote results to {output_dir}/")
-    print("  headline_results.csv, sweep_results.csv, topk_accuracy.pdf, "
-          f"poolsize_sweep_top{args.sweep_top_k}.pdf")
+    outputs = ["headline_results.csv", "sweep_results.csv", "topk_accuracy.pdf",
+               f"poolsize_sweep_top{args.sweep_top_k}.pdf"]
+    if fidelity_csv is not None:
+        outputs.append(fidelity_csv.name)
+    print("  " + ", ".join(outputs))
 
 
 if __name__ == "__main__":

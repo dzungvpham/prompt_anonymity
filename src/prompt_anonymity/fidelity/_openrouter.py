@@ -1,18 +1,22 @@
-"""Lean OpenRouter chat client shared by the utility-fidelity stage.
+"""Lean OpenRouter chat client shared by the fidelity metrics.
 
-The fidelity metric makes two kinds of remote chat call -- generating a response model's answer to
-a prompt, and asking a judge to score two answers -- both against OpenRouter. This module holds the
-one client both use: :class:`OpenRouterChat`, a thin wrapper over the chat-completions endpoint with
-the same production niceties as the OpenAnonymity defense's backend
+The fidelity metrics make remote chat calls against OpenRouter -- generating a response model's
+answer to a prompt, asking a judge to rule PASS/FAIL on two answers, or asking one to score two
+whole conversations 1-5. This module holds the one client they all use: :class:`OpenRouterChat`, a
+thin wrapper over the chat-completions endpoint with the same production niceties as the
+OpenAnonymity defense's backend
 (:class:`prompt_anonymity.defenses.openanonymity._OpenAnonBackend`) -- a lazily read
 ``OPENROUTER_API_KEY`` (from a ``.env``), jittered exponential backoff on transient failures,
 fail-fast on non-retryable 4xx, and a thread pool to fan a batch of requests out.
 
-It is deliberately **leaner** than the scrubber backend: the response and judge inputs here are
-turn-sized and bounded, so there is no token-budget chunking / context-length re-split -- one
-prompt is one request. Like the scrubber, ``requests`` and ``python-dotenv`` are imported lazily so
-importing this module (e.g. to reach the prompt constants or the verdict parser) never requires the
-network deps or a key.
+It is deliberately **leaner** than the scrubber backend: one prompt is one request, with no
+token-budget chunking / context-length re-split. That is safe for the per-turn callers, whose
+inputs are turn-sized and bounded; the conversation-level judge (:mod:`.prompt_judge`), which sends
+two whole conversations per call, is *not* inherently bounded, and relies on its own ``max_chars``
+cap to stay under a context window -- overrun there surfaces as a fail-fast 4xx that aborts the
+batch. Like the scrubber, ``requests`` and ``python-dotenv`` are imported lazily so importing this
+module (e.g. to reach the prompt constants or the verdict parser) never requires the network deps
+or a key.
 """
 
 from __future__ import annotations
