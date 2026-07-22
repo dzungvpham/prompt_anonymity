@@ -38,7 +38,7 @@ def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
     if vecs_a.ndim == 1:
         diff = np.abs(vecs_a - vecs_b)
         product = vecs_a * vecs_b
-        concat = np.concatenate([vecs_a, vecs_b])
+        # concat = np.concatenate([vecs_a, vecs_b])
 
         return np.concatenate(
             [diff, product]
@@ -47,10 +47,10 @@ def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
     # Batch during inference
     diff = np.abs(vecs_a - vecs_b)
     product = vecs_a * vecs_b
-    concat = np.concatenate([vecs_a, vecs_b], axis=1)
+    # concat = np.concatenate([vecs_a, vecs_b], axis=1)
 
     return np.concatenate(
-        [diff, product, concat],
+        [diff, product],
         axis=1,
     )
 
