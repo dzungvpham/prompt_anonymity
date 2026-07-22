@@ -91,19 +91,14 @@ def _make_training_pairs(embeddings: np.ndarray, labels: np.ndarray, seed: int =
     X = np.array([
         _build_pair_features(embeddings[i], embeddings[j])
         for i, j in pairs
-    ])
+    ],
+        dtype=np.float32,
+        )
 
     groups = np.array([
         labels[i]
         for i, j in pairs
     ])
-
-    print("Positive pairs:", len(pos_pairs))
-    print("Negative pairs:", len(neg_pairs))
-    print("Total pairs:", len(pairs))
-    print("X shape:", X.shape)
-    print("dtype:", X.dtype)
-    print(f"Size: {X.nbytes / 1024**2:.1f} MB")
 
     return X, y, groups
 
@@ -121,19 +116,20 @@ def _tune_xgb(X_train, y_train, groups, seed=47):
     cv = GroupKFold(n_splits=5)
 
     search = HalvingRandomSearchCV(
-        estimator=XGBClassifier(
-            eval_metric="logloss",
-            random_state=seed,
-        ),
-        param_distributions=param_dist,
-        resource="n_estimators",
-        max_resources=400,
-        min_resources=25,
-        scoring="roc_auc",
-        cv=cv,
+    estimator=XGBClassifier(
+        eval_metric="logloss",
         random_state=seed,
-        n_jobs=-1,
-    )
+        n_jobs=2,
+    ),
+    param_distributions=param_dist,
+    resource="n_estimators",
+    max_resources=400,
+    min_resources=25,
+    scoring="neg_log_loss",
+    cv=cv,
+    random_state=seed,
+    n_jobs=2,
+)
 
     search.fit(
         X_train,
