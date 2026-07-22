@@ -41,7 +41,7 @@ def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
         concat = np.concatenate([vecs_a, vecs_b])
 
         return np.concatenate(
-            [diff, product, concat]
+            [diff, product]
         )
 
     # Batch during inference
@@ -103,7 +103,12 @@ def _make_training_pairs(embeddings: np.ndarray, labels: np.ndarray, seed: int =
     return X, y, groups
 
 
-def _tune_xgb(X_train, y_train, groups, seed=47):
+def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
+    if len(y_train) > max_search_samples:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(y_train), size=max_search_samples, replace=False)
+        X_train, y_train, groups = X_train[idx], y_train[idx], groups[idx]
+
 
     param_dist = {
         "max_depth": randint(2, 8),
@@ -120,12 +125,13 @@ def _tune_xgb(X_train, y_train, groups, seed=47):
         eval_metric="logloss",
         random_state=seed,
         n_jobs=2,
+        tree_method="hist",
     ),
     param_distributions=param_dist,
     resource="n_estimators",
     max_resources=400,
     min_resources=25,
-    scoring="neg_log_loss",
+    scoring="roc_auc",
     cv=cv,
     random_state=seed,
     n_jobs=2,
