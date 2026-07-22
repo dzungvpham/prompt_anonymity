@@ -131,7 +131,7 @@ def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
     resource="n_estimators",
     max_resources=400,
     min_resources=25,
-    scoring="roc_auc",
+    scoring="neg_log_loss",
     cv=cv,
     random_state=seed,
     n_jobs=2,
