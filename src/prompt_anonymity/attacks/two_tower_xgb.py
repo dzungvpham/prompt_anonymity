@@ -12,6 +12,9 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401
+from sklearn.model_selection import HalvingRandomSearchCV, GroupKFold
+from scipy.stats import randint, uniform
 from ..core import AttackData
 
 
@@ -35,19 +38,19 @@ def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
     if vecs_a.ndim == 1:
         diff = np.abs(vecs_a - vecs_b)
         product = vecs_a * vecs_b
-        concat = np.concatenate([vecs_a, vecs_b])
+        # concat = np.concatenate([vecs_a, vecs_b])
 
         return np.concatenate(
-            [diff, product, concat]
+            [diff, product]
         )
 
     # Batch during inference
     diff = np.abs(vecs_a - vecs_b)
     product = vecs_a * vecs_b
-    concat = np.concatenate([vecs_a, vecs_b], axis=1)
+    # concat = np.concatenate([vecs_a, vecs_b], axis=1)
 
     return np.concatenate(
-        [diff, product, concat],
+        [diff, product],
         axis=1,
     )
 
@@ -79,40 +82,86 @@ def _make_training_pairs(embeddings: np.ndarray, labels: np.ndarray, seed: int =
         attempts += 1
 
     pairs = pos_pairs + neg_pairs
-    y = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs))
-    X = np.array([_build_pair_features(embeddings[i], embeddings[j]) for i, j in pairs])
-    return X, y
 
+    y = np.array(
+        [1] * len(pos_pairs) +
+        [0] * len(neg_pairs)
+    )
+
+    X = np.array([
+        _build_pair_features(embeddings[i], embeddings[j])
+        for i, j in pairs
+    ],
+        dtype=np.float32,
+        )
+
+    groups = np.array([
+        labels[i]
+        for i, j in pairs
+    ])
+
+    return X, y, groups
+
+
+def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
+    if len(y_train) > max_search_samples:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(y_train), size=max_search_samples, replace=False)
+        X_train, y_train, groups = X_train[idx], y_train[idx], groups[idx]
+
+
+    param_dist = {
+        "max_depth": randint(2, 8),
+        "learning_rate": uniform(0.01, 0.29),
+        "subsample": uniform(0.5, 0.5),
+        "colsample_bytree": uniform(0.5, 0.5),
+        "min_child_weight": randint(1, 10),
+    }
+
+    cv = GroupKFold(n_splits=5)
+
+    search = HalvingRandomSearchCV(
+    estimator=XGBClassifier(
+        eval_metric="logloss",
+        random_state=seed,
+        n_jobs=2,
+        tree_method="hist",
+    ),
+    param_distributions=param_dist,
+    resource="n_estimators",
+    max_resources=400,
+    min_resources=25,
+    scoring="average_precision",
+    cv=cv,
+    random_state=seed,
+    n_jobs=2,
+)
+
+    search.fit(
+        X_train,
+        y_train,
+        groups=groups,
+    )
+
+    print("Best params:", search.best_params_)
+    print("Best CV score:", search.best_score_)
+
+    return search.best_estimator_
 
 def run_two_tower_xgb(data: AttackData, seed: int = 47, aggregate_by_identity: bool = True) -> pd.DataFrame:
     """Train on known-known pairs, score unknown-vs-known pairs, return a distance matrix."""
-    X_train, y_train = _make_training_pairs(data.known_embeddings, data.known_labels, seed=seed)
-
-
-    ''' 
-    version 1: clf = XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
-        learning_rate=0.1,
-        eval_metric="logloss",
-        random_state=seed,
+    X_train, y_train, groups = _make_training_pairs(
+    data.known_embeddings,
+    data.known_labels,
+    seed=seed,
     )
-    
-    this is version 2:
-    clf is model object that will learn from training examples
-    XGBClassifier means the model is an XGBoost classifier, which is a tree-based boosting model commonly used for classification tasks.
-    '''
-    clf = XGBClassifier(
-        n_estimators=200, # the model will build 200 decision trees in sequence, with each one improving the previous ones.
-        max_depth=3, # the maximum depth of each decision tree is limited to 3 (small), which helps prevent overfitting and keeps the model simpler.
-        learning_rate=0.05, # controls how much the model adjusts its weights with each new tree. A smaller learning rate means slower learning but can lead to better generalization.
-        subsample=0.8, # only 80% of the training data is randomly selected for each tree, which helps prevent overfitting and improves generalization.
-        colsample_bytree=0.8, # only 80% of the features are randomly selected for each tree, which also helps prevent overfitting and improves generalization.
-        min_child_weight=5, # the minimum sum of instance weights (hessian) needed in a child node to make a split.
-        eval_metric="logloss", # the model will use log loss as the evaluation metric during training, which is suitable for binary classification tasks.
-        random_state=seed, # makes the training reproducible so the same seed gives the same result
-        )
-    clf.fit(X_train, y_train)
+
+    clf = _tune_xgb(
+    X_train,
+    y_train,
+    groups,
+    seed=seed,
+    )
 
     n_unknown, n_known = data.n_unknown, data.n_known
     distance_matrix = np.zeros((n_unknown, n_known))
