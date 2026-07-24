@@ -23,6 +23,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# GPU model-backed defenses (styleremix.py, qwen_rewrite.py). Not needed for the default
+# --defense none pass-through, which reuses the committed StyloMetrix vectors and is GPU-free.
+defenses = [
+    "torch",
+    "transformers",
+    "peft",
+    "accelerate",
+    "bitsandbytes",
+    "vllm",
+    "llama-cpp-python",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

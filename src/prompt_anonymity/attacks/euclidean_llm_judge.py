@@ -107,8 +107,9 @@ def _judge_prompt(query_text: str, candidate_texts: list[str]) -> str:
 
 def _parse_choice(raw: str) -> int:
     """The LAST digit the judge emitted, or 0 if it emitted none. The judge is asked for a
-    forced choice, so 0 (or an out-of-range digit) means it disobeyed; callers treat that as
-    "no rerank", leaving the distance metric's own order in place as the safe fallback.
+    forced choice, so 0 (or an out-of-range digit) means it disobeyed; callers force such a
+    row to the NEAREST candidate (distance rank 0) rather than skipping the rerank, so every
+    gated row commits (see :meth:`EuclideanLLMJudgeAttack.attack`).
 
     Last (not first) digit: with a bare ``"3"`` the two coincide, but if a model leaks a
     preamble before the answer (e.g. ``"answer: 2"``), the decision digit is the trailing one.
@@ -261,18 +262,26 @@ class EuclideanLLMJudgeAttack:
 
         choices = [_parse_choice(raw) for raw in raw_choices]
 
-        # Promote each valid, gated pick to rank 1 by setting its distance strictly below the
-        # row's current minimum. Every other entry -- including which rows are in the top-K --
-        # is untouched, so top-K membership (and top-K/top-2K accuracy) is unchanged and only
-        # top-1 can move relative to the base attack.
+        # Promote each gated pick to rank 1 by setting its distance strictly below the row's
+        # current minimum. Every other entry -- including which rows are in the top-K -- is
+        # untouched, so top-K membership (and top-K/top-2K accuracy) is unchanged and only top-1
+        # can move relative to the base attack.
         boosted = distances.copy()
         applied = 0
+        forced = 0
         for i, choice in enumerate(choices):
             if margins[i] > gate_thresh:
                 continue  # confident row: keep the distance metric's own #1
             if 1 <= choice <= k:
                 boosted[i, present[i][choice - 1]] = row_min[i] - 1.0
                 applied += 1
+            else:
+                # Forced choice: a refusal / invalid digit commits to the NEAREST candidate
+                # (distance rank 0, already this row's #1) instead of skipping the rerank. So the
+                # row never worsens vs. the embedding baseline, but no gated row is left unresolved.
+                boosted[i, top_idx[i, 0]] = row_min[i] - 1.0
+                applied += 1
+                forced += 1
 
         if self.verbose:
             # Position axis (presented slot): with shuffling on, ~uniform => position bias
@@ -285,7 +294,8 @@ class EuclideanLLMJudgeAttack:
             print(f"  LLM judge: positional picks {pos_dist} (0=refused; want ~uniform if unbiased)")
             print(f"  LLM judge: distance-rank of picks {rank_dist} (0=nearest; want mass on 0-1)")
             print(f"  LLM judge: rerank applied to {applied}/{n} rows "
-                  f"(margin_quantile={self.margin_quantile}, gate<= {gate_thresh:.4g})")
+                  f"(margin_quantile={self.margin_quantile}, gate<= {gate_thresh:.4g}); "
+                  f"{forced} refusals forced to nearest")
 
         return pd.DataFrame(boosted)
 

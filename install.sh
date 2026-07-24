@@ -156,8 +156,25 @@ fi
 pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 
 # --- 4. prompt_anonymity package + its dependencies ------------------------
+# The GPU model-backed defenses (styleremix.py's torch/transformers/peft/accelerate/bitsandbytes,
+# qwen_rewrite.py's vllm/llama-cpp-python) live behind the "defenses" extra rather than the base
+# dependencies, since the default --defense none pass-through needs none of them. vllm in particular
+# only builds on Linux+CUDA, so skip the extra on apple/cpu (torch/transformers/peft alone would
+# still work there, but styleremix/qwen_rewrite are written as cluster-GPU defenses; run the "defenses"
+# extra install manually on those boxes if you need them).
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
-pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE"
+DEFENSES_EXTRA=""
+case "$ACCEL" in
+  cuda12x|cuda13x)
+    DEFENSES_EXTRA="with"
+    pip_install -e "$SCRIPT_DIR[defenses]" -c "$CONSTRAINTS_FILE" ;;
+  *)
+    DEFENSES_EXTRA="without"
+    warn "accelerator '$ACCEL' has no CUDA; skipping the [defenses] extra (vllm needs Linux+CUDA)."
+    warn "run 'pip install -e .[defenses] -c <constraints>' manually if you need styleremix/qwen_rewrite here."
+    pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
+esac
 
 log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable). See README.md for running the pipeline."
+log "prompt_anonymity (editable, $DEFENSES_EXTRA the [defenses] extra)."
+log "See README.md for running the pipeline."

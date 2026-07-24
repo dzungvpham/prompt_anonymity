@@ -15,6 +15,8 @@ The script auto-detects your accelerator and falls back to CUDA 12 when no GPU i
 - Apple M-series: `./install.sh --accelerator apple`
 - CPU only: `./install.sh --accelerator cpu` (works, but computing StyloMetrix features falls back to CPU and can be very slow — a GPU is strongly recommended)
 
+On `cuda12x`/`cuda13x` the script also installs the `defenses` extra (`torch`, `transformers`, `peft`, `accelerate`, `bitsandbytes`, `vllm`, `llama-cpp-python`), needed by the GPU model-backed defenses (`styleremix`, `qwen_rewrite`). It's skipped on `apple`/`cpu` because `vllm` needs Linux+CUDA; install it manually there with `pip install -e ".[defenses]"` if you need those defenses. The default `--defense none` pass-through needs none of this.
+
 <details>
 <summary>What <code>install.sh</code> does, as manual steps</summary>
 
