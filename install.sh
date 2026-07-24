@@ -156,25 +156,34 @@ fi
 pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 
 # --- 4. prompt_anonymity package + its dependencies ------------------------
-# The GPU model-backed defenses (styleremix.py's torch/transformers/peft/accelerate/bitsandbytes,
-# qwen_rewrite.py's vllm/llama-cpp-python) live behind the "defenses" extra rather than the base
-# dependencies, since the default --defense none pass-through needs none of them. vllm in particular
-# only builds on Linux+CUDA, so skip the extra on apple/cpu (torch/transformers/peft alone would
-# still work there, but styleremix/qwen_rewrite are written as cluster-GPU defenses; run the "defenses"
-# extra install manually on those boxes if you need them).
+# The GPU model-backed defenses live behind two extras rather than the base dependencies, since the
+# default --defense none pass-through needs neither:
+#   [styleremix] torch/transformers/peft/accelerate/bitsandbytes -- plain wheels, no compiler needed.
+#   [qwen]       vllm/llama-cpp-python -- vllm only builds on Linux+CUDA, and falls back to a source
+#                build (needing CUDA_HOME / the CUDA toolkit, not just a driver) when no prebuilt
+#                wheel matches your CUDA version. Installed separately and non-fatally so a vllm
+#                build failure can't take peft/transformers down with it.
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
-DEFENSES_EXTRA=""
+STYLEREMIX_EXTRA="without"
+QWEN_EXTRA="without"
 case "$ACCEL" in
   cuda12x|cuda13x)
-    DEFENSES_EXTRA="with"
-    pip_install -e "$SCRIPT_DIR[defenses]" -c "$CONSTRAINTS_FILE" ;;
+    pip_install -e "$SCRIPT_DIR[styleremix]" -c "$CONSTRAINTS_FILE"
+    STYLEREMIX_EXTRA="with"
+    if pip_install -e "$SCRIPT_DIR[qwen]" -c "$CONSTRAINTS_FILE"; then
+      QWEN_EXTRA="with"
+    else
+      warn "the [qwen] extra (vllm/llama-cpp-python) failed to install -- qwen_rewrite.py won't work."
+      warn "vllm often needs CUDA_HOME set to your CUDA toolkit to build from source; see its docs."
+      warn "styleremix.py is unaffected: its [styleremix] extra installed separately above."
+    fi
+    ;;
   *)
-    DEFENSES_EXTRA="without"
-    warn "accelerator '$ACCEL' has no CUDA; skipping the [defenses] extra (vllm needs Linux+CUDA)."
-    warn "run 'pip install -e .[defenses] -c <constraints>' manually if you need styleremix/qwen_rewrite here."
+    warn "accelerator '$ACCEL' has no CUDA; skipping the [styleremix]/[qwen] extras (vllm needs Linux+CUDA)."
+    warn "run 'pip install -e .[styleremix] -c <constraints>' manually if you need styleremix here."
     pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
 esac
 
 log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable, $DEFENSES_EXTRA the [defenses] extra)."
+log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen])."
 log "See README.md for running the pipeline."

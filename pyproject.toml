@@ -23,16 +23,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GPU model-backed defenses (styleremix.py, qwen_rewrite.py). Not needed for the default
-# --defense none pass-through, which reuses the committed StyloMetrix vectors and is GPU-free.
-defenses = [
+# GPU model-backed defenses. Not needed for the default --defense none pass-through, which reuses
+# the committed StyloMetrix vectors and is GPU-free. Split from `qwen` below because `vllm` builds
+# from source on platforms/CUDA versions it has no prebuilt wheel for, and that build needs the
+# CUDA toolkit's nvcc (CUDA_HOME) rather than just a GPU driver -- a failure there shouldn't block
+# installing peft/transformers/etc for styleremix.py, which has no such build step.
+styleremix = [
     "torch",
     "transformers",
     "peft",
     "accelerate",
     "bitsandbytes",
+]
+# qwen_rewrite.py's vllm backend. Requires Linux+CUDA; if pip resolves a source build instead of a
+# prebuilt wheel (e.g. no wheel yet for your CUDA version), it also needs CUDA_HOME set to the CUDA
+# toolkit (not just a driver) to compile. llama-cpp-python is qwen_rewrite.py's CPU/laptop fallback.
+qwen = [
     "vllm",
     "llama-cpp-python",
+]
+defenses = [
+    "prompt-anonymity[styleremix]",
+    "prompt-anonymity[qwen]",
 ]
 
 [tool.setuptools.packages.find]
