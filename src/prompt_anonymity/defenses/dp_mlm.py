@@ -57,8 +57,14 @@ DPMLM_EPSILON = float(os.environ.get("DPMLM_EPSILON", "25"))
 #: Seed folded into the per-turn RNG so identical turns rewrite reproducibly (cache-safe).
 DPMLM_SEED = int(os.environ.get("DPMLM_SEED", "0"))
 
-#: MLM forward-pass batch size over masked positions (output-neutral; not in params()).
-DPMLM_BATCH_SIZE = int(os.environ.get("DPMLM_BATCH_SIZE", "16"))
+#: MLM forward-pass batch size over masked positions (output-neutral; not in params()). Default is
+#: sized for an A100 -- masked positions from all turns are pooled and length-sorted, and only the
+#: masked position is projected through the vocab head, so large batches fit easily.
+DPMLM_BATCH_SIZE = int(os.environ.get("DPMLM_BATCH_SIZE", "128"))
+
+#: Masked positions are processed in chunks of whole turns totalling ~this many positions, so peak
+#: memory stays bounded on a large unknown side while GPU batches still fill. Output-neutral.
+DPMLM_FLUSH_POSITIONS = int(os.environ.get("DPMLM_FLUSH_POSITIONS", "8192"))
 
 
 class _DPMLMBackend:
@@ -69,7 +75,8 @@ class _DPMLMBackend:
     this module never requires them.
     """
 
-    def __init__(self, *, model, clip_min, clip_max, epsilon, seed, concat, stop, pii, batch_size):
+    def __init__(self, *, model, clip_min, clip_max, epsilon, seed, concat, stop, pii, batch_size,
+                 flush_positions=DPMLM_FLUSH_POSITIONS):
         import nltk
         import torch
         from nltk.corpus import stopwords
@@ -91,6 +98,7 @@ class _DPMLMBackend:
         self.concat = bool(concat)
         self.stop_flag = bool(stop)  # STOP=True means "also privatize stopwords".
         self.batch_size = int(batch_size)
+        self.flush_positions = int(flush_positions)
 
         self.clip_min = float(clip_min)
         self.clip_max = float(clip_max)
@@ -100,6 +108,8 @@ class _DPMLMBackend:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer = AutoTokenizer.from_pretrained(model)
+        # Right-pad so a mask position computed on the unpadded ids stays valid after padding.
+        self.tokenizer.padding_side = "right"
         # Sliding-window budget: MLM context is halved by the CONCAT sentence pair, minus special
         # tokens (matches the reference's ``(model_max_length // 2) - 32``).
         self.max_context = (self.tokenizer.model_max_length // 2) - 32
@@ -109,6 +119,14 @@ class _DPMLMBackend:
         ).to(self.device)
         self.lm_model.eval()
         torch.set_grad_enabled(False)
+
+        # For the mask-position-only projection: run the encoder trunk, then send just the masked
+        # position's hidden state through the vocab head (RoBERTa ``lm_head`` / BERT ``cls``) --
+        # avoids projecting all ~512 positions through the 50k-vocab head and the multi-GB logits
+        # tensor. Falls back to full logits at runtime if a model doesn't fit this split.
+        self._trunk = self.lm_model.base_model
+        self._head = getattr(self.lm_model, "lm_head", None) or getattr(self.lm_model, "cls", None)
+        self._use_fast_head = self._head is not None
 
         self.analyzer = None
         if pii:
@@ -179,65 +197,48 @@ class _DPMLMBackend:
                 core = core[lo:hi]
         return prefix + core + suffix
 
-    # -- exponential-mechanism sampling over masked positions (verbatim math) ---------------------
+    # -- building masked inputs + batched MLM forward ---------------------------------------------
 
-    def _privatize_batch(self, tokens, indices):
-        """Return ``{"{word}_{idx}": replacement}`` for each word index, sampled via the
-        exponential mechanism over the MLM logits at each masked position."""
-        import numpy as np
+    def _build_input(self, tokens, idx):
+        """Encoded input ids for masking word ``idx`` of ``tokens`` (sliding window + CONCAT)."""
+        lower_w, upper_w = self.sliding_window(tokens, idx, self.max_context)
+        chunk_tokens = tokens[lower_w:upper_w]
+        rel_idx = idx - lower_w
 
+        masked_chunk = list(chunk_tokens)
+        masked_chunk[rel_idx] = self.tokenizer.mask_token
+
+        clean_sent = self.detokenizer.detokenize(chunk_tokens)
+        masked_sent = self.detokenizer.detokenize(masked_chunk)
+        return self._encode_masked(clean_sent, masked_sent)
+
+    def _mask_logits_batch(self, input_ids_list, mask_positions):
+        """Vocab logits at each masked position for a batch, as a ``[len(batch), vocab]`` numpy array.
+
+        Runs the encoder trunk once, then projects ONLY the masked position through the vocab head
+        (``lm_head``/``cls``) -- far cheaper than materializing ``[batch, seq, vocab]`` logits. Falls
+        back to a full forward (indexing the mask position out of the full logits) if the trunk/head
+        split doesn't work for the loaded model.
+        """
         torch = self._torch
-        predictions: dict[str, str] = {}
+        inputs = self.tokenizer.pad(
+            {"input_ids": input_ids_list}, padding=True, return_tensors="pt"
+        ).to(self.device)
+        mpos = torch.as_tensor(mask_positions, device=self.device)
+        rows = torch.arange(mpos.shape[0], device=self.device)
 
-        for k in range(0, len(indices), self.batch_size):
-            batch_indices = indices[k:k + self.batch_size]
-            batch_input_ids = []
-            batch_mask_positions = []
-
-            for idx in batch_indices:
-                lower_w, upper_w = self.sliding_window(tokens, idx, self.max_context)
-                chunk_tokens = tokens[lower_w:upper_w]
-                rel_idx = idx - lower_w
-
-                masked_chunk = list(chunk_tokens)
-                masked_chunk[rel_idx] = self.tokenizer.mask_token
-
-                clean_sent = self.detokenizer.detokenize(chunk_tokens)
-                masked_sent = self.detokenizer.detokenize(masked_chunk)
-
-                input_ids = self._encode_masked(clean_sent, masked_sent)
-
+        with torch.inference_mode():
+            if self._use_fast_head:
                 try:
-                    m_pos = input_ids.index(self.tokenizer.mask_token_id)
-                except ValueError:
-                    m_pos = 0  # fallback; word is left unchanged below.
-                batch_input_ids.append(input_ids)
-                batch_mask_positions.append(m_pos)
-
-            inputs = self.tokenizer.pad(
-                {"input_ids": batch_input_ids}, padding=True, return_tensors="pt"
-            ).to(self.device)
-            with torch.no_grad():
-                logits = self.lm_model(**inputs).logits  # [batch, seq, vocab]
-
-            for i, idx in enumerate(batch_indices):
-                target_word = tokens[idx]
-                m_pos = batch_mask_positions[i]
-                if m_pos == 0:  # mask token was truncated away -> keep original.
-                    predictions[f"{target_word}_{idx}"] = target_word
-                    continue
-
-                mask_logits = logits[i, m_pos].float().cpu().numpy()
-                mask_logits = np.clip(mask_logits, self.clip_min, self.clip_max)
-                # Exponential mechanism: Pr[v] ∝ exp(ε·u(v) / (2·Δu)).
-                mask_logits = mask_logits / (2 * self.sensitivity / self.epsilon)
-                shifted = mask_logits - np.max(mask_logits)  # softmax stability
-                scores = np.exp(shifted)
-                scores /= scores.sum()
-                chosen_idx = np.random.choice(len(scores), p=scores)
-                predictions[f"{target_word}_{idx}"] = self.tokenizer.decode(chosen_idx).strip()
-
-        return predictions
+                    hidden = self._trunk(
+                        input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]
+                    )[0]                                   # [batch, seq, hidden]
+                    logits = self._head(hidden[rows, mpos])  # [batch, vocab]
+                    return logits.float().cpu().numpy()
+                except Exception:
+                    self._use_fast_head = False  # one-time fallback for models that don't fit the split.
+            logits = self.lm_model(**inputs).logits      # [batch, seq, vocab]
+            return logits[rows, mpos].float().cpu().numpy()
 
     # -- PII detection (Presidio) -----------------------------------------------------------------
 
@@ -253,11 +254,11 @@ class _DPMLMBackend:
             placeholder_ranges.append((x.start, x.start + len(rep)))
         return sentence, placeholder_ranges
 
-    # -- per-turn rewriting -----------------------------------------------------------------------
+    # -- per-turn planning ------------------------------------------------------------------------
 
-    def _rewrite_one(self, text):
-        import numpy as np
-
+    def _plan_turn(self, text):
+        """``(sentence, tokens, indices)`` for a turn: word tokens and the content-word indices to
+        privatize (skipping stopwords/punctuation, and PII placeholders in ``pii`` mode)."""
         sentence = " ".join(str(text).split("\n"))
 
         pii_ranges = []
@@ -266,7 +267,7 @@ class _DPMLMBackend:
 
         tokens = self._nltk.word_tokenize(sentence)
         if not tokens:
-            return sentence
+            return sentence, [], []
 
         # Tokens overlapping a PII placeholder are kept verbatim (not DP-rewritten).
         pii_mask = [False] * len(tokens)
@@ -287,27 +288,101 @@ class _DPMLMBackend:
             if not self.stop_flag and tok.lower() in self.stop:
                 continue
             indices.append(i)
+        return sentence, tokens, indices
 
-        # Reproducible per-turn randomness: identical turn -> identical rewrite (cache-safe), while
-        # still sampling from the exponential-mechanism distribution. A *stable* hash is required --
-        # Python's builtin hash() is per-process randomized (PYTHONHASHSEED) and would desync the
-        # cache across runs/machines, so derive the seed from SHA-256 of the turn text + self.seed.
-        digest = hashlib.sha256(f"{self.seed}:{sentence}".encode("utf-8")).digest()
-        np.random.seed(int.from_bytes(digest[:4], "big"))
-        res = self._privatize_batch(tokens, indices)
+    # -- chunked, GPU-saturating rewriting --------------------------------------------------------
 
-        out = []
-        for i, tok in enumerate(tokens):
-            r = res.get(f"{tok}_{i}")
-            if r is None:  # skipped (stopword/punct/PII) -> keep as-is.
-                out.append(tok)
-                continue
-            # Restore the original word's capitalization.
-            out.append(r.capitalize() if tok[:1].isupper() else r.lower())
-        return self.detokenizer.detokenize(out)
+    def _process_chunk(self, chunk, outputs, progress=None):
+        """Rewrite a chunk of planned turns, writing results into ``outputs`` by turn position.
+
+        Phase 1 (CPU): build every masked input in the chunk. Phase 2 (GPU): length-sort and run the
+        MLM in full batches, keeping only the masked position's logits. Phase 3 (CPU): per-turn
+        seeded exponential-mechanism sampling + reassembly -- identical to the per-word path, so
+        output does not depend on how positions were batched.
+        """
+        import numpy as np
+
+        mask_id = self.tokenizer.mask_token_id
+
+        # Phase 1: build masked inputs for every position in the chunk.
+        chunk_positions = sum(len(indices) for _ti, _s, _tok, indices in chunk)
+        flat_ids, flat_mpos, flat_meta = [], [], []
+        for pos, (_ti, _sentence, tokens, indices) in enumerate(chunk):
+            for idx in indices:
+                input_ids = self._build_input(tokens, idx)
+                try:
+                    m_pos = input_ids.index(mask_id)
+                except ValueError:
+                    continue  # mask truncated away -> keep original (no forward, no draw).
+                flat_ids.append(input_ids)
+                flat_mpos.append(m_pos)
+                flat_meta.append((pos, idx))
+        if progress is not None:  # count the kept-original positions (never forwarded) up front.
+            progress.update(chunk_positions - len(flat_ids))
+
+        # Phase 2: length-sorted batches through the MLM; store logits per (chunk position, word idx).
+        logits_by_meta: dict = {}
+        order = sorted(range(len(flat_ids)), key=lambda j: len(flat_ids[j]))
+        for b in range(0, len(order), self.batch_size):
+            sel = order[b:b + self.batch_size]
+            arr = self._mask_logits_batch([flat_ids[j] for j in sel], [flat_mpos[j] for j in sel])
+            for row, j in enumerate(sel):
+                logits_by_meta[flat_meta[j]] = arr[row]
+            if progress is not None:
+                progress.update(len(sel))
+
+        # Phase 3: per-turn seeded sampling (same order/seed as the reference per-word loop).
+        scale = 2 * self.sensitivity / self.epsilon
+        for pos, (ti, sentence, tokens, indices) in enumerate(chunk):
+            # Stable per-turn seed (builtin hash() is per-process randomized -> would desync the cache).
+            digest = hashlib.sha256(f"{self.seed}:{sentence}".encode("utf-8")).digest()
+            np.random.seed(int.from_bytes(digest[:4], "big"))
+
+            repl: dict = {}
+            for idx in indices:
+                ml = logits_by_meta.get((pos, idx))
+                if ml is None:  # mask was truncated away -> keep original.
+                    continue
+                # Exponential mechanism: Pr[v] ∝ exp(ε·u(v) / (2·Δu)).
+                ml = np.clip(ml, self.clip_min, self.clip_max) / scale
+                scores = np.exp(ml - np.max(ml))  # softmax (shift for stability)
+                scores /= scores.sum()
+                repl[idx] = self.tokenizer.decode(int(np.random.choice(len(scores), p=scores))).strip()
+
+            out = []
+            for i, tok in enumerate(tokens):
+                r = repl.get(i)
+                if r is None:  # skipped/kept -> original word, original case.
+                    out.append(tok)
+                else:  # restore the original word's capitalization.
+                    out.append(r.capitalize() if tok[:1].isupper() else r.lower())
+            outputs[ti] = self.detokenizer.detokenize(out)
 
     def rewrite_batch(self, texts):
-        return [self._rewrite_one(t) for t in texts]
+        from tqdm.auto import tqdm
+
+        outputs: list = [None] * len(texts)
+
+        # Plan all turns; accumulate whole turns into a chunk until it holds ~flush_positions masked
+        # positions, so peak memory is bounded but GPU batches still fill.
+        plans = [self._plan_turn(t) for t in texts]
+        total_positions = sum(len(indices) for _s, _tok, indices in plans)
+
+        progress = tqdm(total=total_positions, desc="DP-MLM words", unit="word", leave=False)
+        chunk, chunk_positions = [], 0
+        for ti, (sentence, tokens, indices) in enumerate(plans):
+            if not tokens:
+                outputs[ti] = sentence
+                continue
+            chunk.append((ti, sentence, tokens, indices))
+            chunk_positions += len(indices)
+            if chunk_positions >= self.flush_positions:
+                self._process_chunk(chunk, outputs, progress)
+                chunk, chunk_positions = [], 0
+        if chunk:
+            self._process_chunk(chunk, outputs, progress)
+        progress.close()
+        return outputs
 
 
 class DPMLMDefense(PerTurnBatchRewriteDefense):
