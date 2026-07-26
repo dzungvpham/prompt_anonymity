@@ -193,6 +193,40 @@ def main() -> None:
     # Attack -> distance matrix -> ranking reused by both the headline table and sweep.
     distances = run_attack(args.attack, data)
     ranking = LinkageRanking(distances, data.known_labels, data.unknown_labels)
+        # Save individual nearest-neighbor matches for qualitative/topic analysis
+    import pandas as pd
+
+    predictions = []
+
+    for u in range(len(data.unknown_labels)):
+        true_identity = data.unknown_labels[u]
+
+        # ranked known conversations (identity codes)
+        ranked_codes = ranking._ranked_known_codes[u]
+
+        seen = set()
+        rank = 1
+
+        for code in ranked_codes:
+            identity = ranking._identities[code]
+
+            # keep first occurrence of each identity only
+            if identity not in seen:
+                predictions.append(
+                    {
+                        "unknown_index": u,
+                        "true_identity": true_identity,
+                        "predicted_identity": identity,
+                        "rank": rank,
+                        "correct": identity == true_identity,
+                    }
+                )
+
+                seen.add(identity)
+                rank += 1
+
+            if rank > 10:
+                break
     headline = headline_accuracy(ranking, top_ks=tuple(args.top_ks))
     print("\nHeadline (full pool):")
     for _, row in headline.iterrows():
@@ -208,6 +242,12 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "experiments" / "results" / output_tag(args)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(predictions).to_csv(
+        output_dir / "predictions.csv",
+        index=False
+    )
+
     headline.to_csv(output_dir / "headline_results.csv", index=False)
     sweep.to_csv(output_dir / "sweep_results.csv", index=False)
 
