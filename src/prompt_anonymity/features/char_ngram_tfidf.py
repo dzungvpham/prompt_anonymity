@@ -14,13 +14,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
 
 from .base import Featurizer
-
+from sklearn.preprocessing import normalize
 
 class CharNgramTfidfFeaturizer(Featurizer):
     """TF-IDF over character n-grams, reduced to a fixed-length dense vector via SVD."""
 
     name = "char_ngram_tfidf"
-    version = "1"
+    version = "2"
     metric = "cosine"
 
     def __init__(self, ngram_range=(3, 4), max_features=5000, n_components=128, seed=47):
@@ -42,15 +42,25 @@ class CharNgramTfidfFeaturizer(Featurizer):
         texts = [t or "" for t in texts]
 
         if self._vectorizer is None:
-            # Fit once on the batch passed in (typically all known+unknown texts for
-            # a run); subsequent calls with the same texts reuse the cache in base.py.
             self._vectorizer = TfidfVectorizer(
-                analyzer="char_wb", ngram_range=self.ngram_range, max_features=self.max_features
+                analyzer="char_wb",
+                ngram_range=self.ngram_range,
+                max_features=self.max_features,
             )
             tfidf = self._vectorizer.fit_transform(texts)
-            n_components = min(self.n_components, tfidf.shape[1] - 1, tfidf.shape[0] - 1)
-            self._svd = TruncatedSVD(n_components=n_components, random_state=self.seed)
-            return self._svd.fit_transform(tfidf)
+            n_components = min(
+                self.n_components,
+                tfidf.shape[1] - 1,
+                tfidf.shape[0] - 1,
+            )
+            self._svd = TruncatedSVD(
+                n_components=n_components,
+                random_state=self.seed,
+            )
+
+            vecs = self._svd.fit_transform(tfidf)
+            return normalize(vecs, norm="l2")
 
         tfidf = self._vectorizer.transform(texts)
-        return self._svd.transform(tfidf)
+        vecs = self._svd.transform(tfidf)
+        return normalize(vecs, norm="l2")
