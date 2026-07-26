@@ -363,7 +363,7 @@ class IndexedRowCache:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
-    def apply(self, label: str, sources, compute, *, ids=None) -> list:
+    def apply(self, label: str, sources, compute, *, ids=None, checkpoint_every=None) -> list:
         """Return one output per source (in order), recomputing only rows whose ``source`` changed.
 
         Parameters
@@ -375,18 +375,25 @@ class IndexedRowCache:
             The reference-ordered source rows (e.g. conversation texts).
         compute : callable
             ``compute(missing_sources) -> outputs`` over the DISTINCT cache-missing sources, in
-            order, one text output each. Called at most once, and not at all when every row is
-            cached. Duplicate missing sources are computed once.
+            order, one text output each. Called once when ``checkpoint_every`` is None, else once per
+            batch of that many distinct sources. Not called at all when every row is cached.
         ids : sequence, optional
             The originating dataset's identifier for each row (SWE-chat ``session_id``, WildChat
             ``idx``), used as the cache key and written to the table's ``id`` column. Defaults to
             each row's position when the loader carries no ids.
+        checkpoint_every : int, optional
+            When set, compute the distinct missing sources in batches of this size and flush the
+            completed rows to disk after each batch, so a long producer (e.g. DP-MLM, hours of
+            per-word work) is crash-safe and RESUMABLE: a killed run re-run picks up where it left
+            off because the already-written rows come back as hits. ``None`` (default) keeps the
+            original single-compute, single-write behaviour.
         """
         sources = [str(s) for s in sources]
         ids = [str(i) for i in ids] if ids is not None else [str(i) for i in range(len(sources))]
         if len(ids) != len(sources):
             raise ValueError(f"ids has {len(ids)} entries but sources has {len(sources)}.")
-        cached_by_id, cached_by_position = self._read_table(self._table_path(label))
+        path = self._table_path(label)
+        cached_by_id, cached_by_position = self._read_table(path)
 
         outputs: list = [None] * len(sources)
         missing_positions: list = []
@@ -399,24 +406,50 @@ class IndexedRowCache:
             else:
                 missing_positions.append(i)
 
-        # Compute distinct missing sources once, preserving first-appearance order.
+        # Compute distinct missing sources (once, or in checkpointed batches), first-appearance order.
         distinct: dict = {}
         for i in missing_positions:
             distinct.setdefault(sources[i], None)
         if distinct:
-            results = list(compute(list(distinct)))
-            if len(results) != len(distinct):
-                raise ValueError(
-                    f"compute returned {len(results)} outputs for {len(distinct)} distinct sources."
-                )
-            computed = dict(zip(distinct, results))
+            distinct_list = list(distinct)
+            step = checkpoint_every if checkpoint_every and checkpoint_every > 0 else len(distinct_list)
+            computed: dict = {}
+            for start in range(0, len(distinct_list), step):
+                batch = distinct_list[start:start + step]
+                results = list(compute(batch))
+                if len(results) != len(batch):
+                    raise ValueError(
+                        f"compute returned {len(results)} outputs for {len(batch)} distinct sources."
+                    )
+                computed.update(zip(batch, results))
+                if step < len(distinct_list):  # intermediate checkpoint: only rows done so far.
+                    self._write_checkpoint(path, ids, sources, outputs, computed)
             for i in missing_positions:
                 outputs[i] = str(computed[sources[i]])
 
         self.misses = len(distinct)                         # distinct rows actually computed
         self.hits = len(sources) - len(missing_positions)   # rows served from disk
-        self._write_table(self._table_path(label), ids, sources, outputs)
+        self._write_table(path, ids, sources, outputs)
         return outputs
+
+    def _write_checkpoint(self, path: Path, ids, sources, outputs, computed) -> None:
+        """Write only the rows finished so far (cached hits + freshly computed), omitting the rest.
+
+        Omitting not-yet-done rows (rather than writing them blank) is what makes resume correct: on
+        re-run a missing row is simply absent from the table and gets recomputed, while a genuinely
+        empty output is present and read back as a hit."""
+        ck_ids, ck_sources, ck_outputs = [], [], []
+        for row_id, source, output in zip(ids, sources, outputs):
+            if output is not None:
+                value = output
+            elif source in computed:
+                value = str(computed[source])
+            else:
+                continue  # not done yet -> leave it out so it recomputes on resume.
+            ck_ids.append(row_id)
+            ck_sources.append(source)
+            ck_outputs.append(value)
+        self._write_table(path, ck_ids, ck_sources, ck_outputs)
 
 
 __all__ = [

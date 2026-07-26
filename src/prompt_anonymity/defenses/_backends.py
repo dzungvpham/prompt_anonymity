@@ -115,6 +115,11 @@ class PerTurnBatchRewriteDefense(CachedDefense):
     #: conversations are left as released).
     rewrite_known: bool = False
 
+    #: When set, flush finished conversations to the cache every this many computed conversations, so
+    #: a long/expensive backend is crash-safe and resumable (see :meth:`IndexedRowCache.apply`).
+    #: ``None`` keeps the default single-write-at-the-end behaviour used by the fast rewriters.
+    checkpoint_every: int | None = None
+
     def rewrite_batch(self, texts: list[str]) -> list[str]:
         """Rewrite a list of turns, returning one output per input in order. Implemented by
         subclasses; called only on the cache-missing, de-duplicated, non-blank turns."""
@@ -138,7 +143,10 @@ class PerTurnBatchRewriteDefense(CachedDefense):
         # Cache per conversation, keyed by the originating dataset's row id (SWE-chat session_id,
         # WildChat idx); the compute for cache-missing conversations runs the backend per turn
         # across all of them at once.
-        outputs = cache.apply(label, [str(t) for t in texts], self._defend_conversations, ids=ids)
+        outputs = cache.apply(
+            label, [str(t) for t in texts], self._defend_conversations, ids=ids,
+            checkpoint_every=self.checkpoint_every,
+        )
         return np.asarray(outputs, dtype=object)
 
     def _defend_conversations(self, conversations: list[str]) -> list[str]:

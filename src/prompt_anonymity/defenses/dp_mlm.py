@@ -66,6 +66,10 @@ DPMLM_BATCH_SIZE = int(os.environ.get("DPMLM_BATCH_SIZE", "128"))
 #: memory stays bounded on a large unknown side while GPU batches still fill. Output-neutral.
 DPMLM_FLUSH_POSITIONS = int(os.environ.get("DPMLM_FLUSH_POSITIONS", "8192"))
 
+#: Flush finished conversations to the cache every this many, so this multi-hour defense is crash-
+#: safe and resumable (a killed run picks up from the last checkpoint). Output-neutral.
+DPMLM_CHECKPOINT_EVERY = int(os.environ.get("DPMLM_CHECKPOINT_EVERY", "200"))
+
 
 class _DPMLMBackend:
     """Faithful port of the reference ``DPMLM`` class, trimmed to core + optional PII.
@@ -411,6 +415,7 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
 
     name = "dp_mlm"
     version = "1"
+    checkpoint_every = DPMLM_CHECKPOINT_EVERY  # crash-safe/resumable: flush every N conversations.
 
     def __init__(self, *, model: str = DPMLM_MODEL, epsilon: float = DPMLM_EPSILON,
                  clip_min: float = DPMLM_CLIP_MIN, clip_max: float = DPMLM_CLIP_MAX,
