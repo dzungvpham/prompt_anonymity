@@ -138,6 +138,41 @@ class _DPMLMBackend:
         upper = min(length, upper)
         return int(lower), int(upper)
 
+    def _encode_masked(self, clean_sent, masked_sent):
+        """Build the MLM input ids for one masked position, never raising and keeping the ``<mask>``.
+
+        The reference uses ``truncation="only_first"`` on the ``(clean, masked)`` pair so the masked
+        (second) segment is protected -- but that raises "Sequence to truncate too short" when the
+        masked segment alone exceeds ``model_max_length`` (real on WildChat, where one NLTK "word"
+        can be a long URL / raw ``<svg ...>`` blob that explodes into hundreds of subwords). We keep
+        the reference pair path for the normal case and, on overflow, fall back to a single sequence
+        truncated to a window *centered on the mask* so the mask always survives.
+        """
+        tok = self.tokenizer
+        max_len = tok.model_max_length
+
+        if self.concat:
+            try:
+                return tok.encode(
+                    " " + clean_sent, " " + masked_sent, add_special_tokens=True,
+                    truncation="only_first", max_length=max_len,
+                )
+            except Exception:
+                pass  # masked segment alone too long for the pair -> mask-centered fallback below.
+
+        core = tok.encode(" " + masked_sent, add_special_tokens=False)
+        budget = max_len - tok.num_special_tokens_to_add(pair=False)  # room for the model's specials.
+        if len(core) > budget:
+            try:
+                mpos = core.index(tok.mask_token_id)
+            except ValueError:
+                core = core[:budget]  # no mask (shouldn't happen) -> plain head truncation.
+            else:
+                hi = min(len(core), mpos + budget // 2)
+                lo = max(0, hi - budget)
+                core = core[lo:hi]
+        return tok.build_inputs_with_special_tokens(core)  # adds bos/eos (RoBERTa) or cls/sep (BERT).
+
     # -- exponential-mechanism sampling over masked positions (verbatim math) ---------------------
 
     def _privatize_batch(self, tokens, indices):
@@ -164,16 +199,7 @@ class _DPMLMBackend:
                 clean_sent = self.detokenizer.detokenize(chunk_tokens)
                 masked_sent = self.detokenizer.detokenize(masked_chunk)
 
-                if self.concat:
-                    input_ids = self.tokenizer.encode(
-                        " " + clean_sent, " " + masked_sent, add_special_tokens=True,
-                        truncation="only_first", max_length=self.tokenizer.model_max_length,
-                    )
-                else:
-                    input_ids = self.tokenizer.encode(
-                        " " + masked_sent, add_special_tokens=True, truncation=True,
-                        max_length=self.tokenizer.model_max_length,
-                    )
+                input_ids = self._encode_masked(clean_sent, masked_sent)
 
                 try:
                     m_pos = input_ids.index(self.tokenizer.mask_token_id)
