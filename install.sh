@@ -163,14 +163,19 @@ pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 #                build (needing CUDA_HOME / the CUDA toolkit, not just a driver) when no prebuilt
 #                wheel matches your CUDA version. Installed separately and non-fatally so a vllm
 #                build failure can't take peft/transformers down with it.
-#   [dpmlm]      nltk (on top of [styleremix]'s torch/transformers) for dp_mlm.py. Plain wheels;
-#                the NLTK data files it needs are fetched right after. The dp_mlm_pii variant's
-#                Presidio/spaCy deps ([dpmlm-pii]) are NOT auto-installed here -- install manually if
-#                you need them: pip install -e .[dpmlm-pii] && python -m spacy download en_core_web_lg
+#   [dpmlm]      nltk (on top of [styleremix]'s torch/transformers) for dp_mlm.py (--defense dp_mlm).
+#                Plain wheels; the NLTK data files it needs are fetched right after.
+#   [dpmlm-pii]  presidio-analyzer + spaCy for the --defense dp_mlm_pii variant's PII detection.
+#                Heavier (Presidio needs a spaCy pipeline; we fetch en_core_web_lg, its default);
+#                installed separately and non-fatally so a failure can't take the rest down. Only
+#                needed for dp_mlm_pii -- plain dp_mlm does not use it.
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
 STYLEREMIX_EXTRA="without"
 QWEN_EXTRA="without"
 DPMLM_EXTRA="without"
+DPMLM_PII_EXTRA="without"
+FEATURES_EXTRA="without"
+ARGOS_EXTRA="without"
 case "$ACCEL" in
   cuda12x|cuda13x)
     pip_install -e "$SCRIPT_DIR[styleremix]" -c "$CONSTRAINTS_FILE"
@@ -187,13 +192,30 @@ case "$ACCEL" in
     log "Downloading NLTK data for dp_mlm.py (punkt, stopwords, wordnet) ..."
     "$PYTHON" -m nltk.downloader -q punkt punkt_tab stopwords wordnet || \
       warn "NLTK data download failed; dp_mlm.py will retry it lazily on first use (needs network)."
+    # style_distance featurizer: sentence-transformers (reuses torch from [styleremix]).
+    pip_install -e "$SCRIPT_DIR[features]" -c "$CONSTRAINTS_FILE"
+    FEATURES_EXTRA="with"
+    # rtt_argos defense: argostranslate. Non-fatal -- other defenses are unaffected.
+    if pip_install -e "$SCRIPT_DIR[argos]" -c "$CONSTRAINTS_FILE"; then
+      ARGOS_EXTRA="with"
+    else
+      warn "the [argos] extra (argostranslate) failed to install -- --defense rtt_argos won't work."
+    fi
+    # dp_mlm_pii only: Presidio + its default spaCy model. Non-fatal -- plain dp_mlm is unaffected.
+    if pip_install -e "$SCRIPT_DIR[dpmlm-pii]" -c "$CONSTRAINTS_FILE" \
+       && "$PYTHON" -m spacy download en_core_web_lg; then
+      DPMLM_PII_EXTRA="with"
+    else
+      warn "the [dpmlm-pii] extra (presidio-analyzer/spaCy en_core_web_lg) failed to install --"
+      warn "  --defense dp_mlm_pii won't work, but --defense dp_mlm is unaffected."
+    fi
     ;;
   *)
-    warn "accelerator '$ACCEL' has no CUDA; skipping the [styleremix]/[qwen]/[dpmlm] extras."
-    warn "run 'pip install -e .[styleremix] -c <constraints>' manually if you need styleremix here."
+    warn "accelerator '$ACCEL' has no CUDA; skipping the GPU extras ([styleremix]/[qwen]/[dpmlm]/[dpmlm-pii]/[features]/[argos])."
+    warn "run 'pip install -e .[all] -c <constraints>' manually if you need them here."
     pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
 esac
 
 log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm])."
+log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm], $DPMLM_PII_EXTRA [dpmlm-pii], $FEATURES_EXTRA [features], $ARGOS_EXTRA [argos])."
 log "See README.md for running the pipeline."

@@ -20,6 +20,10 @@ dependencies = [
     "python-dotenv",
     "tqdm",
     "xgboost>=3.3.0",
+    # Remote-API HTTP + token counting for the OpenAnonymity defense and the fidelity judge
+    # (both lazy-import these, so a missing wheel only crashes when that path is actually used).
+    "requests",
+    "tiktoken",
 ]
 
 [project.optional-dependencies]
@@ -56,10 +60,28 @@ dpmlm-pii = [
     "presidio-analyzer",
     "spacy",
 ]
+# argos.py: the rtt_argos round-trip-translation defense (offline; downloads language models at
+# runtime). Lazy-imported, so only --defense rtt_argos needs it.
+argos = [
+    "argostranslate",
+]
+# style_distance.py: the style_distance featurizer (StyleDistance sentence-transformer embeddings).
+# Reuses torch from [styleremix]; lazy-imported so only --featurizer style_distance needs it.
+features = [
+    "prompt-anonymity[styleremix]",
+    "sentence-transformers",
+]
 defenses = [
     "prompt-anonymity[styleremix]",
     "prompt-anonymity[qwen]",
     "prompt-anonymity[dpmlm]",
+    "prompt-anonymity[argos]",
+]
+# Everything: all defenses + the model-backed featurizer + the PII variant. The one-shot extra.
+all = [
+    "prompt-anonymity[defenses]",
+    "prompt-anonymity[features]",
+    "prompt-anonymity[dpmlm-pii]",
 ]
 
 [tool.setuptools.packages.find]

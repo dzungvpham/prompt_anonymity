@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
 
 from .base import Featurizer
 
@@ -17,6 +15,12 @@ class StyleDistanceFeaturizer(Featurizer):
 
     def featurize(self, texts) -> np.ndarray:
         if self._model is None:
+            # Imported lazily (like the model-backed defenses) so importing the features registry
+            # never requires torch / sentence-transformers -- only selecting this featurizer does.
+            # Needs the [features] extra (see pyproject.toml / install.sh).
+            import torch
+            from sentence_transformers import SentenceTransformer
+
             device = "cuda" if torch.cuda.is_available() else "cpu"
             self._model = SentenceTransformer(
                 "StyleDistance/styledistance",
