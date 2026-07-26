@@ -46,6 +46,7 @@ from .character import CharacterStatisticsFeaturizer
 from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidfFeaturizer
+from .style_distance import StyleDistanceFeaturizer
 
 # Registry of featurizer classes, selectable by name (e.g. from a CLI argument). Values are
 # classes (not instances) because a featurizer may need configuration -- e.g. StyloMetrix's
@@ -55,6 +56,7 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "character_statistics": CharacterStatisticsFeaturizer,
     "function_words": FunctionWordFeaturizer,
     "char_ngram_tfidf": CharNgramTfidfFeaturizer,
+    "style_distance": StyleDistanceFeaturizer,
 }
 
 # A loaded AttackData carries committed features for exactly one representation (StyloMetrix
@@ -215,5 +217,6 @@ __all__ = [
     "FEATURIZERS",
     "get_featurizer",
     "apply_featurizer",
+    "StyleDistanceFeaturizer",
     "_REFERENCE_FEATURE",
 ]
