@@ -163,9 +163,14 @@ pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 #                build (needing CUDA_HOME / the CUDA toolkit, not just a driver) when no prebuilt
 #                wheel matches your CUDA version. Installed separately and non-fatally so a vllm
 #                build failure can't take peft/transformers down with it.
+#   [dpmlm]      nltk (on top of [styleremix]'s torch/transformers) for dp_mlm.py. Plain wheels;
+#                the NLTK data files it needs are fetched right after. The dp_mlm_pii variant's
+#                Presidio/spaCy deps ([dpmlm-pii]) are NOT auto-installed here -- install manually if
+#                you need them: pip install -e .[dpmlm-pii] && python -m spacy download en_core_web_lg
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
 STYLEREMIX_EXTRA="without"
 QWEN_EXTRA="without"
+DPMLM_EXTRA="without"
 case "$ACCEL" in
   cuda12x|cuda13x)
     pip_install -e "$SCRIPT_DIR[styleremix]" -c "$CONSTRAINTS_FILE"
@@ -177,13 +182,18 @@ case "$ACCEL" in
       warn "vllm often needs CUDA_HOME set to your CUDA toolkit to build from source; see its docs."
       warn "styleremix.py is unaffected: its [styleremix] extra installed separately above."
     fi
+    pip_install -e "$SCRIPT_DIR[dpmlm]" -c "$CONSTRAINTS_FILE"
+    DPMLM_EXTRA="with"
+    log "Downloading NLTK data for dp_mlm.py (punkt, stopwords, wordnet) ..."
+    "$PYTHON" -m nltk.downloader -q punkt punkt_tab stopwords wordnet || \
+      warn "NLTK data download failed; dp_mlm.py will retry it lazily on first use (needs network)."
     ;;
   *)
-    warn "accelerator '$ACCEL' has no CUDA; skipping the [styleremix]/[qwen] extras (vllm needs Linux+CUDA)."
+    warn "accelerator '$ACCEL' has no CUDA; skipping the [styleremix]/[qwen]/[dpmlm] extras."
     warn "run 'pip install -e .[styleremix] -c <constraints>' manually if you need styleremix here."
     pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
 esac
 
 log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen])."
+log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm])."
 log "See README.md for running the pipeline."

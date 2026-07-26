@@ -42,9 +42,24 @@ qwen = [
     "vllm",
     "llama-cpp-python",
 ]
+# dp_mlm.py: DP-MLM rewriting. Reuses torch/transformers from [styleremix]; adds nltk for the
+# word tokenizer/detokenizer + stopwords (NLTK data is fetched lazily on first backend build).
+dpmlm = [
+    "prompt-anonymity[styleremix]",
+    "nltk",
+]
+# The --defense dp_mlm_pii variant only: Presidio + spaCy for PII entity detection. Kept separate
+# so the core DP-MLM defense stays lightweight. Install a spaCy model too, e.g.
+# `python -m spacy download en_core_web_lg`.
+dpmlm-pii = [
+    "prompt-anonymity[dpmlm]",
+    "presidio-analyzer",
+    "spacy",
+]
 defenses = [
     "prompt-anonymity[styleremix]",
     "prompt-anonymity[qwen]",
+    "prompt-anonymity[dpmlm]",
 ]
 
 [tool.setuptools.packages.find]

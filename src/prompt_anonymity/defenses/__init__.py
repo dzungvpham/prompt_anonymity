@@ -21,6 +21,7 @@ from ..caching import IndexedRowCache, TransformCache, logic_hash, params_hash, 
 from ..core import AttackData
 from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
+from .dp_mlm import DPMLMDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .openanonymity import OpenAnonymityDefense
 from .qwen_rewrite import QwenRewriteDefense
@@ -49,6 +50,8 @@ DEFENSES: dict[str, Defense] = {
     "styleremix": StyleRemixDefense(),
     "openanonymity": OpenAnonymityDefense(),
     "styleremix_openanon": StyleRemixOpenAnonymityDefense(),
+    "dp_mlm": DPMLMDefense(),
+    "dp_mlm_pii": DPMLMDefense(pii=True),
 }
 
 
@@ -93,4 +96,5 @@ __all__ = [
     "StyleRemixDefense",
     "OpenAnonymityDefense",
     "StyleRemixOpenAnonymityDefense",
+    "DPMLMDefense",
 ]
