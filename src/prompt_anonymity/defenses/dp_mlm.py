@@ -160,8 +160,14 @@ class _DPMLMBackend:
             except Exception:
                 pass  # masked segment alone too long for the pair -> mask-centered fallback below.
 
+        # Leading/trailing special-token ids: RoBERTa uses bos/eos, BERT uses cls/sep.
+        bos = tok.bos_token_id if tok.bos_token_id is not None else tok.cls_token_id
+        eos = tok.eos_token_id if tok.eos_token_id is not None else tok.sep_token_id
+        prefix = [bos] if bos is not None else []
+        suffix = [eos] if eos is not None else []
+
         core = tok.encode(" " + masked_sent, add_special_tokens=False)
-        budget = max_len - tok.num_special_tokens_to_add(pair=False)  # room for the model's specials.
+        budget = max_len - len(prefix) - len(suffix)  # room for the specials we add back.
         if len(core) > budget:
             try:
                 mpos = core.index(tok.mask_token_id)
@@ -171,7 +177,7 @@ class _DPMLMBackend:
                 hi = min(len(core), mpos + budget // 2)
                 lo = max(0, hi - budget)
                 core = core[lo:hi]
-        return tok.build_inputs_with_special_tokens(core)  # adds bos/eos (RoBERTa) or cls/sep (BERT).
+        return prefix + core + suffix
 
     # -- exponential-mechanism sampling over masked positions (verbatim math) ---------------------
 
