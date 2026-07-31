@@ -231,6 +231,7 @@ experiments/results/
 *.csv
 *.npz
 .claude/
+data/hf/
 
 !wildchat_filtered_en_2048_stylometrix.csv
 DS_env/datasets
