@@ -86,3 +86,9 @@ all = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Non-Python files the package reads at runtime: the dataset build's default source locations
+# (prompt_anonymity/data/datasets.toml) and the user-agent -> device map WildChat identities are
+# built from. Without this they are missing from an installed (non-editable) copy.
+[tool.setuptools.package-data]
+"prompt_anonymity.data" = ["datasets.toml", "resources/*.json"]

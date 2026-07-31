@@ -63,8 +63,8 @@ import pandas as pd
 from lingua import Language, LanguageDetector, LanguageDetectorBuilder
 from tqdm import tqdm
 
-DATA_DIR = Path(__file__).parent
-DIST_DIR = DATA_DIR / "dist"
+from .config import dist_dir
+
 
 # Candidate languages: the ones that appear in SWE-chat's existing labels, plus common world
 # languages an unlabeled prompt might be in. Restricting the set (vs. all ~75 Lingua supports)
@@ -351,7 +351,7 @@ def add_secondary_languages(
 
 def main() -> None:
     """Report the language columns of ``dist/swe_chat.parquet`` (post-build), or a dry-run resolve."""
-    swe = pd.read_parquet(DIST_DIR / "swe_chat.parquet")
+    swe = pd.read_parquet(dist_dir() / "swe_chat.parquet")
     if "language_primary" in swe.columns:
         prim = swe["language_primary"].fillna("<none>").value_counts()
         n_sec = int(swe["language_secondary"].notna().sum())

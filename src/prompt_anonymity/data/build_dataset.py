@@ -23,7 +23,7 @@ response in between, very long, or a value that recurs often); see
 :func:`dedup_consecutive_turns`. WildChat needs no such step -- its turns strictly alternate
 with the model's replies, so it has no consecutive-duplicate-turn artifacts.
 
-The language stage is likewise per-source (see ``data/language_detection.py``): SWE-chat is fully
+The language stage is likewise per-source (see ``prompt_anonymity/data/language_detection.py``): SWE-chat is fully
 re-detected because its upstream labels are unreliable, while WildChat keeps its trusted upstream
 primary and has only a *secondary* language detected (it ships one language per conversation). That
 WildChat secondary pass used to be a separate follow-up script run against the built parquet; it is
@@ -39,7 +39,7 @@ filter, not a length filter).
 Design choices worth knowing:
 
 * **WildChat inclusion.** Every browser-sent conversation on the studied models
-  (:data:`data.sources_wildchat.WILDCHAT_MODELS`) is kept. The models are pooled with no roles
+  (:data:`prompt_anonymity.data.sources_wildchat.WILDCHAT_MODELS`) is kept. The models are pooled with no roles
   attached -- none is the "known" side and none the "unknown" side -- and the old "identity used
   >=2 distinct models" rule is dropped, so single-model users are retained. Conversations posted
   by HTTP clients rather than typed into a browser are dropped at load time (``--keep-
@@ -64,7 +64,15 @@ with ``--workers``, defaulting to the CPUs this job may actually use (see
 :mod:`prompt_anonymity.resources` -- on a shared cluster that is well below the machine's
 core count).
 
-Run ``python -m data.build_dataset --help`` (from the repo root) for options.
+**Where the data comes from and goes.** Neither location is hard-coded: each source's raw
+upstream data is resolved by :func:`prompt_anonymity.data.config.raw_path` -- a local copy if one
+is configured (``$PROMPT_ANONYMITY_WILDCHAT_RAW`` / ``$PROMPT_ANONYMITY_SWE_CHAT_RAW``, or a
+``path`` in ``datasets.toml``), otherwise downloaded from HuggingFace at the pinned revision --
+and is resolved *only for the sources being built*, so a SWE-chat-only run never touches
+WildChat. The built parquets go to ``--out-dir``, by default the project's ``data/dist``
+(:func:`prompt_anonymity.data.config.dist_dir`).
+
+Run ``python -m prompt_anonymity.data.build_dataset --help`` for options.
 """
 
 from __future__ import annotations
@@ -81,6 +89,7 @@ from tqdm import tqdm
 
 from prompt_anonymity.resources import available_cpus
 
+from .config import dist_dir, raw_path
 from .dedup import MAX_PER_AFFIX, MIN_AFFIX_LEN, deduplicate
 from .identity import hash_author_id, load_ua_device_map
 from .language_detection import (
@@ -93,9 +102,6 @@ from .language_detection import (
 from .sources_swe_chat import is_scaffolding_turn, load_swe_chat_documents
 from .sources_wildchat import WILDCHAT_MODELS, load_wildchat_documents
 from .text_cleaning import clean_prompt
-
-WILDCHAT_RAW = "/datasets/ai/allenai/hub/datasets--allenai--WildChat-4.8M/snapshots/c827c6df8fcf008219ffaffa4d1dd77491099367/data"
-SWE_CHAT_RAW = "/datasets/ai/salt-nlp/hub/datasets--SALT-NLP--SWE-chat/snapshots/f66cca95b14caaa4177f7ed5eaa424608dadcffa/conversations.parquet"
 
 FINAL_COLUMNS = [
     "doc_id", "source", "author_id",
@@ -168,7 +174,7 @@ def _clean_document(args):
 # Columns consumed by the cleaning stage and dead afterwards. Dropped as soon as ``turns`` exists
 # so the corpus text is not held twice (raw + cleaned) through the stages that follow -- at
 # WildChat's scale the raw copy is many GiB, and the next stage (dedup) allocates a third copy of
-# its own. :mod:`data.validate_dataset` separately asserts none of these reach the output.
+# its own. :mod:`prompt_anonymity.data.validate_dataset` separately asserts none of these reach the output.
 _CLEANING_INPUT_COLUMNS = ("turns_raw", "is_command", "repo_id", "user_id")
 
 
@@ -215,10 +221,15 @@ def _uniquify_doc_ids(doc_id: pd.Series) -> pd.Series:
 # small named function is what lets the per-source builder share the pipeline end to end.
 
 def load_source(
-    source: str, *, wildchat_raw: str, swe_raw: str, ua_map: dict | None,
+    source: str, *, wildchat_raw: str | None, swe_raw: str | None, ua_map: dict | None,
     min_docs: int, drop_programmatic: bool, wildchat_max_batches: int | None,
 ) -> pd.DataFrame:
     """Load one source's raw (uncleaned) documents into the common column layout.
+
+    ``wildchat_raw`` / ``swe_raw`` are optional overrides of where that source's raw data is;
+    ``None`` (the default) lets :func:`~prompt_anonymity.data.config.raw_path` resolve it from the
+    environment, the config file, or a HuggingFace download. Only the source being loaded is
+    resolved, so building one source never fetches the other.
 
     ``drop_programmatic`` applies to WildChat only -- SWE-chat sessions have no user-agent (they
     are all agent-CLI traffic by construction, with their non-human turns removed per turn).
@@ -227,11 +238,11 @@ def load_source(
         if ua_map is None:
             ua_map = load_ua_device_map()
         return load_wildchat_documents(
-            wildchat_raw, ua_map, models=WILDCHAT_MODELS, min_docs=min_docs,
+            raw_path("wildchat", wildchat_raw), ua_map, models=WILDCHAT_MODELS, min_docs=min_docs,
             drop_programmatic=drop_programmatic, max_batches=wildchat_max_batches,
         )
     if source == "swe-chat":
-        return load_swe_chat_documents(swe_raw)
+        return load_swe_chat_documents(raw_path("swe-chat", swe_raw))
     raise ValueError(f"unknown source: {source!r}")
 
 
@@ -337,7 +348,7 @@ def run_dedup(frame: pd.DataFrame, *, affix_len: int, max_per_affix: int,
     shared 100-char prefix implies a shared 50-char one).
 
     ``affix_dedup=False`` runs exact-duplicate removal only (no whole-document drop for a shared
-    prefix/suffix); SWE-chat uses this, WildChat keeps the default. See :func:`data.dedup.deduplicate`.
+    prefix/suffix); SWE-chat uses this, WildChat keeps the default. See :func:`prompt_anonymity.data.dedup.deduplicate`.
 
     The joined text is a full second copy of the corpus, so it is dropped again before returning
     rather than riding along (unused) through every later stage.
@@ -439,8 +450,8 @@ def finalize(frame: pd.DataFrame) -> pd.DataFrame:
 def build_source(
     source: str,
     *,
-    wildchat_raw: str = WILDCHAT_RAW,
-    swe_raw: str = SWE_CHAT_RAW,
+    wildchat_raw: str | None = None,
+    swe_raw: str | None = None,
     ua_map: dict | None = None,
     min_docs: int = 2,
     drop_programmatic: bool = True,
@@ -547,8 +558,8 @@ def build_source(
 def build_all(
     sources: tuple[str, ...] = SOURCES,
     *,
-    wildchat_raw: str = WILDCHAT_RAW,
-    swe_raw: str = SWE_CHAT_RAW,
+    wildchat_raw: str | None = None,
+    swe_raw: str | None = None,
     min_docs: int = 2,
     drop_programmatic: bool = True,
     drop_relays: bool = True,
@@ -695,8 +706,12 @@ def _print_report(stats: dict) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--wildchat-raw", default=WILDCHAT_RAW)
-    p.add_argument("--swe-raw", default=SWE_CHAT_RAW)
+    p.add_argument("--wildchat-raw", default=None,
+                   help="directory of raw WildChat parquet shards (default: $PROMPT_ANONYMITY_"
+                        "WILDCHAT_RAW, else the config file, else downloaded from HuggingFace)")
+    p.add_argument("--swe-raw", default=None,
+                   help="raw SWE-chat conversations.parquet (default: $PROMPT_ANONYMITY_"
+                        "SWE_CHAT_RAW, else the config file, else downloaded from HuggingFace)")
     p.add_argument("--sources", nargs="+", default=["wildchat", "swe-chat"],
                    choices=["wildchat", "swe-chat"])
     p.add_argument("--min-docs", type=int, default=2,
@@ -728,7 +743,8 @@ def main() -> None:
                    help="parallel cleaning processes (default: the CPUs this job is allocated, "
                         "which on a shared cluster is fewer than the machine's cores)")
     p.add_argument("--wildchat-max-batches", type=int, default=None, help="testing: cap pass-2 batches")
-    p.add_argument("--out-dir", default=str(Path(__file__).with_name("dist")))
+    p.add_argument("--out-dir", default=None,
+                   help="where the built parquets go (default: the project's data/dist)")
     args = p.parse_args()
 
     frames = build_all(
@@ -742,7 +758,7 @@ def main() -> None:
         secondary_primary_floor=args.secondary_primary_floor, secondary_cap=args.secondary_cap,
         workers=args.workers, wildchat_max_batches=args.wildchat_max_batches,
     )
-    write_outputs(frames, args.out_dir)
+    write_outputs(frames, args.out_dir or dist_dir())
 
 
 if __name__ == "__main__":

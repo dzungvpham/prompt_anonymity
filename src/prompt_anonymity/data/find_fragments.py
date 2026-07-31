@@ -46,8 +46,8 @@ pervasive, but naming *which* authors needs the content signal. See
 
 Usage
 -----
-    PYTHONPATH=. python -m data.find_fragments                      # defaults
-    PYTHONPATH=. python -m data.find_fragments --min-lift 3 --max-gap 45
+    python -m prompt_anonymity.data.find_fragments                      # defaults
+    python -m prompt_anonymity.data.find_fragments --min-lift 3 --max-gap 45
 
 Writes ``data/fragment_chains.csv`` (one row per fragment, grouped into chains, with a sample
 prompt for eyeballing) and ``data/fragment_pairs.csv`` (every scored pair, for tuning the
@@ -65,7 +65,7 @@ import pandas as pd
 import pyarrow.dataset as ds
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .build_dataset import WILDCHAT_RAW
+from .config import data_dir, dist_dir, raw_path
 from .identity import (
     hash_author_id,
     is_programmatic_user_agent,
@@ -76,17 +76,16 @@ from .identity import (
 from .sources_wildchat import WILDCHAT_MODELS
 
 BLOCK_COLUMNS = ["accept_language", "device_info", "country"]
-DIST = Path(__file__).with_name("dist")
 
 
-def scan_identities(raw_path: str, models: list[str], min_convs: int = 2) -> pd.DataFrame:
+def scan_identities(raw_dir: str | Path, models: list[str], min_convs: int = 2) -> pd.DataFrame:
     """One linear pass over the raw metadata -> one row per identity.
 
     Only the small metadata columns are read (never ``conversation``), so this is cheap. Rows from
     programmatic clients are skipped, matching the dataset build.
     """
     ua_map = load_ua_device_map()
-    dataset = ds.dataset(raw_path, format="parquet")
+    dataset = ds.dataset(str(raw_dir), format="parquet")
     columns = ["hashed_ip", "header", "country", "state", "timestamp"]
     agg: dict = {}
     bot_cache: dict = {}
@@ -249,8 +248,11 @@ def assemble_chains(accepted: pd.DataFrame, identities: pd.DataFrame) -> pd.Data
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--raw", default=WILDCHAT_RAW)
-    p.add_argument("--built", default=str(DIST / "wildchat.parquet"))
+    p.add_argument("--raw", default=None,
+                   help="directory of raw WildChat parquet shards (default: $PROMPT_ANONYMITY_"
+                        "WILDCHAT_RAW, else the config file, else downloaded from HuggingFace)")
+    p.add_argument("--built", default=None,
+                   help="the built wildchat.parquet (default: the project's data/dist)")
     p.add_argument("--max-gap", type=float, default=45.0, help="max days between fragments (default 45)")
     p.add_argument("--max-block", type=int, default=200, help="skip fingerprints shared by more identities")
     p.add_argument("--min-sim", type=float, default=0.6,
@@ -258,17 +260,19 @@ def main() -> None:
                         "A language-matched control of different-fingerprint pairs reaches this "
                         "level 1.0%% of the time, so expect roughly half the accepted pairs to be "
                         "coincidence -- this is a shortlist to verify, not a decided answer")
-    p.add_argument("--out-dir", default=str(Path(__file__).parent))
+    p.add_argument("--out-dir", default=None,
+                   help="where the two CSVs go (default: the project's data/)")
     args = p.parse_args()
 
     print("scanning raw metadata ...")
-    identities = scan_identities(args.raw, WILDCHAT_MODELS)
+    identities = scan_identities(raw_path("wildchat", args.raw), WILDCHAT_MODELS)
     print(f"  identities: {len(identities):,}   blocks: {identities.groupby(BLOCK_COLUMNS).ngroups:,}")
 
     pairs = candidate_pairs(identities, args.max_gap, args.max_block)
     print(f"candidate pairs (disjoint, gap<={args.max_gap}d): {len(pairs):,}")
 
-    documents = pd.read_parquet(args.built, columns=["author_id", "turns"])
+    documents = pd.read_parquet(args.built or dist_dir() / "wildchat.parquet",
+                                columns=["author_id", "turns"])
     documents["_text"] = documents["turns"].map(lambda t: "\n".join(t))
     known = set(documents["author_id"])
     pairs = pairs[pairs["a"].isin(known) & pairs["b"].isin(known)].reset_index(drop=True)
@@ -290,7 +294,7 @@ def main() -> None:
         chains["sample_prompt"] = chains["author_id"].map(sample)
         chains["docs_in_dataset"] = chains["author_id"].map(documents["author_id"].value_counts())
 
-    out = Path(args.out_dir)
+    out = Path(args.out_dir) if args.out_dir else data_dir()
     scored.to_csv(out / "fragment_pairs.csv", index=False)
     chains.to_csv(out / "fragment_chains.csv", index=False)
     print(f"wrote {out/'fragment_pairs.csv'} and {out/'fragment_chains.csv'}")

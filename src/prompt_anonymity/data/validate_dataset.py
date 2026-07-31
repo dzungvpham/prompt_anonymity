@@ -1,6 +1,6 @@
 """Integrity + consistency checks for the built unified prompt dataset.
 
-Run after ``build_dataset.py``:  ``PYTHONPATH=. python -m data.validate_dataset``.
+Run after ``build_dataset.py``:  ``python -m prompt_anonymity.data.validate_dataset``.
 The dataset ships as **one parquet per source** (a HuggingFace split): ``wildchat.parquet`` and
 ``swe_chat.parquet``. This validates each file on its own (it holds exactly its own source,
 with source-prefixed author ids and unique doc_ids) and the two combined -- schema/
@@ -20,9 +20,9 @@ from pathlib import Path
 import pandas as pd
 
 from .build_dataset import CONSECUTIVE_DUP_MAX_LEN
+from .config import dist_dir
 from .sources_swe_chat import HUMAN_TURN_MAX_LEN, is_scaffolding_turn
 
-DIST = Path(__file__).with_name("dist")
 # source -> split/parquet file name (must match build_dataset.SPLIT_NAMES).
 SPLIT_FILES = {"wildchat": "wildchat.parquet", "swe-chat": "swe_chat.parquet"}
 EXPECTED_COLUMNS = [
@@ -54,8 +54,9 @@ def _consecutive_dup_stats(turn_lists) -> tuple[int, int]:
     return max_len, n_scaffold
 
 
-def main(dist: str | Path = DIST) -> int:
-    dist = Path(dist)
+def main(dist: str | Path | None = None) -> int:
+    """Validate the built parquets in ``dist`` (default: the project's ``data/dist``)."""
+    dist = Path(dist) if dist else dist_dir()
     checks: list[tuple[str, bool, str]] = []
 
     def check(name, ok, detail=""):

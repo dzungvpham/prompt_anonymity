@@ -46,8 +46,39 @@ logistic (balanced)    0.252         0.600       0.094
 =====================  ============  ==========  ===========
 
 (75% known window, 124 known authors, 997 unknown documents, 17.9% out-of-set; scores
-cohort-normalised. Selected on a known-side simulation, which preferred the winning row on all
-three criteria, then measured once on the unknown window -- see ``benchmark_attribution.py``.)
+cohort-normalised, all attacks at their default settings.)
+
+Among the discriminative attacks the trees win, and by more than the linear ones differ from
+each other. Averaged over all eight rolling windows, with **every hyper-parameter chosen per
+window on that window's own known side** (``run_experiment_v2.py --tune``, measured over the
+exhaustive grid that ``--tune`` used before it moved to successive halving -- the ranking is the
+finding, the third decimal place is not):
+
+=====================  ========  =======  ======  ======  =====
+attack                 top-1     macro    MRR     MAP     ECE
+=====================  ========  =======  ======  ======  =====
+logistic               0.265     0.181    0.388   0.168   0.165
+svm                    0.279     0.189    0.400   0.255   0.374
+**xgboost**            **0.311**  0.198   0.424   0.268   0.199
+=====================  ========  =======  ======  ======  =====
+
+Three things that table is saying, none of them "trees are just better":
+
+* **The gain is concentrated on prolific authors.** Micro top-1 improves by 0.046 from logistic
+  to xgboost but the author-averaged version improves by only 0.017. Trees exploit the document
+  count, which is real signal but means the typical user is much less affected than the headline
+  suggests.
+* **Logistic is far worse at retrieval than at identification** (MAP 0.168 against 0.255-0.268).
+  Per-class bias terms shift a whole score column, which leaves row-wise ``argmax`` untouched but
+  scrambles the column-wise ranking that :mod:`prompt_anonymity.metrics.retrieval` measures.
+* **The SVM's confidence is meaningless** (ECE 0.374, roughly double the others). Expected: its
+  one-vs-one margins are not posteriors, so read its calibration column as "not applicable"
+  rather than "poorly calibrated". Only ``logistic`` and ``xgboost`` emit anything posterior-like.
+
+The choice of *attack* was made the same way as the choice of hyper-parameters: the known-side
+CV preferred xgboost in 7 of the 8 windows, and it went on to win 8 of 8 on the unknown side, so
+the preference was predicted rather than observed. Selecting the attack per window on known-side
+CV scores 0.309, against 0.311 for always using xgboost and 0.311 for a (not legitimate) oracle.
 
 Two things that did *not* help, both worth not re-trying blind: a learned rejector over the
 score-vector shape (margin, entropy, peakedness) overfits the simulation and loses to the plain
@@ -62,6 +93,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 
 
 # --- shared linear algebra ---------------------------------------------------
@@ -195,6 +227,12 @@ class LDACentroid:
 
     LDA maximises between-author over within-author scatter, which both denoises and discards
     the StyloMetrix directions that carry no author information at all.
+
+    ``n_components`` is a *ceiling*: LDA cannot produce more than ``n_authors - 1`` discriminants,
+    so a request for more is silently clamped rather than raised. That matters when the same
+    setting is reused across differently sized author pools -- a hyper-parameter search over
+    subsampled folds would otherwise fail on the small ones for a reason that has nothing to do
+    with the setting's quality.
     """
 
     name = "lda"
@@ -204,7 +242,8 @@ class LDACentroid:
 
     def fit(self, embeddings, labels):
         self.authors, codes = np.unique(labels, return_inverse=True)
-        n_components = self.n_components or min(len(self.authors) - 1, embeddings.shape[1])
+        available = min(len(self.authors) - 1, embeddings.shape[1])
+        n_components = min(self.n_components, available) if self.n_components else available
         self.model = LinearDiscriminantAnalysis(
             solver="eigen", shrinkage="auto", n_components=n_components
         ).fit(embeddings, codes)
@@ -247,6 +286,87 @@ class LogisticAttribution:
 
     def score(self, embeddings):
         return self.model.decision_function(embeddings)
+
+
+class SupportVectorAttribution:
+    """Support vector machine over the known authors; the score is the decision function.
+
+    The other classical discriminative answer alongside :class:`LogisticAttribution`, and worth
+    having because it optimises a different thing: logistic regression fits the whole conditional
+    distribution, while an SVM only cares about the documents near each boundary. With ~25
+    documents per author that focus tends to pay, and the RBF kernel additionally buys
+    non-linearity, which no other attack here has.
+
+    Uses ``sklearn.svm.SVC`` rather than ``LinearSVC`` even for ``kernel="linear"``, and the
+    reason is purely practical: ``SVC`` is one-vs-one, so it trains ~7,600 tiny pairwise problems,
+    whereas ``LinearSVC`` is one-vs-rest and trains 124 problems each against the entire corpus.
+    Measured on a 2,992-document known side, that is 1.8 seconds against 299.
+
+    ``decision_function_shape="ovr"`` folds the pairwise votes back into one column per author, so
+    the output has the same shape as every other attack's. Those margins are *not* posteriors --
+    :func:`prompt_anonymity.metrics.max_softmax_confidence` will report a near-uniform confidence
+    for them, so read this attack's calibration numbers as meaningless rather than as bad.
+    """
+
+    name = "svm"
+
+    def __init__(self, C: float = 1.0, kernel: str = "rbf", gamma: str | float = "scale"):
+        self.C = C
+        self.kernel = kernel
+        self.gamma = gamma
+
+    def fit(self, embeddings, labels):
+        self.authors, codes = np.unique(labels, return_inverse=True)
+        self.model = SVC(C=self.C, kernel=self.kernel, gamma=self.gamma,
+                         decision_function_shape="ovr").fit(embeddings, codes)
+        return self
+
+    def score(self, embeddings):
+        return self.model.decision_function(embeddings)
+
+
+class GradientBoostedTrees:
+    """Gradient-boosted decision trees (XGBoost) over the known authors.
+
+    The only non-linear, non-metric attack here: every other one ultimately compares documents
+    along straight lines in feature space. StyloMetrix features are heterogeneous -- ratios in
+    [0, 1] next to raw counts, many near-zero for most documents -- and trees handle that mix
+    natively, splitting on thresholds instead of weighting directions, and picking up interactions
+    between features that a linear model cannot express.
+
+    The score is the **log** class probability, not the raw probability. It is the same ranking
+    either way, but log-space is what the downstream machinery expects: cohort normalisation
+    z-scores across authors (meaningful for log-odds-like quantities, not for probabilities that
+    sum to 1), and it makes ``softmax(score)`` recover the model's own posterior exactly, so the
+    calibration metrics in :mod:`prompt_anonymity.metrics.detection` measure something real for
+    this attack.
+
+    ``xgboost`` is imported lazily so the rest of the package works without it installed.
+    """
+
+    name = "xgboost"
+
+    def __init__(self, n_estimators: int = 300, max_depth: int = 3, learning_rate: float = 0.3,
+                 subsample: float = 1.0, n_jobs: int = -1):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.n_jobs = n_jobs
+
+    def fit(self, embeddings, labels):
+        from xgboost import XGBClassifier  # lazy: keeps xgboost an optional runtime dependency
+
+        self.authors, codes = np.unique(labels, return_inverse=True)
+        self.model = XGBClassifier(
+            n_estimators=self.n_estimators, max_depth=self.max_depth,
+            learning_rate=self.learning_rate, subsample=self.subsample,
+            tree_method="hist", objective="multi:softprob", n_jobs=self.n_jobs, verbosity=0,
+        ).fit(embeddings, codes)
+        return self
+
+    def score(self, embeddings):
+        return np.log(np.clip(self.model.predict_proba(embeddings), 1e-12, None))
 
 
 class PLDA:
@@ -321,6 +441,8 @@ ATTRIBUTION_ATTACKS = {
     "wccn": WhitenedCentroid,
     "lda": LDACentroid,
     "logistic": LogisticAttribution,
+    "svm": SupportVectorAttribution,
+    "xgboost": GradientBoostedTrees,
     "plda": PLDA,
 }
 

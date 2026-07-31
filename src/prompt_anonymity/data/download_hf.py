@@ -12,10 +12,10 @@ actually moved; ``--force`` throws that away and re-downloads everything from sc
 
 Usage (from the repo root)::
 
-    python data/download_hf.py                       # -> data/hf/, mirroring main
-    python data/download_hf.py --force               # ignore local copies, re-download all
-    python data/download_hf.py --include '*.parquet' # only the data files (no pruning)
-    python data/download_hf.py --repo-id other/repo --out /tmp/hf
+    python -m prompt_anonymity.data.download_hf                       # -> data/hf/, mirroring main
+    python -m prompt_anonymity.data.download_hf --force               # ignore local copies, re-download all
+    python -m prompt_anonymity.data.download_hf --include '*.parquet' # only the data files (no pruning)
+    python -m prompt_anonymity.data.download_hf --repo-id other/repo --out /tmp/hf
 """
 
 from __future__ import annotations
@@ -26,9 +26,12 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
-# Default dataset repo and download destination (``data/hf/``, next to this file).
+from .config import data_dir
+
+# Default dataset repo. The destination is the project's ``data/hf/`` -- resolved at call time
+# (:func:`prompt_anonymity.data.config.data_dir`) rather than from this file's location, since
+# the code lives in the installed package and the outputs live in the working copy.
 REPO_ID = "pavidu/PromptAnonBench"
-OUT_DIR = Path(__file__).with_name("hf")
 
 # HuggingFace's own bookkeeping inside ``local_dir`` (download metadata + locks). It is not repo
 # content, so it is never a pruning candidate and is hidden from the printed file listing.
@@ -68,7 +71,7 @@ def prune_stale_files(
 
 def download(
     repo_id: str = REPO_ID,
-    out_dir: str | Path = OUT_DIR,
+    out_dir: str | Path | None = None,
     revision: str | None = None,
     include: list[str] | None = None,
     token: str | None = None,
@@ -89,8 +92,10 @@ def download(
 
     Pruning is skipped when ``include`` is set: a filtered download is a partial copy by design,
     so the unmatched files already on disk are not stale, they are simply not being refreshed.
+
+    ``out_dir`` defaults to the project's ``data/hf/``.
     """
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir) if out_dir else data_dir() / "hf"
     if force and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +116,7 @@ def download(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo-id", default=REPO_ID, help=f"HF dataset repo (default: {REPO_ID})")
-    parser.add_argument("--out", default=str(OUT_DIR), help="destination folder (default: data/hf/)")
+    parser.add_argument("--out", default=None, help="destination folder (default: the project's data/hf/)")
     parser.add_argument("--revision", default=None, help="branch, tag, or commit to download")
     parser.add_argument(
         "--include", nargs="+", default=None, metavar="GLOB",

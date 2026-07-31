@@ -1,9 +1,33 @@
-"""Dataset loaders and split rules.
+"""Dataset loaders, split rules, and the dataset build pipeline.
 
-Each loader reads a dataset from disk, builds identities, applies a dataset-specific
-known/unknown split, and returns an :class:`~prompt_anonymity.core.AttackData` ready for
-a defense and an attack. Add a dataset by writing a loader (reusing the split helpers in
+This package holds two related but separate families of modules.
+
+**Loaders** (this module, :mod:`~prompt_anonymity.data.splits`,
+:mod:`~prompt_anonymity.data.wildchat`, :mod:`~prompt_anonymity.data.swe_chat`) feed the attack
+pipeline: each reads a dataset from disk, builds identities, applies a dataset-specific
+known/unknown split, and returns an :class:`~prompt_anonymity.core.AttackData` ready for a defense
+and an attack. Add a dataset by writing a loader (reusing the split helpers in
 :mod:`prompt_anonymity.data.splits`) and registering it in ``DATASET_LOADERS``.
+
+**The build pipeline** produces the unified public dataset those loaders (and the experiment
+runners) consume, from the raw upstream corpora. Its entry points are meant to be run as scripts,
+in this order:
+
+    python -m prompt_anonymity.data.build_dataset       # raw sources  -> data/dist/*.parquet
+    python -m prompt_anonymity.data.validate_dataset    # integrity checks on what was built
+    python -m prompt_anonymity.data.compute_features    # -> data/dist/<split>_<feature>.parquet
+
+with :mod:`~prompt_anonymity.data.sources_wildchat` / :mod:`~prompt_anonymity.data.sources_swe_chat`
+adapting one upstream corpus each, and :mod:`~prompt_anonymity.data.text_cleaning`,
+:mod:`~prompt_anonymity.data.identity`, :mod:`~prompt_anonymity.data.dedup` and
+:mod:`~prompt_anonymity.data.language_detection` implementing the shared stages.
+:mod:`~prompt_anonymity.data.download_hf` mirrors the published dataset back down, and
+:mod:`~prompt_anonymity.data.find_fragments` is a one-off study of identity fragmentation.
+
+**Code lives here; data does not.** Where the raw inputs are read from and where the outputs are
+written is configuration, not a constant -- see :mod:`prompt_anonymity.data.config`, which resolves
+both (falling back to downloading the raw sources from HuggingFace) so the build runs on any
+machine.
 """
 
 from __future__ import annotations

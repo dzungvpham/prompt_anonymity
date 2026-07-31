@@ -40,10 +40,12 @@ from .bt_tournament import BradleyTerryTournamentAttack, bt_tournament_attack
 from .attribution import (
     ATTRIBUTION_ATTACKS,
     CentroidCosine,
+    GradientBoostedTrees,
     LDACentroid,
     LogisticAttribution,
     NearestNeighbor,
     PLDA,
+    SupportVectorAttribution,
     WhitenedCentroid,
     get_attribution_attack,
 )
@@ -117,6 +119,8 @@ __all__ = [
     "WhitenedCentroid",
     "LDACentroid",
     "LogisticAttribution",
+    "SupportVectorAttribution",
+    "GradientBoostedTrees",
     "PLDA",
     # score matrix -> accept/reject
     "cohort_normalize",

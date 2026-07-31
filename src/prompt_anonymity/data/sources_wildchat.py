@@ -12,7 +12,7 @@ both shrink what the (memory-hungry) second pass has to hold:
 
 * **Programmatic clients are dropped** -- a conversation posted by ``gradio_client``, ``httpx``,
   ``node``, or any other HTTP library is not one person's writing (see
-  :func:`data.identity.is_programmatic_user_agent`). This runs *before* the identity counting
+  :func:`prompt_anonymity.data.identity.is_programmatic_user_agent`). This runs *before* the identity counting
   below and before all deduplication, so bot traffic can neither qualify an identity for the
   ``min_docs`` floor nor influence which affixes look like shared boilerplate.
 * **Identities below ``min_docs`` are dropped**, which is safe because every downstream stage
@@ -86,7 +86,7 @@ def load_wildchat_documents(
     typed into a browser, in **both** passes -- so a bot's conversations do not count toward its
     identity's ``min_docs`` total either. Pass ``False`` only to measure how much bot traffic the
     corpus carries; keeping it costs the author labels their meaning (see
-    :func:`data.identity.is_programmatic_user_agent`).
+    :func:`prompt_anonymity.data.identity.is_programmatic_user_agent`).
 
     ``max_batches`` caps the number of non-empty pass-2 batches (pass 1 is never capped);
     it exists only for quick end-to-end smoke tests on a slice of the data.

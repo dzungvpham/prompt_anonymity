@@ -4,8 +4,8 @@ Featurization is the third pipeline stage: it runs **after** the defense, so it 
 current (possibly rewritten) text. Two layers are exposed:
 
 * the :class:`Featurizer` classes themselves (:class:`StyloMetrixFeaturizer`,
-  :class:`FunctionWordFeaturizer`, :class:`CharacterStatisticsFeaturizer`), each a cached
-  ``texts -> ndarray`` transform; and
+  :class:`FunctionWordFeaturizer`, :class:`CharacterStatisticsFeaturizer`,
+  :class:`GeminiEmbedding2Featurizer`), each a cached ``texts -> ndarray`` transform; and
 * :func:`apply_featurizer`, which featurizes both sides of a loaded
   :class:`~prompt_anonymity.core.AttackData` and returns a copy carrying the new vectors
   (the caller-chosen ``metric`` already on the data is left untouched).
@@ -46,6 +46,7 @@ from .character import CharacterStatisticsFeaturizer
 from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidfFeaturizer
+from .gemini_embedding import GeminiEmbedding2Featurizer
 from .style_distance import StyleDistanceFeaturizer
 
 # Registry of featurizer classes, selectable by name (e.g. from a CLI argument). Values are
@@ -57,12 +58,14 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "function_words": FunctionWordFeaturizer,
     "char_ngram_tfidf": CharNgramTfidfFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
+    "gemini_embedding_2": GeminiEmbedding2Featurizer,
 }
 
 # A loaded AttackData carries committed features for exactly one representation (StyloMetrix
 # today), so only a featurizer producing that same space can reuse them as a ``reference``;
-# every other featurizer is recomputed from its own on-disk cache. Extend this when another
-# committed representation is added (e.g. Gemini embeddings) that a loader can return.
+# every other featurizer -- including ``gemini_embedding_2``, whose vectors are computed by
+# ``prompt_anonymity.data.compute_features`` and stored in their own parquet -- is recomputed
+# from its own on-disk cache. Extend this when a loader starts returning another representation.
 _REFERENCE_FEATURE = "stylometrix"
 
 
@@ -214,6 +217,7 @@ __all__ = [
     "StyloMetrixFeaturizer",
     "FunctionWordFeaturizer",
     "CharacterStatisticsFeaturizer",
+    "GeminiEmbedding2Featurizer",
     "FEATURIZERS",
     "get_featurizer",
     "apply_featurizer",

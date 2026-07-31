@@ -1,6 +1,6 @@
 r"""Compute feature vectors for a built dataset split -- one parquet per featurizer.
 
-Companion to :mod:`data.build_dataset`: that script writes the documents
+Companion to :mod:`prompt_anonymity.data.build_dataset`: that script writes the documents
 (``dist/swe_chat.parquet``), this one writes the *features* for them
 (``dist/swe_chat_stylometrix.parquet``), keyed by ``doc_id`` so the two join cleanly.
 
@@ -41,11 +41,30 @@ Featurization runs across worker processes where the featurizer supports it (Sty
 sized from the CPUs and memory this job is actually allocated rather than the machine's -- see
 ``--workers`` and :mod:`prompt_anonymity.resources`.
 
+**Remote (paid) featurizers.** ``--feature gemini_embedding_2`` embeds the documents through
+OpenRouter instead of computing anything locally, so it needs no GPU but does need an
+``OPENROUTER_API_KEY`` in the environment or a ``.env``, and it costs money -- about $0.32 for
+all of SWE-chat at ``gemini-embedding-2``'s $0.20/M tokens. Three things follow:
+
+* ``--workers`` there means *concurrent HTTP requests*, not processes.
+* ``--dimensions`` trims the embedding (768 / 1536 instead of the native 3072), which mostly
+  matters for the size of the output parquet.
+* The vector cache is worth more than usual: every cache miss is a paid call, so a re-run, a
+  resumed run and a re-run with different sharding all cost nothing for documents already done.
+  The run prints what it actually spent when it finishes.
+
+``--max-len`` does not apply to it. The embedding model reads a fixed window (8,192 tokens), so
+each document is cut to just above that (10,000) and embedded **once** -- one document, one call,
+one vector, no pooling -- which also caps what any single document can cost, however long it is.
+Each input carries the model's task prefix (``task: sentence similarity | query: ...``), which is
+how Embedding 2 is told what the vector is for. The vector therefore represents a document's
+opening, not all of it; see :mod:`prompt_anonymity.features.gemini_embedding`.
+
 **Sharding (SLURM array jobs).** A whole source can be more than one job's worth of work
 (WildChat is ~172K documents), so a run can be restricted to one *shard* of the split --
 ``--num-shards N --shard-index I`` -- and N such runs launched as a SLURM job array, each on its
 own node and GPU. Either flag is filled in from the array task's own environment when omitted
-(``SLURM_ARRAY_TASK_ID`` / ``SLURM_ARRAY_TASK_COUNT``), so ``data/compute_features_slurm.sh``
+(``SLURM_ARRAY_TASK_ID`` / ``SLURM_ARRAY_TASK_COUNT``), so ``scripts/compute_features_slurm.sh``
 needs no per-task bookkeeping. A sharded run writes ``dist/shards/<split>_<feature>.<I>-of-<N>.parquet``
 rather than the final file, and the last shard to finish concatenates them all into it (in split
 order) -- so the array produces exactly the file a single unsharded run would have. ``--merge``
@@ -57,12 +76,13 @@ on-disk cache is content-addressed with atomic writes, so concurrent tasks share
 
 Run (from the repo root):
 
-    python -m data.compute_features                                  # all swe-chat docs, stylometrix/en
-    python -m data.compute_features --source wildchat --language-code ru
-    python -m data.compute_features --feature function_words --language English
-    python -m data.compute_features --workers 4                      # cap the worker pool
-    python -m data.compute_features --source wildchat --num-shards 32 --shard-index 0
-    python -m data.compute_features --source wildchat --num-shards 32 --merge
+    python -m prompt_anonymity.data.compute_features                                  # all swe-chat docs, stylometrix/en
+    python -m prompt_anonymity.data.compute_features --source wildchat --language-code ru
+    python -m prompt_anonymity.data.compute_features --feature function_words --language English
+    python -m prompt_anonymity.data.compute_features --workers 4                      # cap the worker pool
+    python -m prompt_anonymity.data.compute_features --source wildchat --num-shards 32 --shard-index 0
+    python -m prompt_anonymity.data.compute_features --source wildchat --num-shards 32 --merge
+    python -m prompt_anonymity.data.compute_features --feature gemini_embedding_2    # paid API
 """
 
 from __future__ import annotations
@@ -82,8 +102,7 @@ from tqdm import tqdm
 from prompt_anonymity.features import FEATURIZERS, get_featurizer
 from prompt_anonymity.resources import describe_budget
 
-DIST = Path(__file__).with_name("dist")
-CACHE_DIR = Path(__file__).with_name(".cache")
+from .config import cache_dir, dist_dir
 
 # source -> split / parquet base name (must match build_dataset.SPLIT_NAMES).
 SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
@@ -113,7 +132,8 @@ DEFAULT_LANGUAGE_CODE = "en"
 # session in full is affordable, and truncating discards exactly the long sessions that carry the
 # most style evidence. A source absent from this map keeps the featurizer's own default
 # (StyloMetrix: 2,048 characters) -- WildChat deliberately does, since its length tail reaches
-# ~953K characters and StyloMetrix's cost grows faster than linearly with length.
+# ~953K characters and StyloMetrix's cost grows faster than linearly with length. Featurizers that
+# take no character window at all (gemini_embedding_2 measures its own, in tokens) ignore this.
 #
 # A window of 0 here is a **decision, not a default**: the source is uncapped by design and
 # `--max-len` may not override it (see `resolve_max_len`). Since the output filename does not
@@ -147,7 +167,7 @@ def load_split(source: str, dist_dir: str | Path, columns: list[str] | None = No
     """
     path = Path(dist_dir) / f"{SPLIT_NAMES[source]}.parquet"
     if not path.exists():
-        raise SystemExit(f"{path} not found -- build it first with `python -m data.build_dataset`.")
+        raise SystemExit(f"{path} not found -- build it first with `python -m prompt_anonymity.data.build_dataset`.")
     return pd.read_parquet(path, columns=columns)
 
 
@@ -284,7 +304,7 @@ def resolve_max_len(source: str, requested: int | None) -> int | None:
             f"--max-len {requested} refused: {source} is featurized over whole documents by "
             f"design, and the feature file name does not record the window, so a truncated run "
             f"would silently replace the uncapped vectors. Change MAX_LEN_BY_SOURCE in "
-            f"data/compute_features.py if the source's window should really change."
+            f"prompt_anonymity/data/compute_features.py if the source's window should really change."
         )
     return requested
 
@@ -294,10 +314,11 @@ def build_featurizer(name: str, **options):
 
     The featurizer class comes from ``prompt_anonymity.features.FEATURIZERS``, so this script
     never hard-codes a feature implementation -- but featurizers do not take the same arguments
-    (StyloMetrix has a language model and an input window; the surface-statistic ones take
-    nothing). Options are therefore matched against the constructor's signature rather than a
-    hard-coded list of names, and an option left as ``None`` is dropped so the featurizer keeps
-    its own default.
+    (StyloMetrix has a language model and an input window; the embedding one has an output width
+    and no language model; the surface-statistic ones take nothing). Options are therefore matched
+    against the constructor's signature rather than a hard-coded list of names, and an option left
+    as ``None`` is dropped so the featurizer keeps its own default. A flag a featurizer does not
+    accept is silently ignored, which is what lets one CLI drive all of them.
     """
     featurizer_class = FEATURIZERS.get(name)
     accepted = inspect.signature(featurizer_class).parameters if featurizer_class is not None else {}
@@ -310,10 +331,20 @@ def report_window(featurizer, texts) -> None:
 
     StyloMetrix reads the first ``max_len`` characters of a document (``0`` = all of it), so on a
     corpus of long agent sessions a narrow window can leave most of the text unread -- better
-    seen in the run log than discovered later.
+    seen in the run log than discovered later. A featurizer whose window is measured in *tokens*
+    (``input_tokens``, the embedding ones) reports that instead: counting tokens for the whole
+    split up front would be its own pass over the corpus, so the count of documents actually cut
+    is left to the featurizer's own end-of-run summary.
     """
-    max_len = featurizer.params().get("max_len")
-    if max_len is None or not texts:
+    parameters = featurizer.params()
+    if not texts:
+        return
+    if parameters.get("input_tokens"):
+        print(f"[{featurizer.name}] reads the first {parameters['input_tokens']:,} tokens of each "
+              f"document (longest document: {max(len(text) for text in texts):,} characters)")
+        return
+    max_len = parameters.get("max_len")
+    if max_len is None:
         return
     longest = max(len(text) for text in texts)
     if not max_len:
@@ -531,18 +562,24 @@ def main() -> None:
                         "0 reads whole documents (default: the source's window -- swe-chat is "
                         "uncapped by design and refuses to be truncated here; other sources keep "
                         "the featurizer's own default, 2048 for StyloMetrix)")
+    p.add_argument("--dimensions", type=int, default=None,
+                   help="output width for embedding featurizers that support truncation "
+                        "(gemini_embedding_2: 128-3072, e.g. 768/1536; default: the model's native 3072). "
+                        "Ignored by featurizers with a fixed feature space")
     p.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                    help=f"documents per featurizer call / cache checkpoint; 0 runs one call "
                         f"(default: {CHUNK_SIZE})")
     p.add_argument("--workers", type=int, default=None,
-                   help="worker processes for featurizers that support it (StyloMetrix); 1 runs "
+                   help="worker processes for featurizers that support it (StyloMetrix), or "
+                        "concurrent API requests for remote ones (gemini_embedding_2); 1 runs "
                         "in-process (default: sized from the allocation's CPUs/memory, or free "
                         "GPU memory when running on a GPU)")
-    p.add_argument("--dist-dir", default=str(DIST), help="directory holding the built parquets")
+    p.add_argument("--dist-dir", default=None,
+                   help="directory holding the built parquets (default: the project's data/dist)")
     p.add_argument("--out-dir", default=None,
                    help="where to write the feature parquet (default: --dist-dir)")
-    p.add_argument("--cache-dir", default=str(CACHE_DIR),
-                   help="on-disk cache for computed vectors (regenerable)")
+    p.add_argument("--cache-dir", default=None,
+                   help="on-disk cache for computed vectors, regenerable (default: data/.cache)")
     p.add_argument("--limit", type=int, default=None,
                    help="testing: featurize only the first N selected documents")
     p.add_argument("--num-shards", type=int, default=None,
@@ -567,7 +604,11 @@ def main() -> None:
         print(f"note: no language model mapped for {language!r}; using {language_code!r} "
               f"(set --language-code to override)")
 
-    out_dir = Path(args.out_dir or args.dist_dir)
+    # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
+    # lives in the installed package, the data does not.
+    dist = Path(args.dist_dir) if args.dist_dir else dist_dir()
+    cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
+    out_dir = Path(args.out_dir) if args.out_dir else dist
     merged_path = output_path(out_dir, args.source, args.feature)
     selected = f" (language_primary == {language!r})" if language else " (all languages)"
 
@@ -575,7 +616,7 @@ def main() -> None:
     # two columns the selection needs -- never the `turns` that make the split large.
     if args.merge:
         documents = select_documents(
-            load_split(args.source, args.dist_dir, columns=["doc_id", "language_primary"]),
+            load_split(args.source, dist, columns=["doc_id", "language_primary"]),
             language=language, limit=args.limit,
         )
         merged = merge_shards(out_dir, args.source, args.feature, list(documents["doc_id"]))
@@ -594,14 +635,21 @@ def main() -> None:
 
     max_len = resolve_max_len(args.source, args.max_len)
     featurizer = build_featurizer(args.feature, language_code=language_code, max_len=max_len,
-                                  workers=args.workers)
-    model = f" (language model {language_code!r})" if getattr(featurizer, "language_code", None) else ""
+                                  workers=args.workers, dimensions=args.dimensions)
+    # Which model this run uses: a language model for the local featurizers, a remote model id
+    # for the API-backed ones (whose `model` attribute is an OpenRouter id).
+    if getattr(featurizer, "language_code", None):
+        model = f" (language model {language_code!r})"
+    elif getattr(featurizer, "model", None):
+        model = f" (model {featurizer.model!r})"
+    else:
+        model = ""
     print(f"[{args.feature}] featurizer ready{model}")
     print(f"[resources] {describe_budget()}")
 
     # Only the key/filter columns, never `turns`: this process has to leave room for the worker
     # pool, and an array task reads back the text of just its own shard (see `read_texts`).
-    frame = load_split(args.source, args.dist_dir,
+    frame = load_split(args.source, dist,
                        columns=["doc_id", "author_id", "language_primary"])
     documents = select_documents(frame, language=language, limit=args.limit)
     if documents.empty:
@@ -616,7 +664,7 @@ def main() -> None:
         print(f"[shard {shard_index}/{num_shards}] featurizing {len(shard):,} of them "
               f"-> {out_path.name}")
 
-    texts = read_texts(args.source, args.dist_dir, shard.index)
+    texts = read_texts(args.source, dist, shard.index)
 
     if not texts:
         # More shards than documents: nothing to compute, but the (empty) shard file still has to
@@ -626,7 +674,7 @@ def main() -> None:
     else:
         report_window(featurizer, texts)
         try:
-            vectors = compute_features(featurizer, texts, cache_dir=args.cache_dir,
+            vectors = compute_features(featurizer, texts, cache_dir=cache,
                                        chunk_size=args.chunk_size)
         finally:  # release worker processes (and their models) as soon as the work is done
             if hasattr(featurizer, "close"):

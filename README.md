@@ -69,7 +69,7 @@ Common options (run with `--help` for the full list):
 | `--attack` | `nearest_neighbor` | Attack to run (any key in the `ATTACKS` registry). |
 | `--metric` | `cosine` | Distance metric the attack uses to compare vectors (`cosine`, `euclidean`, or any scipy `cdist` metric). Decoupled from the featurizer. |
 | `--defense` | `none` | Defense applied before the attack (`none`, `example_normalization`, …). |
-| `--feature` | `stylometrix` | Conversation representation(s). Name several (e.g. `--feature stylometrix function_words`) to concatenate their feature vectors into one. Gemini embeddings are planned. |
+| `--feature` | `stylometrix` | Conversation representation(s). Name several (e.g. `--feature stylometrix function_words`) to concatenate their feature vectors into one. `gemini_embedding_2` embeds the text through OpenRouter instead of measuring style (needs `OPENROUTER_API_KEY`, and costs money per document). |
 | `--language` | `English` | WildChat language subset (`English` / `Russian`). |
 | `--model-owner` | `Anthropic` | SWE-chat: restrict to one agent provider, or `all`. |
 | `--top-ks` | `1 5 10` | k values for the headline table. |
@@ -92,15 +92,39 @@ The object handed between stages is `AttackData` (`core.py`): the known (labeled
 
 Each stage is its own subpackage, and most expose a name→implementation registry so the pieces are pluggable:
 
-- **`data/`** — dataset loaders and split rules. `load_dataset(name, dir, **opts)` returns an `AttackData`. WildChat splits *by model* (one model labeled, another anonymous); SWE-chat splits *by time* (each user's last session is the unknown). Registry: `DATASET_LOADERS`.
+- **`data/`** — dataset loaders and split rules, plus the dataset **build pipeline** (see below). `load_dataset(name, dir, **opts)` returns an `AttackData`. WildChat splits *by model* (one model labeled, another anonymous); SWE-chat splits *by time* (each user's last session is the unknown). Registry: `DATASET_LOADERS`.
 - **`defenses/`** — optional transforms that rewrite the conversation *text* to resist linkage, run before the attack. `none` is the baseline; costly rewrites (e.g. round-trip translation) use a disk-cached `CachedDefense`. Registry: `DEFENSES`; entry point `apply_defense`.
-- **`features/`** — turn the (possibly defended) text into attack-ready vectors. `StyloMetrixFeaturizer`, `FunctionWordFeaturizer`, `CharacterStatisticsFeaturizer`. Runs after the defense, and reuses the committed vectors wherever the text is unchanged — so a no-defense run never invokes StyloMetrix (and needs no GPU); GPU is used for any recompute when available, else CPU (much slower). `apply_featurizer` also accepts several featurizers at once and concatenates their vectors column-wise, each one reusing its own cache. Registry: `FEATURIZERS`; entry point `apply_featurizer`.
+- **`features/`** — turn the (possibly defended) text into attack-ready vectors. `StyloMetrixFeaturizer`, `FunctionWordFeaturizer`, `CharacterStatisticsFeaturizer`, and `GeminiEmbedding2Featurizer` (semantic embeddings from `google/gemini-embedding-2` via OpenRouter — a paid API call per document, cached on disk like every other featurizer). Runs after the defense, and reuses the committed vectors wherever the text is unchanged — so a no-defense run never invokes StyloMetrix (and needs no GPU); GPU is used for any recompute when available, else CPU (much slower). `apply_featurizer` also accepts several featurizers at once and concatenates their vectors column-wise, each one reusing its own cache. Registry: `FEATURIZERS`; entry point `apply_featurizer`.
 - **`attacks/`** — score each unknown conversation against all known ones, producing an `[n_unknown × n_known]` distance matrix. `nearest_neighbor`. Registry: `ATTACKS`; entry point `run_attack`.
 - **`evaluation/`** — `LinkageRanking` sorts each unknown's candidates once and then scores any sub-pool cheaply; `headline_accuracy` and `pool_size_sweep` build the result tables.
 - **`metrics/`** — stateless `top_k_accuracy` and the `random_guessing_accuracy` chance baseline.
 - **`viz/`** — Matplotlib/Seaborn plot helpers for the result tables.
 
 To add a dataset, attack, defense, or featurizer, implement the small interface documented in that subpackage's `__init__.py` and add it to the registry; `run_experiment.py` picks it up automatically.
+
+## Building the unified dataset
+
+The newer, unified dataset (one row per document, both sources, cleaned and identifier-scrubbed) is built by the pipeline in `src/prompt_anonymity/data/`. All of it writes to the repo's `data/` folder, which holds **outputs only** — no code:
+
+```bash
+python -m prompt_anonymity.data.build_dataset                     # raw sources -> data/dist/*.parquet
+python -m prompt_anonymity.data.validate_dataset                  # integrity checks
+python -m prompt_anonymity.data.compute_features --source swe-chat --feature stylometrix
+python -m prompt_anonymity.data.compute_features --source swe-chat --feature gemini_embedding_2
+```
+
+**Where the raw data comes from is configuration, not a constant.** `src/prompt_anonymity/data/datasets.toml` pins each source's HuggingFace repo and revision, and with nothing else set the build downloads them (WildChat-4.8M is gated: accept its terms and `hf auth login` first). If you already have local copies, point at them without editing the committed config:
+
+```bash
+# in .env, or exported in your shell
+PROMPT_ANONYMITY_WILDCHAT_RAW=/path/to/WildChat-4.8M/data          # directory of parquet shards
+PROMPT_ANONYMITY_SWE_CHAT_RAW=/path/to/SWE-chat/conversations.parquet
+PROMPT_ANONYMITY_DATA_DIR=/path/for/outputs                        # default: <repo>/data
+```
+
+A `datasets.toml` of your own — in the repo root, or wherever `$PROMPT_ANONYMITY_DATASETS_CONFIG` points — overrides the packaged defaults; see the comments in that file for the schema.
+
+`compute_features` shards for SLURM job arrays (`--num-shards` / `--shard-index`, see `scripts/compute_features_slurm.sh`) and caches every vector by content, so re-runs and resumed runs recompute nothing. That matters most for `--feature gemini_embedding_2`, where each cache miss is a paid OpenRouter call (~$0.32 for all of SWE-chat); the run prints what it spent. That featurizer embeds each document once, from its first 8,192 tokens (the model's window), prefixed with `task: sentence similarity | query: ` — it does not read past the window, so its vectors describe a document's opening rather than all of it.
 
 ## (Optional) Regenerating the WildChat data
 
