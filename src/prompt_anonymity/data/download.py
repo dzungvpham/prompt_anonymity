@@ -12,10 +12,10 @@ actually moved; ``--force`` throws that away and re-downloads everything from sc
 
 Usage (from the repo root)::
 
-    python -m prompt_anonymity.data.download_hf                       # -> data/hf/, mirroring main
-    python -m prompt_anonymity.data.download_hf --force               # ignore local copies, re-download all
-    python -m prompt_anonymity.data.download_hf --include '*.parquet' # only the data files (no pruning)
-    python -m prompt_anonymity.data.download_hf --repo-id other/repo --out /tmp/hf
+    python -m prompt_anonymity.data.download                       # -> data/hf/, mirroring main
+    python -m prompt_anonymity.data.download --force               # ignore local copies, re-download all
+    python -m prompt_anonymity.data.download --include '*.parquet' # only the data files (no pruning)
+    python -m prompt_anonymity.data.download --repo-id other/repo --out /tmp/hf
 """
 
 from __future__ import annotations
