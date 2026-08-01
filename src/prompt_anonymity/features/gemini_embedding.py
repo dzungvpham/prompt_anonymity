@@ -1,12 +1,21 @@
-"""Gemini Embedding 2 semantic embeddings, served through OpenRouter.
+"""Gemini semantic embeddings (Embedding 2 and Embedding 001), served through OpenRouter.
 
-The stylometric featurizers describe *how* a document is written; this one describes what it is
-**about**, by embedding the text with Google's ``gemini-embedding-2`` (up to 3072 dimensions,
-L2-normalized, matryoshka-truncatable). It is the successor to the old
-``wildchat/get_embeddings.py``, which called ``gemini-embedding-001`` through Vertex AI with a
-service account and a hand-rolled token-rate limiter; going through OpenRouter's OpenAI-compatible
-``/embeddings`` endpoint needs nothing but the ``OPENROUTER_API_KEY`` this project already keeps
-in its ``.env`` (the same key the fidelity judges and the OpenAnonymity defense use).
+The stylometric featurizers describe *how* a document is written; these describe what it is
+**about**, by embedding the text with one of Google's embedding models. Two are registered:
+
+* :class:`GeminiEmbedding2Featurizer` (``gemini_embedding_2``) -- the current model, an
+  8,192-token window, and a **task** written into the text;
+* :class:`GeminiEmbedding001Featurizer` (``gemini_embedding_001``) -- the previous generation, a
+  2,048-token window and no usable task selection (see below), kept so its vectors stay
+  reproducible and comparable.
+
+Both are thin subclasses of :class:`OpenRouterEmbeddingFeaturizer`, which holds everything that
+is not model-specific: cutting a document to one model-sized input, packing inputs into requests,
+retrying, normalizing, and accounting for what the run spent. They reach OpenRouter's
+OpenAI-compatible ``/embeddings`` endpoint with nothing but the ``OPENROUTER_API_KEY`` this
+project already keeps in its ``.env`` (the same key the fidelity judges and the OpenAnonymity
+defense use). This supersedes the old ``wildchat/get_embeddings.py``, which called
+``gemini-embedding-001`` through Vertex AI with a service account and a hand-rolled rate limiter.
 
 Like every :class:`~prompt_anonymity.features.base.Featurizer`, vectors are cached on disk by
 text content, so a re-run costs nothing and an interrupted run resumes where it stopped -- which
@@ -19,36 +28,42 @@ field applies to ``gemini-embedding-001`` only. Instead the task is written **in
 
     task: sentence similarity | query: <the document>
 
-which is what this featurizer sends (:data:`TASK_PREFIX_TEMPLATE`, :data:`DEFAULT_TASK`). That
-detail is what makes the task selectable here at all: a request *field* would be dropped in
-transit -- probed 2026-07-31, OpenRouter silently discards ``task_type``/``taskType``/
-``input_type``/``provider.*``/``extra_body.*``, returning bit-identical vectors even for an
-invalid value -- whereas a prefix is part of ``input`` and reaches the model verbatim.
+which is what :class:`GeminiEmbedding2Featurizer` sends. That detail is what makes the task
+selectable here at all: a request *field* would be dropped in transit -- probed 2026-07-31,
+OpenRouter silently discards ``task_type``/``taskType``/``input_type``/``provider.*``/
+``extra_body.*``, returning bit-identical vectors even for an invalid value -- whereas a prefix is
+part of ``input`` and reaches the model. Measured effect: the same document embedded under
+``sentence similarity`` and under ``clustering`` has cosine ~0.88 between its two vectors, so the
+choice genuinely matters.
 
-``sentence similarity`` is the symmetric task: both sides of a comparison are embedded the same
-way, which is what linkage does (an unknown document against known documents, not a query against
-a corpus). ``clustering`` and ``classification`` are the other symmetric options; the asymmetric
-retrieval tasks (``search result``, ``question answering``, ``fact checking``, ``code
-retrieval``) would embed the two sides differently and do not fit this pipeline.
+``sentence similarity`` and ``clustering`` are both symmetric tasks: both sides of a
+comparison are embedded the same way, which is what linkage does -- an unknown document against
+known documents, not a query against a corpus. ``classification`` is the third symmetric option;
+the asymmetric retrieval tasks (``search result``, ``question answering``, ``fact checking``,
+``code retrieval``) would embed the two sides differently and do not fit this pipeline.
+
+Embedding 001 has **no** working task selection through OpenRouter -- its mechanism is exactly the
+dropped request field -- so it refuses a task rather than silently ignoring one.
 
 How much of a document is read
 ------------------------------
-The model reads at most :data:`MODEL_INPUT_TOKENS` (8,192) tokens. On the previous model, input
-past the limit was **silently ignored and still billed** -- embedding a 27,000-token document
-returned, to within floating-point equality, the embedding of its first 2,048 tokens, at 13x the
-price -- so the client, not the provider, does the cutting.
+Each model reads a fixed window (:attr:`~OpenRouterEmbeddingFeaturizer.model_input_tokens`).
+Input past it is **silently ignored and still billed**: verified on both models, a document whose
+first window is identical to another's embeds to cosine 1.000000 no matter what follows, while
+the discarded tail is charged for. The client, not the provider, therefore does the cutting.
 
 One document becomes **one** model-sized input and **one** call: no splitting into several
-windows, no pooling of several vectors. A document's vector therefore represents its opening
-~8,192 tokens, and the rest of a very long session is not represented at all -- a deliberate
-simplification. It keeps a vector a real model output rather than an average of outputs, and it
-caps the price of any document at :data:`INPUT_TOKENS` tokens whatever its length.
+windows, no pooling of several vectors. A document's vector represents its opening window, and the
+rest of a very long session is not represented at all -- a deliberate simplification. It keeps a
+vector a real model output rather than an average of outputs, and it caps what any one document
+can cost, however long it is.
 
-The cut is made *above* the model's limit (:data:`INPUT_TOKENS`, 10,000), because the budget is
-measured with ``tiktoken`` -- a different tokenizer than Gemini's, disagreeing by a few percent on
-prose and rather more on CJK and code. Overshooting means the provider, not this client, drops the
-last tokens, so the model's window is certainly **full**; undershooting would silently leave part
-of it empty. The overshoot is billed and discarded, which is what keeps it modest.
+The cut is made *above* the model's window
+(:attr:`~OpenRouterEmbeddingFeaturizer.default_input_tokens`), because the budget is measured with
+``tiktoken`` -- a different tokenizer than Gemini's, which billed ~7% more than tiktoken counted on
+SWE-chat. Overshooting means the provider, not this client, drops the last tokens, so the model's
+window is certainly **full**; undershooting would silently leave part of it empty. The overshoot is
+billed and discarded, which is what keeps it modest.
 """
 
 from __future__ import annotations
@@ -67,28 +82,11 @@ OPENROUTER_EMBEDDINGS_URL = "https://openrouter.ai/api/v1/embeddings"
 #: Environment variable holding the OpenRouter API key (loaded from a ``.env`` if present).
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
-#: OpenRouter model id. Note the spelling: the Hub serves Gemini Embedding 2 as
-#: ``google/gemini-embedding-2``; ``google/gemini-embedding-002`` is rejected as unknown.
-MODEL_ID = "google/gemini-embedding-2"
-
 #: How Embedding 2 is told what the embedding is for -- a prefix on the text itself, since the
 #: model has no ``task_type`` field (see the module docstring).
 TASK_PREFIX_TEMPLATE = "task: {task} | query: {text}"
 
-#: The symmetric task this pipeline wants: both sides of a linkage comparison are embedded the
-#: same way. Other symmetric options are ``"clustering"`` and ``"classification"``.
-DEFAULT_TASK = "sentence similarity"
-
-#: The model's input limit. Tokens past it are dropped by the provider without an error (and
-#: charged for), so the client must cut the text itself -- see the module docstring.
-MODEL_INPUT_TOKENS = 8192
-
-#: Tokens of each document actually sent. Above the model's limit on purpose: the budget is
-#: measured with a stand-in tokenizer, so the excess guarantees the model's window is full, and
-#: it is billed and discarded.
-INPUT_TOKENS = 10_000
-
-#: ``tiktoken`` encoding used to measure the budget (a proxy for Gemini's tokenizer, see above).
+#: ``tiktoken`` encoding used to measure the input budget (a proxy for Gemini's tokenizer).
 TOKENIZER_ENCODING = "o200k_base"
 
 #: Characters per token assumed when ``tiktoken`` is unavailable. Deliberately *generous*: with a
@@ -97,14 +95,8 @@ TOKENIZER_ENCODING = "o200k_base"
 #: model's window unused. Still only an estimate; ``tiktoken`` is much preferred.
 FALLBACK_CHARS_PER_TOKEN = 5
 
-#: The model's native output width. Fewer dimensions can be requested (Google recommends 768 or
-#: 1536; anything from 128 to 3072 is accepted): the model is matryoshka-trained, so a prefix of
-#: the vector is itself a usable embedding -- but a truncated one comes back **un-normalized**, so
-#: this featurizer always re-normalizes (see :meth:`GeminiEmbedding2Featurizer._normalize`).
-NATIVE_DIMENSIONS = 3072
-
-#: Documents per HTTP request, and the total tokens one request may carry. Both caps apply: at
-#: 8,192-token documents a plain count would build enormous requests, while at this corpus's
+#: Documents per HTTP request, and the total tokens one request may carry. Both caps apply: with
+#: window-sized documents a plain count would build enormous requests, while at this corpus's
 #: median document (a few hundred characters) a token-only rule would build huge ones too. Packing
 #: to whichever cap binds first keeps requests roughly uniform, and keeps the work lost to one
 #: retry bounded.
@@ -116,30 +108,33 @@ REQUEST_TOKEN_BUDGET = 60_000
 DEFAULT_WORKERS = 8
 
 
-class GeminiEmbedding2Featurizer(Featurizer):
-    """Embeds documents with ``gemini-embedding-2`` through OpenRouter.
+class OpenRouterEmbeddingFeaturizer(Featurizer):
+    """Embeds one document per API input through OpenRouter; base of the Gemini featurizers.
 
-    Each document becomes exactly one API input and one vector: it is cut to
-    :attr:`input_tokens` tokens (above what the model reads), wrapped in the task prefix, and
-    embedded as-is. Nothing is pooled or averaged.
+    A subclass supplies the model and its window as class attributes -- :attr:`model_id`,
+    :attr:`model_input_tokens`, :attr:`default_input_tokens`, and (if the model takes one)
+    :attr:`default_task` -- and inherits everything else.
 
     Parameters
     ----------
-    task : str
-        Task written into the prefix (default :data:`DEFAULT_TASK`, ``"sentence similarity"``).
-        Pass ``""``/``None`` to send the bare document with no prefix.
-    input_tokens : int
-        Tokens of each document to send (default :data:`INPUT_TOKENS`). Lower it to spend less
-        per document; raising it far past :data:`MODEL_INPUT_TOKENS` only buys tokens the model
-        will not read but will bill.
+    task : str, optional
+        Task written into the prefix. ``None`` (default) uses the model's :attr:`default_task`;
+        ``""`` sends the bare document with no prefix. Passing a task to a model that has no
+        prefix mechanism is an error rather than a silent no-op.
+    input_tokens : int, optional
+        Tokens of each document to send (default: the model's :attr:`default_input_tokens`).
+        Lower it to spend less per document; raising it far past the model's window only buys
+        tokens the model will not read but will bill.
     dimensions : int, optional
-        Output width. ``None`` (default) keeps the model's native :data:`NATIVE_DIMENSIONS`;
-        768 or 1536 give a smaller vector (and a much smaller feature file) at some quality cost.
+        Output width. ``None`` (default) keeps the model's native width; a smaller value gives a
+        smaller vector (and a much smaller feature file) at some quality cost. Both Gemini models
+        are matryoshka-trained, so a prefix of the vector is itself a usable embedding -- but a
+        truncated one comes back **un-normalized**, so this featurizer always re-normalizes.
     workers : int, optional
         Concurrent HTTP requests (default :data:`DEFAULT_WORKERS`). Named to match the other
         featurizers' ``workers``, though here it is threads rather than processes.
-    model : str
-        OpenRouter model id, for pointing the same code at another embedding model.
+    model : str, optional
+        OpenRouter model id, overriding :attr:`model_id`.
     batch_size, request_token_budget, max_retries, backoff_cap, timeout
         Documents and tokens per request, retry budget for transient failures, backoff ceiling
         (seconds), and per-request timeout.
@@ -150,19 +145,34 @@ class GeminiEmbedding2Featurizer(Featurizer):
     no empty documents (the build drops them), so this only guards ad-hoc use.
     """
 
-    name = "gemini_embedding_2"
-    version = "1"
+    #: OpenRouter model id (subclass).
+    model_id: str = ""
+    #: Tokens the model actually reads; everything past this is dropped by the provider (subclass).
+    model_input_tokens: int = 0
+    #: Tokens sent per document -- above :attr:`model_input_tokens` on purpose (subclass).
+    default_input_tokens: int = 0
+    #: The model's native output width (subclass).
+    native_dimensions: int = 0
+    #: Task written into the prefix by default; ``None`` for a model with no prefix mechanism.
+    default_task: str | None = None
 
-    def __init__(self, *, task: str | None = DEFAULT_TASK, input_tokens: int = INPUT_TOKENS,
-                 dimensions: int | None = None, workers: int | None = None, model: str = MODEL_ID,
-                 batch_size: int = DOCUMENTS_PER_REQUEST,
+    def __init__(self, *, task: str | None = None, input_tokens: int | None = None,
+                 dimensions: int | None = None, workers: int | None = None,
+                 model: str | None = None, batch_size: int = DOCUMENTS_PER_REQUEST,
                  request_token_budget: int = REQUEST_TOKEN_BUDGET, max_retries: int = 8,
                  backoff_cap: float = 30.0, timeout: float = 300.0):
-        self.task = task or ""
-        self.input_tokens = max(1, int(input_tokens))
+        self.task = self.default_task or "" if task is None else task
+        if self.task and self.default_task is None:
+            raise ValueError(
+                f"{type(self).__name__} ({self.model_id}) has no task-prefix mechanism, so "
+                f"task={task!r} would change nothing about the request. Its task_type field is "
+                f"dropped in transit by OpenRouter; use gemini_embedding_2, whose task travels "
+                f"inside the text, if you need to select one."
+            )
+        self.input_tokens = max(1, int(input_tokens or self.default_input_tokens))
         self.dimensions = int(dimensions) if dimensions else None
         self.workers = DEFAULT_WORKERS if workers is None else max(1, int(workers))
-        self.model = model
+        self.model = model or self.model_id
         self.batch_size = max(1, int(batch_size))
         self.request_token_budget = max(1, int(request_token_budget))
         self.max_retries = max_retries
@@ -187,7 +197,7 @@ class GeminiEmbedding2Featurizer(Featurizer):
         # serial and a parallel run share one cache namespace. `task` does change them -- it is
         # part of the text the model sees -- so each task caches separately.
         return {"model": self.model, "task": self.task,
-                "dimensions": self.dimensions or NATIVE_DIMENSIONS,
+                "dimensions": self.dimensions or self.native_dimensions,
                 "input_tokens": self.input_tokens}
 
     # --- reading one document ------------------------------------------------
@@ -209,7 +219,7 @@ class GeminiEmbedding2Featurizer(Featurizer):
         """Token count for ``text``, via ``tiktoken`` when it is installed, else estimated.
 
         ``tiktoken`` is not Gemini's tokenizer -- it is a stand-in, accurate enough given that
-        :data:`INPUT_TOKENS` deliberately overshoots the model's window.
+        :attr:`default_input_tokens` deliberately overshoots the model's window.
         """
         encoding = self._tokenizer()
         if encoding is None:
@@ -371,16 +381,16 @@ class GeminiEmbedding2Featurizer(Featurizer):
     def _normalize(self, vector: np.ndarray) -> np.ndarray:
         """Return ``vector`` on the unit sphere (a zero vector is left alone).
 
-        The native 3072-dimension output already arrives L2-normalized, but a
-        ``dimensions``-truncated matryoshka embedding does not, so normalizing here keeps every
-        vector this featurizer returns comparable -- and cosine and euclidean ranking identical.
+        The native-width output already arrives L2-normalized, but a ``dimensions``-truncated
+        matryoshka embedding does not, so normalizing here keeps every vector this featurizer
+        returns comparable -- and cosine and euclidean ranking identical.
         """
         norm = float(np.linalg.norm(vector))
         return vector / norm if norm else vector
 
     def featurize(self, texts) -> np.ndarray:
         prepared = [self._prepare(text) for text in texts]
-        width = self.dimensions or NATIVE_DIMENSIONS
+        width = self.dimensions or self.native_dimensions
 
         # Blank documents are held out of the request (the endpoint rejects an empty string) and
         # keep their zero row; everything else is one input.
@@ -402,3 +412,44 @@ class GeminiEmbedding2Featurizer(Featurizer):
                   f"{self.total_requests:,} requests "
                   f"({self.total_truncated:,} cut to the first {self.input_tokens:,} tokens), "
                   f"{self.total_tokens:,} tokens, ${self.total_cost:.4f}")
+
+
+class GeminiEmbedding2Featurizer(OpenRouterEmbeddingFeaturizer):
+    """Google's Gemini Embedding 2: 8,192-token window, 3072 dimensions, task in the text.
+
+    Note the OpenRouter model id -- the Hub serves this model as ``google/gemini-embedding-2``;
+    ``google/gemini-embedding-002`` is rejected as unknown. $0.20/M tokens as of 2026-07.
+
+    The default task is ``clustering``; ``sentence similarity`` and ``classification`` are the
+    other symmetric options, and each caches (and should be stored) separately, since the prefix
+    materially changes the vector.
+    """
+
+    name = "gemini_embedding_2"
+    version = "1"
+
+    model_id = "google/gemini-embedding-2"
+    model_input_tokens = 8192
+    default_input_tokens = 10_000
+    native_dimensions = 3072
+    default_task = "clustering"
+
+
+class GeminiEmbedding001Featurizer(OpenRouterEmbeddingFeaturizer):
+    """Google's ``gemini-embedding-001``: 2,048-token window, 3072 dimensions, no task selection.
+    $0.15/M tokens as of 2026-07 -- cheaper, but it reads a quarter as much of each document.
+
+    **It has no usable task selection.** The model's mechanism is the ``task_type`` request field,
+    which OpenRouter drops in transit (see the module docstring), so this featurizer refuses a
+    ``task`` rather than pretending to honour one. Its vectors are whatever the provider's default
+    task produces.
+    """
+
+    name = "gemini_embedding_001"
+    version = "1"
+
+    model_id = "google/gemini-embedding-001"
+    model_input_tokens = 2048
+    default_input_tokens = 2252  # ~10% over the window; see the module docstring
+    native_dimensions = 3072
+    default_task = None

@@ -5,7 +5,8 @@ A sibling of ``run_experiment.py``. The machinery is the same -- vectors in, nea
 accuracy out -- but two things about the experiment differ:
 
 1. **Input is the built parquet pair.** ``<split>.parquet`` (documents) joined on ``doc_id`` to
-   ``<split>_<feature>.parquet`` (precomputed vectors from ``data/compute_features.py``). No
+   ``<split>_<feature>.parquet`` (precomputed vectors from
+   ``prompt_anonymity/data/compute_features.py``). No
    featurization, no defense, no GPU: this script only reads vectors that already exist.
 
 2. **A grid of rolling chronological windows.** Documents are ordered by ``ended_at`` and cut at
@@ -94,9 +95,41 @@ Run (from the repo root)::
     python experiments/run_experiment_v2.py --ood reject --ood-calibration far
     # one known fraction, target pool traced finely:
     python experiments/run_experiment_v2.py --known-fractions 0.5 --window 0.05 0.1 0.2 0.3 0.4 0.5
+    # compare the three trainable attacks, each tuned per window on that window's known side:
+    python experiments/run_experiment_v2.py --attacks logistic svm xgboost --tune
 
-Tune one attack's hyper-parameters on one window with ``experiments/benchmark_attribution.py``,
-which selects on a known-side simulation and scores the unknown window once.
+Hyper-parameters (``--tune``)
+-----------------------------
+Every attack's settings are chosen by :func:`tune_on_known`, which searches **only the known
+side** of the window it is about to attack -- the attacker's own labelled data. Nothing in the
+search, down to the standardization statistics, is derived from a document it will later be
+scored on.
+
+The search is :class:`sklearn.model_selection.HalvingRandomSearchCV`: sample
+``--tune-candidates`` configurations from :data:`HYPERPARAMETER_SPACES`, score them on a small
+subsample of each fold's training block, discard all but the best ``1/--tune-factor``, triple the
+data, repeat. Sampling rather than gridding also allows continuous ranges for ``C`` and the
+learning rate, and lets xgboost past 300 trees -- the old grid's maximum, which it selected in
+every single window, meaning the grid rather than the data was setting that answer.
+
+**How much this actually saves, measured.** Less than the rung sizes suggest -- 63 minutes
+against the grid's ~75 for the same three-attack sweep, at unchanged accuracy -- and the reason is
+worth knowing before tuning anything bigger. Halving assumes cost is proportional to the sample,
+but these attacks are dominated by the *author count*: on the swe-chat 75% window a logistic fit
+on a ninth of the documents costs 0.23 of the full one, not 0.11, because the 124-class softmax
+and the 196x124 coefficient matrix are the same size either way (xgboost 0.18, and only the SVM,
+whose cost really is superlinear in the sample, gets the full 0.05). So the first rung is the
+expensive one, and ``--tune-candidates`` -- not ``--tune-factor`` -- is the dial that matters.
+The other resources sklearn can halve on are no better here: ``max_iter`` is not a real budget
+because lbfgs converges in 104-215 iterations, well inside the 3,000 it is allowed.
+
+The larger saving is not in the search at all but in how often it runs. The eight windows share
+only *three* distinct known sides (one per ``--known-fractions`` value), and for a given known
+fraction every window is attacked from the identical documents, labels and standardisation --
+so the search is run once per known side and reused (:func:`tuned_settings`), 3 searches instead
+of 8. That is what ``--tune-window`` exists for: the inner validation block is a fixed share of
+the known side rather than a copy of the outer window, which is what used to make otherwise
+identical searches differ.
 
 Outputs (under ``--output-dir``), all carrying ``known_fraction``, ``window`` and ``attack``
 columns, so a multi-attack run stays one tidy table per file:
@@ -117,11 +150,16 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
+from scipy.stats import loguniform
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.experimental import enable_halving_search_cv  # noqa: F401  (unlocks the import below)
+from sklearn.model_selection import HalvingRandomSearchCV
 
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, rejection_score
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
@@ -150,10 +188,12 @@ FEATURE_LABELS = {  # legend name per feature, matching run_experiment.py
     "stylometrix": "StyloMetrix",
     "function_words": "Function Words",
     "character_statistics": "Character Stats",
+    "gemini_embedding_001": "Gemini Embedding 001",
+    "gemini_embedding_2": "Gemini Embedding 2",
 }
 DATA_DIR = REPO_ROOT / "data" / "hf"
 
-# source -> split / parquet base name (must match data/build_dataset.py SPLIT_NAMES).
+# source -> split / parquet base name (must match build_dataset.py SPLIT_NAMES).
 SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
 
 # The extra class: "this document's author is not among the known authors". Not a valid
@@ -218,7 +258,10 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     features_path = Path(data_dir) / f"{split}_{feature}.parquet"
     for path in (documents_path, features_path):
         if not path.exists():
-            raise SystemExit(f"{path} not found -- build it first (see data/README.md).")
+            raise SystemExit(f"{path} not found -- build it first with\n"
+                             f"  python -m prompt_anonymity.data.build_dataset\n"
+                             f"  python -m prompt_anonymity.data.compute_features --source {source} "
+                             f"--feature {feature}")
 
     documents = pd.read_parquet(documents_path)
     features = pd.read_parquet(features_path)
@@ -226,7 +269,8 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     if missing:
         raise SystemExit(
             f"{len(missing):,} of {len(documents):,} documents have no {feature} vector. "
-            f"Recompute with `python -m data.compute_features --source {source} --feature {feature}`."
+            f"Recompute with `python -m prompt_anonymity.data.compute_features --source {source} "
+            f"--feature {feature}`."
         )
 
     # The feature parquet mirrors some document metadata (``author_id``); keep only the columns
@@ -310,22 +354,318 @@ def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.
 
 # --- open-set attribution ----------------------------------------------------
 
-def build_attack(name: str, args: argparse.Namespace):
+def build_attack(name: str, args: argparse.Namespace, overrides: dict | None = None):
     """Construct the named attack from :data:`~prompt_anonymity.attacks.ATTRIBUTION_ATTACKS`.
 
     Returned as a *factory* of fresh, unfitted attacks rather than one instance, because
     threshold calibration refits the same configuration on each simulation fold. Each attack
-    picks up whichever of the tuning flags applies to it; the rest are ignored.
+    picks up whichever of the CLI tuning flags applies to it; the rest are ignored.
+    ``overrides`` (from :func:`tune_on_known`) wins over the flags.
     """
     attack = ATTRIBUTION_ATTACKS[name]
+    settings = {}
     if name == "logistic":
-        return lambda: attack(C=args.regularization,
-                              class_weight="balanced" if args.balanced else None)
-    if name in ("wccn", "plda"):
-        return lambda: attack(shrinkage=args.shrinkage)
-    if name == "nearest_neighbor":
-        return lambda: attack(metric=args.metric)
-    return attack
+        settings = {"C": args.regularization,
+                    "class_weight": "balanced" if args.balanced else None}
+    elif name in ("wccn", "plda"):
+        settings = {"shrinkage": args.shrinkage}
+    elif name == "nearest_neighbor":
+        settings = {"metric": args.metric}
+    settings.update(overrides or {})
+    return (lambda: attack(**settings)) if settings else attack
+
+
+# Hyper-parameter search spaces sampled by --tune, in the form
+# :class:`sklearn.model_selection.ParameterSampler` accepts: a mapping of name -> (list of choices
+# | scipy distribution with ``.rvs``), or a *list* of such mappings when the space is conditional
+# (an SVM's ``gamma`` only exists for the RBF kernel, so each kernel is its own sub-space and one
+# is chosen uniformly per draw).
+#
+# These are continuous where the old grids were a handful of points, which is the part of random
+# search that is free: a draw from a range costs exactly what a draw from a list costs. What is
+# *not* free is how expensive an individual draw can be -- see the xgboost note below -- so these
+# ranges are bounded by fit cost rather than by what is plausible. The xgboost range does reach
+# past 300 trees, which every window of the earlier grid search picked: a boundary hit that meant
+# the grid, not the data, was setting that answer.
+# Attacks absent from this mapping have nothing worth tuning and are used as configured.
+HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
+    # C stops at 5 for a cost reason, not a modelling one: above it lbfgs needs several times more
+    # iterations to converge and a single fit dominates the whole search, while every window that
+    # has been searched picked a C below 1. Widen it only alongside a higher max_iter.
+    "logistic": {"C": loguniform(0.02, 5.0), "class_weight": [None, "balanced"]},
+    "svm": [
+        {"kernel": ["linear"], "C": loguniform(0.1, 30.0)},
+        {"kernel": ["rbf"], "C": loguniform(1.0, 300.0), "gamma": ["scale"]},
+        {"kernel": ["rbf"], "C": loguniform(1.0, 300.0), "gamma": loguniform(1e-3, 1e-1)},
+    ],
+    # An xgboost fit costs roughly depth x trees x documents, so this is the one space where
+    # widening is not free -- a first draft reaching depth 8 and 800 trees made the halving search
+    # *slower* than the grid it replaced, having spent the saving on individually huge candidates.
+    # The floor on learning_rate is what keeps the tree count honest: a slow learner needs many
+    # more rounds to pay off, so the cheap way to allow "more trees than the old grid's 300" is to
+    # rule out the configurations that would need thousands of them.
+    "xgboost": {
+        "n_estimators": [100, 200, 300, 500],
+        "max_depth": [2, 3, 4, 6],
+        "learning_rate": loguniform(0.08, 0.5),
+        "subsample": [0.7, 0.85, 1.0],
+    },
+    "wccn": {"shrinkage": loguniform(0.01, 0.9)},
+    "plda": {"shrinkage": loguniform(0.01, 0.9)},
+    "lda": {"n_components": [None, 16, 32, 64, 128]},
+}
+
+
+def inner_known_folds(n_known: int, window: float, n_folds: int = 3) -> list[tuple[slice, slice]]:
+    """Chronological train/validate splits **inside** the known side, for hyper-parameter search.
+
+    These are handed to the search as an explicit ``cv`` rather than letting it default to a
+    random k-fold, which would be the wrong simulation twice over. A random fold would let the
+    model train on a user's later documents to predict their earlier ones, which the real task
+    never permits, and it would keep every author on both sides, whereas the real unknown window
+    contains authors who are simply new. Replaying the experiment's own chronological cut inside
+    the known window reproduces both effects, at the cost of validating on less data.
+
+    Successive halving subsamples the *training* block of each fold to build its early rungs.
+    That preserves both properties -- a random subset of documents that all precede the validation
+    block still precedes it, and dropping documents can only make the "unseen author" effect
+    stronger, not weaker.
+
+    Each fold trains on ``[0, cut)`` and validates on the following ``window`` fraction **of the
+    known side**, with the cuts spaced so the last one ends exactly at the end of it. Every row
+    used is a known row: nothing here can see the unknown window, which is the property that
+    makes any selection made on top of it honest.
+
+    ``window`` is ``--tune-window`` and is deliberately *not* the experiment's outer window. The
+    two are in different units anyway -- one is a share of the known side, the other a share of
+    the whole timeline -- so tying them together never made the inner simulation match the outer
+    task, it only forced a separate search per window. Decoupling them lets the eight window
+    combinations share three searches, one per known side.
+    """
+    folds = []
+    for index in range(n_folds):
+        # Space the validation blocks so the final one ends at the end of the known side.
+        end_fraction = 1.0 - index * window / max(n_folds, 1)
+        end = int(round(end_fraction * n_known))
+        start = int(round((end_fraction - window) * n_known))
+        if start < 2 or end <= start:
+            continue
+        folds.append((slice(0, start), slice(start, end)))
+    return folds
+
+
+class TunableAttack(BaseEstimator, ClassifierMixin):
+    """scikit-learn estimator wrapping one :data:`ATTRIBUTION_ATTACKS` entry, for the tuner.
+
+    The attribution attacks expose ``fit(embeddings, labels)`` / ``score(embeddings)``, where
+    ``score`` returns an ``[n_docs x n_authors]`` matrix. That is deliberately *not* the sklearn
+    convention -- ``BaseEstimator.score(X, y)`` means "accuracy" -- so a search meta-estimator
+    cannot drive them directly. This adapter supplies the missing half of the interface:
+    ``predict`` (argmax over authors), ``classes_``, and ``get_params``/``set_params`` over an
+    open-ended settings dict, which is what lets :func:`clone` rebuild a candidate.
+
+    Standardization is folded in here rather than applied to the whole known side up front,
+    because each cross-validation fold must derive its mean and scale from its own training block
+    only. Fitting them on all of the known data would leak the fold's validation documents into
+    the fold's own preprocessing -- a mild leak, but the point of this machinery is that there
+    are none.
+    """
+
+    def __init__(self, attack_name: str, standardize: bool = True, **settings):
+        self.attack_name = attack_name
+        self.standardize = standardize
+        self.settings = settings
+
+    def get_params(self, deep: bool = True) -> dict:
+        """Flatten the settings dict into the search space's own parameter names."""
+        return {"attack_name": self.attack_name, "standardize": self.standardize, **self.settings}
+
+    def set_params(self, **params):
+        """Accept any hyper-parameter name; unrecognised ones are passed to the attack."""
+        settings = dict(self.settings)
+        for key, value in params.items():
+            if key in ("attack_name", "standardize"):
+                setattr(self, key, value)
+            else:
+                settings[key] = value
+        self.settings = settings
+        return self
+
+    def fit(self, embeddings, labels):
+        embeddings = np.asarray(embeddings, dtype=float)
+        if self.standardize:
+            scale = embeddings.std(axis=0)
+            self.center_ = embeddings.mean(axis=0)
+            self.scale_ = np.where(scale > 0, scale, 1.0)
+            embeddings = (embeddings - self.center_) / self.scale_
+        self.model_ = ATTRIBUTION_ATTACKS[self.attack_name](**self.settings).fit(embeddings, labels)
+        self.classes_ = np.asarray(self.model_.authors)
+        return self
+
+    def predict(self, embeddings):
+        """The highest-scoring author per document."""
+        embeddings = np.asarray(embeddings, dtype=float)
+        if self.standardize:
+            embeddings = (embeddings - self.center_) / self.scale_
+        return self.classes_[self.model_.score(embeddings).argmax(axis=1)]
+
+
+def in_set_top_1(estimator: TunableAttack, embeddings: np.ndarray, labels: np.ndarray) -> float:
+    """Top-1 accuracy over the validation documents whose author was in the training block.
+
+    The scorer used to select hyper-parameters. Documents by an author the model never saw are
+    excluded rather than counted wrong: they are unattributable by construction, so including
+    them would add a term that no hyper-parameter can influence and compress the differences the
+    search is trying to resolve. Folds with no attributable document score 0 -- the same for
+    every candidate, so it cannot change their ordering.
+    """
+    in_set = np.isin(labels, estimator.classes_)
+    if not in_set.any():
+        return 0.0
+    return float((estimator.predict(embeddings[in_set]) == labels[in_set]).mean())
+
+
+def halving_budget(n_known: int, n_authors: int, n_candidates: int, factor: int) -> int:
+    """Training-set size for the first rung, sized so the **last** rung uses all the known side.
+
+    The rung count is set by the candidate count, not by this budget: halving divides the field by
+    ``factor`` each round, so ``n_candidates`` candidates survive ``1 + log_factor(n_candidates)``
+    rounds and then stop, whatever budget they started from. Starting too low therefore does not
+    buy an extra round -- it just means the search runs out of candidates early and its winner is
+    chosen, and reported, on a fraction of the data. Anchoring to the last rung instead makes the
+    winner's ``known_cv_top1`` a full-size number, comparable across searches and against a
+    non-halving baseline.
+
+    (Getting this wrong is not loud: at six candidates and factor three an earlier version ran two
+    rounds ending at a *third* of the known side, which cost only ~0.006 of measured top-1 but
+    moved every reported known-side CV score down by a uniform ~0.055, purely because they were
+    measured on less data.)
+
+    The one floor: a rung with fewer than ~2 documents per author is not the task being tuned for,
+    and every candidate scores near zero there.
+    """
+    rungs = 1
+    while factor ** rungs <= max(n_candidates, 1):
+        rungs += 1
+    if rungs == 1:                       # fewer candidates than `factor`: one full-size round
+        return n_known
+    return int(min(max(n_known // factor ** (rungs - 1), 2 * n_authors),
+                   max(n_known // factor, 1)))
+
+
+def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
+                  args: argparse.Namespace) -> tuple[dict, pd.DataFrame]:
+    """Pick ``name``'s hyper-parameters using known documents only, and say what it picked.
+
+    Runs :class:`sklearn.model_selection.HalvingRandomSearchCV` over
+    :data:`HYPERPARAMETER_SPACES` with the chronological folds from :func:`inner_known_folds` and
+    :func:`in_set_top_1` as the criterion: start ``--tune-candidates`` candidates on a small
+    subsample of each fold's training block, keep the best ``1/factor``, triple the training data,
+    repeat, so a configuration only reaches a full-size fit if it has already outscored two thirds
+    of the field.
+
+    The budget being subsampled is the training block, never the validation block's position: a
+    fold still trains only on documents that precede the ones it is scored on. The subsample is
+    drawn once per rung from a fixed seed, so all candidates at a rung see identical data.
+
+    This runs **once per known side** -- see :func:`tuned_settings`, which memoises it across the
+    windows that share one. It must not be run once for the whole experiment: a value tuned on the
+    75% known side and reused at 25% would have been selected on documents that are the *unknown*
+    side of the shorter window, which is exactly the leak the per-known-side search exists to
+    avoid. Sharing *within* one known fraction is safe because every such window is attacked from
+    the identical labelled set.
+
+    **What it costs, measured.** Against the exhaustive grid this replaced -- same eight windows,
+    same folds, same criterion -- it is roughly a wash for a fifth less wall clock (63 vs ~75
+    minutes for ``--attacks logistic svm xgboost --tune``). Mean unknown-side top-1 moved by
+    -0.001 over the 24 runs, with halving ahead in 9 of them: logistic 0.265 -> 0.254, svm
+    0.279 -> 0.291, xgboost 0.311 -> 0.308. On its own known-side criterion the selected
+    configuration scored -0.010 (logistic), -0.006 (svm) and +0.003 (xgboost) against the grid's
+    best, so the cheaper search is choosing about as well, and the wider continuous ranges make
+    up most of what the coarser search loses.
+
+    The failure mode to watch for is a first rung that ranks candidates differently from a
+    full-size fit -- an RBF SVM that beats every linear one on all the data can sit below them on
+    a third of it, and gets eliminated before it is ever fitted properly. Raise
+    ``--tune-candidates``, or drop ``--tune-factor`` to 2, for a larger first rung when a search
+    returns something implausible.
+
+    Returns ``(best_settings, trials)``, where ``trials`` is every (candidate, rung) pair that was
+    evaluated, so a run's tuning is auditable rather than a hidden choice. A candidate whose fit
+    raises scores 0 and is eliminated (sklearn emits a ``FitFailedWarning`` naming it) rather than
+    aborting the run or, worse, ranking first as a NaN.
+    """
+    space = HYPERPARAMETER_SPACES.get(name)
+    folds = inner_known_folds(len(labels), args.tune_window, args.tune_folds)
+    if not space or not folds:
+        return {}, pd.DataFrame()
+
+    factor = max(args.tune_factor, 2)
+    with warnings.catch_warnings():
+        # Early rungs train on a subsample, so some authors arrive with a single document and the
+        # shrinkage estimators say so once per author per fit -- thousands of lines that mean
+        # "this rung is small", which is the design. Nothing else is silenced.
+        warnings.filterwarnings("ignore", message="Only one sample available")
+        search = _halving_search(name, space, folds, factor, embeddings, labels, args)
+
+    # One row per (candidate, rung), so the CSV shows both what was tried and where each
+    # candidate was cut. `train_budget` is the rung's resource level as a share of the whole
+    # known side; each fold trains on that same share of *its* (shorter) training block.
+    trials = pd.DataFrame(search.cv_results_["params"]).drop(
+        columns=["attack_name", "standardize"], errors="ignore")
+    trials["known_cv_top1"] = search.cv_results_["mean_test_score"]
+    trials["known_cv_std"] = search.cv_results_["std_test_score"]
+    trials["rung"] = search.cv_results_["iter"]
+    trials["train_budget"] = search.cv_results_["n_resources"]
+    trials["selected"] = np.arange(len(trials)) == search.best_index_
+    best = {key: value for key, value in search.best_params_.items()
+            if key not in ("attack_name", "standardize")}
+    return best, trials
+
+
+def tuned_settings(name: str, fraction: float, embeddings: np.ndarray, labels: np.ndarray,
+                   args: argparse.Namespace, cache: dict) -> tuple[dict, pd.DataFrame]:
+    """:func:`tune_on_known`, run at most once per ``(attack, known fraction)``.
+
+    The experiment sweeps ``--known-fractions`` against ``--window``, but only the first of those
+    changes what the attacker holds: for a given known fraction, every window is attacked from the
+    same documents, the same labels and the same standardisation. Searching once per known side
+    rather than once per pair therefore returns identical settings for a third of the work -- on
+    the default 3x3 sweep, 3 searches instead of 8.
+
+    ``cache`` is owned by the caller (:func:`main`) so that its lifetime is one experiment and the
+    sharing is visible in the driver rather than hidden in module state. The trials table is
+    returned only on a miss, so ``tuning_trials.csv`` holds one block per search instead of the
+    same rows repeated once per window.
+    """
+    key = (name, fraction)
+    if key in cache:
+        return cache[key], pd.DataFrame()
+    settings, trials = tune_on_known(name, embeddings, labels, args)
+    cache[key] = settings
+    return settings, trials
+
+
+def _halving_search(name: str, space, folds, factor: int, embeddings: np.ndarray,
+                    labels: np.ndarray, args: argparse.Namespace) -> HalvingRandomSearchCV:
+    """The fitted search behind :func:`tune_on_known`; split out only to keep that one readable."""
+    return HalvingRandomSearchCV(
+        TunableAttack(attack_name=name, standardize=args.standardize),
+        space,
+        n_candidates=args.tune_candidates,
+        factor=factor,
+        resource="n_samples",
+        min_resources=halving_budget(len(labels), len(np.unique(labels)),
+                                     args.tune_candidates, factor),
+        cv=[(np.arange(train.start, train.stop), np.arange(validate.start, validate.stop))
+            for train, validate in folds],
+        scoring=in_set_top_1,
+        refit=False,           # only the winning settings are wanted; run_window does the real fit
+        return_train_score=False,
+        error_score=0.0,       # an infeasible candidate loses; it does not abort or win as NaN
+        random_state=args.seed,
+        n_jobs=args.tune_jobs,
+    ).fit(embeddings, labels)
 
 
 def open_set_folds(labels: np.ndarray, held_out_fraction: float = 0.3, n_folds: int = 3,
@@ -587,14 +927,19 @@ def closed_set_table(distances: np.ndarray, known_labels, unknown_labels, args: 
 # --- driver -----------------------------------------------------------------
 
 def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, window: float,
-               attack: str, known: slice, unknown: slice, args: argparse.Namespace):
+               attack: str, known: slice, unknown: slice, args: argparse.Namespace,
+               tuning_cache: dict):
     """Run one (window, attack) combination end to end: calibrate, attribute, score.
 
-    Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report)`` -- a one-row
-    summary of the window, the per-document decisions, the accept/reject trade-off curve, the
-    closed-set top-k table, the full CMC curve, and the per-author risk/retrieval breakdown.
-    With ``--ood none`` (the default) the reject option is skipped, ``ood_sweep`` is ``None``
-    and the summary covers only the in-set documents.
+    Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
+    one-row summary of the window, the per-document decisions, the accept/reject trade-off curve,
+    the closed-set top-k table, the full CMC curve, the per-author risk/retrieval breakdown, and
+    the hyper-parameter search (empty unless this call was the one that ran it). With ``--ood
+    none`` (the default) the reject option is skipped, ``ood_sweep`` is ``None`` and the summary
+    covers only the in-set documents.
+
+    ``tuning_cache`` is passed through to :func:`tuned_settings`; see there for why sharing a
+    search between windows of the same known fraction is sound.
     """
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
     known_embeddings, unknown_embeddings = embeddings[known], embeddings[unknown]
@@ -611,9 +956,17 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
             f"has an author on the known side, so nothing can be scored."
         )
 
+    # Optionally pick this attack's hyper-parameters, using this window's known side only, and
+    # reusing the search across windows that share it. Deliberately before anything touches
+    # unknown_embeddings.
+    settings, trials = ({}, pd.DataFrame())
+    if args.tune:
+        settings, trials = tuned_settings(attack, fraction, known_embeddings, known_labels,
+                                          args, tuning_cache)
+
     # Fit the attack on the known side (documents + labels, all of which the attacker holds) and
     # score every unknown document against every known author.
-    factory = build_attack(attack, args)
+    factory = build_attack(attack, args, settings)
     fitted = factory().fit(known_embeddings, known_labels)
     author_scores = fitted.score(unknown_embeddings)          # (n_unknown, n_known_authors)
     best = author_scores.argmax(axis=1)
@@ -625,6 +978,11 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
         "known_fraction": fraction,
         "window": window,
         "attack": attack,
+        # Rounded because the search now samples continuous ranges: an unrounded C prints 17
+        # digits of a number whose third one is noise. tuning_trials.csv keeps the exact value.
+        "hyperparameters": ", ".join(
+            f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}"
+            for key, value in settings.items()) or "default",
         "known_period": _period(known_frame),
         "unknown_period": _period(unknown_frame),
         "n_known_docs": len(known_labels),
@@ -687,13 +1045,18 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
     in_set_scores, in_set_labels = author_scores[in_set], unknown_labels[in_set]
     cmc, author_report = closed_set_detail(in_set_scores, fitted.authors, in_set_labels, args, scores)
 
-    # Every table is stamped with the three axes it belongs to, in the same order, so the
-    # concatenated CSVs can be grouped or filtered on any of them.
+    # Every per-window table is stamped with the three axes it belongs to, in the same order, so
+    # the concatenated CSVs can be grouped or filtered on any of them.
     for table in (headline, cmc, author_report):
         table.insert(0, "attack", attack)
         table.insert(0, "window", window)
         table.insert(0, "known_fraction", fraction)
-    return scores, predictions, ood_sweep, headline, cmc, author_report
+    # The search is not a per-window table -- it belongs to the known side, which is why it has no
+    # `window` column and why it is empty on every window after the first that shares one.
+    if not trials.empty:
+        trials.insert(0, "attack", attack)
+        trials.insert(0, "known_fraction", fraction)
+    return scores, predictions, ood_sweep, headline, cmc, author_report, trials
 
 
 def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_authors: np.ndarray,
@@ -792,6 +1155,48 @@ def parse_args() -> argparse.Namespace:
                              "leaving them in measured better (top-1 0.258 vs 0.252).")
     parser.add_argument("--shrinkage", type=float, default=0.2,
                         help="Covariance shrinkage for the wccn / plda attacks (default: 0.2).")
+    parser.add_argument("--tune", action="store_true",
+                        help="Search each attack's hyper-parameter space (HYPERPARAMETER_SPACES) "
+                             "before scoring, by successive halving over randomly sampled "
+                             "configurations. The search runs on chronological folds *inside the "
+                             "known side*, so it never sees the documents it will be evaluated "
+                             "on. It runs once per (attack, known fraction) and is shared by the "
+                             "windows that start from that known side; it is never shared across "
+                             "known fractions, because the 75%% known side contains the 25%% "
+                             "one's unknown documents. Overrides --regularization / --balanced / "
+                             "--shrinkage. Writes every (candidate, rung) pair to "
+                             "tuning_trials.csv, one block per search.")
+    parser.add_argument("--tune-folds", type=int, default=3,
+                        help="Chronological folds inside the known side per --tune search "
+                             "(default: 3).")
+    parser.add_argument("--tune-window", type=float, default=0.25,
+                        help="Validation block of each tuning fold, as a fraction of the known "
+                             "side (default: 0.25). Independent of --window on purpose: the two "
+                             "are in different units, so tying them together never made the "
+                             "inner simulation match the outer task and only forced a separate "
+                             "search per window. Keeping it fixed lets every window of one known "
+                             "fraction share a single search.")
+    parser.add_argument("--tune-candidates", type=int, default=6,
+                        help="Configurations sampled per --tune search, i.e. the width of the "
+                             "first halving rung (default: 6). This is the main speed dial. A "
+                             "first-rung fit is not free -- measured on swe-chat it costs ~0.2 of "
+                             "a full-size one, not the 1/9 its data share suggests, because the "
+                             "124-class softmax and the 196x124 coefficient matrix do not shrink "
+                             "with the sample -- so 12 candidates spend ~2.5 full fits before the "
+                             "search has narrowed anything. Raise it when the search is picking "
+                             "implausible configurations, not by default.")
+    parser.add_argument("--tune-factor", type=int, default=3,
+                        help="Halving aggressiveness (default: 3): each rung keeps the best "
+                             "1/factor of the candidates and multiplies their training data by "
+                             "factor. Together with --tune-candidates it fixes how many rungs "
+                             "there are and therefore how small the first one is (see "
+                             "halving_budget), so lowering it to 2 buys a larger, more "
+                             "trustworthy first rung at roughly double the cost.")
+    parser.add_argument("--tune-jobs", type=int, default=1,
+                        help="Candidate fits run in parallel per --tune rung (default: 1). The "
+                             "xgboost attack already uses every core inside a single fit, so "
+                             "raising this oversubscribes for that attack while helping the "
+                             "single-threaded ones.")
     parser.add_argument("--ood", default="none", choices=["none", "reject"],
                         help="Open-set handling: 'none' (default) scores only the documents whose "
                              "author is on the known side and counts the rest; 'reject' adds an "
@@ -865,9 +1270,10 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
     whole-ranking summary that the table samples; then the per-user views, which routinely tell a
     different story from the document-weighted ones above them.
     """
+    tuned = "" if scores["hyperparameters"] == "default" else f"  [tuned: {scores['hyperparameters']}]"
     print(f"\n=== [{scores['attack']}] known {scores['known_fraction']:.0%} "
           f"({scores['known_period']}) -> unknown next {scores['window']:.0%} "
-          f"({scores['unknown_period']})")
+          f"({scores['unknown_period']}){tuned}")
     print(f"  {scores['n_known_docs']:,} known docs / {scores['n_known_authors']:,} authors  ->  "
           f"{scores['n_unknown_docs']:,} unknown docs / {scores['n_unknown_authors']:,} authors")
     print(f"  of the unknown docs, {scores['n_in_set']:,} have a known author and "
@@ -936,12 +1342,17 @@ def main() -> None:
         print("warning: --no-standardize is set. Every attack measured considerably worse without "
               "it (see --standardize --help); this is a diagnostic mode, not a normal run.")
 
-    results, predictions, ood_sweeps, headlines, cmcs, author_reports = [], {}, [], [], [], {}
+    results, predictions, ood_sweeps, headlines, cmcs, author_reports, all_trials = \
+        [], {}, [], [], [], {}, []
+    # One hyper-parameter search per (attack, known fraction), shared by every window that starts
+    # from that known side. Lives here rather than in run_window so its scope is one experiment.
+    tuning_cache: dict[tuple[str, float], dict] = {}
     windows = rolling_windows(len(frame), args.known_fractions, args.window)
     for fraction, window, known, unknown in windows:
         for attack in args.attacks:
-            outcome = run_window(frame, embeddings, fraction, window, attack, known, unknown, args)
-            scores, window_predictions, ood_sweep, headline, cmc, author_report = outcome
+            outcome = run_window(frame, embeddings, fraction, window, attack, known, unknown,
+                                 args, tuning_cache)
+            scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             predictions[(fraction, window, attack)] = window_predictions
             headlines.append(headline)
@@ -949,6 +1360,8 @@ def main() -> None:
             author_reports[(fraction, window, attack)] = author_report
             if ood_sweep is not None:
                 ood_sweeps.append(ood_sweep)
+            if not trials.empty:
+                all_trials.append(trials)
             report_window(scores, headline, author_report, args)
 
     output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "experiments" / "results" / output_tag(args)
@@ -960,6 +1373,8 @@ def main() -> None:
     all_cmcs.to_csv(output_dir / "cmc_results.csv", index=False)
     if ood_sweeps:
         pd.concat(ood_sweeps, ignore_index=True).to_csv(output_dir / "ood_sweep.csv", index=False)
+    if all_trials:
+        pd.concat(all_trials, ignore_index=True).to_csv(output_dir / "tuning_trials.csv", index=False)
 
     def stem(fraction: float, window: float, attack: str) -> str:
         """``<attack>_known<pct>_window<pct>`` -- all three axes always, so two runs that differ

@@ -46,7 +46,7 @@ from .character import CharacterStatisticsFeaturizer
 from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidfFeaturizer
-from .gemini_embedding import GeminiEmbedding2Featurizer
+from .gemini_embedding import GeminiEmbedding001Featurizer, GeminiEmbedding2Featurizer
 from .style_distance import StyleDistanceFeaturizer
 
 # Registry of featurizer classes, selectable by name (e.g. from a CLI argument). Values are
@@ -59,6 +59,7 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "char_ngram_tfidf": CharNgramTfidfFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
     "gemini_embedding_2": GeminiEmbedding2Featurizer,
+    "gemini_embedding_001": GeminiEmbedding001Featurizer,
 }
 
 # A loaded AttackData carries committed features for exactly one representation (StyloMetrix
@@ -218,6 +219,7 @@ __all__ = [
     "FunctionWordFeaturizer",
     "CharacterStatisticsFeaturizer",
     "GeminiEmbedding2Featurizer",
+    "GeminiEmbedding001Featurizer",
     "FEATURIZERS",
     "get_featurizer",
     "apply_featurizer",

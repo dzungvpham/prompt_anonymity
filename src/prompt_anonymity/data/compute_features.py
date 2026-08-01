@@ -49,6 +49,12 @@ all of SWE-chat at ``gemini-embedding-2``'s $0.20/M tokens. Three things follow:
 * ``--workers`` there means *concurrent HTTP requests*, not processes.
 * ``--dimensions`` trims the embedding (768 / 1536 instead of the native 3072), which mostly
   matters for the size of the output parquet.
+* ``--task`` picks what Embedding 2 is told the vector is *for* (``clustering`` by
+  default, or ``sentence similarity`` / ``classification``). It genuinely changes the vectors -- the same
+  document under two tasks embeds to cosine ~0.88 -- so a non-default task is appended to the
+  output filename (``swe_chat_gemini_embedding_2_clustering.parquet``) and caches separately,
+  letting two tasks sit side by side for comparison. ``gemini_embedding_001`` has no working
+  task mechanism and rejects the flag rather than ignoring it.
 * The vector cache is worth more than usual: every cache miss is a paid call, so a re-run, a
   resumed run and a re-run with different sharding all cost nothing for documents already done.
   The run prints what it actually spent when it finishes.
@@ -82,7 +88,7 @@ Run (from the repo root):
     python -m prompt_anonymity.data.compute_features --workers 4                      # cap the worker pool
     python -m prompt_anonymity.data.compute_features --source wildchat --num-shards 32 --shard-index 0
     python -m prompt_anonymity.data.compute_features --source wildchat --num-shards 32 --merge
-    python -m prompt_anonymity.data.compute_features --feature gemini_embedding_2    # paid API
+    python -m prompt_anonymity.data.compute_features --feature gemini_embedding_2    # paid API, default task type is clustering
 """
 
 from __future__ import annotations
@@ -397,14 +403,32 @@ def stylometrix_column_names(language_code: str) -> list[str] | None:
         return None
 
 
+def positional_feature_names(n_features: int) -> list[str]:
+    """``f0000``-style names for a feature space whose dimensions have no meaning of their own.
+
+    Every name is zero-padded to the width of the **largest index**, inferred from the count --
+    3072 features give ``f0000 .. f3071``, 196 give ``f000 .. f195``. Uniform width is the point:
+    with ragged padding, sorting the column names (``f1000`` before ``f999``) silently permutes
+    the dimensions, and a reader who sorts is not doing anything unreasonable.
+
+    The names are deliberately *not* prefixed with the featurizer: an embedding dimension carries
+    no interpretation, and the file it lives in already says which featurizer (and task) produced
+    it. Two feature files therefore share column names by design -- join them side by side with an
+    explicit suffix.
+    """
+    width = len(str(max(n_features - 1, 0)))
+    return [f"f{i:0{width}d}" for i in range(n_features)]
+
+
 def feature_column_names(featurizer, n_features: int) -> list[str]:
     """Column names for the feature matrix -- the featurizer's own wherever they are recoverable.
 
-    Named columns keep the parquet self-describing (``POS_VERB`` rather than ``stylometrix_007``).
-    A featurizer may publish them directly via an optional ``feature_names()`` method; otherwise
-    the two whose layout is public are resolved here. Anything else -- and any name list whose
-    length disagrees with the computed matrix -- falls back to positional ``<name>_<i>`` columns,
-    so the vectors stay the source of truth and can never be silently mislabeled.
+    Named columns keep the parquet self-describing (``POS_VERB`` rather than ``f0007``) for the
+    featurizers whose dimensions mean something. A featurizer may publish them directly via an
+    optional ``feature_names()`` method; otherwise the two whose layout is public are resolved
+    here. Anything else -- an embedding, say -- and any name list whose length disagrees with the
+    computed matrix falls back to :func:`positional_feature_names`, so the vectors stay the source
+    of truth and can never be silently mislabeled.
     """
     names = None
     published = getattr(featurizer, "feature_names", None)
@@ -419,7 +443,7 @@ def feature_column_names(featurizer, n_features: int) -> list[str]:
         print(f"WARNING: {featurizer.name} reported {len(names)} feature names for {n_features} "
               f"computed features; falling back to positional names.")
         names = None
-    return list(names) if names else [f"{featurizer.name}_{i:03d}" for i in range(n_features)]
+    return list(names) if names else positional_feature_names(n_features)
 
 
 def build_feature_frame(doc_ids, author_ids, vectors: np.ndarray, columns: list[str]) -> pd.DataFrame:
@@ -454,6 +478,26 @@ def write_parquet(frame: pd.DataFrame, path: Path) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def feature_label(feature: str, task: str | None) -> str:
+    """The name the output files carry: the featurizer, plus ``--task`` when it is not the default.
+
+    A featurizer whose vectors depend on a task (``gemini_embedding_2``, whose task is written
+    into the text) produces a *different feature space* per task, so two tasks must not land in
+    one file. Only a **non-default** task is appended, which keeps the default run writing the
+    plain ``<split>_<feature>.parquet`` that already exists and that the experiment runners name;
+    asking for the default task explicitly is not a different file. The task is slugified
+    (``"sentence similarity"`` -> ``sentence_similarity``) so the name stays a plain identifier.
+
+    Takes the default from the registered *class*, so ``--merge`` -- which never builds a
+    featurizer -- labels its files exactly like the run that wrote them.
+    """
+    default = getattr(FEATURIZERS.get(feature), "default_task", None)
+    if task is None or task == default:
+        return feature
+    slug = re.sub(r"[^a-z0-9]+", "_", task.lower()).strip("_") if task else "no_task"
+    return f"{feature}_{slug}"
 
 
 def output_path(out_dir: str | Path, source: str, feature: str) -> Path:
@@ -562,6 +606,11 @@ def main() -> None:
                         "0 reads whole documents (default: the source's window -- swe-chat is "
                         "uncapped by design and refuses to be truncated here; other sources keep "
                         "the featurizer's own default, 2048 for StyloMetrix)")
+    p.add_argument("--task", default=None,
+                   help="task for featurizers that embed with one (gemini_embedding_2: "
+                        "'clustering' (default), 'sentence similarity', 'classification'). A "
+                        "non-default task is appended to the output filename, so tasks never "
+                        "overwrite each other; featurizers with no task mechanism reject it")
     p.add_argument("--dimensions", type=int, default=None,
                    help="output width for embedding featurizers that support truncation "
                         "(gemini_embedding_2: 128-3072, e.g. 768/1536; default: the model's native 3072). "
@@ -609,7 +658,10 @@ def main() -> None:
     dist = Path(args.dist_dir) if args.dist_dir else dist_dir()
     cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
     out_dir = Path(args.out_dir) if args.out_dir else dist
-    merged_path = output_path(out_dir, args.source, args.feature)
+    # Output files are named for the feature *and* a non-default --task, since a task changes the
+    # vectors: two tasks are two feature spaces and must not share a filename.
+    label = feature_label(args.feature, args.task)
+    merged_path = output_path(out_dir, args.source, label)
     selected = f" (language_primary == {language!r})" if language else " (all languages)"
 
     # --merge only reassembles what an array already computed: no featurizer, no GPU, and only the
@@ -619,7 +671,7 @@ def main() -> None:
             load_split(args.source, dist, columns=["doc_id", "language_primary"]),
             language=language, limit=args.limit,
         )
-        merged = merge_shards(out_dir, args.source, args.feature, list(documents["doc_id"]))
+        merged = merge_shards(out_dir, args.source, label, list(documents["doc_id"]))
         if merged is None:
             raise SystemExit("cannot merge yet: the shards listed above have not been computed. "
                              "Re-run those array tasks, then merge again.")
@@ -635,13 +687,14 @@ def main() -> None:
 
     max_len = resolve_max_len(args.source, args.max_len)
     featurizer = build_featurizer(args.feature, language_code=language_code, max_len=max_len,
-                                  workers=args.workers, dimensions=args.dimensions)
+                                  workers=args.workers, dimensions=args.dimensions, task=args.task)
     # Which model this run uses: a language model for the local featurizers, a remote model id
     # for the API-backed ones (whose `model` attribute is an OpenRouter id).
     if getattr(featurizer, "language_code", None):
         model = f" (language model {language_code!r})"
     elif getattr(featurizer, "model", None):
-        model = f" (model {featurizer.model!r})"
+        task = getattr(featurizer, "task", "")
+        model = f" (model {featurizer.model!r}{f', task {task!r}' if task else ''})"
     else:
         model = ""
     print(f"[{args.feature}] featurizer ready{model}")
@@ -659,7 +712,7 @@ def main() -> None:
     doc_order = list(documents["doc_id"])  # split order, for the merge
     shard = select_shard(documents, shard_index, num_shards)
     out_path = merged_path if num_shards == 1 else shard_path(
-        out_dir, args.source, args.feature, shard_index, num_shards)
+        out_dir, args.source, label, shard_index, num_shards)
     if num_shards > 1:
         print(f"[shard {shard_index}/{num_shards}] featurizing {len(shard):,} of them "
               f"-> {out_path.name}")
@@ -690,7 +743,7 @@ def main() -> None:
     if num_shards > 1 and not args.no_auto_merge:
         # Every task tries this; only the last one to finish finds a complete set of shards, so the
         # array assembles its own final file with no follow-up job.
-        merged = merge_shards(out_dir, args.source, args.feature, doc_order)
+        merged = merge_shards(out_dir, args.source, label, doc_order)
         if merged is not None:
             write_parquet(merged, merged_path)
             report_written(merged, merged_path)

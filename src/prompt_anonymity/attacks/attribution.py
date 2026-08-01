@@ -80,6 +80,13 @@ CV preferred xgboost in 7 of the 8 windows, and it went on to win 8 of 8 on the 
 the preference was predicted rather than observed. Selecting the attack per window on known-side
 CV scores 0.309, against 0.311 for always using xgboost and 0.311 for a (not legitimate) oracle.
 
+**How firm is "xgboost wins"?** Firm on the average, softer per window than 8-of-8 suggests.
+Re-running the identical comparison under the successive-halving search that ``--tune`` now uses
+(a different, equally legitimate way to pick each attack's hyper-parameters) gives xgboost 0.308,
+svm 0.291, logistic 0.254 -- the same order, and the same gap between trees and linear models --
+but the per-window tally becomes 5 xgboost, 2 svm, 1 logistic. A clean sweep was partly the luck
+of one search; the mean is what replicates.
+
 Two things that did *not* help, both worth not re-trying blind: a learned rejector over the
 score-vector shape (margin, entropy, peakedness) overfits the simulation and loses to the plain
 cohort-normalised score (DIR@10% 0.055 vs 0.106), and clustering the unknown side to pool
