@@ -77,12 +77,22 @@ def author_query_metrics(scores, candidate_authors, true_authors) -> pd.DataFram
             continue
         relevant = true_authors == author
         n_relevant = int(relevant.sum())
+        column_scores = scores[:, column]
+        if not np.isfinite(column_scores).all():
+            # A candidate filter (``run_experiment_v2.py --language-aware``) scores the documents
+            # this author was never a candidate for as -inf, meaning "would never be retrieved":
+            # they belong at the bottom of the ranking. Both metrics below read only the *order*
+            # of the scores, so substituting a value below every real one is exact -- and it is
+            # necessary, because average_precision_score rejects non-finite input outright.
+            eligible = np.isfinite(column_scores)
+            floor = column_scores[eligible].min() - 1.0 if eligible.any() else 0.0
+            column_scores = np.where(eligible, column_scores, floor)
         # Documents ranked by how strongly this author's model claims them.
-        order = np.argsort(-scores[:, column], kind="mergesort")
+        order = np.argsort(-column_scores, kind="mergesort")
         rows.append({
             "author": author,
             "n_relevant": n_relevant,
-            "average_precision": float(average_precision_score(relevant, scores[:, column])),
+            "average_precision": float(average_precision_score(relevant, column_scores)),
             "r_precision": float(relevant[order][:n_relevant].mean()),
             "random_average_precision": n_relevant / len(true_authors),
         })

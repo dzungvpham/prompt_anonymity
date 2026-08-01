@@ -24,6 +24,13 @@ adapting one upstream corpus each, and :mod:`~prompt_anonymity.data.text_cleanin
 :mod:`~prompt_anonymity.data.download_hf` mirrors the published dataset back down, and
 :mod:`~prompt_anonymity.data.find_fragments` is a one-off study of identity fragmentation.
 
+:mod:`~prompt_anonymity.data.apply_defenses` is an optional fourth step, run between the last two:
+it rewrites a built split's conversations with one registered defense
+(:mod:`prompt_anonymity.defenses`) and writes them back in the *same schema* at
+``data/dist/defended/<defense>/<split>.parquet`` -- a drop-in replacement, so
+``compute_features --dist-dir data/dist/defended/<defense>`` featurizes the defended text with no
+further changes and the attack pipeline can then be run against it.
+
 **Code lives here; data does not.** Where the raw inputs are read from and where the outputs are
 written is configuration, not a constant -- see :mod:`prompt_anonymity.data.config`, which resolves
 both (falling back to downloading the raw sources from HuggingFace) so the build runs on any

@@ -505,19 +505,19 @@ def output_path(out_dir: str | Path, source: str, feature: str) -> Path:
     return Path(out_dir) / f"{SPLIT_NAMES[source]}_{feature}.parquet"
 
 
-def shard_path(out_dir: str | Path, source: str, feature: str,
-               shard_index: int, num_shards: int) -> Path:
-    """One shard's partial feature file, under :data:`SHARD_SUBDIR`.
+def shard_path(out_dir: str | Path, stem: str, shard_index: int, num_shards: int) -> Path:
+    """One shard's partial output file, under :data:`SHARD_SUBDIR`.
 
-    The shard count is part of the name so that shards of a re-run with a different array size
-    cannot be mistaken for each other (see :func:`discover_shards`), and both numbers are
-    zero-padded so a directory listing sorts in shard order.
+    ``stem`` is the merged file's name without its suffix (``swe_chat_stylometrix`` here; the
+    defense pipeline in :mod:`~prompt_anonymity.data.apply_defenses` shards by the same rules with
+    its own stem). The shard count is part of the name so that shards of a re-run with a different
+    array size cannot be mistaken for each other (see :func:`discover_shards`), and both numbers
+    are zero-padded so a directory listing sorts in shard order.
     """
-    name = f"{SPLIT_NAMES[source]}_{feature}.{shard_index:04d}-of-{num_shards:04d}.parquet"
-    return Path(out_dir) / SHARD_SUBDIR / name
+    return Path(out_dir) / SHARD_SUBDIR / f"{stem}.{shard_index:04d}-of-{num_shards:04d}.parquet"
 
 
-def discover_shards(out_dir: str | Path, source: str, feature: str) -> tuple[int, dict[int, Path]]:
+def discover_shards(out_dir: str | Path, stem: str) -> tuple[int, dict[int, Path]]:
     """``(num_shards, {shard_index: path})`` for the shard files on disk; ``(0, {})`` if none.
 
     The shard count is read back from the filenames rather than taken from the caller, so
@@ -527,7 +527,6 @@ def discover_shards(out_dir: str | Path, source: str, feature: str) -> tuple[int
     hard error asking for the stale ones to be removed.
     """
     directory = Path(out_dir) / SHARD_SUBDIR
-    stem = f"{SPLIT_NAMES[source]}_{feature}"
     found: dict[int, Path] = {}
     counts: set[int] = set()
     for path in sorted(directory.glob(f"{stem}.*-of-*.parquet")):
@@ -546,8 +545,7 @@ def discover_shards(out_dir: str | Path, source: str, feature: str) -> tuple[int
     return (counts.pop() if counts else 0), found
 
 
-def merge_shards(out_dir: str | Path, source: str, feature: str,
-                 doc_order: list) -> pd.DataFrame | None:
+def merge_shards(out_dir: str | Path, stem: str, doc_order: list) -> pd.DataFrame | None:
     """Concatenate every shard file into one frame in split order, or ``None`` if any is missing.
 
     ``doc_order`` is the ``doc_id`` of each selected document, in the order the split has them, so
@@ -559,10 +557,9 @@ def merge_shards(out_dir: str | Path, source: str, feature: str,
     were computed over a different selection than this run is merging (a different ``--language``
     or ``--limit``, or a split rebuilt since), which would otherwise produce a quietly wrong file.
     """
-    num_shards, found = discover_shards(out_dir, source, feature)
+    num_shards, found = discover_shards(out_dir, stem)
     if not num_shards:
-        raise SystemExit(f"no shard files found in {Path(out_dir) / SHARD_SUBDIR} for "
-                         f"{SPLIT_NAMES[source]}_{feature}.")
+        raise SystemExit(f"no shard files found in {Path(out_dir) / SHARD_SUBDIR} for {stem}.")
     missing = [i for i in range(num_shards) if i not in found]
     if missing:
         print(f"[merge] {len(found)}/{num_shards} shards present; still missing "
@@ -662,6 +659,7 @@ def main() -> None:
     # vectors: two tasks are two feature spaces and must not share a filename.
     label = feature_label(args.feature, args.task)
     merged_path = output_path(out_dir, args.source, label)
+    stem = merged_path.stem  # what the shard files are named after
     selected = f" (language_primary == {language!r})" if language else " (all languages)"
 
     # --merge only reassembles what an array already computed: no featurizer, no GPU, and only the
@@ -671,7 +669,7 @@ def main() -> None:
             load_split(args.source, dist, columns=["doc_id", "language_primary"]),
             language=language, limit=args.limit,
         )
-        merged = merge_shards(out_dir, args.source, label, list(documents["doc_id"]))
+        merged = merge_shards(out_dir, stem, list(documents["doc_id"]))
         if merged is None:
             raise SystemExit("cannot merge yet: the shards listed above have not been computed. "
                              "Re-run those array tasks, then merge again.")
@@ -712,7 +710,7 @@ def main() -> None:
     doc_order = list(documents["doc_id"])  # split order, for the merge
     shard = select_shard(documents, shard_index, num_shards)
     out_path = merged_path if num_shards == 1 else shard_path(
-        out_dir, args.source, label, shard_index, num_shards)
+        out_dir, stem, shard_index, num_shards)
     if num_shards > 1:
         print(f"[shard {shard_index}/{num_shards}] featurizing {len(shard):,} of them "
               f"-> {out_path.name}")
@@ -743,7 +741,7 @@ def main() -> None:
     if num_shards > 1 and not args.no_auto_merge:
         # Every task tries this; only the last one to finish finds a complete set of shards, so the
         # array assembles its own final file with no follow-up job.
-        merged = merge_shards(out_dir, args.source, label, doc_order)
+        merged = merge_shards(out_dir, stem, doc_order)
         if merged is not None:
             write_parquet(merged, merged_path)
             report_written(merged, merged_path)

@@ -25,7 +25,13 @@ accuracy out -- but two things about the experiment differ:
    read a falling line as "larger pool *and* more drift", and compare against the per-window
    random baseline rather than across windows.
 
-3. **The candidate set is open**, and by default that is handled by *scoring only what can be
+3. **The candidate pool can be narrowed by language** (``--language-aware``, off by default).
+   Language is metadata an attacker reads straight off an anonymous document, and prompt
+   anonymisation does not remove it, so restricting each document to the known authors who write
+   at least one of its languages (``language_primary`` plus ``language_secondary``) is free
+   information. See "Language-aware attribution" below.
+
+4. **The candidate set is open**, and by default that is handled by *scoring only what can be
    scored*: an unknown document whose author is absent from the known side cannot be attributed
    to anyone, so the reported tables cover the in-set documents and the rest are counted
    (``n_ood`` / ``ood_rate``) but not scored. Passing ``--ood reject`` instead turns on an
@@ -47,6 +53,38 @@ separate authors (signal). With ~124 candidates that mistake is fatal: the best 
 distances lands closer than a genuine match, so the nearest centroid is usually the wrong one.
 On the 75% window, learning the weighting instead doubles top-1 (0.129 -> 0.258) and lifts
 out-of-set AUROC from 0.523 to 0.631.
+
+Language-aware attribution (``--language-aware``, off by default)
+-----------------------------------------------------------------
+Every attack here scores an unknown document against *every* known author, including the ones who
+have only ever written in a language the document is not in. ``--language-aware`` removes those
+from the document's pool: an unknown document's languages are matched against the languages each
+known author is on record as using, and an author who shares none of them is marked ineligible.
+
+It is applied as a **filter on the score matrix, not a change of model**. The attack is fitted
+once per window on the whole known side exactly as it would be otherwise, and the filter then
+writes ``-inf`` into the ineligible (document, author) cells before anything reads the matrix.
+Two things follow. The comparison is clean -- the fitted model is identical to the unfiltered
+run's, so the difference between the two runs is the pruning and nothing else. And the cost is
+flat: one fit per window rather than one per language group, which is what makes it runnable on
+WildChat's **181 distinct language sets** (SWE-chat has 12). The work is done group by group
+(:func:`language_candidate_groups`): the eligible-author mask depends only on a document's *set*
+of languages, so it is derived once per distinct set and applied to that group's rows at once.
+
+**Read the baselines, not the accuracy.** Narrowing 19,000 candidates to 300 raises top-1 whether
+or not the attack learned anything, so every chance baseline is recomputed against each
+document's own pool -- ``random_id<k>``, ``random_conv``, ``random_mrr``,
+``mean_percentile_rank``, the CMC ``random`` column, and the new ``random_top1_candidate_pool``
+-- and only the ``advantage`` columns say whether the attack itself improved. ``rolling_results.csv``
+also carries what the filter costs: ``n_true_author_pruned`` counts in-set documents whose own
+author writes none of their languages on the known side and who are therefore now unattributable,
+and ``n_language_fallback`` counts documents kept on the full pool because *no* known author
+writes their language (the filter has no evidence there, and an empty pool would leave every
+metric undefined for them).
+
+``--tune`` searches the unfiltered task, which is the consistent choice rather than an
+oversight: the filter does not change what is fitted, so the model a language-aware run scores
+with is exactly the model the search was selecting.
 
 The reject option (``--ood reject``, off by default)
 ----------------------------------------------------
@@ -93,6 +131,8 @@ Run (from the repo root)::
     python experiments/run_experiment_v2.py --attacks logistic cosine nearest_neighbor
     python experiments/run_experiment_v2.py --ood reject                # add the reject option
     python experiments/run_experiment_v2.py --ood reject --ood-calibration far
+    # only score a document against authors who write its language:
+    python experiments/run_experiment_v2.py --source wildchat --language-aware
     # one known fraction, target pool traced finely:
     python experiments/run_experiment_v2.py --known-fractions 0.5 --window 0.05 0.1 0.2 0.3 0.4 0.5
     # compare the three trainable attacks, each tuned per window on that window's known side:
@@ -134,11 +174,14 @@ identical searches differ.
 Outputs (under ``--output-dir``), all carrying ``known_fraction``, ``window`` and ``attack``
 columns, so a multi-attack run stays one tidy table per file:
 
-* ``rolling_results.csv`` -- one row per (window, attack), every summary metric.
-* ``headline_results.csv`` / ``cmc_results.csv`` -- one row per (window, attack, k).
+* ``rolling_results.csv`` -- one row per (window, attack), every summary metric. Includes the
+  identity-level top-k (``id_acc<k>``, ``random_id<k>``, ``n_identities``); the per-k table these
+  come from is no longer written, because its other columns were already in the two files below.
+* ``cmc_results.csv`` -- one row per (window, attack, k): document-level top-k at every k.
 * ``predictions_<stem>.csv`` and ``author_report_<stem>.csv`` -- per document and per author
   (risk and retrieval, sorted most-exposed first), where ``<stem>`` is
-  ``<attack>_known<pct>_window<pct>``.
+  ``<attack>_known<pct>_window<pct>``. ``--language-aware`` adds each document's ``languages``,
+  its ``n_candidate_authors`` and whether its own author survived the filter.
 * Figures: one ``topk_accuracy_<stem>.pdf`` per combination, and per attack
   ``window_sweep_top<k>_<attack>.pdf`` (accuracy against the number of target users, one line
   per known fraction) and ``cmc_curve_<attack>.pdf`` (one curve per window).
@@ -177,7 +220,6 @@ from prompt_anonymity.metrics import (
     max_softmax_confidence,
     selective_classification,
     per_author_ranking,
-    random_guessing_accuracy,
     ranking_summary,
     retrieval_summary,
     true_author_ranks,
@@ -238,10 +280,12 @@ def filter_documents(frame: pd.DataFrame, model_owner: str = "all", language: st
     return frame
 
 
-# Document metadata this script reads: the join key, the chronological order, the label, and the
-# two filter axes. Everything else in the parquet -- notably ``turns``, the raw conversation text
-# -- is deliberately left on disk (see load_documents_and_features).
-DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "model_owner")
+# Document metadata this script reads: the join key, the chronological order, the label, the two
+# filter axes, and the second language behind --language-aware. Everything else in the parquet --
+# notably ``turns``, the raw conversation text -- is deliberately left on disk (see
+# load_documents_and_features). Columns absent from a split's schema are simply not read.
+DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "language_secondary",
+                    "model_owner")
 
 
 def load_documents_and_features(data_dir, source: str, feature: str, undated: str = "drop",
@@ -366,6 +410,144 @@ def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.
     scale = known.std(axis=0)
     scale = np.where(scale > 0, scale, 1.0)
     return (known - center) / scale, (unknown - center) / scale
+
+
+# --- language-aware candidate filtering (--language-aware) -------------------
+#
+# Language is metadata the attacker gets for free: it is readable straight off an anonymous
+# document, and it is not something prompt anonymisation removes. Restricting each document to
+# the authors already on record as writing one of its languages is therefore a legitimate
+# narrowing of the candidate pool, and on a corpus like WildChat -- 181 distinct language sets,
+# with English and Russian covering two thirds of the documents between them -- it is a large one.
+#
+# Everything below works on the *set* of languages a document is in, ``language_primary`` plus
+# ``language_secondary`` where one was detected, so a document that mixes English and Russian
+# keeps both authors' pools open rather than being forced onto its majority language.
+
+LANGUAGE_COLUMNS = ("language_primary", "language_secondary")
+
+# Ineligible candidates are marked in the score matrix rather than tracked in a parallel mask: at
+# WildChat's scale a boolean [n_unknown x n_authors] mask is another gigabyte, and every consumer
+# of the matrix (argmax, true_author_ranks, max_softmax_confidence, rejection_score,
+# author_query_metrics) already reads -inf as "ranked below every real candidate".
+INELIGIBLE = -np.inf
+
+
+def document_language_sets(frame: pd.DataFrame) -> np.ndarray:
+    """One ``frozenset`` of languages per document, from the primary and secondary columns.
+
+    A document with no detected language at all gets the empty set, which intersects nothing --
+    :func:`language_candidate_groups` gives those the unfiltered pool rather than no candidates.
+    """
+    present = [column for column in LANGUAGE_COLUMNS if column in frame.columns]
+    if "language_primary" not in present:
+        raise SystemExit(
+            "--language-aware needs a language_primary column, which this split's parquet does "
+            "not have. Rebuild it with `python -m prompt_anonymity.data.build_dataset`."
+        )
+    columns = [frame[column].to_numpy(dtype=object) for column in present]
+    return np.array(
+        [frozenset(value for value in values if isinstance(value, str) and value)
+         for values in zip(*columns)],
+        dtype=object,
+    )
+
+
+def author_language_sets(languages: np.ndarray, labels: np.ndarray) -> dict:
+    """Every language each known author is on record as having written in.
+
+    This is the attacker's whole model of "who writes what": it is built from the known side
+    alone, so an author who switches language inside the unknown window can be filtered away from
+    their own document. That is a real cost of the heuristic, not a bug -- ``run_window`` counts
+    it as ``n_true_author_pruned``.
+    """
+    seen: dict = {}
+    for author, document_languages in zip(labels, languages):
+        seen[author] = seen.get(author, frozenset()) | document_languages
+    return seen
+
+
+def language_candidate_groups(unknown_languages: np.ndarray, known_languages: np.ndarray,
+                              known_labels: np.ndarray, authors: np.ndarray) -> list:
+    """``(languages, document_rows, eligible_authors, is_fallback)`` per distinct language set.
+
+    Grouping is what makes this cheap. The eligible-author mask depends only on the document's
+    *set* of languages, so it is derived once per distinct set -- 12 on SWE-chat, 181 on WildChat
+    -- rather than once per document, and applied to that group's rows in a single pass.
+
+    ``eligible_authors`` is a boolean over ``authors`` (the columns of the score matrix, in their
+    order): true where the author wrote at least one known document in at least one of the
+    group's languages. A group whose set matches no known author at all -- a language nobody in
+    the known window writes, or a document with no detected language -- keeps the **full** pool
+    and is flagged ``is_fallback``: with no author writing that language the filter has no
+    evidence to act on, and blanking the row would leave the document with no candidates and
+    every downstream metric undefined for it. The flag is what separates that case from the
+    unremarkable one where the filter simply does not bind because every known author happens to
+    write the language, which is the norm on an English-dominated corpus.
+    """
+    by_author = author_language_sets(known_languages, known_labels)
+    author_languages = [by_author.get(author, frozenset()) for author in authors]
+
+    rows_by_language: dict = {}
+    for row, document_languages in enumerate(unknown_languages):
+        rows_by_language.setdefault(document_languages, []).append(row)
+
+    groups = []
+    for document_languages, rows in rows_by_language.items():
+        eligible = np.array([bool(document_languages & written) for written in author_languages],
+                            dtype=bool)
+        is_fallback = not eligible.any()
+        if is_fallback:
+            eligible = np.ones(len(authors), dtype=bool)
+        groups.append((document_languages, np.array(rows, dtype=int), eligible, is_fallback))
+    return groups
+
+
+def apply_language_filter(scores: np.ndarray, authors: np.ndarray, unknown_languages: np.ndarray,
+                          known_languages: np.ndarray, known_labels: np.ndarray,
+                          true_labels: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Mark every author who does not write a document's language as ineligible, **in place**.
+
+    In place because the alternative is a second copy of a matrix that reaches 4 GB on WildChat;
+    the attacks all return a freshly computed score matrix, so nothing else holds a reference to
+    it. Assignment through :func:`numpy.ix_` with a scalar writes element-wise and allocates
+    nothing beyond the index arrays, which is what keeps this inside the 16 GB job cap.
+
+    Returns ``(candidate_counts, true_author_is_candidate, stats)``:
+
+    * ``candidate_counts`` -- eligible authors per document, i.e. the pool size every chance
+      baseline for that document has to be computed against. This is the number that makes a
+      language-aware result readable: pruning 20,000 candidates to 300 raises top-1 whether or
+      not the attack learned anything, and only the gap to ``random_top1_candidate_pool`` says
+      which happened.
+    * ``true_author_is_candidate`` -- per document, whether its true author survived the filter.
+      False for a document whose author is out-of-set (they were never a candidate), and false
+      for the in-set documents the filter has made unattributable, which is the price of the
+      heuristic and is summarised as ``n_true_author_pruned``.
+    * ``stats`` -- the group count and the fallback count, for ``rolling_results.csv``.
+    """
+    groups = language_candidate_groups(unknown_languages, known_languages, known_labels, authors)
+    column_of = {author: index for index, author in enumerate(authors)}
+    candidate_counts = np.empty(len(unknown_languages), dtype=int)
+    true_author_is_candidate = np.zeros(len(unknown_languages), dtype=bool)
+    n_fallback = 0
+
+    for _, rows, eligible, is_fallback in groups:
+        ineligible = np.flatnonzero(~eligible)
+        if len(ineligible):
+            scores[np.ix_(rows, ineligible)] = INELIGIBLE
+        candidate_counts[rows] = int(eligible.sum())
+        n_fallback += len(rows) if is_fallback else 0
+        if true_labels is not None:
+            true_author_is_candidate[rows] = [
+                column is not None and bool(eligible[column])
+                for column in (column_of.get(author) for author in true_labels[rows])
+            ]
+
+    return candidate_counts, true_author_is_candidate, {
+        "n_language_groups": len(groups),
+        "n_language_fallback": n_fallback,
+    }
 
 
 # --- open-set attribution ----------------------------------------------------
@@ -750,7 +932,8 @@ def estimate_ood_prior(known_labels: np.ndarray, known_fraction: float, window: 
 
 def calibrate_threshold(factory, embeddings: np.ndarray, labels: np.ndarray, folds,
                         calibration: str = "accuracy", target_far: float = 0.10,
-                        cohort_normalize: bool = True, ood_prior: float = 0.2) -> tuple[float, dict]:
+                        cohort_normalize: bool = True, ood_prior: float = 0.2,
+                        languages: np.ndarray | None = None) -> tuple[float, dict]:
     """Choose the accept/reject threshold from the known-side simulation in :func:`open_set_folds`.
 
     Each fold yields a labelled genuine/impostor sample of rejection scores drawn entirely from
@@ -769,6 +952,12 @@ def calibrate_threshold(factory, embeddings: np.ndarray, labels: np.ndarray, fol
       impostors. Fixes the operating point rather than the loss, which is the right choice when
       the cost of a false accept is what matters rather than raw accuracy.
 
+    ``languages`` (the known side's language sets, aligned to ``embeddings``) switches on the same
+    candidate filter the real window gets. It has to be applied here too, not just at scoring
+    time: the rejection score is normalised *across the cohort*, so pruning the cohort changes the
+    distribution the threshold is read off, and a threshold calibrated on unpruned scores would be
+    applied to a different quantity from the one it was chosen for.
+
     Returns ``(threshold, diagnostics)``; the diagnostics carry the simulated AUROC and top-1,
     which say how much to trust the threshold *before* any unknown document is touched.
     """
@@ -776,6 +965,9 @@ def calibrate_threshold(factory, embeddings: np.ndarray, labels: np.ndarray, fol
     for train_rows, query_rows in folds:
         fitted = factory().fit(embeddings[train_rows], labels[train_rows])
         scores = fitted.score(embeddings[query_rows])
+        if languages is not None:
+            apply_language_filter(scores, fitted.authors, languages[query_rows],
+                                  languages[train_rows], labels[train_rows])
         accept_score = rejection_score(scores, cohort_normalize)
         query_labels = labels[query_rows]
         is_ood = ~np.isin(query_labels, fitted.authors)
@@ -902,8 +1094,37 @@ def between_author_mean(embeddings: np.ndarray, labels: np.ndarray, metric: str,
 
 # --- attack ------------------------------------------------------------------
 
-def closed_set_table(distances: np.ndarray, known_labels, unknown_labels, args: argparse.Namespace):
+def random_identity_accuracy(unknown_labels: np.ndarray, k: int, candidate_counts: np.ndarray) -> float:
+    """Identity-level random baseline when each document has its own candidate pool.
+
+    Generalises :func:`prompt_anonymity.metrics.random_guessing_accuracy`, which assumes a single
+    pool shared by every document. A guesser shortlisting ``k`` of document *i*'s ``n_i``
+    candidates names the true author with probability ``min(k, n_i) / n_i``, and an identity is
+    re-identified if *any* of its documents' guesses lands, so its chance is
+    ``1 - prod_i (1 - p_i)``. With a constant pool this is exactly the ``1 - (1 - p) ** c``
+    formula the package function uses, so the default (unfiltered) runs are unaffected.
+
+    The product is taken in log space: a document whose whole pool fits inside k contributes a
+    zero factor, and multiplying tens of thousands of near-one factors directly loses precision
+    on the very identities -- the prolific ones -- whose baseline is highest.
+    """
+    unknown_labels = np.asarray(unknown_labels)
+    counts = np.asarray(candidate_counts, dtype=float)
+    miss = 1.0 - np.minimum(k, counts) / counts
+    _, inverse = np.unique(unknown_labels, return_inverse=True)
+    log_miss = np.zeros(inverse.max() + 1 if inverse.size else 0)
+    np.add.at(log_miss, inverse, np.log(np.maximum(miss, np.finfo(float).tiny)))
+    return float(np.mean(1.0 - np.exp(log_miss))) if log_miss.size else float("nan")
+
+
+def closed_set_table(distances: np.ndarray, known_labels, unknown_labels,
+                     candidate_counts: np.ndarray, args: argparse.Namespace):
     """The standard top-k table from ``run_experiment.py``, on this window's scored documents.
+
+    Unlike there, this table is not written out on its own: its identity-level columns are
+    widened into ``rolling_results.csv`` by :func:`identity_level_scores`, and the table itself
+    stays in memory to draw ``topk_accuracy_*.pdf`` and ``window_sweep_top<k>_*.pdf``. Its
+    document-level columns were already duplicated elsewhere -- see :func:`identity_level_scores`.
 
     ``distances`` must already be restricted to unknown documents whose author appears among the
     known authors: top-k ranking is only defined when the true author is in the candidate pool
@@ -915,6 +1136,14 @@ def closed_set_table(distances: np.ndarray, known_labels, unknown_labels, args: 
     attacker does not know which of them will show up (in a typical window only a third do), so
     a guesser handed that list would be strictly better informed than the attack it is
     benchmarking.
+
+    ``candidate_counts`` is that pool size per document, and it is the whole reason
+    ``--language-aware`` is readable. Narrowing a document to the authors who write its language
+    raises top-1 whether or not the attack learned anything -- guessing among 300 candidates
+    beats guessing among 20,000 -- so the baselines have to narrow with it. Every column below is
+    therefore averaged over the documents' own pools rather than computed from one pool size;
+    without a candidate filter every entry equals the number of known authors and the formulas
+    collapse to the ones they had before.
 
     * ``random_id`` / ``advantage`` -- identity level, a guesser naming ``k`` of the known
       authors per document. This **overrides** the column :func:`headline_accuracy` computes,
@@ -932,22 +1161,57 @@ def closed_set_table(distances: np.ndarray, known_labels, unknown_labels, args: 
     ranking = LinkageRanking(distances, known_labels, unknown_labels)
     headline = headline_accuracy(ranking, top_ks=tuple(args.top_ks))
     n_known_authors = len(np.unique(known_labels))
+    counts = np.asarray(candidate_counts, dtype=float)
     headline["n_known_authors"] = n_known_authors
+    headline["n_candidate_authors"] = float(counts.mean())
     headline["random_id"] = [
-        random_guessing_accuracy(unknown_labels, int(k), n_candidates=n_known_authors)
-        for k in headline["top"]
+        random_identity_accuracy(unknown_labels, int(k), counts) for k in headline["top"]
     ]
     headline["advantage"] = headline["id_acc"] - headline["random_id"]
-    headline["random_conv"] = [min(int(k), n_known_authors) / n_known_authors for k in headline["top"]]
+    headline["random_conv"] = [float(np.mean(np.minimum(int(k), counts) / counts))
+                               for k in headline["top"]]
     headline["advantage_conv"] = headline["conv_acc"] - headline["random_conv"]
     return headline
+
+
+def identity_level_scores(headline: pd.DataFrame) -> dict:
+    """Flatten the identity-level rows of :func:`closed_set_table` into summary columns.
+
+    The headline table is one row per k while ``rolling_results.csv`` is one row per
+    (window, attack), so the identity-level numbers are widened into ``id_acc<k>`` /
+    ``random_id<k>`` and land next to the document-level accuracies they should be read against.
+    Three views of the same ranking, easy to confuse:
+
+    * ``closed_set_top1`` -- document-weighted: the share of anonymous *documents* attributed
+      correctly, which whoever writes the most can carry on their own.
+    * ``macro_conv_acc<k>`` -- the same quantity averaged per author, so every user counts once.
+    * ``id_acc<k>`` -- an author counts as re-identified if **any one** of their documents puts
+      the true author within the top k. The attacker only has to succeed once, so this is the
+      highest of the three, and it is the number a privacy claim has to answer.
+
+    ``random_id<k>`` is its matching baseline (a guesser naming k of the ``n_known_authors``
+    candidates gets one attempt per document, so it rises with how much an author wrote), and
+    ``n_identities`` is the denominator: target authors present in this window *and* on the known
+    side. That is not ``n_unknown_authors``, which counts the out-of-set ones too -- on WildChat
+    the two differ by a factor of three.
+
+    The document-level columns of ``headline`` are deliberately not copied: ``conv_acc`` at k=1 is
+    ``closed_set_top1`` already, and every other k is a row of ``cmc_results.csv`` (to within the
+    CMC's more conservative tie convention, which splits them by <0.002 in practice).
+    """
+    columns: dict = {"n_identities": int(headline["n_identities"].iloc[0])}
+    for _, row in headline.iterrows():
+        k = int(row["top"])
+        columns[f"id_acc{k}"] = float(row["id_acc"])
+        columns[f"random_id{k}"] = float(row["random_id"])
+    return columns
 
 
 # --- driver -----------------------------------------------------------------
 
 def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, window: float,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
-               tuning_cache: dict):
+               tuning_cache: dict, languages: np.ndarray | None = None):
     """Run one (window, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
@@ -959,6 +1223,15 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
 
     ``tuning_cache`` is passed through to :func:`tuned_settings`; see there for why sharing a
     search between windows of the same known fraction is sound.
+
+    ``languages`` (``--language-aware``, off by default) turns on the candidate filter: the
+    attack is still fitted **once** on the whole known side, and the filter then marks the
+    authors who do not write a document's language ineligible in that document's row of the score
+    matrix. Keeping the fit global is what makes the comparison clean -- the model is byte for
+    byte the one an unfiltered run uses, so the difference between the two runs is the pruning
+    and nothing else -- and it is also what keeps the cost flat: one fit per window rather than
+    one per language group, which is the difference between running and not running on WildChat's
+    181 groups.
     """
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
     known_embeddings, unknown_embeddings = embeddings[known], embeddings[unknown]
@@ -988,6 +1261,22 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
     factory = build_attack(attack, args, settings)
     fitted = factory().fit(known_embeddings, known_labels)
     author_scores = fitted.score(unknown_embeddings)          # (n_unknown, n_known_authors)
+
+    # Narrow each document's candidate pool to the authors who write its language(s), before
+    # anything reads the matrix: the argmax, the ranking and the cohort-normalised rejection
+    # score must all see the same pool.
+    known_languages = unknown_languages = None
+    if languages is not None:
+        known_languages, unknown_languages = languages[known], languages[unknown]
+        candidate_counts, true_author_is_candidate, language_stats = apply_language_filter(
+            author_scores, fitted.authors, unknown_languages, known_languages, known_labels,
+            true_labels=unknown_labels,
+        )
+    else:
+        candidate_counts = np.full(len(unknown_labels), len(fitted.authors), dtype=int)
+        true_author_is_candidate = in_set.copy()
+        language_stats = {"n_language_groups": 1, "n_language_fallback": 0}
+
     best = author_scores.argmax(axis=1)
     predicted_author = fitted.authors[best]
     normalize = not args.ood_raw_distance
@@ -1011,6 +1300,21 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
         "within_author_mean": within_author_mean(known_embeddings, known_labels, args.metric),
         "between_author_mean": between_author_mean(known_embeddings, known_labels, args.metric, seed=args.seed),
         "random_top1_known_pool": 1.0 / len(known_authors),
+        # The pool the attack actually ranked, which --language-aware shrinks per document, and
+        # the chance baseline that goes with it. Read every accuracy below against this, not
+        # against random_top1_known_pool: the two are the same number without the filter and can
+        # differ by two orders of magnitude with it.
+        "language_aware": languages is not None,
+        "mean_candidate_authors": float(candidate_counts.mean()),
+        "candidate_pool_reduction": 1.0 - float(candidate_counts.mean()) / len(known_authors),
+        "random_top1_candidate_pool": float(np.mean(1.0 / candidate_counts)),
+        # What the filter costs: in-set documents whose true author writes none of their
+        # languages on the known side, and so was pruned out of their own document's pool. These
+        # are unattributable by construction and count as errors everywhere below.
+        "n_true_author_pruned": int((in_set & ~true_author_is_candidate).sum()),
+        "true_author_prune_rate": (float((~true_author_is_candidate)[in_set].mean())
+                                   if in_set.any() else float("nan")),
+        **language_stats,
     }
     predictions = pd.DataFrame({
         "doc_id": unknown_frame["doc_id"].to_numpy(),
@@ -1019,6 +1323,12 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
         "best_author": predicted_author,
         "accept_score": accept_score,
     })
+    if languages is not None:
+        predictions = predictions.assign(
+            languages=["|".join(sorted(document_languages)) for document_languages in unknown_languages],
+            n_candidate_authors=candidate_counts,
+            true_author_is_candidate=true_author_is_candidate,
+        )
     ood_sweep = None
 
     if args.ood != "none":
@@ -1029,7 +1339,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
         threshold, diagnostics = calibrate_threshold(
             factory, known_embeddings, known_labels, folds,
             calibration=args.ood_calibration, target_far=args.ood_target_far,
-            cohort_normalize=normalize, ood_prior=prior,
+            cohort_normalize=normalize, ood_prior=prior, languages=known_languages,
         )
         predicted = np.where(accept_score <= threshold, predicted_author, OOD_LABEL)
         scores.update(open_set_metrics(predicted, unknown_labels, known_authors,
@@ -1058,11 +1368,15 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
     # Closed-set top-k over the in-set documents. One column per known author (rather than per
     # known document), so `conv_acc` is "true author within the top k authors" -- exactly the
     # document-level top-k of this attack -- and `id_acc` is the identity-level version.
-    headline = closed_set_table(-author_scores[in_set], fitted.authors, unknown_labels[in_set], args)
-    headline["n_in_set_docs"] = int(in_set.sum())
+    in_set_counts = candidate_counts[in_set]
+    headline = closed_set_table(-author_scores[in_set], fitted.authors, unknown_labels[in_set],
+                                in_set_counts, args)
+    scores.update(identity_level_scores(headline))
 
     in_set_scores, in_set_labels = author_scores[in_set], unknown_labels[in_set]
-    cmc, author_report = closed_set_detail(in_set_scores, fitted.authors, in_set_labels, args, scores)
+    cmc, author_report = closed_set_detail(in_set_scores, fitted.authors, in_set_labels,
+                                           in_set_counts, true_author_is_candidate[in_set],
+                                           args, scores)
 
     # Every per-window table is stamped with the three axes it belongs to, in the same order, so
     # the concatenated CSVs can be grouped or filtered on any of them.
@@ -1079,6 +1393,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float, win
 
 
 def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_authors: np.ndarray,
+                      candidate_counts: np.ndarray, true_author_is_candidate: np.ndarray,
                       args: argparse.Namespace, scores: dict):
     """Everything the three-row headline table leaves on the table, from the same score matrix.
 
@@ -1101,12 +1416,25 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
 
     Calibration of the top-1 confidence (``brier``, ``ece``) goes in too, since every threshold
     in the open-set path assumes that confidence means something.
+
+    ``candidate_counts`` is each document's pool size, which ``--language-aware`` makes
+    document-specific; it sets the chance baselines here for the same reason as in
+    :func:`closed_set_table`, and matters most for ``mean_percentile_rank``, whose whole purpose
+    is to be comparable across differently-sized pools. Without the filter every entry is the
+    number of candidate authors and the numbers are the ones the scalar version produced.
+
+    ``true_author_is_candidate`` marks the documents the filter has made unattributable. Their
+    true author sits somewhere inside the ineligible tail, which is a tie among every pruned
+    author rather than a rank: left alone it reads as a middling position in the *full* author
+    list and drags ``mean_percentile_rank`` far outside [0, 1]. They are placed one past their
+    own pool instead -- "below every candidate the attack actually ranked" -- which is a miss at
+    every k, an ~0 contribution to MRR, and the floor of the percentile rank.
     """
-    n_candidates = len(authors)
     ranks = true_author_ranks(scores_matrix, authors, true_authors)
+    ranks = np.where(true_author_is_candidate, ranks, np.asarray(candidate_counts) + 1)
     predicted = authors[scores_matrix.argmax(axis=1)]
 
-    scores.update(ranking_summary(ranks, n_candidates))
+    scores.update(ranking_summary(ranks, candidate_counts))
     scores["macro_f1"] = macro_f1_score(true_authors, predicted)
     for k in args.top_ks:
         scores[f"macro_conv_acc{k}"] = macro_top_k_accuracy(ranks, true_authors, k)
@@ -1136,7 +1464,7 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
     scores["recall_at_50pct"] = float(
         selective.loc[selective["coverage"] == 0.50, "recall"].iloc[0]
     )
-    return cmc_curve(ranks, n_candidates), author_report
+    return cmc_curve(ranks, candidate_counts), author_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -1161,6 +1489,17 @@ def parse_args() -> argparse.Namespace:
                         help="Restrict to one agent provider, e.g. 'Anthropic' (default: all).")
     parser.add_argument("--language", default="all",
                         help="Restrict to one language_primary, e.g. 'English' (default: all).")
+    parser.add_argument("--language-aware", action="store_true",
+                        help="Narrow each unknown document's candidate pool to the known authors "
+                             "who write at least one of its languages (language_primary plus "
+                             "language_secondary). Off by default. The attack is still fitted "
+                             "once per window on the whole known side; only the candidate columns "
+                             "are filtered, so the model is identical to an unfiltered run and "
+                             "the difference between the two is the pruning alone. Every chance "
+                             "baseline is recomputed against each document's own pool -- read "
+                             "'advantage' and random_top1_candidate_pool, because narrowing "
+                             "20,000 candidates to 300 raises top-1 on its own. Redundant with "
+                             "--language <one language>, which leaves a single language group.")
     parser.add_argument("--undated", default="drop", choices=["drop", "known"],
                         help="What to do with documents that have no ended_at: 'drop' them "
                              "(default) or treat them as the oldest, i.e. always known.")
@@ -1284,11 +1623,12 @@ def output_tag(args: argparse.Namespace) -> str:
     scaled = "" if args.standardize else "_unstandardized"
     owner = "" if args.model_owner.lower() == "all" else f"_{args.model_owner.lower()}"
     language = "" if args.language.lower() == "all" else f"_{args.language.lower()}"
+    language_aware = "_langaware" if args.language_aware else ""
     openset = "" if args.ood == "none" else f"_openset_{args.ood_calibration}"
     windows = ("" if args.window == [0.10, 0.25, 0.50]
                else "_w" + "-".join(str(_percent(w)) for w in args.window))
     attacks = "-".join(args.attacks)
-    return (f"{args.source}_{args.feature}{owner}{language}_{attacks}"
+    return (f"{args.source}_{args.feature}{owner}{language}{language_aware}_{attacks}"
             f"_rolling{windows}{openset}{metric}{scaled}")
 
 
@@ -1311,6 +1651,18 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
           f"{scores['n_ood']:,} do not ({scores['ood_rate']:.1%} out-of-set)")
     print(f"  within-author distance mean {scores['within_author_mean']:.4f} | "
           f"between-author mean {scores['between_author_mean']:.4f}")
+
+    if scores["language_aware"]:
+        print(f"  language-aware: {scores['n_language_groups']} language group(s) narrow the pool "
+              f"to {scores['mean_candidate_authors']:,.1f} candidate authors on average "
+              f"({scores['candidate_pool_reduction']:.1%} smaller, random top-1 "
+              f"{scores['random_top1_candidate_pool']:.4f} vs "
+              f"{scores['random_top1_known_pool']:.4f} unfiltered)")
+        print(f"  filter cost:   {scores['n_true_author_pruned']:,} of the {scores['n_in_set']:,} "
+              f"in-set docs ({scores['true_author_prune_rate']:.1%}) lost their own author to the "
+              f"filter and can no longer be attributed"
+              + (f"; {scores['n_language_fallback']:,} doc(s) kept the full pool because no known "
+                 f"author writes their language" if scores["n_language_fallback"] else ""))
 
     if args.ood != "none":
         print(f"  threshold ({args.ood_calibration}) = {scores['threshold']:+.4f}  ->  "
@@ -1336,9 +1688,10 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
                   "from out-of-set, so no threshold on it beats the reject-all baseline "
                   "(see the module docstring for why).")
 
+    pool = (f"{scores['mean_candidate_authors']:,.1f} in the pool on average"
+            if scores["language_aware"] else f"{scores['n_known_authors']} in the pool")
     print(f"  closed-set top-k over the {scores['n_in_set']:,} in-set documents "
-          f"({int(headline['n_identities'].iloc[0])} target authors, "
-          f"{int(headline['n_known_authors'].iloc[0])} in the pool):")
+          f"({scores['n_identities']} target authors, {pool}):")
     for _, row in headline.iterrows():
         k = int(row["top"])
         print(f"    top {k:>2}: conv_acc={row['conv_acc']:.3f}  id_acc={row['id_acc']:.3f}  "
@@ -1376,6 +1729,17 @@ def main() -> None:
         print("warning: --no-standardize is set. Every attack measured considerably worse without "
               "it (see --standardize --help); this is a diagnostic mode, not a normal run.")
 
+    # The language sets are a property of the corpus, not of a window, so they are built once and
+    # sliced per window -- rebuilding a frozenset per document inside every window would repeat
+    # the same work up to eight times over.
+    languages = None
+    if args.language_aware:
+        languages = document_language_sets(frame)
+        distinct = len({document_languages for document_languages in languages})
+        print(f"language-aware: {distinct} distinct language set(s) across the corpus; each "
+              f"unknown document will be scored only against known authors who write one of its "
+              f"languages")
+
     results, predictions, ood_sweeps, headlines, cmcs, author_reports, all_trials = \
         [], {}, [], [], [], {}, []
     # One hyper-parameter search per (attack, known fraction), shared by every window that starts
@@ -1385,7 +1749,7 @@ def main() -> None:
     for fraction, window, known, unknown in windows:
         for attack in args.attacks:
             outcome = run_window(frame, embeddings, fraction, window, attack, known, unknown,
-                                 args, tuning_cache)
+                                 args, tuning_cache, languages)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             predictions[(fraction, window, attack)] = window_predictions
@@ -1400,10 +1764,11 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "experiments" / "results" / output_tag(args)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # `all_headlines` is never written: it duplicated columns of the other two files, and what was
+    # only in it (the identity level) is now in `rolling_results.csv`. It stays for the figures.
     all_headlines = pd.concat(headlines, ignore_index=True)
     all_cmcs = pd.concat(cmcs, ignore_index=True)
     pd.DataFrame(results).to_csv(output_dir / "rolling_results.csv", index=False)
-    all_headlines.to_csv(output_dir / "headline_results.csv", index=False)
     all_cmcs.to_csv(output_dir / "cmc_results.csv", index=False)
     if ood_sweeps:
         pd.concat(ood_sweeps, ignore_index=True).to_csv(output_dir / "ood_sweep.csv", index=False)
@@ -1441,7 +1806,7 @@ def main() -> None:
 
     stems = [stem(*key) for key in predictions]
     print(f"\nWrote results to {output_dir}/")
-    print("  rolling_results.csv, headline_results.csv, cmc_results.csv"
+    print("  rolling_results.csv, cmc_results.csv"
           + (", ood_sweep.csv" if ood_sweeps else ""))
     print("  " + ", ".join(f"predictions_{s}.csv" for s in stems))
     print("  " + ", ".join(f"author_report_{s}.csv" for s in stems))
