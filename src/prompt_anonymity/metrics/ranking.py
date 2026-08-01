@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import rankdata
 from sklearn.metrics import f1_score
 
 
@@ -56,8 +55,18 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
         keeps every metric below unbiased under ties instead of rewarding or punishing whichever
         order the sort happened to produce -- which matters for attacks whose scores are coarse
         or saturate.
+
+    Notes
+    -----
+    Only the true author's rank is computed, never the full ranking. Sorting each row would
+    build an ``(n_documents, n_candidates)`` rank matrix -- 6 GB at 50,000 documents over 15,000
+    candidates -- and then discard all but one entry per row. Counting how many candidates beat
+    the true author gives the identical number (ties included, see below) in a single pass, which
+    is both faster and bounded by one boolean array rather than a float64 one.
     """
-    scores = np.asarray(scores, dtype=float)
+    scores = np.asarray(scores)
+    if not np.issubdtype(scores.dtype, np.floating):
+        scores = scores.astype(float)
     candidate_authors = np.asarray(candidate_authors)
     true_authors = np.asarray(true_authors)
     if scores.ndim != 2:
@@ -81,10 +90,15 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
             f"(e.g. {sorted(missing)[:3]}). Restrict to in-set documents first."
         )
 
-    # rankdata ranks smallest-first, so negate to rank the highest score as 1.
-    all_ranks = rankdata(-scores, method="average", axis=1)
     true_columns = np.array([column_of[author] for author in true_authors])
-    return all_ranks[np.arange(len(true_authors)), true_columns]
+    true_scores = scores[np.arange(len(true_authors)), true_columns][:, None]
+
+    # A value beaten by ``better`` candidates and tied with ``tied`` others (itself excluded)
+    # occupies ranks better+1 ... better+tied+1, whose average is better + 1 + tied/2. This is
+    # exactly scipy's method="average", without sorting anything.
+    better = (scores > true_scores).sum(axis=1)
+    tied = (scores == true_scores).sum(axis=1) - 1
+    return better + 1.0 + tied / 2.0
 
 
 def ranking_summary(ranks, n_candidates: int) -> dict:

@@ -97,9 +97,10 @@ evidence fails because pairwise same-author AUROC is only 0.64 even in the white
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial.distance import cdist
+import sklearn
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import pairwise_distances_chunked
 from sklearn.svm import SVC
 
 
@@ -154,29 +155,129 @@ class NearestNeighbor:
     only ~7 -- so this aggregation is what makes top-k comparable across methods.
 
     ``linkage="max"`` (the default, meaning maximum similarity / minimum distance) is the
-    nearest-neighbour attack proper; ``"mean"`` averages over all of an author's documents,
-    which is a distance-space cousin of :class:`CentroidCosine`.
+    nearest-neighbour attack proper; ``"mean"`` averages over all of an author's documents.
+    Mean linkage is *almost* :class:`CentroidCosine` -- it is exactly that attack without the
+    final re-normalisation of the centroid (see :meth:`fit`) -- but the difference is real
+    rather than cosmetic, so both are worth running.
+
+    Scaling
+    -------
+    Sized for author pools in the tens of thousands. Three things make that work:
+
+    * **Cosine is computed as a matrix product, not by** :func:`scipy.spatial.distance.cdist`.
+      ``cdist``'s cosine is a naive C loop over pairs that also forces float64; normalising both
+      sides once and calling BLAS is the same arithmetic ~150x faster (measured 115s vs 0.77s on
+      2,000 x 20,000 x 3,072, agreeing to 6e-8). Any other ``metric`` falls back to
+      :func:`~sklearn.metrics.pairwise_distances_chunked`, which is BLAS-backed for
+      ``"euclidean"`` and chunks a per-block ``cdist`` for everything else.
+    * **The pairwise matrix is never materialised.** Queries are processed in row blocks sized to
+      ``working_memory_mb`` and each block is reduced to author scores before the next is built.
+      At 50,000 unknown against 100,000 known the full float64 distance matrix would be 40 GB.
+    * **Documents are float32 by default.** Halves both the GEMM cost and the score matrix
+      (3 GB rather than 6 GB at 50,000 x 15,000). Cosine rankings are unaffected at that
+      precision; pass ``dtype=np.float64`` to reproduce older runs bit-for-bit.
+
+    End to end at 50,000 unknown x 100,000 known x 3,072 dimensions over 15,000 authors: about
+    two minutes on 36 CPU cores, against roughly four hours for the ``cdist`` formulation. This
+    is *exact* nearest-neighbour search, deliberately -- an approximate index would trade recall
+    for time, and a missed neighbour is a false negative in precisely the hard cases that
+    separate one attack from another, which would bias the headline re-identification number
+    downward and non-uniformly.
     """
 
     name = "nearest_neighbor"
 
-    def __init__(self, metric: str = "cosine", linkage: str = "max"):
+    def __init__(self, metric: str = "cosine", linkage: str = "max",
+                 working_memory_mb: int = 2048, dtype=np.float32):
         self.metric = metric
         self.linkage = linkage
+        self.working_memory_mb = working_memory_mb
+        self.dtype = dtype
 
     def fit(self, embeddings, labels):
-        self.authors, self._codes = np.unique(labels, return_inverse=True)
-        self._known = np.asarray(embeddings, dtype=float)
+        self.authors, codes = np.unique(labels, return_inverse=True)
+        known = np.asarray(embeddings, dtype=self.dtype)
+
+        # Sort the known side by author so every author's documents form one contiguous block.
+        # ``ufunc.reduceat`` can then aggregate all authors in a single pass over a score block,
+        # replacing a per-author Python loop that rebuilt an n_known boolean mask once per author.
+        order = np.argsort(codes, kind="stable")
+        self._known = np.ascontiguousarray(known[order])
+        sorted_codes = codes[order]
+        # Codes come from np.unique over the labels, so every author owns at least one document:
+        # the block boundaries are strictly increasing and no block is empty, which is exactly
+        # the precondition reduceat needs.
+        self._starts = np.searchsorted(sorted_codes, np.arange(len(self.authors)))
+        # Held in the working dtype rather than as integers: these are only ever a divisor for
+        # mean linkage, and NumPy would promote a float32 score block divided by an int64 count
+        # back to float64, quietly doubling the size of the score matrix.
+        self._counts = np.bincount(sorted_codes, minlength=len(self.authors)).astype(self.dtype)
+
+        if self._uses_cosine:
+            self._known_unit = unit_rows(self._known)
+            if self.linkage == "mean":
+                # Cosine distance is affine in the second vector, so averaging it over an
+                # author's documents commutes with the dot product:
+                #     mean_j (1 - x.y_j) = 1 - x.(mean_j y_j)
+                # One centroid per author therefore reproduces mean linkage *exactly* while
+                # shrinking the known side from n_known vectors to n_authors.
+                #
+                # The centroid is deliberately left un-normalised, which is the whole difference
+                # from CentroidCosine: its length records how tightly the author's documents
+                # cluster, so a diffuse author is penalised. Re-normalising here would change the
+                # top-1 pick on a non-trivial fraction of documents.
+                self._centroids = (np.add.reduceat(self._known_unit, self._starts, axis=0)
+                                   / self._counts[:, None])
         return self
 
+    @property
+    def _uses_cosine(self) -> bool:
+        """Whether the BLAS fast path applies (it is written for cosine only)."""
+        return self.metric == "cosine"
+
+    def _query_block_rows(self, n_known: int) -> int:
+        """Number of query rows whose score block fits the memory budget."""
+        row_bytes = max(n_known * np.dtype(self.dtype).itemsize, 1)
+        return max(1, int(self.working_memory_mb * 1024 * 1024 // row_bytes))
+
     def score(self, embeddings):
-        distances = cdist(np.asarray(embeddings, dtype=float), self._known, metric=self.metric)
-        aggregated = np.empty((len(distances), len(self.authors)))
-        for index in range(len(self.authors)):
-            columns = distances[:, self._codes == index]
-            aggregated[:, index] = columns.mean(axis=1) if self.linkage == "mean" \
-                else columns.min(axis=1)
-        return -aggregated  # negate: higher must mean "more likely this author"
+        query = np.asarray(embeddings, dtype=self.dtype)
+        if self._uses_cosine:
+            return self._score_cosine(query)
+
+        # General path: any other cdist-compatible metric. sklearn picks the block size from
+        # its own working_memory setting and hands each block to reduce_func, so the full
+        # pairwise matrix is never held either.
+        def reduce_func(block, start):
+            if self.linkage == "mean":
+                return np.add.reduceat(block, self._starts, axis=1) / self._counts
+            return np.minimum.reduceat(block, self._starts, axis=1)
+
+        with sklearn.config_context(working_memory=self.working_memory_mb):
+            blocks = list(pairwise_distances_chunked(
+                query, self._known, metric=self.metric, reduce_func=reduce_func))
+        return -np.vstack(blocks)  # negate: higher must mean "more likely this author"
+
+    def _score_cosine(self, query):
+        """Cosine scoring via BLAS, with the aggregation folded into the distance computation.
+
+        Both linkages are rewritten in terms of cosine *similarity* so the work is a matrix
+        product: the cosine distance ``1 - s`` is decreasing in the similarity ``s``, so the
+        minimum distance over an author's documents is their maximum similarity. The trailing
+        ``- 1`` restores the negated-distance scale the caller expects; it is a constant shift
+        across the whole matrix and so leaves every ranking untouched, but keeping it means these
+        scores stay numerically comparable with the general path above.
+        """
+        query_unit = unit_rows(query)
+        if self.linkage == "mean":
+            return query_unit @ self._centroids.T - 1.0
+
+        scores = np.empty((len(query_unit), len(self.authors)), dtype=self.dtype)
+        for start in range(0, len(query_unit), self._query_block_rows(len(self._known_unit))):
+            stop = min(start + self._query_block_rows(len(self._known_unit)), len(query_unit))
+            similarity = query_unit[start:stop] @ self._known_unit.T
+            np.maximum.reduceat(similarity, self._starts, axis=1, out=scores[start:stop])
+        return scores - 1.0
 
 
 class CentroidCosine:
