@@ -29,6 +29,7 @@ from .accuracy import random_guessing_accuracy, top_k_accuracy
 from .detection import (
     c_at_1,
     calibration_metrics,
+    selective_classification,
     detection_auroc,
     detection_identification_rate,
     equal_error_rate,
@@ -61,6 +62,7 @@ __all__ = [
     # detection
     "c_at_1",
     "calibration_metrics",
+    "selective_classification",
     "detection_auroc",
     "detection_identification_rate",
     "equal_error_rate",

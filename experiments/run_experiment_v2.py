@@ -155,6 +155,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 from scipy.spatial.distance import cdist
 from scipy.stats import loguniform
 from sklearn.base import BaseEstimator, ClassifierMixin
@@ -174,6 +175,7 @@ from prompt_anonymity.metrics import (
     macro_f1_score,
     macro_top_k_accuracy,
     max_softmax_confidence,
+    selective_classification,
     per_author_ranking,
     random_guessing_accuracy,
     ranking_summary,
@@ -236,6 +238,12 @@ def filter_documents(frame: pd.DataFrame, model_owner: str = "all", language: st
     return frame
 
 
+# Document metadata this script reads: the join key, the chronological order, the label, and the
+# two filter axes. Everything else in the parquet -- notably ``turns``, the raw conversation text
+# -- is deliberately left on disk (see load_documents_and_features).
+DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "model_owner")
+
+
 def load_documents_and_features(data_dir, source: str, feature: str, undated: str = "drop",
                                 model_owner: str = "all",
                                 language: str = "all") -> tuple[pd.DataFrame, np.ndarray]:
@@ -263,7 +271,13 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
                              f"  python -m prompt_anonymity.data.compute_features --source {source} "
                              f"--feature {feature}")
 
-    documents = pd.read_parquet(documents_path)
+    # Read only the metadata this script actually uses. ``turns`` holds the raw conversation
+    # text and is 98% of the wildchat parquet (1.07 GB of 1.09 GB uncompressed, several times
+    # that once pandas materialises it as Python objects) -- and nothing downstream reads it,
+    # because featurisation already happened. Skipping it is most of this function's footprint.
+    document_schema = pq.ParquetFile(documents_path).schema_arrow.names
+    wanted = [column for column in DOCUMENT_COLUMNS if column in document_schema]
+    documents = pd.read_parquet(documents_path, columns=wanted)
     features = pd.read_parquet(features_path)
     missing = set(documents["doc_id"]) - set(features["doc_id"])
     if missing:
@@ -275,8 +289,10 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
 
     # The feature parquet mirrors some document metadata (``author_id``); keep only the columns
     # that are genuinely features, so the merge cannot collide and the matrix stays numeric.
+    # Checked against the *full* document schema, not the narrowed frame above, so a feature
+    # named after a metadata column we skipped still cannot sneak into the matrix.
     feature_columns = [column for column in features.columns
-                       if column != "doc_id" and column not in documents.columns]
+                       if column != "doc_id" and column not in document_schema]
     merged = documents.merge(features[["doc_id", *feature_columns]], on="doc_id", how="left",
                              validate="one_to_one")
     merged = filter_documents(merged, model_owner, language)
@@ -410,6 +426,9 @@ HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
         "learning_rate": loguniform(0.08, 0.5),
         "subsample": [0.7, 0.85, 1.0],
     },
+    # RLSC has exactly one knob, and its cost does not grow with the author pool,
+    # so a wide range here is free in a way the xgboost space above is not.
+    "rlsc": {"alpha": loguniform(1e-3, 1e3)},
     "wccn": {"shrinkage": loguniform(0.01, 0.9)},
     "plda": {"shrinkage": loguniform(0.01, 0.9)},
     "lda": {"n_components": [None, 16, 32, 64, 128]},
@@ -1105,6 +1124,18 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
     scores.update({"brier": calibration["brier"],
                    "ece": calibration["expected_calibration_error"],
                    "mean_confidence": calibration["mean_confidence"]})
+
+    # Selective classification: the attack answers only its most confident documents. Narayanan
+    # et al. reported this, not top-1, as the real measure of their 100,000-author attack -- 20%
+    # accuracy became >80% precision once it was allowed to pick its battles. Reported at 10/25/50%
+    # coverage so a low headline accuracy that hides a confidently-correct subset is visible.
+    selective = selective_classification(confidence, predicted == true_authors)
+    for _, row in selective.iterrows():
+        if row["coverage"] < 1.0:
+            scores[f"precision_at_{int(row['coverage'] * 100)}pct"] = row["precision"]
+    scores["recall_at_50pct"] = float(
+        selective.loc[selective["coverage"] == 0.50, "recall"].iloc[0]
+    )
     return cmc_curve(ranks, n_candidates), author_report
 
 
@@ -1328,6 +1359,9 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
           f">50% of their documents attributed, {int((exposed == 0).sum())} never once  |  "
           f"confidence {scores['mean_confidence']:.2f} vs accuracy "
           f"{scores['closed_set_top1']:.2f} (ECE {scores['ece']:.3f})")
+    print(f"  when selective: precision {scores['precision_at_10pct']:.3f} @10% coverage  |  "
+          f"{scores['precision_at_25pct']:.3f} @25%  |  {scores['precision_at_50pct']:.3f} @50% "
+          f"(keeping {scores['recall_at_50pct']:.0%} of its correct answers)")
 
 
 def main() -> None:

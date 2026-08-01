@@ -69,7 +69,7 @@ from .prompt_judge import (
 )
 
 # Registry so callers can select a fidelity metric by name (e.g. from a CLI argument), mirroring
-# prompt_anonymity.attacks.ATTACKS. Registering a metric here is all it takes to make it selectable
+# prompt_anonymity.attacks.ATTRIBUTION_ATTACKS. Registering a metric here is all it takes to make it selectable
 # from the experiment driver.
 FIDELITY_METRICS = {
     "utility": utility_fidelity,            # answer-level PASS/FAIL, per turn (the paper's predicate)

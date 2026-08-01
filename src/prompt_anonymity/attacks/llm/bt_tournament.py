@@ -39,11 +39,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..caching import TransformCache, logic_hash, params_hash
-from ..core import AttackData
-from ..fidelity._openrouter import OpenRouterChat
+from ...caching import TransformCache, logic_hash, params_hash
+from ...core import AttackData
+from ...fidelity._openrouter import OpenRouterChat
 from .euclidean_llm_judge import _parse_choice
-from .nearest_neighbor import nearest_neighbor_attack
+from .candidates import author_candidates
 
 #: Pairwise authorship-attribution judge rubric: a 1-vs-2 forced choice returning one digit.
 PAIRWISE_JUDGE_SYSTEM_PROMPT = (
@@ -188,28 +188,32 @@ class BradleyTerryTournamentAttack:
         known_texts = [str(t) for t in np.asarray(data.known_texts)]
         unknown_texts = [str(t) for t in np.asarray(data.unknown_texts)]
 
-        distances = nearest_neighbor_attack(
-            data.known_embeddings, data.unknown_embeddings, metric=data.metric
-        ).to_numpy()
-        n, n_known = distances.shape
-        k = min(self.top_k, n_known)
+        # Shortlist the most likely AUTHORS, each represented by their own document nearest to
+        # this unknown one. See prompt_anonymity.attacks.llm.candidates for why the unit is the
+        # author rather than the conversation.
+        candidates = author_candidates(
+            data.known_embeddings, data.known_labels, data.unknown_embeddings,
+            top_k=self.top_k, metric=data.metric,
+        )
+        self.authors = candidates.authors
+        scores = candidates.scores
+        n, k = candidates.author_index.shape
         if k < 2:
-            return pd.DataFrame(distances)  # need >=2 candidates to hold a match
+            return pd.DataFrame(scores)  # need >=2 candidates to hold a match
 
-        order = np.argsort(distances, axis=1)   # ascending distance -> nearest first
-        top_idx = order[:, :k]                   # (n, k) real known indices; slot 0 = nearest
-        row_min = distances.min(axis=1)          # == distance at slot 0
+        top_idx = candidates.document_index    # (n, k) known-document rows, slot 0 = best author
+        author_idx = candidates.author_index   # (n, k) author columns, slot 0 = best author
+        row_max = scores.max(axis=1)           # == the best author's score
 
-        # Ambiguity gate: tournament only the closest calls (small top-1/top-2 margin).
-        row_sorted = np.take_along_axis(distances, order, axis=1)
-        margins = row_sorted[:, 1] - row_sorted[:, 0]
+        # Ambiguity gate: tournament only the closest calls (small best/second-best AUTHOR margin).
+        margins = candidates.margin
         gate_thresh = np.quantile(margins, self.margin_quantile)
         active_rows = np.where(margins <= gate_thresh)[0]
 
-        # BT ratings, (n, k), in logistic units. Seed a TINY distance-rank prior (nearest slot
-        # highest) so round-1 Swiss pairing is deterministic (nearest vs 2nd-nearest, 3rd vs 4th,
-        # ...) while being small enough that a single upset (step ~elo_k) flips it -- the
-        # tournament, not the prior, decides.
+        # BT ratings, (n, k), in logistic units. Seed a TINY author-rank prior (best slot highest)
+        # so round-1 Swiss pairing is deterministic (best vs 2nd-best, 3rd vs 4th, ...) while
+        # being small enough that a single upset (step ~elo_k) flips it -- the tournament, not
+        # the prior, decides.
         ratings = np.tile(((k - 1 - np.arange(k)) * 1e-3).astype(float), (n, 1))
 
         rng = np.random.default_rng(self.seed)  # seeds 1-vs-2 presentation flips; reproducible
@@ -248,16 +252,17 @@ class BradleyTerryTournamentAttack:
                 ratings[i, s2] -= delta
             total_cmp += len(meta)
 
-        # Rerank each active row's top-K by final rating and place them all strictly below the
-        # row's minimum (all non-top-K distances are >= row_min), so top-K membership is
-        # unchanged and only the internal order (hence top-1) follows the tournament.
-        boosted = distances.copy()
+        # Rerank each active row's shortlist by final rating and place them all strictly above
+        # the row's maximum (every non-shortlisted author scores <= row_max), so shortlist
+        # membership is unchanged and only the internal order (hence top-1) follows the
+        # tournament.
+        boosted = scores.copy()
         changed_top1 = 0
         for i in active_rows:
             final_order = np.argsort(-ratings[i], kind="stable")  # best slot first
             for pos, slot in enumerate(final_order):
-                boosted[i, top_idx[i, slot]] = row_min[i] - (k - pos)  # pos 0 (best) -> smallest
-            if final_order[0] != 0:  # the nearest slot is no longer this row's #1
+                boosted[i, author_idx[i, slot]] = row_max[i] + (k - pos)  # pos 0 (best) -> largest
+            if final_order[0] != 0:  # the base attack's best author is no longer this row's #1
                 changed_top1 += 1
 
         if self.verbose:

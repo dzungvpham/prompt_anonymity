@@ -1,7 +1,7 @@
 """Top-k accuracy and the random-guessing baseline for linkage attacks.
 
 These stateless metrics consume the distance matrix produced by an attack (e.g.
-:func:`prompt_anonymity.attacks.nearest_neighbor_attack`) together with the identity
+:class:`prompt_anonymity.attacks.NearestNeighbor`) together with the identity
 labels of the known and unknown conversations, and report how often the attack
 re-identifies the correct user. They reproduce the ``conv_acc``, ``id_acc`` and
 ``random_id`` quantities computed in the WildChat and SWE-chat analyses.
@@ -44,7 +44,7 @@ def top_k_accuracy(
     distances : pandas.DataFrame or array-like of shape (n_unknown, n_known)
         Distance matrix from an attack; entry ``[u, k]`` is the distance between
         unknown conversation ``u`` and known conversation ``k`` (smaller = more
-        similar), e.g. the output of :func:`~prompt_anonymity.attacks.nearest_neighbor_attack`.
+        similar), e.g. the output of :class:`~prompt_anonymity.attacks.NearestNeighbor`.
     known_labels : array-like of shape (n_known,)
         Identity owning each known conversation, aligned to the *columns* of
         ``distances`` by position.

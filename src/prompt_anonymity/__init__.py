@@ -23,7 +23,7 @@ A linkage experiment runs in stages, one subpackage each:
     loaded features where text is unchanged, and caches recomputed vectors.
 ``attacks``
     Score each unknown conversation against the known ones, producing a distance matrix
-    (e.g. :func:`prompt_anonymity.attacks.nearest_neighbor_attack`).
+    (e.g. :class:`prompt_anonymity.attacks.NearestNeighbor`).
 ``metrics``
     Stateless scoring of an attack's output: :func:`~prompt_anonymity.metrics.top_k_accuracy`
     and the chance baseline :func:`~prompt_anonymity.metrics.random_guessing_accuracy`.

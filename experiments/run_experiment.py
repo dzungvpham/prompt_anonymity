@@ -22,7 +22,7 @@ so text the defense left unchanged keeps its precomputed vector (no GPU) and onl
 text is recomputed and cached -- with no defense this is an exact, GPU-free pass-through.
 
 Attacks, defenses and featurizers are pluggable through the package registries
-(``prompt_anonymity.attacks.ATTACKS``, ``prompt_anonymity.defenses.DEFENSES``,
+(``prompt_anonymity.attacks.ATTRIBUTION_ATTACKS``, ``prompt_anonymity.defenses.DEFENSES``,
 ``prompt_anonymity.features.FEATURIZERS``): the ``--attack`` / ``--defense`` choices below are
 read straight from them, so registering a new attack or defense makes it selectable here with
 no change to this script.
@@ -35,9 +35,10 @@ Outputs (under ``--output-dir``): ``headline_results.csv``, ``sweep_results.csv`
 from __future__ import annotations
 
 import argparse
+import inspect
 from pathlib import Path
 
-from prompt_anonymity.attacks import ATTACKS, run_attack
+from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, get_attribution_attack
 from prompt_anonymity.data import load_dataset
 from prompt_anonymity.defenses import DEFENSES, apply_defense
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy, pool_size_sweep
@@ -83,7 +84,8 @@ def parse_args() -> argparse.Namespace:
         "--feature", nargs="+", default=["stylometrix"], choices=sorted(FEATURIZERS),
         help="Conversation representation(s); name several to concatenate their feature vectors.",
     )
-    parser.add_argument("--attack", default="nearest_neighbor", choices=sorted(ATTACKS), help="Attack to run.")
+    parser.add_argument("--attack", default="nearest_neighbor",
+                        choices=sorted(ATTRIBUTION_ATTACKS), help="Attack to run.")
     parser.add_argument(
         "--metric", default="cosine",
         help="Distance metric the attack uses to compare vectors, e.g. 'cosine' (default) or "
@@ -190,9 +192,16 @@ def main() -> None:
         f"feature={'+'.join(f.name for f in featurizers)} metric={data.metric}"
     )
 
-    # Attack -> distance matrix -> ranking reused by both the headline table and sweep.
-    distances = run_attack(args.attack, data)
-    ranking = LinkageRanking(distances, data.known_labels, data.unknown_labels)
+    # Attack -> author score matrix -> ranking reused by both the headline table and sweep.
+    # Attacks score authors, not conversations, so each column of the matrix handed to
+    # LinkageRanking *is* one identity; it is negated because LinkageRanking ranks ascending
+    # (smaller = more similar) while an attack score means the opposite.
+    attack_class = get_attribution_attack(args.attack)
+    accepted = inspect.signature(attack_class).parameters
+    model = attack_class(**({"metric": data.metric} if "metric" in accepted else {}))
+    model.fit(data.known_embeddings, data.known_labels)
+    scores = model.score(data.unknown_embeddings)
+    ranking = LinkageRanking(-np.asarray(scores, dtype=float), model.authors, data.unknown_labels)
         # Save individual nearest-neighbor matches for qualitative/topic analysis
     import pandas as pd
 

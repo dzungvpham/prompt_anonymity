@@ -1,9 +1,22 @@
-"""Two-tower XGBoost linkage attack.
+"""Cross-encoder authorship verification: a learned same-author classifier over document pairs.
 
-Trains a binary classifier on pairs of (known, known) conversation feature vectors,
-labeled 1 if same author else 0. At inference, scores each unknown conversation
-against every known conversation using 1 - P(same author) as a "distance", so it
-plugs into the same top-k evaluation as nearest_neighbor_attack.
+Trains a binary classifier on pairs of (known, known) conversation feature vectors, labeled 1 if
+same author else 0, then scores each unknown document against every known one and aggregates to
+an author score.
+
+Naming
+------
+Filed under *verification* because that is the task: "were these two documents written by the
+same person?" is authorship verification, the pairwise counterpart of attribution, and the
+framing the PAN shared tasks use.
+
+The class is a **cross-encoder**, not the "two tower" its original filename claimed. A two-tower
+(dual-encoder) model runs each side through its own encoder and compares the two embeddings with
+a fixed metric, which is what makes precomputation and approximate retrieval possible. This model
+does the opposite: :func:`_build_pair_features` *interacts* the two vectors -- elementwise
+``|a - b|`` and ``a * b`` -- before any scoring, so nothing can be precomputed per document and
+every pair costs a full model evaluation. That interaction-before-scoring shape is the definition
+of a cross-encoder, and it is why this attack is the expensive one in the package.
 """
 
 from __future__ import annotations
@@ -15,7 +28,8 @@ from xgboost import XGBClassifier
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401
 from sklearn.model_selection import HalvingRandomSearchCV, GroupKFold
 from scipy.stats import randint, uniform
-from ..core import AttackData
+from ...core import AttackData
+from ..common import group_by_author
 
 
 def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
@@ -148,8 +162,15 @@ def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
 
     return search.best_estimator_
 
-def run_two_tower_xgb(data: AttackData, seed: int = 47, aggregate_by_identity: bool = True) -> pd.DataFrame:
-    """Train on known-known pairs, score unknown-vs-known pairs, return a distance matrix."""
+def run_cross_encoder(data: AttackData, seed: int = 47, linkage: str = "mean") -> pd.DataFrame:
+    """Train on known-known pairs, score unknown-vs-known pairs, aggregate to author scores.
+
+    Returns an ``[n_unknown x n_authors]`` frame of same-author probabilities, **higher = more
+    likely**, with the author labels as columns. ``linkage="mean"`` gives an author their average
+    probability across their documents (the previous ``aggregate_by_identity`` behaviour);
+    ``"max"`` gives them their best single document, matching
+    :class:`~prompt_anonymity.attacks.similarity.NearestNeighbor`'s default.
+    """
     X_train, y_train, groups = _make_training_pairs(
     data.known_embeddings,
     data.known_labels,
@@ -164,24 +185,23 @@ def run_two_tower_xgb(data: AttackData, seed: int = 47, aggregate_by_identity: b
     )
 
     n_unknown, n_known = data.n_unknown, data.n_known
-    distance_matrix = np.zeros((n_unknown, n_known))
+    authors, codes = np.unique(data.known_labels, return_inverse=True)
+    groups = group_by_author(codes, len(authors))
+    known_sorted = np.asarray(data.known_embeddings)[groups.order]
 
+    # One row per unknown document, one column per AUTHOR. The per-document probabilities are
+    # reduced to their author immediately rather than kept, both because that is the unit every
+    # metric scores and because an [n_unknown x n_known] matrix does not fit at corpus scale.
+    author_scores = np.zeros((n_unknown, len(authors)))
     for u in range(n_unknown):
         pair_feats = _build_pair_features(
-            np.tile(data.unknown_embeddings[u], (n_known, 1)), data.known_embeddings
+            np.tile(data.unknown_embeddings[u], (n_known, 1)), known_sorted
         )
         same_author_prob = clf.predict_proba(pair_feats)[:, 1]
-        distance_matrix[u, :] = 1.0 - same_author_prob  # smaller distance = more likely same author
+        if linkage == "mean":
+            author_scores[u] = (np.add.reduceat(same_author_prob, groups.starts)
+                                / groups.counts)
+        else:
+            author_scores[u] = np.maximum.reduceat(same_author_prob, groups.starts)
 
-    # added to aggregate by identity, so that every conversation from the same known identity gets an identical score
-    # only this if block and aggregate_by_identity: bool = True in the class parameter
-    if aggregate_by_identity:
-        # Replace each known conversation's distance with its identity's mean distance,
-        # so every conversation from the same known identity gets an identical score.
-        known_labels = data.known_labels
-        for label in np.unique(known_labels):
-            idx = np.where(known_labels == label)[0]
-            mean_dist = distance_matrix[:, idx].mean(axis=1, keepdims=True)
-            distance_matrix[:, idx] = mean_dist
-
-    return pd.DataFrame(distance_matrix)
+    return pd.DataFrame(author_scores, columns=authors)

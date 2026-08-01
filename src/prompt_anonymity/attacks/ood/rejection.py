@@ -1,6 +1,6 @@
 """Turning an author-score matrix into an accept/reject decision.
 
-The attacks in :mod:`prompt_anonymity.attacks.attribution` answer "which known author?". In any
+The attacks in :mod:`prompt_anonymity.attacks` answer "which known author?". In any
 real corpus most anonymous documents were written by somebody the attacker has never seen, so a
 usable attack also has to answer "**is** it one of them?" -- and the score matrix already
 contains the evidence, if it is read the right way.

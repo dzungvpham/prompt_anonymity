@@ -1,6 +1,6 @@
 """Nearest-neighbor linkage reranked by an LLM-as-a-judge.
 
-Plain :func:`~prompt_anonymity.attacks.nearest_neighbor_attack` usually lands the true
+Plain :class:`~prompt_anonymity.attacks.NearestNeighbor` usually lands the true
 author somewhere in an unknown conversation's top-K nearest known rows, but is much weaker
 at picking *which* of those K is actually correct -- exactly the top-1 vs. top-K accuracy
 gap. This attack keeps the embedding distance's top-K membership but reranks *within* it:
@@ -47,10 +47,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..caching import TransformCache, logic_hash, params_hash
-from ..core import AttackData
-from ..fidelity._openrouter import OpenRouterChat
-from .nearest_neighbor import nearest_neighbor_attack
+from ...caching import TransformCache, logic_hash, params_hash
+from ...core import AttackData
+from ...fidelity._openrouter import OpenRouterChat
+from .candidates import author_candidates
 
 #: Authorship-attribution judge rubric. A forced K-way choice returning a single digit; the
 #: candidate count is filled in per call so the prompt matches ``top_k``.
@@ -194,15 +194,15 @@ class EuclideanLLMJudgeAttack:
         )
 
     def attack(self, data: AttackData, *, cache_dir=None) -> pd.DataFrame:
-        """Run the reranked attack on ``data``, returning an ``[n_unknown x n_known]`` distance
-        matrix (smaller = more similar), aligned to ``data`` by position like every attack.
+        """Run the reranked attack on ``data``, returning an ``[n_unknown x n_authors]`` score
+        matrix (**higher = more likely this author**), with authors in ``self.authors``.
 
         Parameters
         ----------
         data : AttackData
             The split to attack; must carry ``known_texts`` and ``unknown_texts`` (the judge
-            reads raw conversation text, not just embeddings). The base ranking uses
-            ``data.metric``.
+            reads raw conversation text, not just embeddings) and ``known_labels`` (the
+            shortlist is over authors). The base ranking uses ``data.metric``.
         cache_dir : str or pathlib.Path or None
             Cache root; verdicts live under ``<cache_dir>/attacks``. ``None`` disables caching
             (every judged row hits the API), matching the other attacks, which do not cache.
@@ -215,24 +215,27 @@ class EuclideanLLMJudgeAttack:
         known_texts = [str(t) for t in np.asarray(data.known_texts)]
         unknown_texts = [str(t) for t in np.asarray(data.unknown_texts)]
 
-        # Base distance matrix from the underlying nearest-neighbor attack (respects data.metric).
-        distances = nearest_neighbor_attack(
-            data.known_embeddings, data.unknown_embeddings, metric=data.metric
-        ).to_numpy()
-        n, n_known = distances.shape
-        k = min(self.top_k, n_known)
+        # Shortlist the most likely AUTHORS, each represented by their own document nearest to
+        # this unknown one. See prompt_anonymity.attacks.llm.candidates for why the unit is the
+        # author rather than the conversation.
+        candidates = author_candidates(
+            data.known_embeddings, data.known_labels, data.unknown_embeddings,
+            top_k=self.top_k, metric=data.metric,
+        )
+        self.authors = candidates.authors
+        scores = candidates.scores
+        n, k = candidates.author_index.shape
         if k < 2:
-            return pd.DataFrame(distances)  # <2 candidates: nothing to rerank
+            return pd.DataFrame(scores)  # <2 candidates: nothing to rerank
 
-        order = np.argsort(distances, axis=1)   # ascending distance -> nearest first
-        top_idx = order[:, :k]                   # (n, k) real known indices; slot 0 = nearest
-        row_min = distances.min(axis=1)          # == distance at slot 0
+        top_idx = candidates.document_index    # (n, k) known-document rows, slot 0 = best author
+        author_idx = candidates.author_index   # (n, k) author columns, slot 0 = best author
+        row_max = scores.max(axis=1)           # == the best author's score
 
-        # Per-row top-1 vs top-2 distance margin (>= 0; small = the two nearest are near-tied =
-        # ambiguous). gate_thresh is that margin's `margin_quantile` quantile, so ~that fraction
-        # of the closest calls pass.
-        row_sorted = np.take_along_axis(distances, order, axis=1)
-        margins = row_sorted[:, 1] - row_sorted[:, 0]
+        # Per-row best vs second-best AUTHOR margin (>= 0; small = the two leading candidates are
+        # near-tied = ambiguous). gate_thresh is that margin's `margin_quantile` quantile, so
+        # ~that fraction of the closest calls pass.
+        margins = candidates.margin
         gate_thresh = np.quantile(margins, self.margin_quantile)
 
         # Presentation order of each row's K candidates. Shuffling (seeded -> reproducible, so the
@@ -245,7 +248,8 @@ class EuclideanLLMJudgeAttack:
             perms = [rng.permutation(k) for _ in range(n)]
         else:
             perms = [np.arange(k) for _ in range(n)]
-        present = [top_idx[i][perms[i]] for i in range(n)]
+        present = [top_idx[i][perms[i]] for i in range(n)]            # documents to show
+        present_authors = [author_idx[i][perms[i]] for i in range(n)]  # their authors
 
         prompts = [
             _judge_prompt(
@@ -266,20 +270,20 @@ class EuclideanLLMJudgeAttack:
         # current minimum. Every other entry -- including which rows are in the top-K -- is
         # untouched, so top-K membership (and top-K/top-2K accuracy) is unchanged and only top-1
         # can move relative to the base attack.
-        boosted = distances.copy()
+        boosted = scores.copy()
         applied = 0
         forced = 0
         for i, choice in enumerate(choices):
             if margins[i] > gate_thresh:
-                continue  # confident row: keep the distance metric's own #1
+                continue  # confident row: keep the base attack's own #1 author
             if 1 <= choice <= k:
-                boosted[i, present[i][choice - 1]] = row_min[i] - 1.0
+                boosted[i, present_authors[i][choice - 1]] = row_max[i] + 1.0
                 applied += 1
             else:
-                # Forced choice: a refusal / invalid digit commits to the NEAREST candidate
-                # (distance rank 0, already this row's #1) instead of skipping the rerank. So the
-                # row never worsens vs. the embedding baseline, but no gated row is left unresolved.
-                boosted[i, top_idx[i, 0]] = row_min[i] - 1.0
+                # Forced choice: a refusal / invalid digit commits to the BEST candidate (slot 0,
+                # already this row's #1) instead of skipping the rerank. So the row never worsens
+                # vs. the embedding baseline, but no gated row is left unresolved.
+                boosted[i, author_idx[i, 0]] = row_max[i] + 1.0
                 applied += 1
                 forced += 1
 
@@ -292,7 +296,7 @@ class EuclideanLLMJudgeAttack:
             rank_picks = [int(perms[i][c - 1]) for i, c in enumerate(choices) if 1 <= c <= k]
             rank_dist = {r: rank_picks.count(r) for r in range(k)}
             print(f"  LLM judge: positional picks {pos_dist} (0=refused; want ~uniform if unbiased)")
-            print(f"  LLM judge: distance-rank of picks {rank_dist} (0=nearest; want mass on 0-1)")
+            print(f"  LLM judge: author-rank of picks {rank_dist} (0=best; want mass on 0-1)")
             print(f"  LLM judge: rerank applied to {applied}/{n} rows "
                   f"(margin_quantile={self.margin_quantile}, gate<= {gate_thresh:.4g}); "
                   f"{forced} refusals forced to nearest")
