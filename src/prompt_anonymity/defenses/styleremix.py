@@ -40,17 +40,25 @@ Fidelity to the upstream implementation
 ---------------------------------------
 
 Matching upstream: the adapter set, the ``### Original: ... ### Rewrite:`` format (which Appendix
-C.3 confirms is also the *training* format), the ``cat`` merge, and cutting the generation at the
-next ``###`` -- upstream's ``process_output``, which is the only thing stopping a base model from
-running on past the rewrite. Here that is a vLLM ``stop`` string, so generation *halts* rather than
-being trimmed after the fact.
+C.3 confirms is also the *training* format), the ``cat`` merge, and stopping the generation before
+it rolls into a new example -- upstream's ``process_output``, which is the only thing stopping a
+base model from running on past the rewrite. Here that is a vLLM ``stop`` string, so generation
+*halts* rather than being trimmed after the fact, and it fires on the example boundary rather than
+on any ``###`` (see :data:`STYLEREMIX_STOP` for why that distinction costs upstream half the content
+of every turn containing a markdown heading).
 
 Deliberately different, and why:
 
-* **Greedy decoding.** Upstream samples (``do_sample=True, top_p=0.95``, and temperature 0.6
-  inherited from Llama-3's ``generation_config.json``). We decode greedily: convergence wants the
-  same input to land on the same rewrite, and a cached defense whose output is not reproducible
-  cannot be re-run.
+* **Sampling is upstream's, the seed is not.** Upstream passes ``do_sample=True, top_p=0.95`` and
+  *no* temperature, so it samples at the 0.6 its base model's ``generation_config.json`` supplies --
+  a value stated in neither the repo nor the paper. :data:`STYLEREMIX_TEMPERATURE` and
+  :data:`STYLEREMIX_TOP_P` reproduce that, with a fixed :data:`STYLEREMIX_SEED` added so the run is
+  reproducible: a cached defense whose output cannot be regenerated cannot be resumed or checked.
+  Set ``STYLEREMIX_TEMPERATURE=0`` for greedy decoding.
+* **Degenerate generations are caught, not kept** (:func:`cut_repetition`). A rewrite that runs far
+  past its input has usually fallen into a loop, and the text before the loop is a fine rewrite, so
+  the loop is cut and the rest kept; if what survives no longer covers the turn, the original is
+  kept instead. Upstream has no such guard, but upstream also never fed the adapters a line of dots.
 * **Long turns are split, not truncated.** The adapters were trained at a 512-token sequence
   length, and upstream's merge pipeline truncates its input at 256 tokens. Chat turns are routinely
   longer than either, and silently dropping their tails would make the defended dataset a lie, so a
@@ -120,8 +128,19 @@ STYLEREMIX_SLIDERS = {
 
 #: The prompt format the adapters were trained on. Not a chat template -- the base model has none.
 STYLEREMIX_PROMPT_TEMPLATE = "### Original: {text}\n ### Rewrite:"
-#: Upstream cuts every generation at the next ``###``; as a vLLM stop string it also halts decoding.
-STYLEREMIX_STOP = "###"
+#: Where a generation must stop: the start of a *new training example*, not any ``###``.
+#:
+#: Upstream cuts at the next bare ``###`` (``process_output``), which is safe for its corpora of
+#: essays and speeches and destructive here: a markdown heading inside a chat turn is a legitimate
+#: ``###``, and stopping there truncates the rewrite mid-turn. Measured on this corpus, turns whose
+#: input contains ``###`` came back at a median 0.58x their input length against 1.24x for the rest,
+#: with 40% of them losing more than half their content.
+#:
+#: The real terminator is the ``<eos>`` the adapters were trained to emit (Appendix C.3: the
+#: training text is ``<bos>### Original:{original} \n ### Rewrite: {rewrite}<eos>``), which vLLM
+#: honours from the tokenizer. These stops are the guard for when the model instead rolls on into a
+#: fresh example, so they match that boundary rather than the heading marker it starts with.
+STYLEREMIX_STOP = ("### Original", "### Rewrite")
 
 #: Input tokens per fragment. The adapters were trained at a 512-token sequence length, so this is
 #: what they have actually seen; a longer turn is split rather than truncated.
@@ -147,6 +166,44 @@ STYLEREMIX_CHECKPOINT_EVERY = int(os.environ.get("STYLEREMIX_CHECKPOINT_EVERY", 
 #: (see :data:`~prompt_anonymity.defenses._backends.MIN_DEFEND_CHARS` for the measurement). Style is
 #: the one thing a 5-character turn does not carry, so skipping it costs the defense almost nothing.
 STYLEREMIX_MIN_CHARS = int(os.environ.get("STYLEREMIX_MIN_CHARS", str(MIN_DEFEND_CHARS)))
+
+# --- decoding ---
+#: Sampling settings, matching upstream. Upstream passes ``do_sample=True, top_p=0.95`` and no
+#: temperature, so its temperature is whatever Llama-3-8B's ``generation_config.json`` carries --
+#: **0.6** — which is where this default comes from; it is not written down in the repo or the paper.
+#: Set ``STYLEREMIX_TEMPERATURE=0`` for greedy decoding instead.
+STYLEREMIX_TEMPERATURE = float(os.environ.get("STYLEREMIX_TEMPERATURE", "0.6"))
+STYLEREMIX_TOP_P = float(os.environ.get("STYLEREMIX_TOP_P", "0.95"))
+#: Sampling seed. Upstream leaves sampling unseeded, so its rewrites are unreproducible; here a
+#: fixed per-request seed makes a re-run reproduce the cache it would have written, which is what
+#: lets an interrupted run resume and a result be checked. Part of the cache key.
+STYLEREMIX_SEED = int(os.environ.get("STYLEREMIX_SEED", "0"))
+
+# --- degenerate-output guards ---
+#: A rewrite longer than this multiple of its input is treated as a failure once
+#: :func:`cut_repetition` has had a go at it, and the original text is kept instead. Restyling
+#: changes length (formal register ran ~1.3x on this corpus, and the length axis can lengthen
+#: deliberately), so this is set well clear of legitimate expansion.
+STYLEREMIX_MAX_EXPANSION = float(os.environ.get("STYLEREMIX_MAX_EXPANSION", "4.0"))
+#: Longest repeating block :func:`cut_repetition` will look for, and how many consecutive copies
+#: count as degenerate rather than deliberate.
+STYLEREMIX_LOOP_PERIOD = int(os.environ.get("STYLEREMIX_LOOP_PERIOD", "120"))
+STYLEREMIX_LOOP_REPEATS = int(os.environ.get("STYLEREMIX_LOOP_REPEATS", "4"))
+#: Least of its input a rewrite must still cover, or the original is kept instead. A rewrite this
+#: much shorter than its input has dropped content rather than restyled it -- either the model
+#: summarised a structured document down to its opening sentence (which is what the adapters do with
+#: markdown specs and compiler dumps, being trained on prose), or a loop cut left a stub.
+#:
+#: 0.5 is set from the corpus, not by taste: restyling to a formal register *expands* text, so
+#: measured over 26,651 rewrites the 1st percentile of the length ratio is 0.52 and the 5th is 0.95.
+#: A floor at 0.5 therefore reverts the outlier tail (~1% of rewrites, whose median ratio is 0.34 --
+#: two thirds of the turn gone) while leaving the legitimate distribution untouched.
+#:
+#: The trade-off is real: a reverted turn is *undefended*, so its author's style survives. That is
+#: the honest failure, and it is counted in the run log. Lower it to defend more turns at the cost
+#: of keeping mangled ones; raise it toward 1.0 only if no shortening slider is enabled, since
+#: ``length_less`` shortens on purpose.
+STYLEREMIX_MIN_RETENTION = float(os.environ.get("STYLEREMIX_MIN_RETENTION", "0.5"))
 
 # slider name -> (positive-direction adapter, negative-direction adapter).
 AXIS_ADAPTERS = {
@@ -272,10 +329,84 @@ def merged_adapter_rank(adapter_dir: Path) -> int:
     return int(json.loads((adapter_dir / "adapter_config.json").read_text())["r"])
 
 
+def cut_repetition(text: str, max_period: int = STYLEREMIX_LOOP_PERIOD,
+                   min_repeats: int = STYLEREMIX_LOOP_REPEATS) -> str:
+    """Truncate a degenerate repeated tail, keeping one copy of the repeated block.
+
+    A language model that runs out of anything to say falls into a loop -- a character, a phrase or
+    a sentence repeated until the token budget runs out. Observed here on an input that was itself
+    contentless (a line of dots), whose rewrite reached 64,736 characters. The salvageable part is
+    everything *before* the loop, so this finds where the repetition starts and cuts there rather
+    than discarding the whole rewrite.
+
+    Scans for the earliest position where some block of up to ``max_period`` characters repeats
+    ``min_repeats`` times back to back, and cuts after that block's first copy. Returns ``text``
+    unchanged when nothing qualifies. Cost is O(``max_period`` x len(text)), so callers should gate
+    this on an output already suspected of being degenerate.
+
+    A legitimately repetitive rewrite (a markdown table, a numbered list) is at some risk here,
+    which is why ``min_repeats`` counts *consecutive, exact* copies -- four identical blocks in a
+    row with nothing between them is not something prose does.
+    """
+    n = len(text)
+    earliest = None
+    for period in range(1, min(max_period, n // min_repeats) + 1):
+        run = 0
+        limit = earliest if earliest is not None else n
+        for i in range(n - period):
+            if text[i] == text[i + period]:
+                run += 1
+                if run + period >= period * min_repeats:
+                    start = i - run + 1            # first index of the periodic region
+                    if earliest is None or start + period < earliest:
+                        earliest = start + period  # keep exactly one copy of the block
+                    break
+            else:
+                run = 0
+                if i > limit:                      # cannot beat the cut we already have
+                    break
+    return text[:earliest].rstrip() if earliest is not None else text
+
+
 def strip_leading_marker(text: str) -> str:
     """Drop a leading ``###`` marker the model sometimes echoes before its rewrite (upstream does
     the same), then trim."""
     return re.sub(r"^\s*###\s*(Rewrite:)?", "", text).strip()
+
+
+def within_length_bounds(original: str, rewritten: str,
+                         min_retention: float = STYLEREMIX_MIN_RETENTION,
+                         max_expansion: float = STYLEREMIX_MAX_EXPANSION) -> bool:
+    """Is ``rewritten`` a plausible restyling of ``original``, judged only on length?
+
+    A restyling changes wording, not quantity of content. Far shorter means the model summarised
+    the turn away (:data:`STYLEREMIX_MIN_RETENTION`); far longer means it invented or looped
+    (:data:`STYLEREMIX_MAX_EXPANSION`). Either way the original is the safer thing to keep, because
+    an undefended turn is a visible, countable failure while a mangled one is silent.
+
+    Applied to a whole **turn**, not a fragment: it is the turn that has to remain a faithful
+    version of what the user wrote, and judging fragments separately would leave a turn half
+    restyled and half original.
+    """
+    if not rewritten:
+        return False
+    length = max(len(original), 1)
+    return min_retention * length <= len(rewritten) <= max_expansion * length
+
+
+def cut_at_example_boundary(text: str) -> str:
+    """Drop anything from the start of a new training example onwards.
+
+    Belt to :data:`STYLEREMIX_STOP`'s braces: vLLM already halts there, so this normally changes
+    nothing, but it also catches a boundary that arrives split across a token edge, and it applies
+    the same rule to text that never went through the sampler.
+    """
+    cut = len(text)
+    for marker in STYLEREMIX_STOP:
+        found = text.find(marker)
+        if found != -1:
+            cut = min(cut, found)
+    return text[:cut].rstrip()
 
 
 class _StyleRemixBackend:
@@ -289,7 +420,10 @@ class _StyleRemixBackend:
     def __init__(self, base_model, adapters, sliders, *, max_new_tokens=STYLEREMIX_MAX_NEW_TOKENS,
                  input_tokens=STYLEREMIX_INPUT_TOKENS, max_model_len=STYLEREMIX_MAX_MODEL_LEN,
                  gpu_memory_utilization=STYLEREMIX_GPU_MEM_UTIL,
-                 enforce_eager=STYLEREMIX_ENFORCE_EAGER, max_lora_rank=STYLEREMIX_MAX_LORA_RANK):
+                 enforce_eager=STYLEREMIX_ENFORCE_EAGER, max_lora_rank=STYLEREMIX_MAX_LORA_RANK,
+                 temperature=STYLEREMIX_TEMPERATURE, top_p=STYLEREMIX_TOP_P, seed=STYLEREMIX_SEED,
+                 max_expansion=STYLEREMIX_MAX_EXPANSION,
+                 min_retention=STYLEREMIX_MIN_RETENTION):
         configure_cuda_toolkit()  # must precede the import: vLLM reads the environment at import
         from vllm import LLM, SamplingParams
         from vllm.lora.request import LoRARequest
@@ -311,9 +445,14 @@ class _StyleRemixBackend:
         )
         self.tokenizer = self.llm.get_tokenizer()
         self.lora_request = LoRARequest(slider_tag(active), 1, str(adapter_dir))
-        # Greedy, and stopped at the next "###" so a base model cannot run on past the rewrite.
-        self.sampling = SamplingParams(temperature=0.0, top_p=1.0, max_tokens=max_new_tokens,
-                                       stop=[STYLEREMIX_STOP])
+        self.max_expansion = max_expansion
+        self.min_retention = min_retention
+        # Upstream's sampling settings, stopped at the next "###" so a base model cannot run on past
+        # the rewrite. Seeded, which upstream is not: vLLM gives each request its own generator, so
+        # a re-run reproduces this run's rewrites instead of drawing new ones.
+        self.sampling = SamplingParams(temperature=temperature, top_p=top_p, seed=seed,
+                                       max_tokens=max_new_tokens, stop=list(STYLEREMIX_STOP))
+        print(f"StyleRemix: sampling temperature={temperature}, top_p={top_p}, seed={seed}")
 
     def _fragments(self, text: str) -> list[str]:
         """``text`` split into pieces of at most :attr:`input_tokens` tokens, concatenating back to
@@ -344,20 +483,49 @@ class _StyleRemixBackend:
         outputs = self.llm.generate(prompts, self.sampling, lora_request=self.lora_request)
 
         rejoined: dict[int, list[str]] = {}
-        empty = 0
+        empty = looped = reverted = 0
         for position, output, fragment in zip(owners, outputs, fragments):
-            rewritten = strip_leading_marker(output.outputs[0].text)
+            rewritten = cut_at_example_boundary(strip_leading_marker(output.outputs[0].text))
+            # A rewrite far longer than its input has degenerated. Cut a repeated tail if that is
+            # what happened -- the text before the loop is usually a fine rewrite -- and only give
+            # up on what is left if it is *still* implausibly long.
+            if len(rewritten) > self.max_expansion * max(len(fragment), 1):
+                cut = cut_repetition(rewritten)
+                # Only take the cut if what survives still covers the turn; a loop that started
+                # early leaves a stub, and a stub would delete the turn's content rather than
+                # restyle it -- better to hand back the original and say so.
+                if len(cut) < len(rewritten) and len(cut) >= self.min_retention * len(fragment):
+                    looped += 1
+                    rewritten = cut
             if not rewritten:
                 # The model emitted the stop marker immediately, so there is no rewrite to use.
                 # Keeping the original leaves the turn visibly undefended rather than blank.
                 rewritten = fragment
                 empty += 1
             rejoined.setdefault(position, []).append(rewritten)
+
+        # Length is judged on the whole turn, once its fragments are back together (see
+        # `within_length_bounds`); a turn that failed goes back to the user's own text.
+        results = []
+        for i, text in enumerate(texts):
+            if i not in rejoined:
+                results.append(text)
+                continue
+            candidate = " ".join(rejoined[i])
+            if within_length_bounds(text, candidate, self.min_retention, self.max_expansion):
+                results.append(candidate)
+            else:
+                results.append(text)
+                reverted += 1
         if empty:
-            print(f"StyleRemix: {empty:,}/{len(fragments):,} fragments produced no rewrite and were "
-                  f"left unchanged.")
-        return [" ".join(rejoined[i]) if i in rejoined else text
-                for i, text in enumerate(texts)]
+            print(f"StyleRemix: {empty:,}/{len(fragments):,} fragments produced no rewrite.")
+        if looped:
+            print(f"StyleRemix: trimmed a repeated tail from {looped:,}/{len(fragments):,} fragments.")
+        if reverted:
+            print(f"StyleRemix: {reverted:,}/{len(texts):,} turns fell outside "
+                  f"[{self.min_retention:g}x, {self.max_expansion:g}x] of their input length and "
+                  f"were left undefended.")
+        return results
 
     def close(self) -> None:
         """Shut the engine down and hand its GPU memory back (see :func:`shutdown_vllm`)."""
@@ -384,12 +552,20 @@ class StyleRemixDefense(PerTurnBatchRewriteDefense):
     def __init__(self, *, base_model: str = STYLEREMIX_BASE_MODEL, sliders: dict | None = None,
                  max_new_tokens: int = STYLEREMIX_MAX_NEW_TOKENS,
                  input_tokens: int = STYLEREMIX_INPUT_TOKENS,
-                 min_defend_chars: int = STYLEREMIX_MIN_CHARS):
+                 min_defend_chars: int = STYLEREMIX_MIN_CHARS,
+                 temperature: float = STYLEREMIX_TEMPERATURE, top_p: float = STYLEREMIX_TOP_P,
+                 seed: int = STYLEREMIX_SEED, max_expansion: float = STYLEREMIX_MAX_EXPANSION,
+                 min_retention: float = STYLEREMIX_MIN_RETENTION):
         self.base_model = base_model
         self.sliders = dict(STYLEREMIX_SLIDERS if sliders is None else sliders)
         self.max_new_tokens = max_new_tokens
         self.input_tokens = input_tokens
         self.min_defend_chars = min_defend_chars
+        self.temperature = temperature
+        self.top_p = top_p
+        self.seed = seed
+        self.max_expansion = max_expansion
+        self.min_retention = min_retention
         self._backend = None
 
     def params(self) -> dict:
@@ -399,13 +575,21 @@ class StyleRemixDefense(PerTurnBatchRewriteDefense):
         # mode) do not change the output.
         return {"base_model": self.base_model, "sliders": self.sliders,
                 "input_tokens": self.input_tokens, "max_new_tokens": self.max_new_tokens,
-                "min_defend_chars": self.min_defend_chars}
+                "min_defend_chars": self.min_defend_chars, "temperature": self.temperature,
+                "top_p": self.top_p, "seed": self.seed,
+                # These four are module constants, so the class-source hash does not cover them --
+                # without them here, editing a stop string or a guard threshold would silently reuse
+                # rewrites made under the old ones.
+                "stop": list(STYLEREMIX_STOP), "max_expansion": self.max_expansion,
+                "min_retention": self.min_retention}
 
     def _get_backend(self) -> _StyleRemixBackend:
         if self._backend is None:
             self._backend = _StyleRemixBackend(
                 self.base_model, STYLEREMIX_ADAPTERS, self.sliders,
                 max_new_tokens=self.max_new_tokens, input_tokens=self.input_tokens,
+                temperature=self.temperature, top_p=self.top_p, seed=self.seed,
+                max_expansion=self.max_expansion, min_retention=self.min_retention,
             )
         return self._backend
 
