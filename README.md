@@ -92,12 +92,17 @@ positional — `<split>`, then a defense and/or a featurizer:
 | --- | --- | --- |
 | `swe_chat.parquet` | `build_dataset` | documents: `doc_id`, `author_id`, `turns`, timestamps, language |
 | `swe_chat_stylometrix.parquet` | `compute_features` | `doc_id`, `author_id`, one column per feature |
-| `swe_chat_openanonymity.parquet` | `apply_defenses` | documents again, same schema, `turns` rewritten |
+| `swe_chat_openanonymity.parquet` | `apply_defenses` | `doc_id`, `author_id`, `turns` rewritten |
 | `swe_chat_openanonymity_stylometrix.parquet` | `compute_features --defense` | features of the defended text |
 
 Defended splits and feature files share the `<split>_<name>.parquet` namespace, so keep defense and
 featurizer names disjoint. On disk you tell them apart by their columns: a defended split has
-`turns`, a feature file has `doc_id`/`author_id` plus feature columns.
+`turns`, a feature file has feature columns.
+
+A defended file carries **only** `doc_id`, `author_id` and the rewritten `turns` — a defense changes
+nothing else, so timestamps, language and model stay in `<split>.parquet` instead of being
+duplicated. Join them back on `doc_id` when you need them; `compute_features --defense` does exactly
+that for its `--language` filter.
 
 **Where the raw data comes from is configuration, not a constant.** `src/prompt_anonymity/data/datasets.toml` pins each source's HuggingFace repo and revision, and with nothing else set the build downloads them (WildChat-4.8M is gated: accept its terms and `hf auth login` first). If you already have local copies, point at them without editing the committed config:
 

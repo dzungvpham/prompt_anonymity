@@ -197,6 +197,31 @@ def load_split(source: str, dist_dir: str | Path, columns: list[str] | None = No
     return pd.read_parquet(path, columns=columns)
 
 
+def load_documents(source: str, dist_dir: str | Path, columns: list[str],
+                   defense: str | None = None) -> pd.DataFrame:
+    """The documents to featurize, with the metadata this script needs, defended or not.
+
+    A defended file (:mod:`prompt_anonymity.data.apply_defenses`) carries only ``doc_id``,
+    ``author_id`` and the rewritten ``turns`` -- a defense changes nothing else, so the rest stays
+    in ``<split>.parquet`` rather than being duplicated. Any other requested column is therefore
+    joined back from the undefended split on ``doc_id``, which is also what keeps this correct for
+    a *subset* of the split (a ``--language`` or ``--limit`` run) rather than assuming the two files
+    are row-aligned. The frame's index stays each row's position in the file being featurized, which
+    is what :func:`read_texts` reads back against.
+    """
+    if defense is None:
+        return load_split(source, dist_dir, columns=columns, defense=None)
+    available = set(pq.ParquetFile(split_path(source, dist_dir, defense)).schema_arrow.names)
+    frame = load_split(source, dist_dir, columns=[c for c in columns if c in available],
+                       defense=defense)
+    missing = [c for c in columns if c not in available]
+    if missing:
+        base = load_split(source, dist_dir, columns=["doc_id", *missing]).set_index("doc_id")
+        for column in missing:
+            frame[column] = frame["doc_id"].map(base[column])
+    return frame[columns]
+
+
 def select_documents(frame: pd.DataFrame, language: str | None = None,
                      limit: int | None = None) -> pd.DataFrame:
     """Pick the documents to featurize, keeping the split's row order.
@@ -696,8 +721,7 @@ def main() -> None:
     # two columns the selection needs -- never the `turns` that make the split large.
     if args.merge:
         documents = select_documents(
-            load_split(args.source, dist, columns=["doc_id", "language_primary"],
-                       defense=args.defense),
+            load_documents(args.source, dist, ["doc_id", "language_primary"], args.defense),
             language=language, limit=args.limit,
         )
         merged = merge_shards(out_dir, stem, list(documents["doc_id"]))
@@ -731,8 +755,8 @@ def main() -> None:
 
     # Only the key/filter columns, never `turns`: this process has to leave room for the worker
     # pool, and an array task reads back the text of just its own shard (see `read_texts`).
-    frame = load_split(args.source, dist,
-                       columns=["doc_id", "author_id", "language_primary"], defense=args.defense)
+    frame = load_documents(args.source, dist,
+                           ["doc_id", "author_id", "language_primary"], args.defense)
     documents = select_documents(frame, language=language, limit=args.limit)
     if documents.empty:
         raise SystemExit(f"no documents in {args.source} match --language {args.language}.")

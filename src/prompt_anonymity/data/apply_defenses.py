@@ -110,8 +110,12 @@ from .compute_features import (
 )
 from .config import cache_dir, dist_dir
 
-# (Defended splits are written beside the split they came from, as <split>_<defense>.parquet; see
-# `output_path` and the module docstring.)
+# The defended file's columns. Just the key, its author, and the rewritten text: everything else in
+# the split (timestamps, language, model, agent) is unchanged by a defense, so copying it would
+# duplicate the split rather than describe the defense. Anything that needs those columns joins back
+# to <split>.parquet on doc_id, which is what `compute_features --defense` does for the language
+# filter.
+DEFENDED_COLUMNS = ["doc_id", "author_id", "turns"]
 
 # Where the per-turn defense cache is rooted under --cache-dir. The defense machinery adds its own
 # ``defenses/<name>/<logic hash>/<params hash>/`` below this; what this level adds is the split (and
@@ -125,23 +129,6 @@ TURN_ID_SEPARATOR = "#"
 
 
 # --- input ------------------------------------------------------------------
-
-def split_columns(source: str, dist_dir: str | Path) -> list[str]:
-    """The built split's column names, in file order, read from the parquet footer alone.
-
-    Used to reproduce the split's exact schema in the defended output -- including where ``turns``
-    sits among the other columns -- without reading a single row of data.
-
-    Read from the **Arrow** schema, not the Parquet one: Parquet describes a list column by its
-    leaf, so ``turns`` appears there as the element name (``element``), which is not a column
-    anything can select.
-    """
-    path = Path(dist_dir) / f"{SPLIT_NAMES[source]}.parquet"
-    if not path.exists():
-        raise SystemExit(f"{path} not found -- build it first with "
-                         f"`python -m prompt_anonymity.data.build_dataset`.")
-    return list(pq.ParquetFile(path).schema_arrow.names)
-
 
 def read_turns(source: str, dist_dir: str | Path, positions) -> list[list[str]]:
     """The turn lists of these split row positions, in the order given.
@@ -279,18 +266,18 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
 
 # --- output -----------------------------------------------------------------
 
-def build_defended_frame(metadata: pd.DataFrame, turn_lists: list[list[str]],
-                         columns: list[str]) -> pd.DataFrame:
-    """The defended documents in the split's own schema: every column, with ``turns`` replaced.
+def build_defended_frame(metadata: pd.DataFrame, turn_lists: list[list[str]]) -> pd.DataFrame:
+    """The defended documents: ``doc_id``, ``author_id``, and the rewritten ``turns``.
 
-    Keeping the schema byte-for-byte comparable to the undefended split is what lets a defended
-    file be read by anything that reads the original -- the loaders, the featurizer, the runners --
-    with no special case for "this one is defended". ``num_turns`` needs no recomputation: a
-    per-turn rewrite returns one turn per turn (see :func:`regroup_turns`).
+    Only what the defense actually produces (see :data:`DEFENDED_COLUMNS`). The split's other
+    columns -- timestamps, language, model, agent -- are untouched by a defense, so they stay in
+    ``<split>.parquet`` and are joined back on ``doc_id`` by whoever needs them; ``num_turns`` is
+    likewise recoverable, since a per-turn rewrite returns one turn per turn
+    (see :func:`regroup_turns`).
     """
     frame = metadata.reset_index(drop=True).copy()
     frame["turns"] = pd.Series(turn_lists, dtype=object)
-    return frame[columns]
+    return frame[DEFENDED_COLUMNS]
 
 
 def defended_stem(source: str, defense: str) -> str:
@@ -376,10 +363,9 @@ def main() -> None:
 
     shard_index, num_shards = resolve_sharding(args.shard_index, args.num_shards)
 
-    # Every column except `turns`, which is read separately (and only for this shard's rows) since
-    # it is the bulk of the dataset; `columns` keeps the output in the split's own schema order.
-    columns = split_columns(args.source, dist)
-    frame = load_split(args.source, dist, columns=[c for c in columns if c != "turns"])
+    # Only the columns this needs: the two that are written out, plus the one --language filters on.
+    # `turns` is read separately, and only for this shard's rows, since it is the bulk of the split.
+    frame = load_split(args.source, dist, columns=["doc_id", "author_id", "language_primary"])
     documents = select_documents(frame, language=language, limit=args.limit)
     if documents.empty:
         raise SystemExit(f"no documents in {args.source} match --language {args.language}.")
@@ -398,7 +384,7 @@ def main() -> None:
         args.defense, shard["doc_id"], shard["author_id"], turn_lists,
         cache_dir=defense_cache_dir(cache, args.source, shard_index, num_shards),
     )
-    documents_out = build_defended_frame(shard, defended, columns)
+    documents_out = build_defended_frame(shard, defended)
     write_parquet(documents_out, out_path)
     report_written(documents_out, out_path,
                    "defended documents" if num_shards == 1 else "defended shard documents")
