@@ -2,7 +2,7 @@
 """Linkage re-identification experiment driver (WildChat / SWE-chat).
 
 Selects a dataset, an optional defense, and an attack -- all by name -- using the
-``prompt_anonymity`` package, and writes CSV results and PDF plots::
+``prompt_anonymity`` package, and writes CSV results::
 
     python experiments/run_experiment.py --dataset swe-chat
     python experiments/run_experiment.py --dataset wildchat --language English \
@@ -11,7 +11,7 @@ Selects a dataset, an optional defense, and an attack -- all by name -- using th
 Pipeline (identical regardless of dataset/attack/defense)::
 
     load_dataset -> apply_defense -> [--fidelity] -> apply_featurizer -> run_attack -> LinkageRanking
-                 -> headline_accuracy + pool_size_sweep -> CSVs + plots
+                 -> headline_accuracy + pool_size_sweep -> CSVs
 
 ``--fidelity`` optionally scores how much of the prompt the defense preserved (a utility axis
 orthogonal to the attack) before featurizing; see ``prompt_anonymity.fidelity``.
@@ -28,8 +28,12 @@ read straight from them, so registering a new attack or defense makes it selecta
 no change to this script.
 
 Outputs (under ``--output-dir``): ``headline_results.csv``, ``sweep_results.csv``,
-``topk_accuracy.pdf``, ``poolsize_sweep_top{k}.pdf``, and ``fidelity_{metric}.csv`` when
-``--fidelity`` is set.
+``predictions.csv``, and ``fidelity_{metric}.csv`` when ``--fidelity`` is set.
+
+**No figures.** This script produces numbers only; every figure in the project is drawn by
+``experiments/plot_results.py``, run separately with no arguments. It finds runs by their
+directory name, which is why :func:`output_tag` spells the four axes out in full
+(``<dataset>_<defense>_<feature>_<attack>``, with ``base`` for no defense).
 """
 
 from __future__ import annotations
@@ -38,25 +42,27 @@ import argparse
 import inspect
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, get_attribution_attack
 from prompt_anonymity.data import load_dataset
 from prompt_anonymity.defenses import DEFENSES, apply_defense
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy, pool_size_sweep
 from prompt_anonymity.features import FEATURIZERS, get_featurizer, apply_featurizer
 from prompt_anonymity.fidelity import FIDELITY_METRICS, run_fidelity
-from prompt_anonymity.viz import plot_headline_topk, plot_pool_size_sweep
 
 # Dataset files live in the repo next to this script; the package itself is path-agnostic
 # and takes the directory as an argument.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIRS = {"wildchat": REPO_ROOT / "wildchat", "swe-chat": REPO_ROOT / "swe-chat"}
-FEATURE_LABELS = {  # legend name per feature; a combined run joins these with " + "
-    "stylometrix": "StyloMetrix",
-    "function_words": "Function Words",
-    "character_statistics": "Character Stats",
-}
 # StyloMetrix language model code per WildChat language subset (SWE-chat is English-only).
 STYLOMETRIX_LANGUAGE_CODES = {"English": "en", "Russian": "ru"}
+
+#: How :func:`output_tag` spells "no defense". The results directory names all four axes
+#: positionally, so the undefended case needs a name of its own rather than an empty slot;
+#: ``experiments/plot_results.py`` parses the same word.
+NO_DEFENSE_TAG = "base"
 
 
 def build_featurizers(args: argparse.Namespace) -> list:
@@ -135,16 +141,23 @@ def parse_args() -> argparse.Namespace:
 
 
 def output_tag(args: argparse.Namespace) -> str:
-    """Short, self-describing directory name for this run's outputs."""
+    """Short, self-describing directory name for this run's outputs.
+
+    A default run is exactly ``<dataset>_<defense>_<feature>_<attack>``, the four axes
+    positionally, with :data:`NO_DEFENSE_TAG` standing in when there is no defense so the shape
+    never changes. That is the name ``experiments/plot_results.py`` parses. Every non-default
+    scope choice is then appended, which both keeps two runs from overwriting each other and
+    takes the qualified run out of the comparable set -- a Russian-subset run is not a point on
+    the same curve as an English one.
+    """
     feature = "+".join(args.feature)  # combined runs list every feature, e.g. "stylometrix+function_words"
+    defense = NO_DEFENSE_TAG if args.defense == "none" else args.defense
     if args.dataset == "wildchat":
-        scope = f"wildchat_{feature}_{args.language.lower()}"
+        scope = "" if args.language == "English" else f"_{args.language.lower()}"
     else:
-        owner = "" if args.model_owner.lower() == "all" else f"_{args.model_owner.lower()}"
-        scope = f"swe-chat_{feature}{owner}"
-    defense = "" if args.defense == "none" else f"_{args.defense}"
+        scope = "" if args.model_owner.lower() == "all" else f"_{args.model_owner.lower()}"
     metric = "" if args.metric == "cosine" else f"_{args.metric}"  # only a non-default metric gets a suffix
-    return f"{scope}_{args.attack}{metric}{defense}"
+    return f"{args.dataset}_{defense}_{feature}_{args.attack}{scope}{metric}"
 
 
 def main() -> None:
@@ -202,9 +215,8 @@ def main() -> None:
     model.fit(data.known_embeddings, data.known_labels)
     scores = model.score(data.unknown_embeddings)
     ranking = LinkageRanking(-np.asarray(scores, dtype=float), model.authors, data.unknown_labels)
-        # Save individual nearest-neighbor matches for qualitative/topic analysis
-    import pandas as pd
 
+    # Save the individual top-10 matches for qualitative/topic analysis.
     predictions = []
 
     for u in range(len(data.unknown_labels)):
@@ -268,16 +280,13 @@ def main() -> None:
         fidelity_csv = output_dir / f"fidelity_{args.fidelity}{suffix}.csv"
         fidelity_result.to_csv(fidelity_csv)
 
-    method_label = " + ".join(FEATURE_LABELS.get(f, f) for f in args.feature)
-    plot_headline_topk(headline, method_label, output_dir / "topk_accuracy.pdf")
-    plot_pool_size_sweep(sweep, method_label, args.sweep_top_k, output_dir / f"poolsize_sweep_top{args.sweep_top_k}.pdf")
-
     print(f"\nWrote results to {output_dir}/")
-    outputs = ["headline_results.csv", "sweep_results.csv", "topk_accuracy.pdf",
-               f"poolsize_sweep_top{args.sweep_top_k}.pdf"]
+    outputs = ["headline_results.csv", "sweep_results.csv", "predictions.csv"]
     if fidelity_csv is not None:
         outputs.append(fidelity_csv.name)
     print("  " + ", ".join(outputs))
+    print("\nNo figures were drawn. To (re)draw every figure in the project from the CSVs:")
+    print("  python experiments/plot_results.py")
 
 
 if __name__ == "__main__":

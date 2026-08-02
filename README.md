@@ -19,6 +19,9 @@ python -m prompt_anonymity.data.download
 
 # 2. Run the attack (rolling chronological windows, open candidate set)
 python experiments/run_experiment_v2.py --source swe-chat --feature stylometrix --attacks nearest_neighbor
+
+# 3. Draw the figures from every result on disk
+python experiments/plot_results.py
 ```
 
 ## Building data from scratch (Optional)
@@ -41,7 +44,11 @@ python -m prompt_anonymity.data.compute_features --source swe-chat --feature gem
 python -m prompt_anonymity.data.apply_defenses   --source swe-chat --defense openanonymity
 python -m prompt_anonymity.data.compute_features --source swe-chat --defense openanonymity \
     --feature stylometrix
-python experiments/run_experiment_v2.py --source swe-chat --feature openanonymity_stylometrix
+python experiments/run_experiment_v2.py --source swe-chat --defense openanonymity \
+    --feature stylometrix
+
+# 5. Draw every figure from the CSVs the runs left behind (no arguments, run it any time)
+python experiments/plot_results.py
 ```
 
 Every stage is a name→implementation **registry**, so `--feature`, `--defense` and `--attacks`
@@ -168,11 +175,16 @@ fractions of that timeline, so the attacker never sees the future.
 ```bash
 # defaults: 0.25/0.50/0.75 known fractions x 0.10/0.25/0.50 windows = 8 independent attacks
 python experiments/run_experiment_v2.py --source wildchat --feature stylometrix \
-    --attacks nearest_neighbor rlsc --output-dir experiments/results/wc-stylo
+    --attacks nearest_neighbor
 
-# semantic embeddings instead of style, one window, with hyper-parameter tuning
+# the same attack against text a defense rewrote (the vectors must already exist)
+python experiments/run_experiment_v2.py --source wildchat --feature stylometrix \
+    --defense openanonymity --attacks nearest_neighbor
+
+# semantic embeddings instead of style, one window (hyper-parameters are tuned by default,
+# per window, on that window's own known side; --no-tune uses the defaults instead)
 python experiments/run_experiment_v2.py --source swe-chat --feature gemini_embedding_2 \
-    --known-fractions 0.5 --window 0.25 --attacks rlsc --tune
+    --known-fractions 0.5 --window 0.25 --attacks rlsc
 
 # open-set: score everything, with an explicit reject class
 python experiments/run_experiment_v2.py --source swe-chat --feature stylometrix --ood reject
@@ -189,9 +201,62 @@ Two things to read carefully in the output:
   identified once. Read the macro numbers and `selective_classification` (precision when the attack
   answers only its most confident documents) in `rolling_results.csv`.
 
-Results land in `experiments/results/<tag>/`: `rolling_results.csv` (one row per window per attack,
-all metrics), `cmc_results.csv` (document-level top-k at every k), per-window `predictions_*.csv`
-and `author_report_*.csv`, plus `topk_accuracy_*.pdf`, `window_sweep_top1_*.pdf`, `cmc_curve_*.pdf`.
+Results land in `experiments/results/<dataset>_<defense>_<feature>_<attack>/`: `rolling_results.csv`
+(one row per window per attack, all metrics), `cmc_results.csv` (document-level top-k at every k),
+and per-window `predictions_*.csv` and `author_report_*.csv`. **The runner draws no figures** — see
+the next section.
+
+### Figures
+
+`experiments/plot_results.py` draws every figure in the project, from the CSVs the runs left
+behind. Run it with no arguments, any time:
+
+```bash
+python experiments/plot_results.py         # -> experiments/plots/<dataset>/
+```
+
+It picks up each results directory whose name is `<dataset>_<defense>_<feature>_<attack>` (an
+undefended run spells its defense `base`; anything else — an ad-hoc directory, or a run carrying
+extra qualifiers such as `_langaware` — is skipped, and says so). Per dataset it writes:
+
+Four curve types, each with the same layout — `by_defense/<feature>_<attack>.pdf` holds the attack
+fixed (**does the defense cost the attacker anything?**) and `by_method/<defense>.pdf` holds the
+defense fixed (**which attack is strongest against it?**):
+
+- `accuracy/by_{defense,method}/` — **CMC**: top-k accuracy against k.
+- `risk_coverage/by_{defense,method}/` — **precision when the attack answers only its most
+  confident documents.** An attack that is usually wrong but knows when it is right is a sharper
+  threat than its headline accuracy suggests: on SWE-chat, Gemini embeddings go from 0.57 top-1 to
+  **1.00 precision at 10% coverage**.
+- `author_risk/by_{defense,method}/` — **each user's own accuracy, most exposed first.** Anonymity
+  fails unevenly: on WildChat **89% of users are never identified once** under StyloMetrix (68%
+  under Gemini embeddings), and the mean is carried by the few percent who are identified every
+  time.
+- `scaling/by_{defense,method}/` — **accuracy against the size of the candidate pool**: is the
+  threat an artefact of a small pool? Each window is interpolated down to smaller galleries, so
+  the curve is continuous rather than three measured points. Drawn only for `nearest_neighbor`
+  and `cosine`, the attacks whose scores do not depend on which other authors are enrolled —
+  anything that refits against the gallery would be understated by the interpolation.
+- `per_run/<run>/` — the per-window detail for one run on its own (CMC per window, the window
+  sweep, top-k bars).
+
+Two figures have no `by_defense`/`by_method` split. `accuracy/macro_micro.pdf` shows every run's
+top-1 counted three ways — per document, per user, per identity — which differ by up to 3× on the
+same run.
+`plots/cross_dataset/scaling.pdf` puts every undefended run on one log axis from 2 to 19,711
+candidate users; matched there, WildChat turns out to be *more* identifiable than SWE-chat, the
+opposite of what the raw headline numbers suggest. `plots/cross_dataset/` is where anything
+spanning both corpora goes, since filing it under either would imply it belonged to that one.
+
+Both comparison figures plot the CMC curve **averaged over the run's rolling windows** — one curve
+per run is what makes several runs comparable on one axes — inside a shaded 95% interval for that
+mean, and each is written next to a `.csv` of the exact numbers plotted. Two things to read
+correctly: the average is truncated to the k values *every* window reached, so a curve stops short
+of 1.0 at its right edge even though each individual window's CMC reaches 1.0 at its own pool size
+(`per_run/` shows those); and the band describes how much the result moves across windows, not
+sampling error, since the windows are nested slices of one corpus. Keeping the figures out of the
+runners is what lets them compare runs at all: a script that plots its own output can only ever
+plot one.
 
 <details>
 <summary>The older <code>run_experiment.py</code> (single fixed split, defense + fidelity pipeline)</summary>
@@ -207,7 +272,8 @@ python experiments/run_experiment.py --dataset swe-chat --model-owner Anthropic
 python experiments/run_experiment.py --dataset wildchat --feature stylometrix function_words
 ```
 
-It writes `headline_results.csv`, `sweep_results.csv` and two plots to `experiments/results/<tag>/`.
+It writes `headline_results.csv`, `sweep_results.csv` and `predictions.csv` to
+`experiments/results/<tag>/`, and like the canonical runner draws no figures of its own.
 `advantage` (`id_acc − random_id`) is the adversary's edge over random guessing; anything above zero
 means the prompts are not fully anonymous.
 
@@ -219,7 +285,7 @@ The runners are thin drivers over the installable package in `src/`. One experim
 pipeline, regardless of dataset, attack, or defense:
 
 ```
-load documents → (defend) → featurize → attack → rank → metrics → CSVs + plots
+load documents → (defend) → featurize → attack → rank → metrics → CSVs
 ```
 
 The object handed between stages in the older pipeline is `AttackData` (`core.py`): the known
@@ -232,7 +298,9 @@ choice, not tied to the featurizer).
 - **`features/`** — text → vectors, cached per document by content hash. Registry: `FEATURIZERS`.
 - **`attacks/`** — every attack returns an `[n_documents × n_authors]` score matrix, higher = more likely. Four families: `similarity/` (summarise each author, score the match), `multiclass/` (a decision function per author), `llm/` (shortlist cheaply, let a judge reorder), `verification/` (learned same-author scoring over pairs), plus `ood/` for accept-or-reject. Registry: `ATTRIBUTION_ATTACKS`.
 - **`metrics/`** — top-k and macro/micro accuracy, CMC curves, selective classification, and open-set scoring (`detection_auroc`, `equal_error_rate`, `c_at_1`, calibration).
-- **`evaluation/`**, **`viz/`** — ranking helpers and the plot functions behind the result figures.
+- **`evaluation/`** — ranking helpers: rank once, reuse it for the headline table and the sweep.
+  There is deliberately no plotting module in the package; figures live in
+  `experiments/plot_results.py`.
 - **`fidelity/`** — does a defended prompt still get the same answer? Remote judges, the only part that needs `OPENROUTER_API_KEY`.
 
 Scale is the constraint that shapes the attack code: WildChat is 172,509 documents / 25,357 authors,

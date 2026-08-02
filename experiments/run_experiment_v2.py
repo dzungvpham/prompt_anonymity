@@ -136,14 +136,22 @@ Run (from the repo root)::
     # one known fraction, target pool traced finely:
     python experiments/run_experiment_v2.py --known-fractions 0.5 --window 0.05 0.1 0.2 0.3 0.4 0.5
     # compare the three trainable attacks, each tuned per window on that window's known side:
-    python experiments/run_experiment_v2.py --attacks logistic svm xgboost --tune
+    python experiments/run_experiment_v2.py --attacks logistic svm xgboost
 
-Hyper-parameters (``--tune``)
------------------------------
+Hyper-parameters (tuning is **on by default**; ``--no-tune`` opts out)
+---------------------------------------------------------------------
 Every attack's settings are chosen by :func:`tune_on_known`, which searches **only the known
 side** of the window it is about to attack -- the attacker's own labelled data. Nothing in the
 search, down to the standardization statistics, is derived from a document it will later be
 scored on.
+
+Tuning is the default because an untuned trainable attack measures the default settings rather
+than the attack, and a privacy result should not understate the attacker. It costs nothing for
+the attacks with no space to search (``nearest_neighbor``, ``cosine``), where it returns
+immediately. ``--no-tune`` restores the old behaviour; it does *not* change the output directory
+name, so re-running the same configuration either way overwrites the previous results. What was
+actually used is recorded per window in ``rolling_results.csv``'s ``hyperparameters`` column, and
+in full in ``tuning_trials.csv``.
 
 The search is :class:`sklearn.model_selection.HalvingRandomSearchCV`: sample
 ``--tune-candidates`` configurations from :data:`HYPERPARAMETER_SPACES`, score them on a small
@@ -182,11 +190,15 @@ columns, so a multi-attack run stays one tidy table per file:
   (risk and retrieval, sorted most-exposed first), where ``<stem>`` is
   ``<attack>_known<pct>_window<pct>``. ``--language-aware`` adds each document's ``languages``,
   its ``n_candidate_authors`` and whether its own author survived the filter.
-* Figures: one ``topk_accuracy_<stem>.pdf`` per combination, and per attack
-  ``window_sweep_top<k>_<attack>.pdf`` (accuracy against the number of target users, one line
-  per known fraction) and ``cmc_curve_<attack>.pdf`` (one curve per window).
 * ``--ood reject`` adds ``ood_sweep.csv``, the open-set columns of ``rolling_results.csv``, and
   the per-document decision in ``predictions_*.csv``.
+
+**No figures.** This script produces numbers only; every figure in the project is drawn by
+``experiments/plot_results.py``, which reads these CSVs back and can therefore compare runs
+against each other -- something a runner that plots its own output can never do. Run it with no
+arguments after any experiment. It finds runs by their directory name, which is why
+:func:`output_tag` spells the four axes out in full (``<dataset>_<defense>_<feature>_<attack>``,
+with ``base`` for no defense).
 """
 
 from __future__ import annotations
@@ -206,6 +218,7 @@ from sklearn.experimental import enable_halving_search_cv  # noqa: F401  (unlock
 from sklearn.model_selection import HalvingRandomSearchCV
 
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, rejection_score
+from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
 from prompt_anonymity.metrics import (
     author_query_metrics,
@@ -224,18 +237,15 @@ from prompt_anonymity.metrics import (
     retrieval_summary,
     true_author_ranks,
 )
-from prompt_anonymity.viz import plot_cmc_curve, plot_headline_topk, plot_window_sweep
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-FEATURE_LABELS = {  # legend name per feature, matching run_experiment.py
-    "stylometrix": "StyloMetrix",
-    "function_words": "Function Words",
-    "character_statistics": "Character Stats",
-    "gemini_embedding_001": "Gemini Embedding 001",
-    "gemini_embedding_2": "Gemini Embedding 2",
-}
 DATA_DIR = REPO_ROOT / "data" / "hf"
+
+#: How :func:`output_tag` spells "no defense". The results directory names all four axes
+#: positionally, so the undefended case needs a name of its own rather than an empty slot;
+#: ``experiments/plot_results.py`` parses the same word.
+NO_DEFENSE_TAG = "base"
 
 # source -> split / parquet base name (must match build_dataset.py SPLIT_NAMES).
 SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
@@ -289,14 +299,20 @@ DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "lang
 
 
 def load_documents_and_features(data_dir, source: str, feature: str, undated: str = "drop",
-                                model_owner: str = "all",
-                                language: str = "all") -> tuple[pd.DataFrame, np.ndarray]:
+                                model_owner: str = "all", language: str = "all",
+                                defense: str = "none") -> tuple[pd.DataFrame, np.ndarray]:
     """Load one split's documents and its feature matrix, aligned and ordered by ``ended_at``.
 
     The two parquets are joined on ``doc_id`` (one-to-one), so a feature file that is stale or
     covers only part of the split is a hard error rather than a silent misalignment. Ties in
     ``ended_at`` are broken by ``doc_id`` so the ordering -- and therefore every window boundary
     -- is deterministic.
+
+    ``defense`` selects *which* feature file, not a transformation done here: a defense rewrote
+    the text long before this script ran (``prompt_anonymity.data.apply_defenses``) and the
+    vectors of the rewritten text live in ``<split>_<defense>_<feature>.parquet``. The document
+    metadata is unchanged by a defense, so it always comes from the undefended ``<split>.parquet``
+    -- which is exactly why the two files join on ``doc_id`` at all.
 
     Some documents carry no timestamp at all (SWE-chat: ~8%, all from one agent), and a
     chronological experiment has to decide where they go. ``undated="drop"`` (the default)
@@ -306,14 +322,18 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     known side -- the reading that an attacker holding undated history would get.
     """
     split = SPLIT_NAMES[source]
+    defended = "" if defense == "none" else f"_{defense}"
     documents_path = Path(data_dir) / f"{split}.parquet"
-    features_path = Path(data_dir) / f"{split}_{feature}.parquet"
+    features_path = Path(data_dir) / f"{split}{defended}_{feature}.parquet"
     for path in (documents_path, features_path):
         if not path.exists():
             raise SystemExit(f"{path} not found -- build it first with\n"
                              f"  python -m prompt_anonymity.data.build_dataset\n"
-                             f"  python -m prompt_anonymity.data.compute_features --source {source} "
-                             f"--feature {feature}")
+                             + (f"  python -m prompt_anonymity.data.apply_defenses --source {source} "
+                                f"--defense {defense}\n" if defended else "")
+                             + f"  python -m prompt_anonymity.data.compute_features --source {source} "
+                             f"--feature {feature}"
+                             + (f" --defense {defense}" if defended else ""))
 
     # Read only the metadata this script actually uses. ``turns`` holds the raw conversation
     # text and is 98% of the wildchat parquet (1.07 GB of 1.09 GB uncompressed, several times
@@ -328,7 +348,7 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
         raise SystemExit(
             f"{len(missing):,} of {len(documents):,} documents have no {feature} vector. "
             f"Recompute with `python -m prompt_anonymity.data.compute_features --source {source} "
-            f"--feature {feature}`."
+            f"--feature {feature}" + (f" --defense {defense}" if defended else "") + "`."
         )
 
     # The feature parquet mirrors some document metadata (``author_id``); keep only the columns
@@ -1473,6 +1493,13 @@ def parse_args() -> argparse.Namespace:
                         help="Which built split to attack (default: swe-chat).")
     parser.add_argument("--feature", default="stylometrix",
                         help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: stylometrix).")
+    parser.add_argument("--defense", default="none", choices=sorted(DEFENSES),
+                        help="Attack the vectors of text this defense rewrote, i.e. "
+                             "<split>_<defense>_<feature>.parquet (default: none, the original "
+                             "text). The defense itself runs beforehand -- "
+                             "`python -m prompt_anonymity.data.apply_defenses` then "
+                             "`compute_features --defense <name>`; this only selects which "
+                             "vectors to attack.")
     parser.add_argument("--data-dir", default=str(DATA_DIR), help="Directory holding the built parquets.")
     parser.add_argument("--metric", default="cosine",
                         help="Distance metric (any scipy cdist metric; default: cosine).")
@@ -1525,17 +1552,21 @@ def parse_args() -> argparse.Namespace:
                              "leaving them in measured better (top-1 0.258 vs 0.252).")
     parser.add_argument("--shrinkage", type=float, default=0.2,
                         help="Covariance shrinkage for the wccn / plda attacks (default: 0.2).")
-    parser.add_argument("--tune", action="store_true",
+    parser.add_argument("--tune", action=argparse.BooleanOptionalAction, default=True,
                         help="Search each attack's hyper-parameter space (HYPERPARAMETER_SPACES) "
                              "before scoring, by successive halving over randomly sampled "
-                             "configurations. The search runs on chronological folds *inside the "
+                             "configurations (default: on; --no-tune uses the defaults instead). "
+                             "The search runs on chronological folds *inside the "
                              "known side*, so it never sees the documents it will be evaluated "
                              "on. It runs once per (attack, known fraction) and is shared by the "
                              "windows that start from that known side; it is never shared across "
                              "known fractions, because the 75%% known side contains the 25%% "
                              "one's unknown documents. Overrides --regularization / --balanced / "
                              "--shrinkage. Writes every (candidate, rung) pair to "
-                             "tuning_trials.csv, one block per search.")
+                             "tuning_trials.csv, one block per search, and the chosen settings to "
+                             "the hyperparameters column of rolling_results.csv. No-op for the "
+                             "attacks with no space to search (nearest_neighbor, cosine), which "
+                             "is why leaving it on by default costs those runs nothing.")
     parser.add_argument("--tune-folds", type=int, default=3,
                         help="Chronological folds inside the known side per --tune search "
                              "(default: 3).")
@@ -1594,8 +1625,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-ks", type=int, nargs="+", default=[1, 5, 10],
                         help="Measure metrics for top k most likely authors (default: 1, 5, 10).")
     parser.add_argument("--sweep-top-k", type=int, default=1,
-                        help="k plotted in the window sweep, i.e. accuracy vs. number of target "
-                             "users (default: 1). Must be one of --top-ks.")
+                        help="k the per-window risk summary is reported at, i.e. the "
+                             "top<k>_accuracy column of author_report_*.csv (default: 1). Must be "
+                             "one of --top-ks.")
     parser.add_argument("--seed", type=int, default=47,
                         help="Seed for the open-set calibration folds and the separability "
                              "diagnostic's sampling.")
@@ -1604,7 +1636,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.sweep_top_k not in args.top_ks:
         raise SystemExit(f"--sweep-top-k {args.sweep_top_k} is not among --top-ks {args.top_ks}; "
-                         "the window sweep plots a k that was measured.")
+                         "it can only summarise a k that was measured.")
     return args
 
 
@@ -1616,8 +1648,16 @@ def _percent(fraction: float) -> int:
 def output_tag(args: argparse.Namespace) -> str:
     """Short, self-describing directory name for this run's outputs.
 
-    Every non-default choice that changes the numbers appears in the name, so two runs that
-    differ in any of them cannot overwrite each other's results.
+    A default run is exactly ``<dataset>_<defense>_<feature>_<attack>`` -- the four axes,
+    positionally, with :data:`NO_DEFENSE_TAG` standing in when there is no defense so the shape
+    never changes. That is the name ``experiments/plot_results.py`` parses, and a run named this
+    way is one it will put on a comparison figure.
+
+    Every *non-default* choice that changes the numbers is then appended, so two runs that differ
+    in any of them cannot overwrite each other's results. Those extra qualifiers deliberately
+    take the name out of the comparable set: a language-aware run and a plain one are not two
+    points on the same curve, and silently drawing them as if they were would be worse than
+    leaving the qualified run out of the figures.
     """
     metric = "" if args.metric == "cosine" else f"_{args.metric}"
     scaled = "" if args.standardize else "_unstandardized"
@@ -1627,9 +1667,10 @@ def output_tag(args: argparse.Namespace) -> str:
     openset = "" if args.ood == "none" else f"_openset_{args.ood_calibration}"
     windows = ("" if args.window == [0.10, 0.25, 0.50]
                else "_w" + "-".join(str(_percent(w)) for w in args.window))
+    defense = NO_DEFENSE_TAG if args.defense == "none" else args.defense
     attacks = "-".join(args.attacks)
-    return (f"{args.source}_{args.feature}{owner}{language}{language_aware}_{attacks}"
-            f"_rolling{windows}{openset}{metric}{scaled}")
+    return (f"{args.source}_{defense}_{args.feature}_{attacks}"
+            f"{owner}{language}{language_aware}{windows}{openset}{metric}{scaled}")
 
 
 def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFrame,
@@ -1720,10 +1761,12 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
 def main() -> None:
     args = parse_args()
     frame, embeddings = load_documents_and_features(
-        args.data_dir, args.source, args.feature, args.undated, args.model_owner, args.language
+        args.data_dir, args.source, args.feature, args.undated, args.model_owner, args.language,
+        args.defense,
     )
     print(f"[{args.source}] {len(frame):,} documents x {embeddings.shape[1]} {args.feature} features | "
           f"{frame['author_id'].nunique():,} authors | {_period(frame)} | "
+          f"defense={args.defense} | "
           f"attacks={' '.join(args.attacks)}{' | standardized' if args.standardize else ''}")
     if not args.standardize:
         print("warning: --no-standardize is set. Every attack measured considerably worse without "
@@ -1740,8 +1783,7 @@ def main() -> None:
               f"unknown document will be scored only against known authors who write one of its "
               f"languages")
 
-    results, predictions, ood_sweeps, headlines, cmcs, author_reports, all_trials = \
-        [], {}, [], [], [], {}, []
+    results, predictions, ood_sweeps, cmcs, author_reports, all_trials = [], {}, [], [], {}, []
     # One hyper-parameter search per (attack, known fraction), shared by every window that starts
     # from that known side. Lives here rather than in run_window so its scope is one experiment.
     tuning_cache: dict[tuple[str, float], dict] = {}
@@ -1753,7 +1795,6 @@ def main() -> None:
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             predictions[(fraction, window, attack)] = window_predictions
-            headlines.append(headline)
             cmcs.append(cmc)
             author_reports[(fraction, window, attack)] = author_report
             if ood_sweep is not None:
@@ -1764,9 +1805,6 @@ def main() -> None:
 
     output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "experiments" / "results" / output_tag(args)
     output_dir.mkdir(parents=True, exist_ok=True)
-    # `all_headlines` is never written: it duplicated columns of the other two files, and what was
-    # only in it (the identity level) is now in `rolling_results.csv`. It stays for the figures.
-    all_headlines = pd.concat(headlines, ignore_index=True)
     all_cmcs = pd.concat(cmcs, ignore_index=True)
     pd.DataFrame(results).to_csv(output_dir / "rolling_results.csv", index=False)
     all_cmcs.to_csv(output_dir / "cmc_results.csv", index=False)
@@ -1785,32 +1823,14 @@ def main() -> None:
     for key, author_report in author_reports.items():
         author_report.to_csv(output_dir / f"author_report_{stem(*key)}.csv", index=False)
 
-    # One top-k figure per (window, attack), plus two per-attack figures across windows, rendered
-    # by the same helpers run_experiment.py uses. The across-window figures are split by attack
-    # rather than overlaid: 8 windows x several attacks in one axes is unreadable.
-    label = FEATURE_LABELS.get(args.feature, args.feature)
-    for headline in headlines:
-        first = headline.iloc[0]
-        plot_headline_topk(headline, label, output_dir /
-                           f"topk_accuracy_{stem(first['known_fraction'], first['window'], first['attack'])}.pdf")
-    figures = []
-    for attack in args.attacks:
-        series_label = f"{label} ({attack})" if len(args.attacks) > 1 else label
-        sweep_path = output_dir / f"window_sweep_top{args.sweep_top_k}_{attack}.pdf"
-        plot_window_sweep(all_headlines[(all_headlines["top"] == args.sweep_top_k)
-                                        & (all_headlines["attack"] == attack)],
-                          series_label, args.sweep_top_k, sweep_path)
-        cmc_path = output_dir / f"cmc_curve_{attack}.pdf"
-        plot_cmc_curve(all_cmcs[all_cmcs["attack"] == attack], series_label, cmc_path)
-        figures += [sweep_path.name, cmc_path.name]
-
     stems = [stem(*key) for key in predictions]
     print(f"\nWrote results to {output_dir}/")
     print("  rolling_results.csv, cmc_results.csv"
           + (", ood_sweep.csv" if ood_sweeps else ""))
     print("  " + ", ".join(f"predictions_{s}.csv" for s in stems))
     print("  " + ", ".join(f"author_report_{s}.csv" for s in stems))
-    print("  " + ", ".join(f"topk_accuracy_{s}.pdf" for s in stems) + ", " + ", ".join(figures))
+    print("\nNo figures were drawn. To (re)draw every figure in the project from the CSVs:")
+    print("  python experiments/plot_results.py")
 
 
 if __name__ == "__main__":

@@ -36,10 +36,13 @@ A linkage experiment runs in stages, one subpackage each:
 ``evaluation``
     Rank once and reuse it: :class:`~prompt_anonymity.evaluation.LinkageRanking`, the
     headline table, and the candidate-pool-size sweep.
-``viz``
-    Plot helpers for the result tables (optional ``viz`` extra).
 
 The shared hand-off object across stages is :class:`prompt_anonymity.core.AttackData`.
+
+The package deliberately stops at numbers: it has no plotting module. Figures are a
+presentation concern that belongs with the experiments, and drawing them from inside a run
+means each run can only ever plot itself -- so all of it lives in
+``experiments/plot_results.py``, which reads the written CSVs back and can compare runs.
 """
 
 __version__ = "0.1.0"

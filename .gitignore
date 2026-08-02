@@ -224,8 +224,9 @@ wildchat_preprocessed/
 # Cached (regenerable) expensive transforms: defense rewrites + featurizer vectors
 experiments/.cache/
 experiments/.defense_cache/
-# Regenerable experiment outputs (CSVs + plots)
+# Regenerable experiment outputs: the runners' CSVs, and the figures plot_results.py draws from them
 experiments/results/
+experiments/plots/
 
 # Data Protection
 *.csv
