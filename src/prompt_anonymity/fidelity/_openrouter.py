@@ -3,20 +3,22 @@
 The fidelity metrics make remote chat calls against OpenRouter -- generating a response model's
 answer to a prompt, asking a judge to rule PASS/FAIL on two answers, or asking one to score two
 whole conversations 1-5. This module holds the one client they all use: :class:`OpenRouterChat`, a
-thin wrapper over the chat-completions endpoint with the same production niceties as the
-OpenAnonymity defense's backend
-(:class:`prompt_anonymity.defenses.openanonymity._OpenAnonBackend`) -- a lazily read
-``OPENROUTER_API_KEY`` (from a ``.env``), jittered exponential backoff on transient failures,
-fail-fast on non-retryable 4xx, and a thread pool to fan a batch of requests out.
+thin wrapper over the chat-completions endpoint: a lazily read ``OPENROUTER_API_KEY`` (from a
+``.env``), jittered exponential backoff on transient failures, fail-fast on non-retryable 4xx, and
+a thread pool to fan a batch of requests out.
 
-It is deliberately **leaner** than the scrubber backend: one prompt is one request, with no
-token-budget chunking / context-length re-split. That is safe for the per-turn callers, whose
-inputs are turn-sized and bounded; the conversation-level judge (:mod:`.prompt_judge`), which sends
-two whole conversations per call, is *not* inherently bounded, and relies on its own ``max_chars``
-cap to stay under a context window -- overrun there surfaces as a fail-fast 4xx that aborts the
-batch. Like the scrubber, ``requests`` and ``python-dotenv`` are imported lazily so importing this
-module (e.g. to reach the prompt constants or the verdict parser) never requires the network deps
-or a key.
+**This is the only part of the package that still calls a hosted API.** The OpenAnonymity defense
+was the other one and now runs a local model through vLLM
+(:mod:`prompt_anonymity.defenses.openanonymity`); the judges stay remote because a judge is meant
+to be a stronger, independent model than the one under test.
+
+One prompt is one request, with no token-budget chunking / context-length re-split (which the
+scrubber does do). That is safe for the per-turn callers, whose inputs are turn-sized and bounded;
+the conversation-level judge (:mod:`.prompt_judge`), which sends two whole conversations per call,
+is *not* inherently bounded, and relies on its own ``max_chars`` cap to stay under a context window
+-- overrun there surfaces as a fail-fast 4xx that aborts the batch. ``requests`` and
+``python-dotenv`` are imported lazily so importing this module (e.g. to reach the prompt constants
+or the verdict parser) never requires the network deps or a key.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import os
 import random
 import time
 
-#: OpenRouter chat-completions endpoint (same as the OpenAnonymity defense).
+#: OpenRouter chat-completions endpoint.
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 #: Environment variable holding the OpenRouter API key (loaded from a ``.env`` if present).
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"

@@ -165,15 +165,35 @@ UNSHARDABLE_FEATURES = {"char_ngram_tfidf"}
 
 # --- input ------------------------------------------------------------------
 
-def load_split(source: str, dist_dir: str | Path, columns: list[str] | None = None) -> pd.DataFrame:
+def split_stem(source: str, defense: str | None = None) -> str:
+    """The document file's name without its suffix: ``swe_chat``, or ``swe_chat_<defense>``.
+
+    A defense writes its output beside the split it came from
+    (:mod:`prompt_anonymity.data.apply_defenses`), so featurizing defended text is a matter of
+    reading that file instead -- same schema, same row order, one name apart.
+    """
+    return f"{SPLIT_NAMES[source]}_{defense}" if defense else SPLIT_NAMES[source]
+
+
+def split_path(source: str, dist_dir: str | Path, defense: str | None = None) -> Path:
+    """Path of the document parquet to featurize -- the split, or a defended version of it."""
+    return Path(dist_dir) / f"{split_stem(source, defense)}.parquet"
+
+
+def load_split(source: str, dist_dir: str | Path, columns: list[str] | None = None,
+               defense: str | None = None) -> pd.DataFrame:
     """Read the built parquet for ``source`` (``swe-chat`` -> ``swe_chat.parquet``).
 
     ``columns`` reads a subset of them, which is what makes ``--merge`` cheap: merging only needs
-    each document's id and language, never the ``turns`` that dominate the file's size.
+    each document's id and language, never the ``turns`` that dominate the file's size. ``defense``
+    reads that defense's defended version of the split instead.
     """
-    path = Path(dist_dir) / f"{SPLIT_NAMES[source]}.parquet"
+    path = split_path(source, dist_dir, defense)
     if not path.exists():
-        raise SystemExit(f"{path} not found -- build it first with `python -m prompt_anonymity.data.build_dataset`.")
+        hint = (f"run `python -m prompt_anonymity.data.apply_defenses --source {source} "
+                f"--defense {defense}` first." if defense else
+                "build it first with `python -m prompt_anonymity.data.build_dataset`.")
+        raise SystemExit(f"{path} not found -- {hint}")
     return pd.read_parquet(path, columns=columns)
 
 
@@ -196,7 +216,7 @@ def select_documents(frame: pd.DataFrame, language: str | None = None,
     return frame
 
 
-def read_texts(source: str, dist_dir: str | Path, positions) -> list[str]:
+def read_texts(source: str, dist_dir: str | Path, positions, defense: str | None = None) -> list[str]:
     """Document text (``turns`` joined with :data:`TURN_SEPARATOR`) for these split row positions.
 
     Streams the ``turns`` column a batch at a time and materializes only the wanted rows, instead
@@ -209,7 +229,7 @@ def read_texts(source: str, dist_dir: str | Path, positions) -> list[str]:
     only :data:`~prompt_anonymity.features.stylometrix.PARENT_MEMORY_RESERVE_BYTES` for this
     process).
     """
-    path = Path(dist_dir) / f"{SPLIT_NAMES[source]}.parquet"
+    path = split_path(source, dist_dir, defense)
     wanted = {int(position) for position in positions}
     texts: dict[int, str] = {}
     first_row = 0
@@ -500,9 +520,14 @@ def feature_label(feature: str, task: str | None) -> str:
     return f"{feature}_{slug}"
 
 
-def output_path(out_dir: str | Path, source: str, feature: str) -> Path:
-    """The merged feature file for a source/featurizer -- what an unsharded run writes."""
-    return Path(out_dir) / f"{SPLIT_NAMES[source]}_{feature}.parquet"
+def output_path(out_dir: str | Path, source: str, feature: str, defense: str | None = None) -> Path:
+    """The merged feature file for a source/featurizer -- what an unsharded run writes.
+
+    Features of defended text carry the defense in the name too
+    (``swe_chat_openanonymity_stylometrix.parquet``), so a defended run's vectors never overwrite
+    the undefended ones.
+    """
+    return Path(out_dir) / f"{split_stem(source, defense)}_{feature}.parquet"
 
 
 def shard_path(out_dir: str | Path, stem: str, shard_index: int, num_shards: int) -> Path:
@@ -620,6 +645,11 @@ def main() -> None:
                         "concurrent API requests for remote ones (gemini_embedding_2); 1 runs "
                         "in-process (default: sized from the allocation's CPUs/memory, or free "
                         "GPU memory when running on a GPU)")
+    p.add_argument("--defense", default=None,
+                   help="featurize a DEFENDED version of the split instead: reads "
+                        "<split>_<defense>.parquet (written by apply_defenses) and writes "
+                        "<split>_<defense>_<feature>.parquet, so defended and undefended vectors "
+                        "never overwrite each other")
     p.add_argument("--dist-dir", default=None,
                    help="directory holding the built parquets (default: the project's data/dist)")
     p.add_argument("--out-dir", default=None,
@@ -658,7 +688,7 @@ def main() -> None:
     # Output files are named for the feature *and* a non-default --task, since a task changes the
     # vectors: two tasks are two feature spaces and must not share a filename.
     label = feature_label(args.feature, args.task)
-    merged_path = output_path(out_dir, args.source, label)
+    merged_path = output_path(out_dir, args.source, label, args.defense)
     stem = merged_path.stem  # what the shard files are named after
     selected = f" (language_primary == {language!r})" if language else " (all languages)"
 
@@ -666,7 +696,8 @@ def main() -> None:
     # two columns the selection needs -- never the `turns` that make the split large.
     if args.merge:
         documents = select_documents(
-            load_split(args.source, dist, columns=["doc_id", "language_primary"]),
+            load_split(args.source, dist, columns=["doc_id", "language_primary"],
+                       defense=args.defense),
             language=language, limit=args.limit,
         )
         merged = merge_shards(out_dir, stem, list(documents["doc_id"]))
@@ -701,7 +732,7 @@ def main() -> None:
     # Only the key/filter columns, never `turns`: this process has to leave room for the worker
     # pool, and an array task reads back the text of just its own shard (see `read_texts`).
     frame = load_split(args.source, dist,
-                       columns=["doc_id", "author_id", "language_primary"])
+                       columns=["doc_id", "author_id", "language_primary"], defense=args.defense)
     documents = select_documents(frame, language=language, limit=args.limit)
     if documents.empty:
         raise SystemExit(f"no documents in {args.source} match --language {args.language}.")
@@ -715,7 +746,7 @@ def main() -> None:
         print(f"[shard {shard_index}/{num_shards}] featurizing {len(shard):,} of them "
               f"-> {out_path.name}")
 
-    texts = read_texts(args.source, dist, shard.index)
+    texts = read_texts(args.source, dist, shard.index, defense=args.defense)
 
     if not texts:
         # More shards than documents: nothing to compute, but the (empty) shard file still has to

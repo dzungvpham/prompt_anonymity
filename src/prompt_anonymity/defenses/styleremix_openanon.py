@@ -9,10 +9,15 @@ TURN. Order rationale: style-convergence first, identifier redaction LAST, so OA
 Granularity: both stages are per turn, so every user turn is defended on its own and the turn
 structure (and count) is preserved end to end. That keeps the defended conversation aligned
 turn-for-turn with the original -- which is what per-turn utility/fidelity scoring needs -- and lets
-StyleRemix reuse the standalone StyleRemix defense's per-turn cache. The trade-off is cost: the paid
-OpenRouter API is now called once per distinct turn rather than once per conversation. This defense's
-own cache holds the stage-2 result keyed per conversation (by the styled text), so the run stays
-resumable, and OA token-chunks any oversized turn so no length cap is needed.
+StyleRemix reuse the standalone StyleRemix defense's per-turn cache. This defense's own cache holds
+the stage-2 result keyed per conversation (by the *styled* text, so a stage-1 change re-caches
+stage 2), and OA fragments any oversized turn so no length cap is needed.
+
+Sequencing: the stages are not concurrent. Stage 1 restyles the entire dataset, then its vLLM engine
+is shut down and the GPU handed to stage 2, which loads the scrubber and works from stage 1's
+output. Both models are large (Llama-3-8B and gpt-oss-120b) and each vLLM engine reserves a fixed
+fraction of the device for its lifetime, so overlapping them would mean splitting the GPU between
+two models that are never used at the same moment.
 
 Not a simple per-text rewrite, so it implements :meth:`__call__`/:meth:`transform` directly and
 composes the two backends rather than subclassing the text-rewrite spine. Bump :attr:`version` when
@@ -69,17 +74,35 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
         return self._redactor
 
     def __call__(self, data: AttackData, *, cache_dir) -> AttackData:
-        # Stage 1: StyleRemix restyle PER TURN, via the standalone defense so its cache is shared
-        # (already-restyled turns are reused, not recomputed).
+        # The two stages run STRICTLY IN SEQUENCE, and only one model is resident at a time. Stage 1
+        # restyles the whole dataset and its engine is then shut down, handing the GPU to stage 2,
+        # which scrubs the restyled text. That ordering is the definition of the defense -- stage 2
+        # reads stage 1's output, not the original -- and running the models concurrently would need
+        # their memory fractions to sum under 1.0, which neither 8B + 120B nor the defaults allow.
         restyle = StyleRemixDefense(sliders=self.sliders, base_model=self.base_model)
         restyle.rewrite_known = self.rewrite_known
-        styled = restyle(data, cache_dir=cache_dir)
+        try:
+            styled = restyle(data, cache_dir=cache_dir)
+        finally:
+            # Free the restyler even if it failed part-way: a fully-cached stage 1 loaded nothing,
+            # and anything it did load has no further use.
+            restyle.close()
 
-        # Stage 2: OpenAnonymity redact PER CONVERSATION, in this defense's own index-keyed cache.
+        # Stage 2: OpenAnonymity redact PER TURN over the restyled text, in this defense's own
+        # index-keyed cache (keyed by the styled text, so a stage-1 change re-caches stage 2).
         cache = IndexedRowCache(
             Path(cache_dir) / "defenses", self.name, self._logic_hash(), params_hash(self.params())
         )
-        return self.transform(styled, cache)
+        try:
+            return self.transform(styled, cache)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Release the stage-2 scrubber (the restyler is released as soon as stage 1 finishes)."""
+        if self._redactor is not None and hasattr(self._redactor, "close"):
+            self._redactor.close()
+        self._redactor = None
 
     def transform(self, data: AttackData, cache: IndexedRowCache) -> AttackData:
         if data.unknown_texts is None:
