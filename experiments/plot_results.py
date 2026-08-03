@@ -1001,11 +1001,25 @@ TEMPORAL_KNOWN_FRACTION = 0.25
 
 @dataclass
 class TemporalDecay:
-    """One run's top-1 accuracy per week, with the population each week was measured over."""
+    """One run's top-1 accuracy per week, split by whether the week's users are new to the attack.
 
-    #: Columns ``week``, ``accuracy``, ``n_users``, ``n_documents`` -- one row per whole week.
+    ``curve`` is long-form -- ``week``, ``cohort``, ``accuracy``, ``n_documents``, ``n_users`` --
+    with ``cohort`` in :data:`COHORTS`. ``counts`` is the same population *unfiltered*, so the
+    context panel can show a thin week that the accuracy line drops.
+    """
+
     curve: pd.DataFrame
+    counts: pd.DataFrame
     known_fraction: float
+
+
+#: The two kinds of user a week can contain, in the order they are drawn and stacked. "New" is
+#: relative to the *unknown stream only*: every user here is enrolled on the known side (that is
+#: what makes them attackable at all), so this asks whether the attacker has already had to
+#: attribute this person once before, not whether it has ever seen them.
+COHORTS = ("new", "returning")
+
+COHORT_LABELS = {"new": "First seen this week", "returning": "Seen in an earlier week"}
 
 
 def document_end_times(dataset: str) -> pd.Series | None:
@@ -1038,33 +1052,43 @@ _END_TIMES: dict[str, pd.Series | None] = {}
 
 def temporal_accuracy(run: Run, known_fraction: float = TEMPORAL_KNOWN_FRACTION,
                       min_documents: int = MIN_DOCUMENTS_PER_WEEK) -> TemporalDecay | None:
-    """Top-1 accuracy as a function of how far past the attacker's data a document sits.
+    """Top-1 accuracy per week, split by whether the week's users are new to the unknown stream.
 
     Every other figure here holds time fixed and varies the attack. This one does the opposite,
     and it separates the two things the old window sweep confounded: a longer window contains
     *more users* **and** reaches *further into the future*, so a falling accuracy could be either.
-    Binning by elapsed weeks holds the attacker fixed and lets only the second vary -- a falling
-    line here is staleness, the claim that anonymity improves on its own as a writing style drifts
-    away from whatever the attacker once saw.
+    Binning by elapsed weeks holds the attacker fixed and lets only staleness vary.
+
+    **The cohort split removes the remaining confound, which is composition.** Week 12 is not a
+    random sample of week 0's people: users who write steadily are still there, one-off users are
+    not, and the attacker has by then already attributed the steady ones several times. A single
+    line mixes "the attack is going stale" with "the surviving population is different", and those
+    have opposite privacy readings. So each week is cut in two:
+
+    * ``new`` -- the user's **first** appearance in the unknown stream. Note "new" is relative to
+      the *testing* side only: every user counted here is enrolled on the known side, or the
+      document would have no correct answer and be dropped. This is the honest measure of decay,
+      because a new user's documents are the same kind of first-contact problem in week 12 as in
+      week 0.
+    * ``returning`` -- the user appeared in some earlier week. The attacker has met them before,
+      and their staying power is itself a signal.
+
+    The label is per *user per week*, not per document: several documents by one person in one
+    week share whichever cohort that person is in that week, so a prolific week cannot put the
+    same user on both lines.
 
     **The weeks are disjoint buckets, not running totals.** Week 3 is the documents that ended in
-    the third week after the cut and no others, so a point can move freely from its neighbour.
-    A cumulative reading would drag every later point toward the average and hide exactly the
-    decay this figure is asked to show -- by week 20 a cumulative curve is nine tenths history.
-
-    Week 0 is the first document the attacker has to attribute, so the x axis is *elapsed time
-    since the known side ends*, not a calendar date.
+    the third week after the cut and no others. A cumulative reading would drag every later point
+    toward the average and hide exactly the decay this figure is asked to show.
 
     One known side (``known_fraction``), so there is nothing to average and no interval to draw:
-    every point is the whole population of its week, not a sample of it. ``n_users`` and
-    ``n_documents`` ride along instead, because what a thin week deserves is a look at how few
-    people it holds rather than a band computed from three attackers who disagree for reasons
-    that have nothing to do with that week.
+    every point is the whole population of its week-and-cohort. ``counts`` carries the populations
+    instead, unfiltered, so a week whose accuracy was dropped for thinness still shows up as the
+    handful of people it was.
 
-    A hit is ``best_author == true_author`` rather than ``true_author_rank <= 1``. They are the
-    same statement, but the pair of author columns is in *every* predictions file this project has
-    ever written, so this figure needs no re-run and no new column -- it covers runs from both
-    output layouts, WildChat included.
+    A hit is ``best_author == true_author`` rather than ``true_author_rank <= 1`` -- the same
+    statement, but those columns are in *every* predictions file this project has written, so this
+    needs no re-run and covers every output layout.
 
     Returns ``None`` when the run has no predictions for that known side, or when the dataset's
     parquet is not on disk to supply the timestamps.
@@ -1095,7 +1119,8 @@ def temporal_accuracy(run: Run, known_fraction: float = TEMPORAL_KNOWN_FRACTION,
     # The pre-change layout wrote one file per window, and its windows are nested prefixes of one
     # another -- so a document appears in up to three of them. Deduplicating collapses those back
     # to the union, which is what a single full-unknown-side file already is. Without it the early
-    # weeks would be counted once per window that covers them.
+    # weeks would be counted once per window that covers them, and a user's "first week" could be
+    # read off a duplicate.
     table = table.drop_duplicates(subset="doc_id")
     stamps = table["doc_id"].map(end_times)
     table, stamps = table[stamps.notna()], stamps[stamps.notna()]
@@ -1107,34 +1132,42 @@ def temporal_accuracy(run: Run, known_fraction: float = TEMPORAL_KNOWN_FRACTION,
         "week": elapsed.to_numpy().astype(int),
         "hit": (table["best_author"] == table["true_author"]).to_numpy(),
         "author": table["true_author"].to_numpy(),
-    }).groupby("week")
-    curve = pd.DataFrame({"accuracy": weekly["hit"].mean(),
-                          "n_documents": weekly["hit"].size(),
-                          "n_users": weekly["author"].nunique()}).reset_index()
+    })
+    # A user is "new" in the week they first appear on the unknown side and "returning" in every
+    # week after it -- computed per user, then broadcast to that user's documents.
+    first_seen = weekly.groupby("author")["week"].transform("min")
+    weekly["cohort"] = np.where(weekly["week"] == first_seen, "new", "returning")
+
+    grouped = weekly.groupby(["cohort", "week"])
+    counts = pd.DataFrame({"n_documents": grouped["hit"].size(),
+                           "n_users": grouped["author"].nunique()}).reset_index()
+    curve = pd.DataFrame({"accuracy": grouped["hit"].mean(),
+                          "n_documents": grouped["hit"].size(),
+                          "n_users": grouped["author"].nunique()}).reset_index()
     curve = curve[curve["n_documents"] >= min_documents]
     if curve.empty:
         return None
-    return TemporalDecay(curve=curve.sort_values("week"), known_fraction=known_fraction)
+    return TemporalDecay(curve=curve.sort_values(["cohort", "week"]),
+                         counts=counts.sort_values(["cohort", "week"]),
+                         known_fraction=known_fraction)
 
 
 def plot_temporal_decay(dataset: str, runs: list[Run], decay: dict[Run, TemporalDecay],
                         output_dir: Path) -> list[Path]:
     """Top-1 accuracy against elapsed weeks, one line per attack+defense combination.
 
-    Faceted with **one column per defense** rather than drawn on a single axes. The combinations
-    outnumber the palette -- swe-chat has ten, against eight validated hues -- and a ninth series
-    would have to either repeat a colour or invent one, both of which make the figure unreadable
-    exactly where it is busiest. Splitting on the defense keeps every column inside the palette,
-    lets colour stay with the *method* (so a method is the same colour in both, which is what makes
-    the defense's effect legible), and still draws precisely one line per combination.
+    Three rows against one column per defense. The **rows are the cohorts** -- users meeting the
+    attack for the first time, then users it has already attributed in an earlier week -- because
+    putting both on one axes would double the lines and blow past the eight-hue palette, and
+    separating them by dash would say "not a measurement" in a file where that is what a dash
+    means. Split into rows, colour keeps meaning the method and the two readings sit one above the
+    other on a shared scale, which is the comparison worth making.
 
-    Under each column sits **the number of users that week was measured over**. It is the same
-    population for every line in the figure -- the defense rewrites text but changes neither who
-    wrote it nor when -- so it is drawn once per column as recessive context, not as a series. It
-    is what makes a spiky tail readable: a week holding eight people can move a long way on one
-    document, and no interval drawn on the accuracy panel would say that as directly.
-
-    A dual y axis for the counts is deliberately not used; the panel is separate and shares only x.
+    The bottom row is **the population each week was measured over, stacked by cohort**. It is the
+    same population for every line in the figure -- a defense rewrites text but changes neither who
+    wrote it nor when -- so it is drawn once per column in recessive grey, never as a second y
+    axis. It is what makes the accuracy rows legible: it shows the returning share climbing as the
+    weeks pass, which is precisely the composition shift the rows above are controlling for.
     """
     present = [defense for defense in DEFENSES if any(run.defense == defense for run in runs)]
     if not present:
@@ -1143,73 +1176,77 @@ def plot_temporal_decay(dataset: str, runs: list[Run], decay: dict[Run, Temporal
     # Truncate every line to the last week they all reach. Runs still in the pre-change layout
     # stop early for a reason that has nothing to do with their attack: that layout's widest
     # window is half the corpus *by position*, and documents are denser early, so it covers about
-    # four weeks of an eight-week future. Drawn untruncated, a defense whose runs happen to be
-    # old would look as though its curve ended -- so the shared range is the comparable one, and
-    # the note says what is costing the rest.
+    # four weeks of an eight-week future. Drawn untruncated, a defense whose runs happen to be old
+    # would look as though its curve simply ended.
     limit = min(int(decay[run].curve["week"].max()) for run in runs)
-    short = [run for run in runs if int(decay[run].curve["week"].max()) < limit + 1
-             and int(decay[run].curve["week"].max()) == limit]
-    longer = [run for run in runs if int(decay[run].curve["week"].max()) > limit]
-    if longer:
-        print(f"  temporal: truncated to week {limit}; {len(longer)} run(s) reach further but "
-              f"{', '.join(sorted(r.directory.name for r in short))} do not "
+    short = sorted(run.directory.name for run in runs
+                   if int(decay[run].curve["week"].max()) == limit)
+    if any(int(decay[run].curve["week"].max()) > limit for run in runs):
+        print(f"  temporal: truncated to week {limit}; {', '.join(short)} do not reach further "
               f"(pre-change output layout) -- re-run those to extend the axis")
 
     figure, axes_grid = plt.subplots(
-        2, len(present), figsize=(5.8 * len(present), 5.8), squeeze=False,
-        sharex="col", sharey="row", gridspec_kw={"height_ratios": [3, 1], "hspace": 0.12})
+        3, len(present), figsize=(5.8 * len(present), 8.6), squeeze=False,
+        sharex="col", sharey="row", gridspec_kw={"height_ratios": [3, 3, 1.6]})
     figure.patch.set_facecolor(SURFACE)
 
     handles: dict[str, object] = {}
     for column, defense in enumerate(present):
-        top, bottom = axes_grid[0][column], axes_grid[1][column]
         panel = sorted((run for run in runs if run.defense == defense),
                        key=lambda run: METHOD_SLOTS[run.method])
         slots = resolve_slots([METHOD_SLOTS[run.method] for run in panel])
-        for run, slot in zip(panel, slots):
-            curve = decay[run].curve
-            curve = curve[curve["week"] <= limit]
-            color = series_style(slot)
-            # The 2px surface ring that keeps overlapping markers separable turns into a
-            # dashed-looking line once the points are dense -- and on these figures a dash means
-            # "not a measurement". Past a dozen weeks the markers come off and the line speaks.
-            marks = dict(marker="o", markersize=MARKER_SIZE, markeredgecolor=SURFACE,
-                         markeredgewidth=2) if len(curve) <= 12 else {}
-            top.plot(curve["week"], curve["accuracy"], color=color, linewidth=LINE_WIDTH,
-                     solid_capstyle="round", zorder=3, **marks)
-            handles.setdefault(run.method_label,
-                               Line2D([], [], color=color, linewidth=LINE_WIDTH))
-        # Identical for every line above, so it is read off whichever run reaches furthest.
-        counts = max((decay[run].curve for run in panel), key=len)
-        counts = counts[counts["week"] <= limit]
-        bottom.bar(counts["week"], counts["n_users"], width=0.7, color=TEXT_MUTED, alpha=0.35,
-                   linewidth=0, zorder=2)
 
-        # Only the leftmost column states what the shared y axes measure.
-        style_axes(top, "", "Top-1 accuracy" if column == 0 else "", DEFENSE_LABELS[defense], "")
-        style_axes(bottom, "Weeks after the attacker's data ends",
+        for row, cohort in enumerate(COHORTS):
+            axes = axes_grid[row][column]
+            for run, slot in zip(panel, slots):
+                curve = decay[run].curve
+                curve = curve[(curve["cohort"] == cohort) & (curve["week"] <= limit)]
+                if curve.empty:
+                    continue
+                color = series_style(slot)
+                # The 2 px surface ring that keeps overlapping markers separable turns into a
+                # dashed-looking line once the points are dense -- and here a dash means "not a
+                # measurement". Past a dozen weeks the markers come off and the line speaks.
+                marks = dict(marker="o", markersize=MARKER_SIZE, markeredgecolor=SURFACE,
+                             markeredgewidth=2) if len(curve) <= 12 else {}
+                axes.plot(curve["week"], curve["accuracy"], color=color, linewidth=LINE_WIDTH,
+                          solid_capstyle="round", zorder=3, **marks)
+                handles.setdefault(run.method_label,
+                                   Line2D([], [], color=color, linewidth=LINE_WIDTH))
+            label = f"Top-1 accuracy\n({COHORT_LABELS[cohort].lower()})" if column == 0 else ""
+            style_axes(axes, "", label, DEFENSE_LABELS[defense] if row == 0 else "", "")
+            axes.set_ylim(bottom=0)
+
+        # Identical for every line above, so it is read off whichever run reaches furthest.
+        counts = max((decay[run].counts for run in panel), key=len)
+        counts = counts[counts["week"] <= limit]
+        bars = axes_grid[2][column]
+        bottom = np.zeros(limit + 1)
+        for shade, cohort in zip((0.22, 0.5), COHORTS):
+            per_week = (counts[counts["cohort"] == cohort].set_index("week")["n_users"]
+                        .reindex(range(limit + 1), fill_value=0).to_numpy())
+            bars.bar(range(limit + 1), per_week, bottom=bottom, width=0.7, color=TEXT_MUTED,
+                     alpha=shade, linewidth=0.8, edgecolor=SURFACE, zorder=2,
+                     label=COHORT_LABELS[cohort] if column == 0 else None)
+            bottom = bottom + per_week
+        style_axes(bars, "Weeks after the attacker's data ends",
                    "Users" if column == 0 else "", "", "")
-        top.set_ylim(bottom=0)
-        bottom.set_ylim(bottom=0)
+        bars.set_ylim(bottom=0)
         # The bins are whole weeks; a tick at 1.5 weeks labels a point that cannot exist.
-        bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+        bars.xaxis.set_major_locator(MaxNLocator(integer=True))
+        if column == 0:
+            add_legend(bars, loc="upper right", ncol=2)
 
     known = next(iter(decay.values())).known_fraction
     figure.suptitle(f"{DATASET_LABELS[dataset]}: does re-identification go stale?  "
                     f"(attacker knows the first {known:.0%})",
                     color=TEXT_PRIMARY, fontsize=12, x=0.01, ha="left")
-    # A figure-level legend along the bottom rather than inside an axes: `loc="best"` has no good
-    # answer here, because the panels are full of lines from edge to edge and whichever corner it
-    # picks covers one. Below the panels it can never collide, and it reads once for both columns.
-    # tight_layout does not know about figure-level legends, so the band is reserved first and
-    # the legend anchored inside it; anchoring below the figure instead lands it on the x label.
+    # tight_layout does not know about figure-level legends, so the band is reserved first and the
+    # legend anchored inside it; anchoring below the figure instead lands it on the x label.
     columns = min(len(handles), 3)
     rows = -(-len(handles) // columns)
     figure.tight_layout()
-    # `tight_layout(rect=...)` is not enough on its own here -- the gridspec's own spacing wins
-    # and the x label lands back on the legend. Setting the axes box afterwards is what actually
-    # frees the band, sized by how many rows the legend will wrap onto.
-    figure.subplots_adjust(bottom=0.13 + 0.05 * rows)
+    figure.subplots_adjust(bottom=0.09 + 0.033 * rows)
     legend = figure.legend(list(handles.values()), list(handles), title="Feature / attack",
                            loc="lower center", bbox_to_anchor=(0.5, 0.01), ncol=columns,
                            frameon=False, fontsize=8.5, labelcolor=TEXT_PRIMARY)
