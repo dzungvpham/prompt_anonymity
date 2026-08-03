@@ -62,6 +62,8 @@ figure is written alongside a ``.csv`` of the exact numbers plotted.
 
 from __future__ import annotations
 
+import argparse
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,10 +75,18 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402  (proxy handles for the two-legend figures)
+from matplotlib.ticker import MaxNLocator  # noqa: E402  (whole-week ticks on the decay figure)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
 PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
+
+#: Where the built dataset lives, and the split parquet each dataset's documents come from --
+#: the same defaults ``run_experiment_v2.py`` attacks. Only the temporal figure reads them, and
+#: only for two columns: a document's ``ended_at`` is metadata that never depended on the attack,
+#: so it is joined back on ``doc_id`` rather than copied into every run's predictions.
+DATA_DIR = REPO_ROOT / "data" / "hf"
+SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
 
 
 # --- the vocabulary a results directory name is built from -------------------
@@ -356,6 +366,108 @@ def discover_runs(results_dir: Path) -> list[Run]:
 
 # --- averaging the rolling windows -------------------------------------------
 
+#: Windows (as fractions of the whole timeline) that :func:`split_windows` cuts each known side
+#: into, unless ``--window`` overrides them. These are the three the runner itself used to sweep,
+#: so the default figures are the ones this project has always drawn.
+DEFAULT_WINDOWS = (0.10, 0.25, 0.50)
+
+#: The windows every figure is actually cut into, replaced by ``--window`` in :func:`main`. Module
+#: state rather than a threaded argument because it is one global statement about what the figures
+#: mean, read by four otherwise unrelated curve builders; there is exactly one writer.
+WINDOWS: tuple[float, ...] = DEFAULT_WINDOWS
+
+
+def split_windows(table: pd.DataFrame, windows: tuple[float, ...] | None = None) -> list[pd.DataFrame]:
+    """Cut one known side's per-document table into the rolling windows to average over.
+
+    ``run_experiment_v2.py`` no longer sweeps a window axis: it fits on the known side and scores
+    **everything after it**, once, because the fit never depended on how much of the future was
+    being scored. The windows are therefore cut here instead -- a window of *w* is the documents
+    up to ``w`` of the whole timeline past the known cut, exactly the slice that used to be its
+    own run. ``position`` (the document's index in the ordered corpus) makes that exact, with no
+    rounding to reproduce.
+
+    Why cut at all, rather than plot the one full-timeline curve: the window is the unit every
+    figure here averages over, and the spread across windows is what the shaded band reports.
+    One curve per known side would leave three samples and a band from ``t(df=2) = 4.303``.
+
+    Windows that run past the end of the corpus are dropped rather than truncated, so a 50%
+    window is never silently a 40% one. Tables with a ``window`` column (written by the sweeping
+    runner) are split on it instead, and anything with neither column is one window -- which is
+    what keeps results directories from before either change readable.
+    """
+    windows = WINDOWS if windows is None else windows
+    if "window" in table.columns:
+        return [group for _, group in table.groupby("window", sort=True)]
+    if "position" not in table.columns or table.empty:
+        return [table]
+    start = int(table["position"].min())
+    n_documents = int(table["position"].max()) + 1   # the unknown side always runs to the end
+    # The requested known fraction, not `start / n_documents`: the runner cut at
+    # `round(fraction * n_documents)`, so re-deriving the fraction from the cut and rounding
+    # again can land a document either side of where the sweeping runner put the boundary.
+    fraction = (float(table["known_fraction"].iloc[0]) if "known_fraction" in table.columns
+                else start / n_documents)
+    cuts = []
+    for window in windows:
+        end = int(round((fraction + window) * n_documents))
+        if end > n_documents:                        # off the end of the timeline: not comparable
+            continue
+        cut = table[table["position"] < end]
+        if not cut.empty:
+            cuts.append(cut)
+    return cuts or [table]
+
+
+def prediction_windows(run: Run, windows: tuple[float, ...] | None = None) -> list[pd.DataFrame]:
+    """``run``'s per-document predictions, cut into windows and restricted to the in-set rows.
+
+    The single source every windowed figure derives from. Out-of-set documents (whose author is
+    absent from the known side) are dropped here rather than by each caller: they have no correct
+    answer available, so they have no rank, and counting them would cap every curve below 1 for a
+    reason the attack cannot control.
+
+    Empty when the run predates ``true_author_rank`` -- callers fall back to the aggregate CSVs.
+    """
+    tables = []
+    for path in sorted(run.directory.glob(f"predictions_{run.attack}_*.csv")):
+        table = pd.read_csv(path)
+        if "attack" in table.columns:
+            table = table[table["attack"] == run.attack]
+        if "true_author_rank" not in table.columns:
+            return []
+        for window in split_windows(table, windows):
+            in_set = window[window["author_in_known"].astype(bool)]
+            in_set = in_set[in_set["true_author_rank"].notna()]
+            if not in_set.empty:
+                tables.append(in_set)
+    return tables
+
+
+def cmc_from_ranks(table: pd.DataFrame) -> pd.DataFrame:
+    """One window's CMC curve, rebuilt from per-document true-author ranks.
+
+    Mirrors :func:`prompt_anonymity.metrics.ranking.cmc_curve` -- ``accuracy`` is the share of
+    documents whose true author ranks within k and ``random`` is ``mean(min(k, pool) / pool)`` --
+    but is written out here rather than imported, to keep this script free of the package's heavy
+    imports (the same reason its name vocabulary is literal).
+
+    Both are computed by prefix sum over sorted values rather than a ``k x documents`` comparison,
+    which at WildChat's scale would be a 19,711 x 130,000 boolean array per window.
+    """
+    ranks = np.sort(table["true_author_rank"].to_numpy(dtype=float))
+    pool = np.sort(table["n_candidate_authors"].to_numpy(dtype=float))
+    n_documents = len(ranks)
+    ks = np.arange(1, int(pool[-1]) + 1)
+    accuracy = np.searchsorted(ranks, ks, side="right") / n_documents
+    # A document whose pool is <= k is a certain hit at k and contributes 1; the rest contribute
+    # k / pool, summed via the running total of 1 / pool over the pools still larger than k.
+    inverse = np.concatenate([[0.0], np.cumsum(1.0 / pool)])
+    saturated = np.searchsorted(pool, ks, side="right")
+    chance = (saturated + ks * (inverse[-1] - inverse[saturated])) / n_documents
+    return pd.DataFrame({"k": ks, "accuracy": accuracy, "random": chance})
+
+
 #: Student-t multipliers for a two-sided 95 % interval, indexed by degrees of freedom (n - 1).
 #: Tabulated rather than pulled from ``scipy.stats`` to keep this script's imports light; the
 #: window grid is small and fixed (eight windows -> df 7 -> 2.365), and anything past the table
@@ -426,16 +538,21 @@ def average_cmc(run: Run) -> AveragedCmc | None:
     sampling error bar: the windows overlap (they are nested prefixes of one corpus), so they are
     not independent draws and the interval is narrower than a true one would be.
     """
-    path = run.directory / "cmc_results.csv"
-    if not path.exists():
-        return None
-    cmc = pd.read_csv(path)
-    if "attack" in cmc.columns:
-        cmc = cmc[cmc["attack"] == run.attack]
-    if cmc.empty:
-        return None
-
-    n_windows = cmc.groupby(["known_fraction", "window"]).ngroups
+    windows = prediction_windows(run)
+    if windows:
+        cmc = pd.concat([cmc_from_ranks(window) for window in windows], ignore_index=True)
+        n_windows = len(windows)
+    else:                                    # a run written before per-document ranks were kept
+        path = run.directory / "cmc_results.csv"
+        if not path.exists():
+            return None
+        cmc = pd.read_csv(path)
+        if "attack" in cmc.columns:
+            cmc = cmc[cmc["attack"] == run.attack]
+        if cmc.empty:
+            return None
+        n_windows = cmc.groupby([column for column in ("known_fraction", "window")
+                                 if column in cmc.columns]).ngroups
     per_k = cmc.groupby("k")
     complete = per_k.size() == n_windows  # k values present in every window
     curve = add_interval(per_k[["accuracy", "random"]].mean()[complete],
@@ -514,14 +631,14 @@ def risk_coverage(run: Run) -> AveragedRiskCoverage | None:
     """
     windows = []
     for path in sorted(run.directory.glob(f"predictions_{run.attack}_*.csv")):
-        predictions = pd.read_csv(path)
-        in_set = predictions[predictions["author_in_known"].astype(bool)]
-        if in_set.empty:
-            continue
-        windows.append(selective_precision(
-            confidence=-in_set["accept_score"].to_numpy(dtype=float),
-            correct=(in_set["best_author"] == in_set["true_author"]).to_numpy(),
-        ))
+        for predictions in split_windows(pd.read_csv(path)):
+            in_set = predictions[predictions["author_in_known"].astype(bool)]
+            if in_set.empty:
+                continue
+            windows.append(selective_precision(
+                confidence=-in_set["accept_score"].to_numpy(dtype=float),
+                correct=(in_set["best_author"] == in_set["true_author"]).to_numpy(),
+            ))
     if not windows:
         return None
 
@@ -781,17 +898,34 @@ def per_author_risk(run: Run) -> AveragedAuthorRisk | None:
     roughly 70% of users are never identified once, while a few percent are identified every
     time -- which is exactly the structure a headline accuracy hides and a reviewer asks about.
 
-    ``top1_accuracy`` in ``author_report_*.csv`` is one user's own document-level accuracy, so the
-    mean of this curve is the macro accuracy in :func:`plot_macro_micro`, read a different way.
+    Each user's own document-level top-1 accuracy is recomputed per window from
+    ``predictions_*.csv`` -- the same quantity ``author_report_*.csv`` reports as
+    ``top1_accuracy``, but following the window being plotted, which a report aggregated over the
+    whole unknown side cannot. The mean of this curve is the macro accuracy in
+    :func:`plot_macro_micro`, read a different way. Runs without per-document ranks fall back to
+    the aggregate report.
     """
+    exposures = []
+    for table in prediction_windows(run):
+        # One user's own document-level top-1 accuracy, the same quantity `per_author_ranking`
+        # writes as `top1_accuracy` -- recomputed here so it follows the window being plotted.
+        exposures.append(table.groupby("true_author")["true_author_rank"]
+                         .apply(lambda rank: float((rank <= 1).mean())).to_numpy())
+    if not exposures:                        # a run written before per-document ranks were kept
+        for path in sorted(run.directory.glob(f"author_report_{run.attack}_*.csv")):
+            report = pd.read_csv(path)
+            if "attack" in report.columns:
+                report = report[report["attack"] == run.attack]
+            if report.empty or "top1_accuracy" not in report.columns:
+                continue
+            for window in split_windows(report):
+                exposures.append(window["top1_accuracy"].to_numpy(dtype=float))
+
     windows = []
-    for path in sorted(run.directory.glob(f"author_report_{run.attack}_*.csv")):
-        report = pd.read_csv(path)
-        if "attack" in report.columns:
-            report = report[report["attack"] == run.attack]
-        if report.empty or "top1_accuracy" not in report.columns:
+    for values in exposures:
+        exposure = np.sort(values)[::-1]
+        if not len(exposure):
             continue
-        exposure = np.sort(report["top1_accuracy"].to_numpy(dtype=float))[::-1]
         # Midpoints of each user's share of the population, so the curve is anchored at the
         # centre of a user's slice rather than its edge and does not depend on the user count.
         position = (np.arange(len(exposure)) + 0.5) / len(exposure) * 100
@@ -850,6 +984,245 @@ def plot_author_risk_comparison(series: list[Series], title: str, legend_title: 
     table.to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return save_figure(figure, stem)
 
+
+# --- temporal decay: does the attack go stale? -------------------------------
+
+#: Documents a (known side, week) bin needs before its accuracy is plotted. A week holding three
+#: documents produces an accuracy of 0, 1/3, 2/3 or 1, which is noise drawn at full contrast.
+MIN_DOCUMENTS_PER_WEEK = 5
+
+
+#: Which known side the temporal figure draws. One attacker, not an average over three: the
+#: three known sides cut the timeline at different dates, so averaging them truncates to the
+#: weeks the *shortest* reaches -- on swe-chat 4 weeks against the 25% side's own 8. Taking the
+#: earliest side alone keeps the longest run of future, which is the axis this figure exists for.
+TEMPORAL_KNOWN_FRACTION = 0.25
+
+
+@dataclass
+class TemporalDecay:
+    """One run's top-1 accuracy per week, with the population each week was measured over."""
+
+    #: Columns ``week``, ``accuracy``, ``n_users``, ``n_documents`` -- one row per whole week.
+    curve: pd.DataFrame
+    known_fraction: float
+
+
+def document_end_times(dataset: str) -> pd.Series | None:
+    """``doc_id -> ended_at`` for one dataset, read from its split parquet.
+
+    When a document ended is a property of the corpus, not of any attack, so it is joined back
+    here rather than written into every run's ``predictions_*.csv``. That keeps one copy of the
+    fact, and -- the reason that matters in practice -- it makes the temporal figure available for
+    **every run already on disk**, including ones far too expensive to re-run for a column.
+
+    Only two columns are read, so the 411 MB WildChat parquet costs a projection rather than a
+    load. Memoised because a dataset's runs all need the same mapping.
+    """
+    if dataset in _END_TIMES:
+        return _END_TIMES[dataset]
+    path = DATA_DIR / f"{SPLIT_NAMES[dataset]}.parquet"
+    times = None
+    if path.exists():
+        frame = pd.read_parquet(path, columns=["doc_id", "ended_at"])
+        times = pd.Series(pd.to_datetime(frame["ended_at"], errors="coerce", utc=True,
+                                         format="mixed").to_numpy(),
+                          index=frame["doc_id"].to_numpy())
+    _END_TIMES[dataset] = times
+    return times
+
+
+#: Memo for :func:`document_end_times`, one entry per dataset (``None`` when its parquet is absent).
+_END_TIMES: dict[str, pd.Series | None] = {}
+
+
+def temporal_accuracy(run: Run, known_fraction: float = TEMPORAL_KNOWN_FRACTION,
+                      min_documents: int = MIN_DOCUMENTS_PER_WEEK) -> TemporalDecay | None:
+    """Top-1 accuracy as a function of how far past the attacker's data a document sits.
+
+    Every other figure here holds time fixed and varies the attack. This one does the opposite,
+    and it separates the two things the old window sweep confounded: a longer window contains
+    *more users* **and** reaches *further into the future*, so a falling accuracy could be either.
+    Binning by elapsed weeks holds the attacker fixed and lets only the second vary -- a falling
+    line here is staleness, the claim that anonymity improves on its own as a writing style drifts
+    away from whatever the attacker once saw.
+
+    **The weeks are disjoint buckets, not running totals.** Week 3 is the documents that ended in
+    the third week after the cut and no others, so a point can move freely from its neighbour.
+    A cumulative reading would drag every later point toward the average and hide exactly the
+    decay this figure is asked to show -- by week 20 a cumulative curve is nine tenths history.
+
+    Week 0 is the first document the attacker has to attribute, so the x axis is *elapsed time
+    since the known side ends*, not a calendar date.
+
+    One known side (``known_fraction``), so there is nothing to average and no interval to draw:
+    every point is the whole population of its week, not a sample of it. ``n_users`` and
+    ``n_documents`` ride along instead, because what a thin week deserves is a look at how few
+    people it holds rather than a band computed from three attackers who disagree for reasons
+    that have nothing to do with that week.
+
+    A hit is ``best_author == true_author`` rather than ``true_author_rank <= 1``. They are the
+    same statement, but the pair of author columns is in *every* predictions file this project has
+    ever written, so this figure needs no re-run and no new column -- it covers runs from both
+    output layouts, WildChat included.
+
+    Returns ``None`` when the run has no predictions for that known side, or when the dataset's
+    parquet is not on disk to supply the timestamps.
+    """
+    end_times = document_end_times(run.dataset)
+    if end_times is None:
+        return None
+    files = sorted(run.directory.glob(f"predictions_{run.attack}_*.csv"))
+    if not files:
+        return None
+    # The earliest layout stamped nothing on the rows and put every axis in the filename, so the
+    # known fraction is recovered from `..._known<pct>[_window<pct>].csv` when the column is
+    # missing. It is the one axis this function has to select on.
+    frames = []
+    for path in files:
+        frame = pd.read_csv(path)
+        if "known_fraction" not in frame.columns:
+            match = re.search(r"_known(\d+)", path.stem)
+            if match is None:
+                return None
+            frame["known_fraction"] = int(match.group(1)) / 100
+        frames.append(frame)
+    table = pd.concat(frames, ignore_index=True)
+    if "attack" in table.columns:
+        table = table[table["attack"] == run.attack]
+    table = table[np.isclose(table["known_fraction"], known_fraction)]
+    table = table[table["author_in_known"].astype(bool)]
+    # The pre-change layout wrote one file per window, and its windows are nested prefixes of one
+    # another -- so a document appears in up to three of them. Deduplicating collapses those back
+    # to the union, which is what a single full-unknown-side file already is. Without it the early
+    # weeks would be counted once per window that covers them.
+    table = table.drop_duplicates(subset="doc_id")
+    stamps = table["doc_id"].map(end_times)
+    table, stamps = table[stamps.notna()], stamps[stamps.notna()]
+    if table.empty:
+        return None
+
+    elapsed = (stamps - stamps.min()).dt.total_seconds() / (7 * 24 * 3600)
+    weekly = pd.DataFrame({
+        "week": elapsed.to_numpy().astype(int),
+        "hit": (table["best_author"] == table["true_author"]).to_numpy(),
+        "author": table["true_author"].to_numpy(),
+    }).groupby("week")
+    curve = pd.DataFrame({"accuracy": weekly["hit"].mean(),
+                          "n_documents": weekly["hit"].size(),
+                          "n_users": weekly["author"].nunique()}).reset_index()
+    curve = curve[curve["n_documents"] >= min_documents]
+    if curve.empty:
+        return None
+    return TemporalDecay(curve=curve.sort_values("week"), known_fraction=known_fraction)
+
+
+def plot_temporal_decay(dataset: str, runs: list[Run], decay: dict[Run, TemporalDecay],
+                        output_dir: Path) -> list[Path]:
+    """Top-1 accuracy against elapsed weeks, one line per attack+defense combination.
+
+    Faceted with **one column per defense** rather than drawn on a single axes. The combinations
+    outnumber the palette -- swe-chat has ten, against eight validated hues -- and a ninth series
+    would have to either repeat a colour or invent one, both of which make the figure unreadable
+    exactly where it is busiest. Splitting on the defense keeps every column inside the palette,
+    lets colour stay with the *method* (so a method is the same colour in both, which is what makes
+    the defense's effect legible), and still draws precisely one line per combination.
+
+    Under each column sits **the number of users that week was measured over**. It is the same
+    population for every line in the figure -- the defense rewrites text but changes neither who
+    wrote it nor when -- so it is drawn once per column as recessive context, not as a series. It
+    is what makes a spiky tail readable: a week holding eight people can move a long way on one
+    document, and no interval drawn on the accuracy panel would say that as directly.
+
+    A dual y axis for the counts is deliberately not used; the panel is separate and shares only x.
+    """
+    present = [defense for defense in DEFENSES if any(run.defense == defense for run in runs)]
+    if not present:
+        return []
+
+    # Truncate every line to the last week they all reach. Runs still in the pre-change layout
+    # stop early for a reason that has nothing to do with their attack: that layout's widest
+    # window is half the corpus *by position*, and documents are denser early, so it covers about
+    # four weeks of an eight-week future. Drawn untruncated, a defense whose runs happen to be
+    # old would look as though its curve ended -- so the shared range is the comparable one, and
+    # the note says what is costing the rest.
+    limit = min(int(decay[run].curve["week"].max()) for run in runs)
+    short = [run for run in runs if int(decay[run].curve["week"].max()) < limit + 1
+             and int(decay[run].curve["week"].max()) == limit]
+    longer = [run for run in runs if int(decay[run].curve["week"].max()) > limit]
+    if longer:
+        print(f"  temporal: truncated to week {limit}; {len(longer)} run(s) reach further but "
+              f"{', '.join(sorted(r.directory.name for r in short))} do not "
+              f"(pre-change output layout) -- re-run those to extend the axis")
+
+    figure, axes_grid = plt.subplots(
+        2, len(present), figsize=(5.8 * len(present), 5.8), squeeze=False,
+        sharex="col", sharey="row", gridspec_kw={"height_ratios": [3, 1], "hspace": 0.12})
+    figure.patch.set_facecolor(SURFACE)
+
+    handles: dict[str, object] = {}
+    for column, defense in enumerate(present):
+        top, bottom = axes_grid[0][column], axes_grid[1][column]
+        panel = sorted((run for run in runs if run.defense == defense),
+                       key=lambda run: METHOD_SLOTS[run.method])
+        slots = resolve_slots([METHOD_SLOTS[run.method] for run in panel])
+        for run, slot in zip(panel, slots):
+            curve = decay[run].curve
+            curve = curve[curve["week"] <= limit]
+            color = series_style(slot)
+            # The 2px surface ring that keeps overlapping markers separable turns into a
+            # dashed-looking line once the points are dense -- and on these figures a dash means
+            # "not a measurement". Past a dozen weeks the markers come off and the line speaks.
+            marks = dict(marker="o", markersize=MARKER_SIZE, markeredgecolor=SURFACE,
+                         markeredgewidth=2) if len(curve) <= 12 else {}
+            top.plot(curve["week"], curve["accuracy"], color=color, linewidth=LINE_WIDTH,
+                     solid_capstyle="round", zorder=3, **marks)
+            handles.setdefault(run.method_label,
+                               Line2D([], [], color=color, linewidth=LINE_WIDTH))
+        # Identical for every line above, so it is read off whichever run reaches furthest.
+        counts = max((decay[run].curve for run in panel), key=len)
+        counts = counts[counts["week"] <= limit]
+        bottom.bar(counts["week"], counts["n_users"], width=0.7, color=TEXT_MUTED, alpha=0.35,
+                   linewidth=0, zorder=2)
+
+        # Only the leftmost column states what the shared y axes measure.
+        style_axes(top, "", "Top-1 accuracy" if column == 0 else "", DEFENSE_LABELS[defense], "")
+        style_axes(bottom, "Weeks after the attacker's data ends",
+                   "Users" if column == 0 else "", "", "")
+        top.set_ylim(bottom=0)
+        bottom.set_ylim(bottom=0)
+        # The bins are whole weeks; a tick at 1.5 weeks labels a point that cannot exist.
+        bottom.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    known = next(iter(decay.values())).known_fraction
+    figure.suptitle(f"{DATASET_LABELS[dataset]}: does re-identification go stale?  "
+                    f"(attacker knows the first {known:.0%})",
+                    color=TEXT_PRIMARY, fontsize=12, x=0.01, ha="left")
+    # A figure-level legend along the bottom rather than inside an axes: `loc="best"` has no good
+    # answer here, because the panels are full of lines from edge to edge and whichever corner it
+    # picks covers one. Below the panels it can never collide, and it reads once for both columns.
+    # tight_layout does not know about figure-level legends, so the band is reserved first and
+    # the legend anchored inside it; anchoring below the figure instead lands it on the x label.
+    columns = min(len(handles), 3)
+    rows = -(-len(handles) // columns)
+    figure.tight_layout()
+    # `tight_layout(rect=...)` is not enough on its own here -- the gridspec's own spacing wins
+    # and the x label lands back on the legend. Setting the axes box afterwards is what actually
+    # frees the band, sized by how many rows the legend will wrap onto.
+    figure.subplots_adjust(bottom=0.13 + 0.05 * rows)
+    legend = figure.legend(list(handles.values()), list(handles), title="Feature / attack",
+                           loc="lower center", bbox_to_anchor=(0.5, 0.01), ncol=columns,
+                           frameon=False, fontsize=8.5, labelcolor=TEXT_PRIMARY)
+    legend.get_title().set_color(TEXT_SECONDARY)
+    legend.get_title().set_fontsize(8.5)
+
+    stem = output_dir / "temporal" / "top1_by_week"
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat([decay[run].curve.assign(defense=run.defense, method=run.method_label,
+                                       known_fraction=decay[run].known_fraction)
+               for run in runs], ignore_index=True).to_csv(
+        stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
 
 # --- macro vs micro vs identity: three ways to count the same result ---------
 
@@ -1060,20 +1433,24 @@ def load_scaling(run: Run) -> ScalingCurve | None:
     """
     if run.attack not in POOL_INTERPOLABLE_ATTACKS:
         return None
-    path = run.directory / "cmc_results.csv"
-    if not path.exists():
-        return None
-    cmc = pd.read_csv(path)
-    if "attack" in cmc.columns:
-        cmc = cmc[cmc["attack"] == run.attack]
-    if cmc.empty:
-        return None
-
-    windows = list(cmc.groupby(["known_fraction", "window"]))
-    pool_sizes = pool_lattice(min(int(group["k"].max()) for _, group in windows))
+    derived = prediction_windows(run)
+    if derived:
+        groups = [cmc_from_ranks(window) for window in derived]
+    else:                                    # a run written before per-document ranks were kept
+        path = run.directory / "cmc_results.csv"
+        if not path.exists():
+            return None
+        cmc = pd.read_csv(path)
+        if "attack" in cmc.columns:
+            cmc = cmc[cmc["attack"] == run.attack]
+        if cmc.empty:
+            return None
+        keys = [column for column in ("known_fraction", "window") if column in cmc.columns]
+        groups = [group for _, group in cmc.groupby(keys)]
+    pool_sizes = pool_lattice(min(int(group["k"].max()) for group in groups))
 
     curves, measured = [], []
-    for _, group in windows:
+    for group in groups:
         group = group.sort_values("k")
         accuracy = group["accuracy"].to_numpy(dtype=float)
         # The CMC is the cumulative rank distribution, so differencing it recovers the mass at
@@ -1208,15 +1585,21 @@ def plot_windowed_cmc(cmc: pd.DataFrame, title: str, stem: Path) -> Path:
     confidently right about a subset, while one that climbs steadily means it is merely narrowing
     a large pool, and the two can share a top-1.
     """
-    windows = sorted(cmc.groupby(["known_fraction", "window"]), key=lambda item: item[0])
+    keys = [column for column in ("known_fraction", "window") if column in cmc.columns]
+    windows = sorted(cmc.groupby(keys), key=lambda item: item[0])
     figure, axes = plt.subplots(figsize=(7.4, 4.7))
     figure.patch.set_facecolor(SURFACE)
-    for slot, ((fraction, window), group) in enumerate(windows):
+    for slot, (key, group) in enumerate(windows):
+        # groupby returns a tuple per key, of length 1 when only `known_fraction` is present --
+        # which is every run since the window axis moved to `--window`.
+        key = key if isinstance(key, tuple) else (key,)
+        fraction, window = key[0], (key[1] if len(key) > 1 else None)
         group = group.sort_values("k")
         color = series_style(slot)
         axes.plot(group["k"], group["accuracy"], color=color, linewidth=LINE_WIDTH,
                   solid_capstyle="round", zorder=3,
-                  label=f"known {fraction:.0%} → next {window:.0%}")
+                  label=(f"known {fraction:.0%} → next {window:.0%}" if window is not None
+                         else f"known {fraction:.0%} → rest"))
         axes.plot(group["k"], group["random"], color=TEXT_MUTED, linewidth=1.0,
                   linestyle=BASELINE_DASH, alpha=0.6, zorder=2)
     style_axes(axes, "k (candidate authors returned)", "Top-k accuracy", title,
@@ -1239,17 +1622,22 @@ def plot_window_sweep(sweep: pd.DataFrame, top_k: int, title: str, stem: Path) -
     """
     figure, axes = plt.subplots(figsize=(7.0, 4.4))
     figure.patch.set_facecolor(SURFACE)
-    for slot, (fraction, group) in enumerate(sweep.groupby("known_fraction")):
+    # Without a window axis each known fraction contributes a single row, so grouping on it would
+    # draw three one-point series. The rows then form one series in their own right -- accuracy
+    # against a pool that grows because the known side does.
+    groups = (list(sweep.groupby("known_fraction")) if "window" in sweep.columns
+              else [(None, sweep)])
+    for slot, (fraction, group) in enumerate(groups):
         group = group.sort_values("n_identities")
         color = series_style(slot)
         axes.plot(group["n_identities"], group["id_acc"], color=color, linewidth=LINE_WIDTH,
                   marker="o", markersize=MARKER_SIZE,
                   markeredgecolor=SURFACE, markeredgewidth=2, zorder=3,
-                  label=f"known {fraction:.0%}")
+                  label=f"known {fraction:.0%}" if fraction is not None else "measured")
         axes.plot(group["n_identities"], group["random_id"], color=TEXT_MUTED, linewidth=1.2,
                   linestyle=BASELINE_DASH, zorder=2)
-    style_axes(axes, "Target users in the window", f"Top-{top_k} identification accuracy", title,
-               "Grey dashes are random guessing over the same pool")
+    style_axes(axes, "Target users on the unknown side", f"Top-{top_k} identification accuracy",
+               title, "Grey dashes are random guessing over the same pool")
     axes.set_ylim(bottom=0)
     add_legend(axes, loc="best")  # the lines can sit anywhere in the frame; let it find the gap
     figure.tight_layout()
@@ -1353,12 +1741,14 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
             headline = rolling_headline(rolling, row)
             if headline.empty:
                 continue
+            window = row["window"] if "window" in rolling.columns else None
             name = (f"topk_accuracy_known{round(row['known_fraction'] * 100)}"
-                    f"_window{round(row['window'] * 100)}")
+                    + (f"_window{round(window * 100)}" if window is not None else ""))
+            span = f"next {window:.0%}" if window is not None else "rest"
             written.append(plot_topk_bars(
                 headline,
                 f"{DATASET_LABELS[run.dataset]}: {scope}\n"
-                f"known {row['known_fraction']:.0%} → next {row['window']:.0%}",
+                f"known {row['known_fraction']:.0%} → {span}",
                 stem_dir / name))
 
     # The older fixed-split runner's two tables.
@@ -1377,7 +1767,32 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
 
 # --- driver ------------------------------------------------------------------
 
+def parse_args() -> argparse.Namespace:
+    """The one knob this script has: which windows to cut each known side into.
+
+    It lives here rather than in the runner because the window is no longer something an
+    experiment has to be re-run to change. ``run_experiment_v2.py`` fits on the known side and
+    scores the whole remaining timeline once; a window is a chronological prefix of that, so
+    asking for a different set of them is a question about the *figures*, answered from the CSVs
+    already on disk in seconds.
+    """
+    parser = argparse.ArgumentParser(
+        description="Draw every figure in the project from experiments/results/.")
+    parser.add_argument("--window", type=float, nargs="+", default=list(DEFAULT_WINDOWS),
+                        metavar="W",
+                        help="Fractions of the timeline to cut each known side's unknown "
+                             "documents into, one averaged sample per window (default: "
+                             "0.1 0.25 0.5). A window running past the end of the corpus is "
+                             "dropped rather than truncated. Runs whose CSVs predate the "
+                             "per-document `true_author_rank` column ignore this and use the "
+                             "windows they were run with.")
+    return parser.parse_args()
+
+
 def main() -> None:
+    global WINDOWS
+    WINDOWS = tuple(parse_args().window)
+
     if not RESULTS_DIR.exists():
         raise SystemExit(f"{RESULTS_DIR} does not exist -- run an experiment first.")
 
@@ -1406,6 +1821,7 @@ def main() -> None:
         scaling: dict[Run, ScalingCurve] = {}
         exposure: dict[Run, AveragedAuthorRisk] = {}
         modes: dict[Run, pd.DataFrame] = {}
+        decay: dict[Run, TemporalDecay] = {}
         for run in dataset_runs:
             curve = average_cmc(run)
             if curve is None:
@@ -1431,6 +1847,12 @@ def main() -> None:
             counted = counting_modes(run, averaged.get(run))
             if counted is not None:
                 modes[run] = counted
+            staleness = temporal_accuracy(run)
+            if staleness is None:
+                print(f"  {run.directory.name}: predictions_*.csv has no ended_at column "
+                      f"(run predates it), temporal decay skipped -- re-run to include it")
+            else:
+                decay[run] = staleness
         all_scaling.update(scaling)
 
         written = []
@@ -1451,6 +1873,9 @@ def main() -> None:
             written += plot_method_comparisons(dataset, dataset_runs, curves, plotter,
                                                subdirectory, output_dir)
         written += plot_macro_micro(dataset, dataset_runs, modes, output_dir)
+        if decay:
+            written += plot_temporal_decay(dataset, [run for run in dataset_runs if run in decay],
+                                           decay, output_dir)
         for run in dataset_runs:
             written += plot_run_detail(run, output_dir)
 

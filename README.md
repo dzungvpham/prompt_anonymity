@@ -47,7 +47,7 @@ python -m prompt_anonymity.data.compute_features --source swe-chat --defense ope
 python experiments/run_experiment_v2.py --source swe-chat --defense openanonymity \
     --feature stylometrix
 
-# 5. Draw every figure from the CSVs the runs left behind (no arguments, run it any time)
+# 5. Draw every figure from the CSVs the runs left behind (run it any time; --window to re-cut)
 python experiments/plot_results.py
 ```
 
@@ -203,13 +203,13 @@ Two things to read carefully in the output:
 
 Results land in `experiments/results/<dataset>_<defense>_<feature>_<attack>/`: `rolling_results.csv`
 (one row per window per attack, all metrics), `cmc_results.csv` (document-level top-k at every k),
-and per-window `predictions_*.csv` and `author_report_*.csv`. **The runner draws no figures** — see
-the next section.
+and `predictions_*.csv` and `author_report_*.csv`, one file per known side with a `window` column
+distinguishing the windows run from it. **The runner draws no figures** — see the next section.
 
 ### Figures
 
 `experiments/plot_results.py` draws every figure in the project, from the CSVs the runs left
-behind. Run it with no arguments, any time:
+behind. Run it any time; `--window` re-cuts the windows without re-running an experiment:
 
 ```bash
 python experiments/plot_results.py         # -> experiments/plots/<dataset>/
