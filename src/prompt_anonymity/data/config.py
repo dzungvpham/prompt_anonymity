@@ -144,8 +144,24 @@ def data_dir() -> Path:
     return (_base_dir(config_path) / configured).resolve()
 
 
+def hf_dir() -> Path:
+    """Where dataset parquets are READ from (``<data_dir>/hf``).
+
+    :mod:`~prompt_anonymity.data.download` mirrors the published HF dataset here; every stage
+    that reads a base split (or another stage's output) looks here by default, so a downloaded
+    checkout works with no local build. Not written to by this project's own scripts -- see
+    :func:`dist_dir` for where they write -- so it stays an exact mirror of what was downloaded.
+    """
+    return data_dir() / "hf"
+
+
 def dist_dir() -> Path:
-    """Where the built dataset parquets live (``<data_dir>/dist``)."""
+    """Where this project's own scripts WRITE their outputs (``<data_dir>/dist``): a freshly
+    built split, computed features, a defended split. Kept separate from :func:`hf_dir` so running
+    the pipeline locally never mutates the downloaded mirror -- read from ``hf/``, write to
+    ``dist/``, and point a later stage's ``--dist-dir`` at ``dist/`` explicitly to chain onto a
+    local output rather than the mirror.
+    """
     return data_dir() / "dist"
 
 

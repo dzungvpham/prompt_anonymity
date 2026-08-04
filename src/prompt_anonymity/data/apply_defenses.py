@@ -15,9 +15,11 @@ and a newly registered defense becomes available with no change to this file.
 Where the output goes
 ---------------------
 
-A defended split is written to ``dist/<split>_<defense>.parquet`` -- ``dist/swe_chat_openanonymity.parquet``
--- beside the split it came from, carrying the split's own schema so anything that reads the
-original can read it.
+The split itself is READ from ``data/hf`` (the downloaded/published mirror, see
+:func:`prompt_anonymity.data.config.hf_dir`) and a defended split is WRITTEN to
+``dist/<split>_<defense>.parquet`` -- ``dist/swe_chat_openanonymity.parquet`` -- carrying the
+split's own schema so anything that reads the original can read it. Keeping writes out of
+``data/hf`` means running this locally never mutates the downloaded mirror.
 
 Note this shares a namespace with the feature files ``compute_features`` writes
 (``dist/swe_chat_stylometrix.parquet``): both are ``<split>_<name>.parquet``, distinguished only by
@@ -26,12 +28,13 @@ disjoint today. What tells them apart on disk is their columns -- a defended spl
 a feature file has ``doc_id``/``author_id`` plus feature columns.
 
 To featurize defended text, point ``compute_features`` at the defended file with its ``--defense``
-flag::
+flag -- and, since that file lives in ``dist/`` rather than ``compute_features``'s own default
+read location (``data/hf``), also point ``--dist-dir`` there::
 
     python -m prompt_anonymity.data.apply_defenses   --source swe-chat --defense openanonymity
     python -m prompt_anonymity.data.compute_features --source swe-chat --defense openanonymity \
-        --feature stylometrix        # reads swe_chat_openanonymity.parquet
-                                     # writes swe_chat_openanonymity_stylometrix.parquet
+        --feature stylometrix --dist-dir data/dist   # reads swe_chat_openanonymity.parquet
+                                                      # writes swe_chat_openanonymity_stylometrix.parquet
 
 What a defense sees: one user turn at a time
 --------------------------------------------
@@ -108,7 +111,7 @@ from .compute_features import (
     shard_path,
     write_parquet,
 )
-from .config import cache_dir, dist_dir
+from .config import cache_dir, dist_dir, hf_dir
 
 # The defended file's columns. Just the key, its author, and the rewritten text: everything else in
 # the split (timestamps, language, model, agent) is unchanged by a defense, so copying it would
@@ -289,7 +292,7 @@ def defended_stem(source: str, defense: str) -> str:
 
 
 def output_path(out_dir: str | Path, source: str, defense: str) -> Path:
-    """The defended split file, beside the split it came from: ``dist/<split>_<defense>.parquet``."""
+    """The defended split file: ``dist/<split>_<defense>.parquet``."""
     return Path(out_dir) / f"{defended_stem(source, defense)}.parquet"
 
 
@@ -313,10 +316,12 @@ def main() -> None:
                         "(default: defend every document). A filtered run writes a SUBSET of the "
                         "split under the same filename, so do not mix the two")
     p.add_argument("--dist-dir", default=None,
-                   help="directory holding the built parquets (default: the project's data/dist)")
+                   help="directory holding the built parquets to read (default: the project's "
+                        "data/hf; point this at data/dist to defend a local, unpublished build "
+                        "instead)")
     p.add_argument("--out-dir", default=None,
-                   help="where to write the defended split (default: --dist-dir, i.e. beside the "
-                        "split it came from, as <split>_<defense>.parquet)")
+                   help="where to write the defended split (default: the project's data/dist, as "
+                        "<split>_<defense>.parquet)")
     p.add_argument("--cache-dir", default=None,
                    help="on-disk cache for defended turns, regenerable (default: data/.cache)")
     p.add_argument("--limit", type=int, default=None,
@@ -340,9 +345,9 @@ def main() -> None:
     language = None if (args.language or "all").lower() == "all" else args.language
     # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
     # lives in the installed package, the data does not.
-    dist = Path(args.dist_dir) if args.dist_dir else dist_dir()
+    dist = Path(args.dist_dir) if args.dist_dir else hf_dir()
     cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
-    out_dir = Path(args.out_dir) if args.out_dir else dist
+    out_dir = Path(args.out_dir) if args.out_dir else dist_dir()
     merged_path = output_path(out_dir, args.source, args.defense)
     stem = defended_stem(args.source, args.defense)
 

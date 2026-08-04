@@ -65,7 +65,7 @@ import pandas as pd
 import pyarrow.dataset as ds
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .config import data_dir, dist_dir, raw_path
+from .config import data_dir, hf_dir, raw_path
 from .identity import (
     hash_author_id,
     is_programmatic_user_agent,
@@ -252,7 +252,7 @@ def main() -> None:
                    help="directory of raw WildChat parquet shards (default: $PROMPT_ANONYMITY_"
                         "WILDCHAT_RAW, else the config file, else downloaded from HuggingFace)")
     p.add_argument("--built", default=None,
-                   help="the built wildchat.parquet (default: the project's data/dist)")
+                   help="the built wildchat.parquet (default: the project's data/hf)")
     p.add_argument("--max-gap", type=float, default=45.0, help="max days between fragments (default 45)")
     p.add_argument("--max-block", type=int, default=200, help="skip fingerprints shared by more identities")
     p.add_argument("--min-sim", type=float, default=0.6,
@@ -271,7 +271,7 @@ def main() -> None:
     pairs = candidate_pairs(identities, args.max_gap, args.max_block)
     print(f"candidate pairs (disjoint, gap<={args.max_gap}d): {len(pairs):,}")
 
-    documents = pd.read_parquet(args.built or dist_dir() / "wildchat.parquet",
+    documents = pd.read_parquet(args.built or hf_dir() / "wildchat.parquet",
                                 columns=["author_id", "turns"])
     documents["_text"] = documents["turns"].map(lambda t: "\n".join(t))
     known = set(documents["author_id"])

@@ -36,15 +36,17 @@ from pathlib import Path
 from ._backends import (
     PerTurnBatchRewriteDefense,
     configure_cuda_toolkit,
+    model_path,
     resolve_model_path,
     shutdown_vllm,
 )
 
-#: EDIT ME — the scrubber model. Either a directory holding a checkpoint, a HuggingFace hub *cache*
-#: entry (``.../models--<org>--<name>/``, resolved to its snapshot by :func:`resolve_model_path`),
-#: or a hub repo id for vLLM to fetch. Part of the cache key, so a swap re-caches.
-OPENANON_MODEL = os.environ.get(
-    "OPENANON_MODEL", "/datasets/ai/gpt/hub/models--openai--gpt-oss-safeguard-120b")
+#: The scrubber model: a directory holding a checkpoint, a HuggingFace hub *cache* entry
+#: (``.../models--<org>--<name>/``, resolved to its snapshot by :func:`resolve_model_path`), or a
+#: hub repo id for vLLM to fetch. Configured in ``models.toml`` (``$OPENANON_MODEL`` overrides --
+#: see :func:`~prompt_anonymity.defenses._backends.model_path`), not hardcoded here, since it is a
+#: machine-specific path. Part of the cache key, so a swap re-caches.
+OPENANON_MODEL = model_path("openanonymity", "OPENANON_MODEL")
 OPENANON_TEMPERATURE = 0.0   # greedy -> deterministic, reproducible
 OPENANON_TOP_P = 1.0
 OPENANON_OUTPUT_TAG = "scrubbed_prompt"

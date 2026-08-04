@@ -63,7 +63,7 @@ import pandas as pd
 from lingua import Language, LanguageDetector, LanguageDetectorBuilder
 from tqdm import tqdm
 
-from .config import dist_dir
+from .config import hf_dir
 
 
 # Candidate languages: the ones that appear in SWE-chat's existing labels, plus common world
@@ -350,8 +350,8 @@ def add_secondary_languages(
 
 
 def main() -> None:
-    """Report the language columns of ``dist/swe_chat.parquet`` (post-build), or a dry-run resolve."""
-    swe = pd.read_parquet(dist_dir() / "swe_chat.parquet")
+    """Report the language columns of ``hf/swe_chat.parquet`` (post-build), or a dry-run resolve."""
+    swe = pd.read_parquet(hf_dir() / "swe_chat.parquet")
     if "language_primary" in swe.columns:
         prim = swe["language_primary"].fillna("<none>").value_counts()
         n_sec = int(swe["language_secondary"].notna().sum())

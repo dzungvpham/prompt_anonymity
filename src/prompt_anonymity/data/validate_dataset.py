@@ -55,7 +55,8 @@ def _consecutive_dup_stats(turn_lists) -> tuple[int, int]:
 
 
 def main(dist: str | Path | None = None) -> int:
-    """Validate the built parquets in ``dist`` (default: the project's ``data/dist``)."""
+    """Validate the built parquets in ``dist`` (default: the project's ``data/dist`` -- a fresh
+    local build is what needs checking; ``data/hf`` is the already-validated, published mirror)."""
     dist = Path(dist) if dist else dist_dir()
     checks: list[tuple[str, bool, str]] = []
 

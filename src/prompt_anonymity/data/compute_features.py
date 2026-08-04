@@ -108,7 +108,7 @@ from tqdm import tqdm
 from prompt_anonymity.features import FEATURIZERS, get_featurizer
 from prompt_anonymity.resources import describe_budget
 
-from .config import cache_dir, dist_dir
+from .config import cache_dir, dist_dir, hf_dir
 
 # source -> split / parquet base name (must match build_dataset.SPLIT_NAMES).
 SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
@@ -168,9 +168,9 @@ UNSHARDABLE_FEATURES = {"char_ngram_tfidf"}
 def split_stem(source: str, defense: str | None = None) -> str:
     """The document file's name without its suffix: ``swe_chat``, or ``swe_chat_<defense>``.
 
-    A defense writes its output beside the split it came from
-    (:mod:`prompt_anonymity.data.apply_defenses`), so featurizing defended text is a matter of
-    reading that file instead -- same schema, same row order, one name apart.
+    A defense writes its output to ``dist/`` (:mod:`prompt_anonymity.data.apply_defenses`), so
+    featurizing defended text is a matter of reading that file instead (point ``--dist-dir`` at
+    ``dist/`` too) -- same schema, same row order, one name apart.
     """
     return f"{SPLIT_NAMES[source]}_{defense}" if defense else SPLIT_NAMES[source]
 
@@ -676,9 +676,11 @@ def main() -> None:
                         "<split>_<defense>_<feature>.parquet, so defended and undefended vectors "
                         "never overwrite each other")
     p.add_argument("--dist-dir", default=None,
-                   help="directory holding the built parquets (default: the project's data/dist)")
+                   help="directory holding the built parquets to read (default: the project's "
+                        "data/hf; point this at data/dist to featurize a local, unpublished build "
+                        "or defended split instead)")
     p.add_argument("--out-dir", default=None,
-                   help="where to write the feature parquet (default: --dist-dir)")
+                   help="where to write the feature parquet (default: the project's data/dist)")
     p.add_argument("--cache-dir", default=None,
                    help="on-disk cache for computed vectors, regenerable (default: data/.cache)")
     p.add_argument("--limit", type=int, default=None,
@@ -707,9 +709,9 @@ def main() -> None:
 
     # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
     # lives in the installed package, the data does not.
-    dist = Path(args.dist_dir) if args.dist_dir else dist_dir()
+    dist = Path(args.dist_dir) if args.dist_dir else hf_dir()
     cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
-    out_dir = Path(args.out_dir) if args.out_dir else dist
+    out_dir = Path(args.out_dir) if args.out_dir else dist_dir()
     # Output files are named for the feature *and* a non-default --task, since a task changes the
     # vectors: two tasks are two feature spaces and must not share a filename.
     label = feature_label(args.feature, args.task)

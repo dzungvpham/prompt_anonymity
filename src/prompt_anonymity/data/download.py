@@ -26,7 +26,7 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, snapshot_download
 
-from .config import data_dir
+from .config import hf_dir
 
 # Default dataset repo. The destination is the project's ``data/hf/`` -- resolved at call time
 # (:func:`prompt_anonymity.data.config.data_dir`) rather than from this file's location, since
@@ -95,7 +95,7 @@ def download(
 
     ``out_dir`` defaults to the project's ``data/hf/``.
     """
-    out_dir = Path(out_dir) if out_dir else data_dir() / "hf"
+    out_dir = Path(out_dir) if out_dir else hf_dir()
     if force and out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

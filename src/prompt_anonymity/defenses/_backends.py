@@ -22,7 +22,9 @@ from __future__ import annotations
 import importlib.util
 import os
 import shutil
+import tomllib
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -130,6 +132,61 @@ def shutdown_vllm(llm) -> None:
             torch.cuda.empty_cache()
     except Exception:  # noqa: BLE001 - torch may be absent or already torn down
         pass
+
+
+#: Name of a user-supplied models config, searched for from the working directory upwards --
+#: mirrors :mod:`prompt_anonymity.data.config`'s ``datasets.toml`` convention.
+MODELS_CONFIG_FILENAME = "models.toml"
+#: Machine-independent defaults shipped with the package: HuggingFace repo ids, no local paths.
+PACKAGED_MODELS_CONFIG = Path(__file__).with_name(MODELS_CONFIG_FILENAME)
+#: Environment variable pointing at a models config file directly (wins over the search).
+MODELS_CONFIG_ENV = "PROMPT_ANONYMITY_MODELS_CONFIG"
+
+
+def find_models_config() -> Path:
+    """Locate the models config: the env override, else a ``models.toml`` at or above the working
+    directory, else the packaged default (see :data:`MODELS_CONFIG_FILENAME`)."""
+    override = os.environ.get(MODELS_CONFIG_ENV)
+    if override:
+        path = Path(override).expanduser()
+        if not path.exists():
+            raise SystemExit(f"{MODELS_CONFIG_ENV}={override} does not exist.")
+        return path
+    here = Path.cwd().resolve()
+    for directory in (here, *here.parents):
+        candidate = directory / MODELS_CONFIG_FILENAME
+        if candidate.exists():
+            return candidate
+    return PACKAGED_MODELS_CONFIG
+
+
+@lru_cache(maxsize=1)
+def _load_models_config() -> dict:
+    with open(find_models_config(), "rb") as handle:
+        return tomllib.load(handle)
+
+
+def model_path(defense: str, env_var: str) -> str:
+    """A defense's configured model checkpoint: ``$env_var``, else ``models.toml``'s
+    ``[defense].model``.
+
+    Keeps the actual path out of the source (a checkpoint directory is a machine-specific
+    absolute path, not something to hardcode into committed code) while still letting a quick
+    override win, exactly as :func:`prompt_anonymity.data.config.raw_path` resolves a dataset's
+    raw location. Point ``$PROMPT_ANONYMITY_MODELS_CONFIG`` at a config of your own, or copy the
+    packaged ``models.toml`` (:data:`PACKAGED_MODELS_CONFIG`) to the repo root and edit the path
+    there, rather than editing the committed default.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        return override
+    section = _load_models_config().get(defense) or {}
+    if "model" not in section:
+        raise SystemExit(
+            f"no [{defense}] model in {find_models_config()}; set ${env_var} or add one "
+            f"(see {PACKAGED_MODELS_CONFIG} for the schema)."
+        )
+    return section["model"]
 
 
 def resolve_model_path(model: str) -> str:
