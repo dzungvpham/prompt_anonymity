@@ -105,7 +105,7 @@ def _candidate_pool(n_candidates, ranks) -> np.ndarray:
     """Broadcast a candidate-pool size to one entry per document, and validate it.
 
     Accepts either a single size shared by every document (the usual case) or a per-document
-    array, which is what a **candidate filter** produces: ``run_experiment_v2.py
+    array, which is what a **candidate filter** produces: ``run_experiment.py
     --language-aware`` restricts each document to the authors who write its language, so the
     pool -- and therefore every chance baseline computed from it -- differs from document to
     document. Passing a scalar reproduces the constant-pool formulas exactly.
@@ -175,7 +175,7 @@ def ranking_summary(ranks, n_candidates) -> dict:
     harmonic = np.array([np.sum(1.0 / np.arange(1, size + 1)) for size in sizes])[inverse]
     # A single-candidate pool makes the percentile rank degenerate (everything is first). The
     # clip only bites on a rank *past* the pool, which is how a caller says "the true author was
-    # never a candidate for this document" (see run_experiment_v2.py --language-aware): that is a
+    # never a candidate for this document" (see run_experiment.py --language-aware): that is a
     # percentile of 0, not a negative one. Ranks produced by true_author_ranks are always within
     # the pool, so this is a no-op unless a caller has substituted one.
     percentile = np.clip(

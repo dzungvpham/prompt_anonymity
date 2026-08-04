@@ -18,7 +18,7 @@ After `./install.sh` (below), these are the commands that matter. Everything rea
 python -m prompt_anonymity.data.download
 
 # 2. Run the attack (rolling chronological windows, open candidate set)
-python experiments/run_experiment_v2.py --source swe_chat --feature stylometrix --attacks nearest_neighbor
+python experiments/run_experiment.py --source swe_chat --feature stylometrix --attacks nearest_neighbor
 
 # 3. Draw the figures from every result on disk
 python experiments/plot_results.py
@@ -44,7 +44,7 @@ python -m prompt_anonymity.data.compute_features --source swe_chat --feature gem
 python -m prompt_anonymity.data.apply_defenses   --source swe_chat --defense openanonymity
 python -m prompt_anonymity.data.compute_features --source swe_chat --defense openanonymity \
     --feature stylometrix
-python experiments/run_experiment_v2.py --source swe_chat --defense openanonymity \
+python experiments/run_experiment.py --source swe_chat --defense openanonymity \
     --feature stylometrix
 
 # 5. Draw every figure from the CSVs the runs left behind (run it any time; --window to re-cut)
@@ -168,26 +168,26 @@ re-submitted unchanged.
 
 ## Running re-identification experiments
 
-**`experiments/run_experiment_v2.py` is the canonical runner.** It reads the built parquets and
+**`experiments/run_experiment.py` is the canonical runner.** It reads the built parquets and
 sweeps a grid of **rolling chronological windows**: documents are ordered by `ended_at` and cut at
 fractions of that timeline, so the attacker never sees the future.
 
 ```bash
 # defaults: 0.25/0.50/0.75 known fractions x 0.10/0.25/0.50 windows = 8 independent attacks
-python experiments/run_experiment_v2.py --source wildchat --feature stylometrix \
+python experiments/run_experiment.py --source wildchat --feature stylometrix \
     --attacks nearest_neighbor
 
 # the same attack against text a defense rewrote (the vectors must already exist)
-python experiments/run_experiment_v2.py --source wildchat --feature stylometrix \
+python experiments/run_experiment.py --source wildchat --feature stylometrix \
     --defense openanonymity --attacks nearest_neighbor
 
 # semantic embeddings instead of style, one window (hyper-parameters are tuned by default,
 # per window, on that window's own known side; --no-tune uses the defaults instead)
-python experiments/run_experiment_v2.py --source swe_chat --feature gemini_embedding_2 \
+python experiments/run_experiment.py --source swe_chat --feature gemini_embedding_2 \
     --known-fractions 0.5 --window 0.25 --attacks rlsc
 
 # open-set: score everything, with an explicit reject class
-python experiments/run_experiment_v2.py --source swe_chat --feature stylometrix --ood reject
+python experiments/run_experiment.py --source swe_chat --feature stylometrix --ood reject
 ```
 
 Two things to read carefully in the output:
@@ -258,30 +258,16 @@ sampling error, since the windows are nested slices of one corpus. Keeping the f
 runners is what lets them compare runs at all: a script that plots its own output can only ever
 plot one.
 
-<details>
-<summary>The older <code>run_experiment.py</code> (single fixed split, defense + fidelity pipeline)</summary>
-
-`experiments/run_experiment.py` predates the unified dataset: it reads the older per-dataset CSVs
-with `--dataset`, does one fixed known/unknown split instead of rolling windows, and is the only
-path that runs the **fidelity judges** (`--fidelity`, which ask a remote model whether a defended
-prompt still gets the same answer — the one part of the package that still calls a hosted API).
-
-```bash
-python experiments/run_experiment.py --dataset wildchat
-python experiments/run_experiment.py --dataset swe_chat --model-owner Anthropic
-python experiments/run_experiment.py --dataset wildchat --feature stylometrix function_words
-```
-
-It writes `headline_results.csv`, `sweep_results.csv` and `predictions.csv` to
-`experiments/results/<tag>/`, and like the canonical runner draws no figures of its own.
-`advantage` (`id_acc − random_id`) is the adversary's edge over random guessing; anything above zero
-means the prompts are not fully anonymous.
-
-</details>
+The single fixed-split runner that used to sit beside this one — `--dataset`, the older
+per-dataset CSVs, one known/unknown split, a defense applied to the text inside the run, and the
+`--fidelity` judges — was **removed on 2026-08-04**; what is now `run_experiment.py` is the file
+that was `run_experiment_v2.py`. Defending is a build step of its own now (`apply_defenses` +
+`compute_features --defense`, above). The fidelity measurement has no command-line entry point at
+present: `src/prompt_anonymity/fidelity/` is still in the package, but nothing calls it.
 
 ## How it works: the `prompt_anonymity` package
 
-The runners are thin drivers over the installable package in `src/`. One experiment is a fixed
+The runner is a thin driver over the installable package in `src/`. One experiment is a fixed
 pipeline, regardless of dataset, attack, or defense:
 
 ```

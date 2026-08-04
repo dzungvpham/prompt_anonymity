@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Drive ``run_experiment_v2.py`` over the whole experiment grid, once per cell.
+"""Drive ``run_experiment.py`` over the whole experiment grid, once per cell.
 
 The grid is ``{dataset} x {defense} x {feature} x {attack}`` -- :data:`SOURCES`,
 :data:`DEFENSES`, :data:`FEATURES`, :data:`ATTACKS`, minus the cells :data:`SOURCE_ATTACKS`
-rules out. Each cell becomes one ``run_experiment_v2.py`` invocation and one results directory,
+rules out. Each cell becomes one ``run_experiment.py`` invocation and one results directory,
 ``experiments/results/<dataset>_<defense>_<feature>_<attack>/``, which is the four-part name
 ``experiments/plot_results.py`` parses. Nothing here plots; run that afterwards.
 
@@ -27,7 +27,7 @@ Run it::
     python experiments/run_all_experiments.py --force     # re-run every cell that has data
     # one slice, e.g. to shard the expensive attack across jobs:
     python experiments/run_all_experiments.py --attacks xgboost --defenses openanonymity
-    # anything after `--` is appended to every run_experiment_v2.py command line:
+    # anything after `--` is appended to every run_experiment.py command line:
     python experiments/run_all_experiments.py -- --no-tune
 
 Cells run **cheapest attack first** (:data:`ATTACKS` is in increasing cost order), so a batch
@@ -46,11 +46,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RUNNER = REPO_ROOT / "experiments" / "run_experiment_v2.py"
+RUNNER = REPO_ROOT / "experiments" / "run_experiment.py"
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
 
 #: Where the feature parquets are read from. This is the *mirror of the published dataset* that
-#: ``prompt_anonymity.data.download`` writes -- the same default ``run_experiment_v2.py`` uses --
+#: ``prompt_anonymity.data.download`` writes -- the same default ``run_experiment.py`` uses --
 #: and deliberately not ``data/dist``, where ``build_dataset`` / ``compute_features`` /
 #: ``apply_defenses`` write. The two hold overlapping copies of the same filenames, so a parquet
 #: that was just built is invisible here until it is copied across or ``--data-dir data/dist`` is
@@ -91,7 +91,7 @@ ATTACKS = ("nearest_neighbor", "logistic", "xgboost")
 #: measurement showing the fit is affordable.
 SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor",)}
 
-#: The known configurations every cell is expected to produce, i.e. ``run_experiment_v2.py``'s
+#: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
 #: ``DEFAULT_KNOWN_WINDOWS``. Used only to decide whether a directory is complete; this script
 #: never passes ``--known-windows``, so a run that gets a different set of these (because the
 #: corpus is too small for one of them) would look permanently incomplete -- which has not
@@ -110,7 +110,7 @@ class Cell:
 
     @property
     def tag(self) -> str:
-        """The results directory name -- ``run_experiment_v2.output_tag`` for a default run.
+        """The results directory name -- ``run_experiment.output_tag`` for a default run.
 
         Four parts, positional, ``base`` for no defense. The dataset part is the source name
         verbatim, which is also its parquet's base name -- one spelling per corpus. Every flag
@@ -127,7 +127,7 @@ class Cell:
     def defended_parquet(self, data_dir: Path) -> Path | None:
         """The *defended text* the vectors would be computed from, or ``None`` if undefended.
 
-        Not an input to the run -- ``run_experiment_v2.py`` reads vectors only -- but its
+        Not an input to the run -- ``run_experiment.py`` reads vectors only -- but its
         presence is what separates "the defense has not been applied to this corpus" from "it
         has, and only the featurization is missing", which are different jobs to go and run.
         """
@@ -232,7 +232,7 @@ def plan_cell(cell: Cell, data_dir: Path, results_dir: Path, force: bool) -> Pla
 # --- running -----------------------------------------------------------------
 
 def runner_command(cell: Cell, args: argparse.Namespace) -> list[str]:
-    """The ``run_experiment_v2.py`` command line for one cell.
+    """The ``run_experiment.py`` command line for one cell.
 
     Only the four grid axes and the settings that decide *where* the work happens are passed;
     everything else is left at the runner's default, which is what keeps the output directory

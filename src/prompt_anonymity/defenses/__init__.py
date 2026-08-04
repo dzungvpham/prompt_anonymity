@@ -56,8 +56,8 @@ DEFENSES: dict[str, Defense] = {
 
 #: DP-MLM per-word privacy budgets exposed as a sweep. Each registers a ``dp_mlm_eps<eps>`` defense
 #: selectable via ``--defense``. Because run_experiment.py's output_tag embeds the defense name, every
-#: epsilon writes to its OWN results dir (headline_results.csv / sweep_results.csv / ...), and each
-#: caches separately since epsilon is in ``params()``. The paper's set is {10,25,50,100,250}; the
+#: epsilon writes to its OWN results directory, and each caches separately since epsilon is in
+#: ``params()``. The paper's set is {10,25,50,100,250}; the
 #: higher values are added because DP-MLM only becomes near-readable at large epsilon (weaker privacy
 #: -- the point of sweeping). Keep this in sync with experiments/run_dpmlm_sweep.sh.
 DPMLM_SWEEP_EPSILONS = (10, 25, 50, 100, 250, 500, 1000)

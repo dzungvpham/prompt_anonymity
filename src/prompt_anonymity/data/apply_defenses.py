@@ -9,7 +9,8 @@ schema*, so everything downstream can read it exactly like the original split.
 
 Defenses are **not reimplemented here**. The script drives the registered defenses of the
 installed package (``prompt_anonymity.defenses.DEFENSES``) -- the same registry
-``run_experiment.py --defense`` reads -- so ``--defense`` accepts whatever that registry exposes
+``run_experiment.py --defense`` names its already-defended parquet from -- so ``--defense`` accepts
+whatever that registry exposes
 and a newly registered defense becomes available with no change to this file.
 
 Where the output goes
@@ -49,9 +50,10 @@ in and verified against the source text), so handing it turns rather than whole 
 a turn repeated across documents is computed once, and an interrupted run resumes at turn
 granularity instead of re-doing a 422-turn session from the top. Turn ids are ``<doc_id>#<n>``.
 
-Note this differs from ``run_experiment.py --defense``, which splits a WildChat conversation *cell*
-on the legacy ``\n===\n`` marker to recover its turns. The unified dataset stores turns as a real
-list, so no delimiter is involved and no text can be mistaken for one.
+This is the only place a defense is applied to text. The removed fixed-split runner used to do it
+inside the run, splitting a WildChat conversation *cell* on the legacy ``\n===\n`` marker to recover
+its turns; the unified dataset stores turns as a real list, so no delimiter is involved here and no
+text can be mistaken for one.
 
 Cost, caching and re-runs
 -------------------------

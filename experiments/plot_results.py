@@ -5,7 +5,7 @@ Run it with no arguments::
 
     python experiments/plot_results.py
 
-Nothing here recomputes an attack: the runners (``run_experiment_v2.py`` and
+Nothing here recomputes an attack: the runners (``run_experiment.py`` and
 ``run_experiment.py``) write CSVs and stop, and this script turns the accumulated CSVs into
 figures. Re-running it is cheap and idempotent, so it is the right thing to run after any new
 experiment finishes.
@@ -83,7 +83,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
 PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
 
-#: Where the built dataset lives -- the same default ``run_experiment_v2.py`` attacks. Only the
+#: Where the built dataset lives -- the same default ``run_experiment.py`` attacks. Only the
 #: temporal figure reads it, and only for two columns: a document's ``ended_at`` is metadata that
 #: never depended on the attack, so it is joined back on ``doc_id`` rather than copied into every
 #: run's predictions. A dataset's parquet is ``<dataset>.parquet``, because the dataset part of a
@@ -375,7 +375,7 @@ def discover_runs(results_dir: Path) -> list[Run]:
 
 # --- the known configurations, and what a figure is allowed to average -------
 
-#: Share of the timeline ``run_experiment_v2.py`` holds out of every known side. Every
+#: Share of the timeline ``run_experiment.py`` holds out of every known side. Every
 #: configuration is scored on it, which is what makes them comparable, so it is also the slice
 #: every figure here restricts to. A run whose ``--test-fraction`` differed carries a suffix in
 #: its directory name and is skipped by :func:`parse_run_name` before it reaches this file.
@@ -1766,7 +1766,7 @@ def plot_scaling_across_datasets(runs: list[Run], scaling: dict[Run, dict[str, S
 
 # --- per-run figures ---------------------------------------------------------
 #
-# These are the figures `run_experiment_v2.py` and `run_experiment.py` used to draw at the end of
+# These are the figures `run_experiment.py` and `run_experiment.py` used to draw at the end of
 # a run. They now live here, rebuilt from the same CSVs, so that the runners only produce numbers
 # and every figure in the project comes from one place.
 
@@ -1903,9 +1903,9 @@ def rolling_headline(rolling: pd.DataFrame, row, top_ks=(1, 5, 10)) -> pd.DataFr
 def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Path]:
     """Every per-run figure the run's own CSVs support, into ``per_run/<run>/``.
 
-    Which figures appear depends on which runner produced the directory: a configuration run
-    (``run_experiment_v2.py``) has ``cmc_results.csv`` and ``rolling_results.csv``, while the
-    older fixed-split runner leaves ``headline_results.csv`` and ``sweep_results.csv``.
+    Which figures appear depends on what the directory holds: a run of ``run_experiment.py`` has
+    ``cmc_results.csv`` and ``rolling_results.csv``, while a directory archived from the removed
+    fixed-split runner has ``headline_results.csv`` and ``sweep_results.csv`` instead.
     """
     stem_dir = output_dir / "per_run" / run.directory.name
     written, scope = [], f"{run.defense_label}, {run.method_label}"
@@ -1940,7 +1940,8 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
                 f"{config.label if config else row['known_config']} → rest",
                 stem_dir / f"topk_accuracy_{row['known_config']}"))
 
-    # The older fixed-split runner's two tables.
+    # The two tables the removed fixed-split runner wrote (deleted 2026-08-04). Nothing produces
+    # these any more; the branch is kept so results archived from it stay plottable.
     headline_path = run.directory / "headline_results.csv"
     if headline_path.exists() and not rolling_path.exists():
         written.append(plot_topk_bars(pd.read_csv(headline_path),
@@ -1960,7 +1961,7 @@ def parse_args() -> argparse.Namespace:
     """The one knob this script has: how many bootstrap replicates the bands are drawn from.
 
     There is no window flag any more, and nothing here chooses what is measured. The experiment
-    fixes that: ``run_experiment_v2.py`` holds out the final :data:`TEST_FRACTION` of the corpus
+    fixes that: ``run_experiment.py`` holds out the final :data:`TEST_FRACTION` of the corpus
     from every known side, so which documents a comparison is made on is a property of the run
     rather than a decision taken at plot time. What is left to choose is only how finely the
     uncertainty is estimated.

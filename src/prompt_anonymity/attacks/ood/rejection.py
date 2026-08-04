@@ -23,7 +23,7 @@ def _cohort_statistics(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-document mean and standard deviation over the candidates the document was ranked against.
 
     **Ineligible candidates are read off the scores themselves.** A candidate filter -- e.g.
-    ``run_experiment_v2.py --language-aware``, which drops authors who never wrote in the
+    ``run_experiment.py --language-aware``, which drops authors who never wrote in the
     document's language -- marks the authors a document was never allowed to match by scoring
     them ``-inf``. Those entries are excluded from both statistics instead of dragging the mean
     to ``-inf``, so a document's cohort is the set of authors it actually competed over. With no

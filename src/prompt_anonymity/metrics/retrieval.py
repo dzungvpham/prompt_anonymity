@@ -79,7 +79,7 @@ def author_query_metrics(scores, candidate_authors, true_authors) -> pd.DataFram
         n_relevant = int(relevant.sum())
         column_scores = scores[:, column]
         if not np.isfinite(column_scores).all():
-            # A candidate filter (``run_experiment_v2.py --language-aware``) scores the documents
+            # A candidate filter (``run_experiment.py --language-aware``) scores the documents
             # this author was never a candidate for as -inf, meaning "would never be retrieved":
             # they belong at the bottom of the ranking. Both metrics below read only the *order*
             # of the scores, so substituting a value below every real one is exact -- and it is

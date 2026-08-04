@@ -1,5 +1,15 @@
 """Fidelity: did the defense keep what mattered?
 
+.. note::
+   **Nothing currently calls this subpackage.** Its only entry point was the ``--fidelity`` flag
+   of the fixed-split experiment runner, which was deleted on 2026-08-04; today's
+   ``experiments/run_experiment.py`` reads precomputed vectors and never sees prompt text, so it
+   has nowhere to put a text-level utility judge. The code below is unchanged and working -- the
+   docstrings' references to ``--fidelity``/``--fidelity-limit`` describe that removed CLI, and
+   are kept because they document the parameters :func:`run_fidelity` still takes. Reaching the
+   measurement again means writing a small driver over ``prompt_anonymity.data.apply_defenses``'s
+   original/defended parquet pair, which is where a defense's before-and-after text now lives.
+
 A linkage defense is only worth using if rewriting a prompt does not ruin what the user was trying
 to get. This subpackage measures that -- the utility axis complementing the privacy axis the attacks
 measure -- with two metrics that ask the question from opposite ends:
