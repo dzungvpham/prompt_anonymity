@@ -21,7 +21,7 @@ with :mod:`~prompt_anonymity.data.sources_wildchat` / :mod:`~prompt_anonymity.da
 adapting one upstream corpus each, and :mod:`~prompt_anonymity.data.text_cleaning`,
 :mod:`~prompt_anonymity.data.identity`, :mod:`~prompt_anonymity.data.dedup` and
 :mod:`~prompt_anonymity.data.language_detection` implementing the shared stages.
-:mod:`~prompt_anonymity.data.download_hf` mirrors the published dataset back down, and
+:mod:`~prompt_anonymity.data.download` mirrors the published dataset back down, and
 :mod:`~prompt_anonymity.data.find_fragments` is a one-off study of identity fragmentation.
 
 :mod:`~prompt_anonymity.data.apply_defenses` is an optional fourth step, run between the last two:

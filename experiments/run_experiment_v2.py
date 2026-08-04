@@ -271,7 +271,7 @@ from prompt_anonymity.metrics import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: Where ``--data-dir`` looks by default: the *mirror* of the published dataset (written by
-#: ``prompt_anonymity.data.download_hf``), not ``data/dist`` where the build modules write. The two
+#: ``prompt_anonymity.data.download``), not ``data/dist`` where the build modules write. The two
 #: hold overlapping copies of the same filenames, so a freshly built or freshly defended parquet in
 #: ``data/dist`` is invisible to a run until it is copied here or named with ``--data-dir``.
 DATA_DIR = REPO_ROOT / "data" / "hf"
@@ -1734,7 +1734,7 @@ def parse_args() -> argparse.Namespace:
                              "vectors to attack.")
     parser.add_argument("--data-dir", default=str(DATA_DIR),
                         help="Directory holding the parquets to attack (default: data/hf, the "
-                             "mirror of the published dataset that download_hf writes). Note this "
+                             "mirror of the published dataset that `download` writes). Note this "
                              "is NOT data/dist, where build_dataset / compute_features / "
                              "apply_defenses write -- point it there to attack something you just "
                              "built rather than the published copy.")
