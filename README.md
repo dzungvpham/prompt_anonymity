@@ -17,8 +17,11 @@ After `./install.sh` (below), these are the commands that matter. Everything rea
 # 1. Download prepared datasets to data/hf
 python -m prompt_anonymity.data.download
 
-# 2. Run the attack (rolling chronological windows, open candidate set)
+# 2. Run a specific experiment
 python experiments/run_experiment.py --source swe_chat --feature stylometrix --attacks nearest_neighbor
+
+# 2b. Run all eligible experiments
+python experiments/run_all_experiments.py
 
 # 3. Draw the figures from every result on disk
 python experiments/plot_results.py
