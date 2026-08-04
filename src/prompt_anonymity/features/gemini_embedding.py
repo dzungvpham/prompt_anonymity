@@ -13,7 +13,7 @@ Both are thin subclasses of :class:`OpenRouterEmbeddingFeaturizer`, which holds 
 is not model-specific: cutting a document to one model-sized input, packing inputs into requests,
 retrying, normalizing, and accounting for what the run spent. They reach OpenRouter's
 OpenAI-compatible ``/embeddings`` endpoint with nothing but the ``OPENROUTER_API_KEY`` this
-project already keeps in its ``.env`` (the same key the fidelity judges and the OpenAnonymity
+project already keeps in its ``.env`` (the same key the utility judges and the OpenAnonymity
 defense use). This supersedes the old ``wildchat/get_embeddings.py``, which called
 ``gemini-embedding-001`` through Vertex AI with a service account and a hand-rolled rate limiter.
 

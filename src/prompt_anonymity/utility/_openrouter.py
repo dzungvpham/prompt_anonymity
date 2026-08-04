@@ -1,6 +1,6 @@
-"""Lean OpenRouter chat client shared by the fidelity metrics.
+"""Lean OpenRouter chat client shared by the utility metrics.
 
-The fidelity metrics make remote chat calls against OpenRouter -- generating a response model's
+The utility metrics make remote chat calls against OpenRouter -- generating a response model's
 answer to a prompt, asking a judge to rule PASS/FAIL on two answers, or asking one to score two
 whole conversations 1-5. This module holds the one client they all use: :class:`OpenRouterChat`, a
 thin wrapper over the chat-completions endpoint: a lazily read ``OPENROUTER_API_KEY`` (from a
@@ -36,7 +36,7 @@ OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 class OpenRouterChat:
     """Minimal OpenRouter chat client: one fixed system prompt, one user message per call.
 
-    Built lazily by the fidelity scorer on first real need, so a fully-cached scoring run
+    Built lazily by the utility scorer on first real need, so a fully-cached scoring run
     constructs no client and needs no API key. ``temperature=0`` by default -> greedy and
     reproducible, so cache hits are stable.
 
@@ -78,9 +78,9 @@ class OpenRouterChat:
         if not self.api_key:
             raise RuntimeError(
                 f"{api_key_env} not set. Add it to a .env file (e.g. '{api_key_env}=sk-or-...') "
-                "so the fidelity metric can call OpenRouter."
+                "so the utility metric can call OpenRouter."
             )
-        print(f"Fidelity: OpenRouter client using model '{model}'.")
+        print(f"Utility: OpenRouter client using model '{model}'.")
 
     def _backoff(self, attempt: int) -> None:
         delay = min(self.backoff_cap, 2 ** attempt)

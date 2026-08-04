@@ -240,7 +240,6 @@ with ``base`` for no defense).
 from __future__ import annotations
 
 import argparse
-import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path

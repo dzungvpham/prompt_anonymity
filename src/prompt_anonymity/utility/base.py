@@ -1,18 +1,18 @@
-"""Base classes shared by the fidelity metrics.
+"""Base classes shared by the utility metrics.
 
-A fidelity metric answers one question: *did the defense keep what mattered?* Each one scores a
+A utility metric answers one question: *did the defense keep what mattered?* Each one scores a
 post-defense :class:`~prompt_anonymity.core.AttackData` against its pre-defense ``reference``, and
 they differ only in what they compare and what they report -- :mod:`.answer_judge` compares the
 **answers** two prompts elicit (per turn, PASS/FAIL), :mod:`.prompt_judge` compares the **prompts**
 themselves (per conversation, 1-5).
 
-A developer writing a new metric subclasses :class:`FidelityMetric` and implements
-:meth:`~FidelityMetric.score`; the base supplies the three things every metric needs and would
-otherwise copy: side loading + validation (:meth:`~FidelityMetric._load_sides`), seeded sampling
+A developer writing a new metric subclasses :class:`UtilityMetric` and implements
+:meth:`~UtilityMetric.score`; the base supplies the three things every metric needs and would
+otherwise copy: side loading + validation (:meth:`~UtilityMetric._load_sides`), seeded sampling
 for cheap calibration runs (the ``limit`` argument), and a ready
 :class:`~prompt_anonymity.caching.TransformCache` whose key is derived from the subclass's
-``version`` and :meth:`~FidelityMetric.params` (:meth:`~FidelityMetric._cache`). Results subclass
-:class:`FidelityResult`, which supplies the shared ``__str__`` / ``to_csv`` behaviour.
+``version`` and :meth:`~UtilityMetric.params` (:meth:`~UtilityMetric._cache`). Results subclass
+:class:`UtilityResult`, which supplies the shared ``__str__`` / ``to_csv`` behaviour.
 
 Cache invalidation deliberately differs from :class:`prompt_anonymity.defenses.base.CachedDefense`.
 A defense hashes its whole class hierarchy, so editing a base class invalidates every defense --
@@ -20,8 +20,8 @@ affordable there, because recomputing is local GPU time. Here recomputing means 
 calls**, and :func:`~prompt_anonymity.caching.source_digest` hashes comments and docstrings too, so
 hierarchy hashing would throw away a cache of paid judge replies every time someone reworded a
 comment in this file. Metrics therefore hash only the classes named by
-:meth:`~FidelityMetric.logic_classes` (by default just the API client), and real logic changes are
-declared by bumping :attr:`~FidelityMetric.version`. The trade is explicit: a logic edit *without*
+:meth:`~UtilityMetric.logic_classes` (by default just the API client), and real logic changes are
+declared by bumping :attr:`~UtilityMetric.version`. The trade is explicit: a logic edit *without*
 a version bump serves stale results, which is the cheaper mistake of the two.
 """
 
@@ -67,7 +67,7 @@ class Sides(NamedTuple):
         return self.total if len(self.indices) < self.total else None
 
 
-class FidelityResult:
+class UtilityResult:
     """Shared behaviour for metric results: string form and a worst-first CSV dump.
 
     Not a dataclass -- subclasses declare their own fields with ``@dataclass`` and inherit these
@@ -91,7 +91,7 @@ class FidelityResult:
     def sample_note(self) -> str:
         """``"[SAMPLE 50/2500] "`` when this run scored a subset, else ``""``.
 
-        Prefixed to :meth:`summary` so a cheap ``--fidelity-limit`` calibration number cannot be
+        Prefixed to :meth:`summary` so a cheap ``limit`` calibration number cannot be
         misread as a full-split result.
         """
         if self.sampled_from is None:
@@ -115,8 +115,8 @@ class FidelityResult:
         ).to_csv(path, index=False)
 
 
-class FidelityMetric:
-    """Base class for fidelity metrics.
+class UtilityMetric:
+    """Base class for utility metrics.
 
     Subclasses set :attr:`name` (required -- it is the cache namespace) and :attr:`version`, may
     override :meth:`params` to declare configuration that changes model input, and implement
@@ -125,7 +125,7 @@ class FidelityMetric:
     :class:`prompt_anonymity.defenses.base.CachedDefense`.
     """
 
-    #: Cache namespace under ``<cache_dir>/fidelity/``. Required, and must be unique across
+    #: Cache namespace under ``<cache_dir>/utility/``. Required, and must be unique across
     #: metrics: :class:`~prompt_anonymity.caching.TransformCache` prunes sibling logic-version
     #: directories under its own name, so a shared name would let one metric delete another's cache.
     name: str = ""
@@ -160,7 +160,7 @@ class FidelityMetric:
         data, reference : AttackData
             The defended split and the loader's original; rows align by position.
         cache_dir : str or pathlib.Path
-            Cache root; entries live under ``<cache_dir>/fidelity/<name>/``.
+            Cache root; entries live under ``<cache_dir>/utility/<name>/``.
         side : {"unknown", "known"}
             Which side to score. Defaults to the side a defense rewrites.
         limit : int, optional
@@ -171,7 +171,7 @@ class FidelityMetric:
 
         Returns
         -------
-        FidelityResult
+        UtilityResult
         """
         raise NotImplementedError
 
@@ -180,7 +180,7 @@ class FidelityMetric:
         """Validate and extract the aligned ``(original, defended)`` text pair, optionally sampled.
 
         Sampling lives here rather than in the caller so every metric -- including ones not yet
-        written -- inherits ``--fidelity-limit`` for free, and so the sampled row *indices* travel
+        written -- inherits ``limit`` for free, and so the sampled row *indices* travel
         with the text instead of being lost.
         """
         if side not in ("unknown", "known"):
@@ -189,7 +189,7 @@ class FidelityMetric:
         defended = getattr(data, f"{side}_texts", None)
         if original is None or defended is None:
             raise ValueError(
-                f"fidelity scoring needs {side}_texts on both reference and data; "
+                f"utility scoring needs {side}_texts on both reference and data; "
                 "load the dataset with text and run the defense first."
             )
         original = [str(t) for t in np.asarray(original)]
@@ -217,14 +217,14 @@ class FidelityMetric:
 
     def _cache(self, cache_dir, *, name: str | None = None,
                params: dict | None = None) -> TransformCache:
-        """A cache for this metric under ``<cache_dir>/fidelity/``.
+        """A cache for this metric under ``<cache_dir>/utility/``.
 
         ``name`` and ``params`` default to :attr:`name` and :meth:`params`; pass them explicitly
         for a metric that needs a second, separately-keyed cache (e.g. :mod:`.answer_judge`, whose
         response stage is keyed by prompt text independently of the judge stage).
         """
         return TransformCache(
-            Path(cache_dir) / "fidelity",
+            Path(cache_dir) / "utility",
             name or self.name,
             self._logic_hash(),
             params_hash(self.params() if params is None else params),

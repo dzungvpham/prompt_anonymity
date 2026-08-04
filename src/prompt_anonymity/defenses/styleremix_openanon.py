@@ -8,7 +8,7 @@ TURN. Order rationale: style-convergence first, identifier redaction LAST, so OA
 
 Granularity: both stages are per turn, so every user turn is defended on its own and the turn
 structure (and count) is preserved end to end. That keeps the defended conversation aligned
-turn-for-turn with the original -- which is what per-turn utility/fidelity scoring needs -- and lets
+turn-for-turn with the original -- which is what per-turn utility scoring needs -- and lets
 StyleRemix reuse the standalone StyleRemix defense's per-turn cache. This defense's own cache holds
 the stage-2 result keyed per conversation (by the *styled* text, so a stage-1 change re-caches
 stage 2), and OA fragments any oversized turn so no length cap is needed.

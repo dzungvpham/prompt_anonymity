@@ -65,7 +65,6 @@ draw shared by every configuration and run of a dataset. Every figure is written
 from __future__ import annotations
 
 import argparse
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -1590,7 +1589,8 @@ def subpool_weights(n_candidates: int, pool_sizes: np.ndarray) -> np.ndarray:
     ``C(N-r, n-1) / C(N-1, n-1)``, so this matrix holds that weight for every (rank, pool size)
     pair and the accuracy against a smaller gallery is the rank distribution times it -- the
     standard gallery-size extrapolation, and the same reasoning
-    :func:`prompt_anonymity.evaluation.pool_size_sweep` implements by sampling.
+    the package's ``evaluation.pool_size_sweep`` used to implement by sampling (removed
+    2026-08-04 -- this closed form replaced it).
 
     Being a *matrix product* is what makes bootstrapping it affordable: a replicate re-weights
     the rank histogram and multiplies, rather than re-running the binomial sweep. Ranks worse
@@ -1863,31 +1863,6 @@ def plot_topk_bars(headline: pd.DataFrame, title: str, stem: Path) -> Path:
     return save_figure(figure, stem)
 
 
-def plot_pool_size_sweep(sweep: pd.DataFrame, top_k: int, title: str, stem: Path) -> Path:
-    """Identity accuracy vs. candidate-pool size, over random sub-pools (``run_experiment.py``).
-
-    ``sweep`` is the table from :func:`prompt_anonymity.evaluation.pool_size_sweep`: many random
-    sub-pools per size, so each size gets a spread rather than a point. The attack's spread and
-    the random baseline's are drawn as a median line with an inter-quartile band.
-    """
-    figure, axes = plt.subplots(figsize=(7.0, 4.4))
-    figure.patch.set_facecolor(SURFACE)
-    grouped = sweep.groupby("n")
-    for column, color, label in (("id_acc", CATEGORICAL[0], "Attack"),
-                                 ("random_id", TEXT_MUTED, "Random guessing")):
-        quartiles = grouped[column].quantile([0.25, 0.5, 0.75]).unstack()
-        axes.fill_between(quartiles.index, quartiles[0.25], quartiles[0.75], color=color,
-                          alpha=BAND_ALPHA, linewidth=0, zorder=2)
-        axes.plot(quartiles.index, quartiles[0.5], color=color, linewidth=LINE_WIDTH,
-                  linestyle="-" if column == "id_acc" else BASELINE_DASH, zorder=3, label=label)
-    style_axes(axes, "Candidate users in the pool", f"Top-{top_k} identification accuracy", title,
-               "Median over the random sub-pools, with the inter-quartile band")
-    axes.set_ylim(bottom=0)
-    add_legend(axes, loc="upper right")
-    figure.tight_layout()
-    return save_figure(figure, stem)
-
-
 def rolling_headline(rolling: pd.DataFrame, row, top_ks=(1, 5, 10)) -> pd.DataFrame:
     """The per-k headline table for one window, rebuilt from ``rolling_results.csv``.
 
@@ -1903,9 +1878,8 @@ def rolling_headline(rolling: pd.DataFrame, row, top_ks=(1, 5, 10)) -> pd.DataFr
 def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Path]:
     """Every per-run figure the run's own CSVs support, into ``per_run/<run>/``.
 
-    Which figures appear depends on what the directory holds: a run of ``run_experiment.py`` has
-    ``cmc_results.csv`` and ``rolling_results.csv``, while a directory archived from the removed
-    fixed-split runner has ``headline_results.csv`` and ``sweep_results.csv`` instead.
+    Every figure here comes from ``cmc_results.csv`` and ``rolling_results.csv``, so a directory
+    missing one simply produces fewer figures rather than failing.
     """
     stem_dir = output_dir / "per_run" / run.directory.name
     written, scope = [], f"{run.defense_label}, {run.method_label}"
@@ -1940,18 +1914,6 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
                 f"{config.label if config else row['known_config']} → rest",
                 stem_dir / f"topk_accuracy_{row['known_config']}"))
 
-    # The two tables the removed fixed-split runner wrote (deleted 2026-08-04). Nothing produces
-    # these any more; the branch is kept so results archived from it stay plottable.
-    headline_path = run.directory / "headline_results.csv"
-    if headline_path.exists() and not rolling_path.exists():
-        written.append(plot_topk_bars(pd.read_csv(headline_path),
-                                      f"{DATASET_LABELS[run.dataset]}: {scope}",
-                                      stem_dir / "topk_accuracy"))
-    sweep_path = run.directory / "sweep_results.csv"
-    if sweep_path.exists():
-        written.append(plot_pool_size_sweep(pd.read_csv(sweep_path), sweep_top_k,
-                                            f"{DATASET_LABELS[run.dataset]}: {scope}",
-                                            stem_dir / f"poolsize_sweep_top{sweep_top_k}"))
     return written
 
 

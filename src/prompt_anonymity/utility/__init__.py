@@ -1,24 +1,23 @@
-"""Fidelity: did the defense keep what mattered?
+"""Utility: did the defense keep what mattered?
 
 .. note::
    **Nothing currently calls this subpackage.** Its only entry point was the ``--fidelity`` flag
-   of the fixed-split experiment runner, which was deleted on 2026-08-04; today's
-   ``experiments/run_experiment.py`` reads precomputed vectors and never sees prompt text, so it
-   has nowhere to put a text-level utility judge. The code below is unchanged and working -- the
-   docstrings' references to ``--fidelity``/``--fidelity-limit`` describe that removed CLI, and
-   are kept because they document the parameters :func:`run_fidelity` still takes. Reaching the
-   measurement again means writing a small driver over ``prompt_anonymity.data.apply_defenses``'s
-   original/defended parquet pair, which is where a defense's before-and-after text now lives.
+   of the fixed-split experiment runner, deleted on 2026-08-04 (this package was called
+   ``fidelity`` then, and was renamed with it); today's ``experiments/run_experiment.py`` reads
+   precomputed vectors and never sees prompt text, so it has nowhere to put a text-level judge.
+   The code below is unchanged and working. Reaching the measurement again means a small driver
+   over the original/defended parquet pair ``prompt_anonymity.data.apply_defenses`` writes, which
+   is where a defense's before-and-after text now lives.
 
 A linkage defense is only worth using if rewriting a prompt does not ruin what the user was trying
 to get. This subpackage measures that -- the utility axis complementing the privacy axis the attacks
 measure -- with two metrics that ask the question from opposite ends:
 
-``utility`` (:mod:`.answer_judge`)
+``answer`` (:mod:`.answer_judge`)
     The predicate from "Operationalizing Data Minimization for Privacy-Preserving LLM Prompting"
     (ICLR 2026, App. E). A response model ``F`` answers the original prompt (reference ``A``) and the
     defended prompt (candidate ``B``), and a judge rules **PASS** (``B`` still addresses every key
-    point) or **FAIL**. Scored **per user turn**; fidelity is the fraction that PASS. Grounded in
+    point) or **FAIL**. Scored **per user turn**; utility is the fraction that PASS. Grounded in
     real answers, but blind to anything that only shows up across turns, and PASS/FAIL puts every
     defense that mostly works in one bucket.
 
@@ -34,25 +33,23 @@ consistent *rankings*. A defense with a high pass rate and a mean score of 2 mea
 rubrics is miscalibrated.
 
 Both run on OpenRouter and cache every call with the package's content-addressed
-:class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/fidelity``, so re-runs and
+:class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/utility``, so re-runs and
 text shared across defenses cost nothing, and conversations a defense left unchanged short-circuit
-with no API call at all. Scoring takes the loaded split and its defended copy -- mirroring
-:func:`prompt_anonymity.features.apply_featurizer`, which also pairs post-defense ``data`` with the
-pre-defense ``reference`` -- so it slots into the driver flow
-``load -> apply_defense -> run_fidelity(defended, reference=loaded) -> featurize -> attack``.
+with no API call at all. Scoring pairs a defended split with its pre-defense ``reference``, so the
+flow a driver would implement is ``defend -> run_utility(defended, reference=original)``.
 
-Writing a new metric: subclass :class:`~prompt_anonymity.fidelity.base.FidelityMetric`, add a
-lowercase wrapper, and register it in :data:`FIDELITY_METRICS` -- the experiment driver reads its
-``--fidelity`` choices from there, so nothing else needs to change. See :mod:`.base` for the
-contract (and for why cache invalidation is opt-in here rather than source-driven).
+Writing a new metric: subclass :class:`~prompt_anonymity.utility.base.UtilityMetric`, add a
+lowercase wrapper, and register it in :data:`UTILITY_METRICS`; :func:`run_utility` then reaches it
+by name. See :mod:`.base` for the contract (and for why cache invalidation is opt-in here rather
+than source-driven).
 
 Example
 -------
 >>> from prompt_anonymity.defenses import apply_defense
->>> from prompt_anonymity.fidelity import run_fidelity
+>>> from prompt_anonymity.utility import run_utility
 >>> defended = apply_defense("qwen_rewrite", data, cache_dir=".cache")
 >>> # limit= scores a seeded sample -- calibrate a rubric for cents before a full run
->>> result = run_fidelity("conversation", defended, cache_dir=".cache", reference=data, limit=50)
+>>> result = run_utility("conversation", defended, cache_dir=".cache", reference=data, limit=50)
 >>> print(result.summary())
 """
 
@@ -60,60 +57,60 @@ from ._openrouter import OpenRouterChat
 from .answer_judge import (
     DEFAULT_JUDGE_MODEL,
     DEFAULT_RESPONSE_MODEL,
-    FIDELITY_VERSION,
+    ANSWER_UTILITY_VERSION,
     RESPONSE_SYSTEM_PROMPT,
-    UTILITY_JUDGE_SYSTEM_PROMPT,
-    UtilityFidelity,
-    UtilityFidelityResult,
-    utility_fidelity,
+    ANSWER_JUDGE_SYSTEM_PROMPT,
+    AnswerUtility,
+    AnswerUtilityResult,
+    answer_utility,
 )
-from .base import DEFAULT_SEED, FidelityMetric, FidelityResult
+from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 from .prompt_judge import (
-    CONVERSATION_FIDELITY_VERSION,
+    CONVERSATION_UTILITY_VERSION,
     CONVERSATION_JUDGE_SYSTEM_PROMPT,
     DEFAULT_CONVERSATION_JUDGE_MODEL,
     USABLE_SCORE_THRESHOLD,
-    ConversationFidelity,
-    ConversationFidelityResult,
-    conversation_fidelity,
+    ConversationUtility,
+    ConversationUtilityResult,
+    conversation_utility,
 )
 
-# Registry so callers can select a fidelity metric by name (e.g. from a CLI argument), mirroring
+# Registry so callers can select a utility metric by name (e.g. from a CLI argument), mirroring
 # prompt_anonymity.attacks.ATTRIBUTION_ATTACKS. Registering a metric here is all it takes to make it selectable
 # from the experiment driver.
-FIDELITY_METRICS = {
-    "utility": utility_fidelity,            # answer-level PASS/FAIL, per turn (the paper's predicate)
-    "conversation": conversation_fidelity,  # prompt-level 1-5, whole conversation
+UTILITY_METRICS = {
+    "answer": answer_utility,              # answer-level PASS/FAIL, per turn (the paper's predicate)
+    "conversation": conversation_utility,  # prompt-level 1-5, whole conversation
 }
 
 
-def get_fidelity(name: str):
-    """Look up a registered fidelity metric by name."""
+def get_utility(name: str):
+    """Look up a registered utility metric by name."""
     try:
-        return FIDELITY_METRICS[name]
+        return UTILITY_METRICS[name]
     except KeyError:
         raise ValueError(
-            f"unknown fidelity metric {name!r}; available: {sorted(FIDELITY_METRICS)}"
+            f"unknown utility metric {name!r}; available: {sorted(UTILITY_METRICS)}"
         ) from None
 
 
-def run_fidelity(name: str, data, *, cache_dir, reference, side: str = "unknown",
+def run_utility(name: str, data, *, cache_dir, reference, side: str = "unknown",
                  limit: int | None = None, seed: int = DEFAULT_SEED, **kwargs):
     """Score ``data`` against ``reference`` with the named metric.
 
     Parameters
     ----------
     name : str
-        A key of :data:`FIDELITY_METRICS`.
+        A key of :data:`UTILITY_METRICS`.
     data, reference : AttackData
         The defended split and the loader's original (rows align by position).
     cache_dir : str or pathlib.Path
-        Cache root; entries live under ``<cache_dir>/fidelity``.
+        Cache root; entries live under ``<cache_dir>/utility``.
     side : {"unknown", "known"}
         Which side to score.
     limit : int, optional
         Score only a seeded random sample of this many **conversations** -- not API calls. The two
-        metrics differ sharply in calls per conversation (``conversation`` makes one; ``utility``
+        metrics differ sharply in calls per conversation (``conversation`` makes one; ``answer``
         makes roughly three per changed turn), so size it per metric.
     seed : int
         Seed for that sample.
@@ -122,36 +119,36 @@ def run_fidelity(name: str, data, *, cache_dir, reference, side: str = "unknown"
 
     Returns
     -------
-    FidelityResult
+    UtilityResult
         A metric-specific subclass; all of them expose ``summary()`` and ``to_csv()``, so callers
         need not know which metric ran.
     """
-    return get_fidelity(name)(
+    return get_utility(name)(
         data, cache_dir=cache_dir, reference=reference, side=side, limit=limit, seed=seed, **kwargs
     )
 
 
 __all__ = [
-    "utility_fidelity",
-    "UtilityFidelity",
-    "UtilityFidelityResult",
-    "conversation_fidelity",
-    "ConversationFidelity",
-    "ConversationFidelityResult",
-    "FidelityMetric",
-    "FidelityResult",
-    "FIDELITY_METRICS",
-    "get_fidelity",
-    "run_fidelity",
+    "answer_utility",
+    "AnswerUtility",
+    "AnswerUtilityResult",
+    "conversation_utility",
+    "ConversationUtility",
+    "ConversationUtilityResult",
+    "UtilityMetric",
+    "UtilityResult",
+    "UTILITY_METRICS",
+    "get_utility",
+    "run_utility",
     "OpenRouterChat",
     "RESPONSE_SYSTEM_PROMPT",
-    "UTILITY_JUDGE_SYSTEM_PROMPT",
+    "ANSWER_JUDGE_SYSTEM_PROMPT",
     "CONVERSATION_JUDGE_SYSTEM_PROMPT",
     "DEFAULT_RESPONSE_MODEL",
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_CONVERSATION_JUDGE_MODEL",
     "USABLE_SCORE_THRESHOLD",
     "DEFAULT_SEED",
-    "FIDELITY_VERSION",
-    "CONVERSATION_FIDELITY_VERSION",
+    "ANSWER_UTILITY_VERSION",
+    "CONVERSATION_UTILITY_VERSION",
 ]

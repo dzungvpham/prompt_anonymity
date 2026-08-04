@@ -1,6 +1,6 @@
-"""Utility fidelity: the paper's LLM-as-a-judge PASS/FAIL predicate for a defense.
+"""Utility utility: the paper's LLM-as-a-judge PASS/FAIL predicate for a defense.
 
-This is the *answer-side* fidelity metric: it judges the **answers** two prompts elicit. For the
+This is the *answer-side* utility metric: it judges the **answers** two prompts elicit. For the
 prompt-side complement -- one 1-5 score comparing the two whole conversations directly, which sees
 cross-turn breakage this cannot -- see :mod:`.prompt_judge`.
 
@@ -9,7 +9,7 @@ This module scores that the way "Operationalizing Data Minimization for Privacy-
 Prompting" (ICLR 2026, App. E) defines **utility**: a response model ``F`` answers the original
 prompt (reference response ``A = F(x)``) and the defended prompt (candidate response
 ``B = F(defended)``), then a judge model decides whether ``B`` still addresses every key point of
-the user's message -- returning **PASS** or **FAIL**. The fidelity of a defense is the fraction of
+the user's message -- returning **PASS** or **FAIL**. The utility of a defense is the fraction of
 prompts that PASS.
 
 Scoring is **per user turn**: a conversation cell is a user's turns joined by the ``\\n===\\n``
@@ -19,9 +19,9 @@ structure (e.g. one that rewrites the whole joined conversation) is scored as a 
 unit instead.
 
 The response model and the judge both run on OpenRouter (default ``openai/gpt-4o``, the paper's
-judge) via :class:`~prompt_anonymity.fidelity._openrouter.OpenRouterChat`. Both calls are cached
+judge) via :class:`~prompt_anonymity.utility._openrouter.OpenRouterChat`. Both calls are cached
 with the package's content-addressed :class:`~prompt_anonymity.caching.TransformCache` under
-``<cache_dir>/fidelity``: responses are keyed by prompt text (so an identical prompt -- e.g. the
+``<cache_dir>/utility``: responses are keyed by prompt text (so an identical prompt -- e.g. the
 same original across defenses, or a defense that left a row unchanged -- is answered once) and
 verdicts by the composed judge input, so re-runs and shared turns cost no API calls. A model or
 prompt swap re-caches automatically (it is part of the cache key), and unchanged turns short-circuit
@@ -50,13 +50,13 @@ import pandas as pd
 from ..defenses._backends import split_turns
 from ._openrouter import OpenRouterChat
 from ._parsing import json_object, render_turns, strip_code_fence
-from .base import DEFAULT_SEED, FidelityMetric, FidelityResult
+from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 
 #: Neutral persona for the response model F -- it just answers the user's prompt.
 RESPONSE_SYSTEM_PROMPT = "You are a helpful assistant."
 
 #: Utility judge rubric, verbatim from the paper (App. E). Returns a JSON PASS/FAIL verdict.
-UTILITY_JUDGE_SYSTEM_PROMPT = (
+ANSWER_JUDGE_SYSTEM_PROMPT = (
     "You are a utility evaluator. Your task is to assess whether a second response adequately "
     "addresses a user's original message. You will be provided with: (i) the user message (what the "
     "user is asking or talking about), (ii) a reference response A (a standard answer that is known "
@@ -74,15 +74,15 @@ UTILITY_JUDGE_SYSTEM_PROMPT = (
 DEFAULT_RESPONSE_MODEL = "openai/gpt-4o"
 DEFAULT_JUDGE_MODEL = "openai/gpt-4o"
 
-#: Manual logic version for the fidelity caches; bump to force a full recompute (see caching.py).
-FIDELITY_VERSION = "1"
+#: Manual logic version for the utility caches; bump to force a full recompute (see caching.py).
+ANSWER_UTILITY_VERSION = "1"
 
 
 def _response_prompt(text) -> str:
     """The prompt handed to F: a conversation cell's user turns joined by real newlines instead of
     the on-disk ``\\n===\\n`` delimiter, so the response model sees clean text.
 
-    Delegates to :func:`prompt_anonymity.fidelity._parsing.render_turns` with both of its flags off,
+    Delegates to :func:`prompt_anonymity.utility._parsing.render_turns` with both of its flags off,
     which is byte-for-byte what this function has always produced. That matters more than it looks:
     this rendered text is the *cache key* for a store of paid completions, so any change here --
     including dropping whitespace-only turns -- would silently orphan existing entries.
@@ -134,8 +134,8 @@ def _parse_verdict(raw: str) -> tuple[bool | None, str]:
 
 
 @dataclass
-class UtilityFidelityResult(FidelityResult):
-    """Utility-fidelity score for one (original, defended) comparison.
+class AnswerUtilityResult(UtilityResult):
+    """Utility-utility score for one (original, defended) comparison.
 
     Attributes
     ----------
@@ -144,7 +144,7 @@ class UtilityFidelityResult(FidelityResult):
     n, n_pass, n_fail, n_unparsed : int
         Number of scored turns, and how many passed / failed / had an unparseable verdict (the last
         are counted as FAIL in ``pass_rate``, matching the paper's strict predicate -- note this
-        differs from :class:`~prompt_anonymity.fidelity.prompt_judge.ConversationFidelityResult`,
+        differs from :class:`~prompt_anonymity.utility.prompt_judge.ConversationUtilityResult`,
         which excludes unparsed rows because imputing a floor on a 1-5 scale distorts a mean far
         more than it distorts a rate).
     sampled_from : int or None
@@ -166,7 +166,7 @@ class UtilityFidelityResult(FidelityResult):
 
     def summary(self) -> str:
         return (
-            f"{self.sample_note()}Utility fidelity  n={self.n}  pass_rate={self.pass_rate:.4f}  "
+            f"{self.sample_note()}Utility utility  n={self.n}  pass_rate={self.pass_rate:.4f}  "
             f"(PASS={self.n_pass}, FAIL={self.n_fail}, unparsed={self.n_unparsed})"
         )
 
@@ -176,7 +176,7 @@ class UtilityFidelityResult(FidelityResult):
         return self.table["result"].map({"FAIL": 0, "PASS": 1}).fillna(0)
 
 
-class UtilityFidelity(FidelityMetric):
+class AnswerUtility(UtilityMetric):
     """Score defense utility the paper's way: F answers original vs. defended, a judge rules PASS/FAIL.
 
     The response and judge clients are built lazily on first real need, so a fully-cached run makes
@@ -194,12 +194,12 @@ class UtilityFidelity(FidelityMetric):
     """
 
     name = "utility_judge"
-    version = FIDELITY_VERSION
+    version = ANSWER_UTILITY_VERSION
 
     def __init__(self, *, response_model: str = DEFAULT_RESPONSE_MODEL,
                  judge_model: str = DEFAULT_JUDGE_MODEL,
                  response_system_prompt: str = RESPONSE_SYSTEM_PROMPT,
-                 judge_system_prompt: str = UTILITY_JUDGE_SYSTEM_PROMPT,
+                 judge_system_prompt: str = ANSWER_JUDGE_SYSTEM_PROMPT,
                  response_max_tokens: int = 1024, judge_max_tokens: int = 512):
         self.response_model = response_model
         self.judge_model = judge_model
@@ -245,15 +245,15 @@ class UtilityFidelity(FidelityMetric):
         return self._cache(cache_dir)
 
     def score(self, data, *, cache_dir, reference, side: str = "unknown",
-              limit: int | None = None, seed: int = DEFAULT_SEED) -> UtilityFidelityResult:
-        """Score the utility fidelity of ``data`` (post-defense) against ``reference`` (pre-defense).
+              limit: int | None = None, seed: int = DEFAULT_SEED) -> AnswerUtilityResult:
+        """Score the utility utility of ``data`` (post-defense) against ``reference`` (pre-defense).
 
         Parameters
         ----------
         data : AttackData
             The defended split; ``data.{side}_texts`` are the rewritten prompts.
         cache_dir : str or pathlib.Path
-            Cache root; responses and verdicts live under ``<cache_dir>/fidelity``.
+            Cache root; responses and verdicts live under ``<cache_dir>/utility``.
         reference : AttackData
             The loaded (pre-defense) split -- typically the loader's output; ``reference.{side}_texts``
             are the original prompts. Rows must align with ``data`` by position.
@@ -268,7 +268,7 @@ class UtilityFidelity(FidelityMetric):
 
         Returns
         -------
-        UtilityFidelityResult
+        AnswerUtilityResult
             The per-turn pass rate and a per-turn table (see the module docstring for the per-turn
             scoring convention and the whole-cell fallback for structure-changing defenses).
         """
@@ -347,22 +347,22 @@ class UtilityFidelity(FidelityMetric):
             "result": ["PASS" if r else "FAIL" for r in results],
             "reason": reasons,
         })
-        return UtilityFidelityResult(
+        return AnswerUtilityResult(
             pass_rate=pass_rate, n=n, n_pass=n_pass, n_fail=n_fail, n_unparsed=n_unparsed,
             table=table, sampled_from=sides.sampled_from,
         )
 
 
-def utility_fidelity(data, *, cache_dir, reference, side: str = "unknown",
+def answer_utility(data, *, cache_dir, reference, side: str = "unknown",
                      limit: int | None = None, seed: int = DEFAULT_SEED,
-                     **kwargs) -> UtilityFidelityResult:
-    """Convenience wrapper: score ``data`` vs. ``reference`` with a default :class:`UtilityFidelity`.
+                     **kwargs) -> AnswerUtilityResult:
+    """Convenience wrapper: score ``data`` vs. ``reference`` with a default :class:`AnswerUtility`.
 
     Mirrors :func:`prompt_anonymity.defenses.apply_defense` /
-    :func:`prompt_anonymity.features.apply_featurizer`. Any :class:`UtilityFidelity` constructor
+    :func:`prompt_anonymity.features.apply_featurizer`. Any :class:`AnswerUtility` constructor
     argument (``response_model``, ``judge_model``, ``*_system_prompt``, ``*_max_tokens``) may be
     passed through ``kwargs``.
     """
-    return UtilityFidelity(**kwargs).score(
+    return AnswerUtility(**kwargs).score(
         data, cache_dir=cache_dir, reference=reference, side=side, limit=limit, seed=seed
     )

@@ -262,8 +262,11 @@ The single fixed-split runner that used to sit beside this one — `--dataset`, 
 per-dataset CSVs, one known/unknown split, a defense applied to the text inside the run, and the
 `--fidelity` judges — was **removed on 2026-08-04**; what is now `run_experiment.py` is the file
 that was `run_experiment_v2.py`. Defending is a build step of its own now (`apply_defenses` +
-`compute_features --defense`, above). The fidelity measurement has no command-line entry point at
-present: `src/prompt_anonymity/fidelity/` is still in the package, but nothing calls it.
+`compute_features --defense`, above). The utility measurement has no command-line entry point at
+present: `src/prompt_anonymity/utility/` (called `fidelity/` until the same day) is still in the
+package, but nothing calls it. Removed with the runner, as its only callers: the per-dataset CSV
+loaders (`data/splits.py`, `data/wildchat.py`, `data/swe_chat.py`, `load_dataset`,
+`DATASET_LOADERS`), `features.apply_featurizer`, and `evaluation.pool_size_sweep`.
 
 ## How it works: the `prompt_anonymity` package
 
@@ -274,20 +277,20 @@ pipeline, regardless of dataset, attack, or defense:
 load documents → (defend) → featurize → attack → rank → metrics → CSVs
 ```
 
-The object handed between stages in the older pipeline is `AttackData` (`core.py`): the known
-(labeled) and unknown (anonymous) conversations, one feature vector and one true-author label per
-conversation on each side, plus the distance metric (`--metric`, default `cosine` — an attack-level
-choice, not tied to the featurizer).
+`AttackData` (`core.py`) is what a defense is handed: conversations on a known and an unknown
+side, one feature vector and one true-author label each, plus the distance metric (`--metric`,
+default `cosine` — an attack-level choice, not tied to the featurizer). `data/apply_defenses.py`
+builds one per defense run; nothing else constructs it now that the loaders are gone.
 
-- **`data/`** — two families that share a package: the **loaders** (`splits.py`, `wildchat.py`, `swe_chat.py`) that feed the attack pipeline, and the **build modules** (`build_dataset.py`, `compute_features.py`, `apply_defenses.py`, `text_cleaning.py`, `identity.py`, `dedup.py`, …) that produce the dataset. WildChat splits *by model*; SWE-chat splits *by time* (each user's last session is the unknown). Registry: `DATASET_LOADERS`.
+- **`data/`** — the build pipeline: `build_dataset.py`, `compute_features.py`, `apply_defenses.py`, `validate_dataset.py`, `download.py`, and the shared stages (`text_cleaning.py`, `identity.py`, `dedup.py`, `language_detection.py`, `sources_*.py`). Each is a `python -m` entry point or a stage of one; the package exports nothing, so importing it is free. The per-dataset loaders that used to live here went with the fixed-split runner — the known/unknown split is a property of the experiment now, not of a loader.
 - **`defenses/`** — text rewrites applied before the attack. Expensive ones subclass `CachedDefense` and get automatic, auto-invalidating disk caching: edit a defense's code and its cache namespace changes. Registry: `DEFENSES`.
 - **`features/`** — text → vectors, cached per document by content hash. Registry: `FEATURIZERS`.
 - **`attacks/`** — every attack returns an `[n_documents × n_authors]` score matrix, higher = more likely. Four families: `similarity/` (summarise each author, score the match), `multiclass/` (a decision function per author), `llm/` (shortlist cheaply, let a judge reorder), `verification/` (learned same-author scoring over pairs), plus `ood/` for accept-or-reject. Registry: `ATTRIBUTION_ATTACKS`.
 - **`metrics/`** — top-k and macro/micro accuracy, CMC curves, selective classification, and open-set scoring (`detection_auroc`, `equal_error_rate`, `c_at_1`, calibration).
-- **`evaluation/`** — ranking helpers: rank once, reuse it for the headline table and the sweep.
+- **`evaluation/`** — ranking helpers: rank once, reuse it for the headline table.
   There is deliberately no plotting module in the package; figures live in
   `experiments/plot_results.py`.
-- **`fidelity/`** — does a defended prompt still get the same answer? Remote judges, the only part that needs `OPENROUTER_API_KEY`.
+- **`utility/`** — does a defended prompt still get the same answer? Two remote judges (`answer`, per turn; `conversation`, whole), the only part that needs `OPENROUTER_API_KEY`. **Currently has no caller** — see the note at the top of the package.
 
 Scale is the constraint that shapes the attack code: WildChat is 172,509 documents / 25,357 authors,
 and jobs here run under a 16 GB memory cap. Attacks whose training cost is flat in the number of

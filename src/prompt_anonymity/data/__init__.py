@@ -1,17 +1,15 @@
-"""Dataset loaders, split rules, and the dataset build pipeline.
+"""The dataset build pipeline: raw upstream corpora in, the unified public dataset out.
 
-This package holds two related but separate families of modules.
+This package used to hold a second family of modules beside the build pipeline -- per-dataset
+*loaders* (``splits.py``, ``wildchat.py``, ``swe_chat.py``) that read the pre-unification CSVs,
+applied a dataset-specific known/unknown split and returned an
+:class:`~prompt_anonymity.core.AttackData` for a defense and an attack. Their only caller was the
+fixed-split experiment runner, and both went on 2026-08-04: the split is now a property of the
+*experiment* (``experiments/run_experiment.py`` cuts the timeline into known intervals itself,
+straight from the built parquets), not of a loader. Recover them from git history if the
+per-dataset CSV path is ever needed again.
 
-**Loaders** (this module, :mod:`~prompt_anonymity.data.splits`,
-:mod:`~prompt_anonymity.data.wildchat`, :mod:`~prompt_anonymity.data.swe_chat`) feed the attack
-pipeline: each reads a dataset from disk, builds identities, applies a dataset-specific
-known/unknown split, and returns an :class:`~prompt_anonymity.core.AttackData` ready for a defense
-and an attack. Add a dataset by writing a loader (reusing the split helpers in
-:mod:`prompt_anonymity.data.splits`) and registering it in ``DATASET_LOADERS``.
-
-**The build pipeline** produces the unified public dataset those loaders (and the experiment
-runners) consume, from the raw upstream corpora. Its entry points are meant to be run as scripts,
-in this order:
+The pipeline's entry points are meant to be run as scripts, in this order:
 
     python -m prompt_anonymity.data.build_dataset       # raw sources  -> data/dist/*.parquet
     python -m prompt_anonymity.data.validate_dataset    # integrity checks on what was built
@@ -39,55 +37,8 @@ machine.
 
 from __future__ import annotations
 
-from ..core import AttackData
-from .splits import (
-    KNOWN,
-    UNKNOWN,
-    attackable_mask,
-    build_attack_data,
-    split_by_last_conversation,
-    split_by_model,
-)
-from .swe_chat import load_swe_chat
-from .wildchat import load_wildchat
-
-# Registry so callers can select a dataset by name (e.g. from a CLI argument).
-DATASET_LOADERS = {
-    "wildchat": load_wildchat,
-    "swe_chat": load_swe_chat,
-}
-
-
-def load_dataset(name: str, data_dir, **options) -> AttackData:
-    """Load a dataset by name, forwarding dataset-specific keyword options to its loader.
-
-    Parameters
-    ----------
-    name : str
-        Dataset key in ``DATASET_LOADERS`` (e.g. ``"wildchat"`` or ``"swe_chat"``).
-    data_dir : str or pathlib.Path
-        Directory holding that dataset's files.
-    **options
-        Loader-specific options, e.g. ``language=`` for WildChat or ``model_owner=`` for
-        SWE-chat (both take ``feature=``).
-    """
-    try:
-        loader = DATASET_LOADERS[name]
-    except KeyError:
-        raise ValueError(f"unknown dataset {name!r}; available: {sorted(DATASET_LOADERS)}") from None
-    return loader(data_dir, **options)
-
-
-__all__ = [
-    "AttackData",
-    "DATASET_LOADERS",
-    "load_dataset",
-    "load_wildchat",
-    "load_swe_chat",
-    "split_by_model",
-    "split_by_last_conversation",
-    "attackable_mask",
-    "build_attack_data",
-    "KNOWN",
-    "UNKNOWN",
-]
+# Deliberately empty of re-exports. Every module here is either a script (`python -m
+# prompt_anonymity.data.<name>`) or a stage imported by one, so importing this package should cost
+# nothing: `build_dataset` alone pulls in pyarrow, the raw-source adapters and language detection,
+# which is not a price `import prompt_anonymity.data` should pay to reach `config.data_dir`.
+__all__: list[str] = []

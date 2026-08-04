@@ -20,7 +20,7 @@ dependencies = [
     "python-dotenv",
     "tqdm",
     "xgboost>=3.3.0",
-    # Remote-API HTTP + token counting for the OpenAnonymity defense and the fidelity judge
+    # Remote-API HTTP + token counting for the OpenAnonymity defense and the utility judges
     # (both lazy-import these, so a missing wheel only crashes when that path is actually used).
     "requests",
     "tiktoken",

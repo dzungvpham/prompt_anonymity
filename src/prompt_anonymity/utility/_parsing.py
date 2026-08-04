@@ -1,4 +1,4 @@
-"""Shared string wrangling for the fidelity metrics: reply cleanup and conversation rendering.
+"""Shared string wrangling for the utility metrics: reply cleanup and conversation rendering.
 
 Every metric here has to do the same two unglamorous jobs -- turn a chat model's reply into
 structured data despite markdown fences and reasoning preambles, and turn a stored conversation

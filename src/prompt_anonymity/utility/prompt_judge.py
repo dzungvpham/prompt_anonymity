@@ -1,6 +1,6 @@
-"""Conversation-level fidelity: how much of the original survives the defense, scored 1-5.
+"""Conversation-level utility: how much of the original survives the defense, scored 1-5.
 
-This is the *prompt-side* fidelity metric. Where :mod:`.answer_judge` asks a response model to
+This is the *prompt-side* utility metric. Where :mod:`.answer_judge` asks a response model to
 answer each turn and judges whether the two **answers** match, this shows a judge the two
 **conversations** -- original and defended, whole, in one call -- and asks for a 1-5 score.
 
@@ -20,16 +20,16 @@ inputs.
 **The rubric scores task utility, not textual similarity.** The judge is told explicitly that
 stripping identifiers and rewriting style is what the defense is *for* and must not cost points.
 Without that carve-out the metric would quietly re-measure the privacy axis -- a defense that
-anonymizes well would score badly precisely *because* it worked -- and fidelity would stop being an
+anonymizes well would score badly precisely *because* it worked -- and utility would stop being an
 independent reading. Whether that instruction is actually landing is checkable, and worth checking:
-read the ``reason`` column of the worst-scoring rows (see :meth:`ConversationFidelityResult.to_csv`).
+read the ``reason`` column of the worst-scoring rows (see :meth:`ConversationUtilityResult.to_csv`).
 If the reasons complain that names were removed or the voice changed, the carve-out is not holding
 and the numbers should not be trusted yet.
 
 Judging runs on OpenRouter (default ``anthropic/claude-sonnet-5``) through
-:class:`~prompt_anonymity.fidelity._openrouter.OpenRouterChat`, and every verdict is cached by the
+:class:`~prompt_anonymity.utility._openrouter.OpenRouterChat`, and every verdict is cached by the
 package's content-addressed :class:`~prompt_anonymity.caching.TransformCache` under
-``<cache_dir>/fidelity/conversation_judge``. Conversations the defense left untouched short-circuit
+``<cache_dir>/utility/conversation_judge``. Conversations the defense left untouched short-circuit
 to 5 with no API call, so scoring ``--defense none`` is free.
 
 Caveats:
@@ -53,18 +53,18 @@ import pandas as pd
 
 from ._openrouter import OpenRouterChat
 from ._parsing import json_object, render_turns, strip_code_fence
-from .base import DEFAULT_SEED, FidelityMetric, FidelityResult
+from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 
-#: Conversation-level fidelity rubric. Scores 1-5 how much of the original's substance survives,
+#: Conversation-level utility rubric. Scores 1-5 how much of the original's substance survives,
 #: judging the conversation as a whole. The "style and identity changes are expected" carve-out is
 #: stated twice -- once in the framing, once inside the scale -- because it is the instruction most
 #: likely to be dropped, and dropping it silently turns this into a privacy metric.
 CONVERSATION_JUDGE_SYSTEM_PROMPT = (
-    "You are a fidelity evaluator. You will be shown two versions of the SAME conversation's user "
+    "You are a utility evaluator. You will be shown two versions of the SAME conversation's user "
     "messages: the ORIGINAL, and a DEFENDED rewrite produced by a privacy defense whose goal is to "
     "hide the author's identity and writing style.\n\n"
     "Judge content, not style. The defense is SUPPOSED to change wording, tone, register, "
-    "verbosity, and identifying details; none of that is a fidelity loss. A fidelity loss is a "
+    "verbosity, and identifying details; none of that is a utility loss. A utility loss is a "
     "change in what the user is asking for, what they told you, or what they need -- in what an "
     "assistant reading only the defended version would do differently. Removing a specific detail "
     "IS a loss when that detail was needed to answer, and is NOT a loss when it was incidental or "
@@ -72,7 +72,7 @@ CONVERSATION_JUDGE_SYSTEM_PROMPT = (
     "Weigh the conversation AS A WHOLE: whether the turns still follow from one another, whether "
     "references back to earlier turns still resolve, and whether the overall arc of what the user "
     "was trying to accomplish survives. Cross-turn coherence that was present in the original and "
-    "is broken in the rewrite is a fidelity loss even when every turn reads fine on its own.\n\n"
+    "is broken in the rewrite is a utility loss even when every turn reads fine on its own.\n\n"
     "Score on this scale:\n"
     "5 -- Fully faithful. Every request, constraint, fact, and nuance survives, and the turns "
     "still hang together. An assistant answering the defended version would give an answer just as "
@@ -112,9 +112,9 @@ DEFAULT_MAX_CHARS = None
 USABLE_SCORE_THRESHOLD = 4
 
 #: Manual logic version for the conversation-judge cache; bump to force a full recompute. Separate
-#: from :data:`prompt_anonymity.fidelity.answer_judge.FIDELITY_VERSION` so bumping one metric never
+#: from :data:`prompt_anonymity.utility.answer_judge.ANSWER_UTILITY_VERSION` so bumping one metric never
 #: throws away the other's paid results.
-CONVERSATION_FIDELITY_VERSION = "1"
+CONVERSATION_UTILITY_VERSION = "1"
 
 #: Valid scores, and the labeled-field fallback for a reply whose JSON did not parse.
 _VALID_SCORES = (1, 2, 3, 4, 5)
@@ -142,7 +142,7 @@ def _judge_input(original: str, defended: str) -> str:
 def _parse_score(raw: str) -> tuple[int | None, str]:
     """Parse a judge reply into ``(score, reason)``; ``score`` is ``None`` when unparseable.
 
-    Layered like :func:`prompt_anonymity.fidelity.answer_judge._parse_verdict`: strip a code fence,
+    Layered like :func:`prompt_anonymity.utility.answer_judge._parse_verdict`: strip a code fence,
     try JSON, then a labeled ``"Score": N`` field, then a bare digit.
 
     Two decisions worth stating:
@@ -183,8 +183,8 @@ def _parse_score(raw: str) -> tuple[int | None, str]:
 
 
 @dataclass
-class ConversationFidelityResult(FidelityResult):
-    """Conversation-level fidelity for one (original, defended) comparison.
+class ConversationUtilityResult(UtilityResult):
+    """Conversation-level utility for one (original, defended) comparison.
 
     Attributes
     ----------
@@ -227,19 +227,19 @@ class ConversationFidelityResult(FidelityResult):
     def summary(self) -> str:
         if not self.n_scored:
             return (
-                f"{self.sample_note()}Conversation fidelity  n={self.n}  "
+                f"{self.sample_note()}Conversation utility  n={self.n}  "
                 f"NO PARSED SCORES (unparsed={self.n_unparsed})"
             )
         dist = {s: self.score_counts.get(s, 0) for s in reversed(_VALID_SCORES)}
         return (
-            f"{self.sample_note()}Conversation fidelity  n={self.n}  "
+            f"{self.sample_note()}Conversation utility  n={self.n}  "
             f"mean={self.mean_score:.2f}  usable(>={USABLE_SCORE_THRESHOLD})={self.usable_rate:.4f}  "
             f"dist={dist}  (unchanged={self.n_unchanged}, unparsed={self.n_unparsed})"
         )
 
 
-class ConversationFidelity(FidelityMetric):
-    """Score defense fidelity by showing a judge both whole conversations and asking for 1-5.
+class ConversationUtility(UtilityMetric):
+    """Score defense utility by showing a judge both whole conversations and asking for 1-5.
 
     The judge client is built lazily on first real need, so a fully cached run makes no API calls
     and needs no ``OPENROUTER_API_KEY``. The model, rubric, and truncation cap are part of the cache
@@ -258,7 +258,7 @@ class ConversationFidelity(FidelityMetric):
     """
 
     name = "conversation_judge"
-    version = CONVERSATION_FIDELITY_VERSION
+    version = CONVERSATION_UTILITY_VERSION
 
     def __init__(self, *, judge_model: str = DEFAULT_CONVERSATION_JUDGE_MODEL,
                  judge_system_prompt: str = CONVERSATION_JUDGE_SYSTEM_PROMPT,
@@ -285,10 +285,10 @@ class ConversationFidelity(FidelityMetric):
         return self._judge_client.complete_batch(inputs)
 
     def score(self, data, *, cache_dir, reference, side: str = "unknown",
-              limit: int | None = None, seed: int = DEFAULT_SEED) -> ConversationFidelityResult:
-        """Score the conversation fidelity of ``data`` (post-defense) against ``reference``.
+              limit: int | None = None, seed: int = DEFAULT_SEED) -> ConversationUtilityResult:
+        """Score the conversation utility of ``data`` (post-defense) against ``reference``.
 
-        See :meth:`prompt_anonymity.fidelity.base.FidelityMetric.score` for the parameters. Scoring
+        See :meth:`prompt_anonymity.utility.base.UtilityMetric.score` for the parameters. Scoring
         is per conversation: one judge call compares the whole original against the whole defended
         rewrite.
         """
@@ -339,23 +339,23 @@ class ConversationFidelity(FidelityMetric):
             "score": scores,          # None for unparsed -> sorts first in to_csv
             "reason": reasons,
         })
-        return ConversationFidelityResult(
+        return ConversationUtilityResult(
             mean_score=mean_score, usable_rate=usable_rate, n=n, n_scored=len(parsed),
             n_unchanged=n - len(changed), n_unparsed=n_unparsed, score_counts=score_counts,
             table=table, sampled_from=sides.sampled_from,
         )
 
 
-def conversation_fidelity(data, *, cache_dir, reference, side: str = "unknown",
+def conversation_utility(data, *, cache_dir, reference, side: str = "unknown",
                           limit: int | None = None, seed: int = DEFAULT_SEED,
-                          **kwargs) -> ConversationFidelityResult:
+                          **kwargs) -> ConversationUtilityResult:
     """Convenience wrapper: score ``data`` vs. ``reference`` with a default
-    :class:`ConversationFidelity`.
+    :class:`ConversationUtility`.
 
-    Mirrors :func:`prompt_anonymity.fidelity.utility_fidelity`. Any
-    :class:`ConversationFidelity` constructor argument (``judge_model``, ``judge_system_prompt``,
+    Mirrors :func:`prompt_anonymity.utility.answer_utility`. Any
+    :class:`ConversationUtility` constructor argument (``judge_model``, ``judge_system_prompt``,
     ``judge_max_tokens``, ``max_chars``) may be passed through ``kwargs``.
     """
-    return ConversationFidelity(**kwargs).score(
+    return ConversationUtility(**kwargs).score(
         data, cache_dir=cache_dir, reference=reference, side=side, limit=limit, seed=seed
     )
