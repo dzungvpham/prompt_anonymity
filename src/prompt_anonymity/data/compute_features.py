@@ -110,8 +110,12 @@ from prompt_anonymity.resources import describe_budget
 
 from .config import cache_dir, dist_dir, hf_dir
 
-# source -> split / parquet base name (must match build_dataset.SPLIT_NAMES).
-SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
+# The sources, which are also their split and parquet base names -- one spelling per corpus, so
+# there is no mapping here any more, only a vocabulary. Kept as a literal rather than imported
+# from ``build_dataset`` (which it must match): featurizing does not otherwise need the build
+# pipeline, and importing it would pull the whole raw-source and language-detection stack in
+# behind ``--help``.
+SOURCES = ("wildchat", "swe_chat")
 
 # A document's text is its turns joined by a blank line. The earlier per-source scripts joined
 # with "\n===\n"; that marker is not natural writing and leaves its own fingerprint in the
@@ -146,7 +150,7 @@ DEFAULT_LANGUAGE_CODE = "en"
 # encode the window, a truncated run would otherwise quietly overwrite the uncapped feature file
 # with a differently-computed one under the same name. To genuinely change a source's window,
 # change it here.
-MAX_LEN_BY_SOURCE = {"swe-chat": 0}
+MAX_LEN_BY_SOURCE = {"swe_chat": 0}
 
 # Where a sharded run parks its partial outputs, under the output directory. They are the array
 # job's intermediate state, not a deliverable -- once merged, the shard files can be deleted.
@@ -172,7 +176,7 @@ def split_stem(source: str, defense: str | None = None) -> str:
     featurizing defended text is a matter of reading that file instead (point ``--dist-dir`` at
     ``dist/`` too) -- same schema, same row order, one name apart.
     """
-    return f"{SPLIT_NAMES[source]}_{defense}" if defense else SPLIT_NAMES[source]
+    return f"{source}_{defense}" if defense else source
 
 
 def split_path(source: str, dist_dir: str | Path, defense: str | None = None) -> Path:
@@ -182,7 +186,7 @@ def split_path(source: str, dist_dir: str | Path, defense: str | None = None) ->
 
 def load_split(source: str, dist_dir: str | Path, columns: list[str] | None = None,
                defense: str | None = None) -> pd.DataFrame:
-    """Read the built parquet for ``source`` (``swe-chat`` -> ``swe_chat.parquet``).
+    """Read the built parquet for ``source`` (``swe_chat`` -> ``swe_chat.parquet``).
 
     ``columns`` reads a subset of them, which is what makes ``--merge`` cheap: merging only needs
     each document's id and language, never the ``turns`` that dominate the file's size. ``defense``
@@ -637,8 +641,8 @@ def report_written(frame: pd.DataFrame, path: Path, kind: str = "features") -> N
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", default="swe-chat", choices=sorted(SPLIT_NAMES),
-                   help="which built split to featurize (default: swe-chat)")
+    p.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
+                   help="which built split to featurize (default: swe_chat)")
     p.add_argument("--feature", default="stylometrix", choices=sorted(FEATURIZERS),
                    help="registered featurizer to run (default: stylometrix)")
     p.add_argument("--language", default=None,
@@ -650,7 +654,7 @@ def main() -> None:
                         f"derived from --language, else {DEFAULT_LANGUAGE_CODE!r})")
     p.add_argument("--max-len", type=int, default=None,
                    help="characters of each document to read, for featurizers that read a prefix; "
-                        "0 reads whole documents (default: the source's window -- swe-chat is "
+                        "0 reads whole documents (default: the source's window -- swe_chat is "
                         "uncapped by design and refuses to be truncated here; other sources keep "
                         "the featurizer's own default, 2048 for StyloMetrix)")
     p.add_argument("--task", default=None,

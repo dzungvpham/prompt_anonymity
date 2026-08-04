@@ -31,8 +31,8 @@ To featurize defended text, point ``compute_features`` at the defended file with
 flag -- and, since that file lives in ``dist/`` rather than ``compute_features``'s own default
 read location (``data/hf``), also point ``--dist-dir`` there::
 
-    python -m prompt_anonymity.data.apply_defenses   --source swe-chat --defense openanonymity
-    python -m prompt_anonymity.data.compute_features --source swe-chat --defense openanonymity \
+    python -m prompt_anonymity.data.apply_defenses   --source swe_chat --defense openanonymity
+    python -m prompt_anonymity.data.compute_features --source swe_chat --defense openanonymity \
         --feature stylometrix --dist-dir data/dist   # reads swe_chat_openanonymity.parquet
                                                       # writes swe_chat_openanonymity_stylometrix.parquet
 
@@ -82,7 +82,7 @@ defense, and it bounds the size of each task's cache table as well as its runtim
 Run (from the repo root):
 
     python -m prompt_anonymity.data.apply_defenses --defense openanonymity --limit 3   # smoke test
-    python -m prompt_anonymity.data.apply_defenses --source swe-chat --defense openanonymity
+    python -m prompt_anonymity.data.apply_defenses --source swe_chat --defense openanonymity
     python -m prompt_anonymity.data.apply_defenses --source wildchat --defense dp_mlm_eps100 \
         --num-shards 32 --shard-index 0
     python -m prompt_anonymity.data.apply_defenses --source wildchat --defense dp_mlm_eps100 --merge
@@ -102,7 +102,7 @@ from prompt_anonymity.defenses import DEFENSES, apply_defense
 
 from .compute_features import (
     READ_BATCH_ROWS,
-    SPLIT_NAMES,
+    SOURCES,
     load_split,
     merge_shards,
     resolve_sharding,
@@ -142,7 +142,7 @@ def read_turns(source: str, dist_dir: str | Path, positions) -> list[list[str]]:
     it), while a shard needs 1/N of it. Reading a batch at a time and keeping only the wanted rows
     makes a task's memory scale with its shard rather than with the corpus.
     """
-    path = Path(dist_dir) / f"{SPLIT_NAMES[source]}.parquet"
+    path = Path(dist_dir) / f"{source}.parquet"
     wanted = {int(position) for position in positions}
     turns: dict[int, list[str]] = {}
     first_row = 0
@@ -212,7 +212,7 @@ def defense_cache_dir(cache_root: str | Path, source: str,
     different ``--num-shards`` starts from an empty cache. That is the deliberate trade: a
     recomputation is expensive, but silently losing another task's rows is worse.
     """
-    path = Path(cache_root) / CACHE_SUBDIR / SPLIT_NAMES[source]
+    path = Path(cache_root) / CACHE_SUBDIR / source
     if num_shards > 1:
         path = path / f"{shard_index:04d}-of-{num_shards:04d}"
     return path
@@ -288,7 +288,7 @@ def defended_stem(source: str, defense: str) -> str:
 
     Also the stem its shard files are named after, so a sharded run and an unsharded one agree.
     """
-    return f"{SPLIT_NAMES[source]}_{defense}"
+    return f"{source}_{defense}"
 
 
 def output_path(out_dir: str | Path, source: str, defense: str) -> Path:
@@ -306,8 +306,8 @@ def report_written(frame: pd.DataFrame, path: Path, kind: str = "defended docume
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", default="swe-chat", choices=sorted(SPLIT_NAMES),
-                   help="which built split to defend (default: swe-chat)")
+    p.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
+                   help="which built split to defend (default: swe_chat)")
     p.add_argument("--defense", default="openanonymity", choices=sorted(DEFENSES),
                    help="registered defense to apply (default: openanonymity). 'none' copies the "
                         "split through unchanged, as a control")

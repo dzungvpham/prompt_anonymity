@@ -18,7 +18,7 @@ After `./install.sh` (below), these are the commands that matter. Everything rea
 python -m prompt_anonymity.data.download
 
 # 2. Run the attack (rolling chronological windows, open candidate set)
-python experiments/run_experiment_v2.py --source swe-chat --feature stylometrix --attacks nearest_neighbor
+python experiments/run_experiment_v2.py --source swe_chat --feature stylometrix --attacks nearest_neighbor
 
 # 3. Draw the figures from every result on disk
 python experiments/plot_results.py
@@ -37,14 +37,14 @@ python -m prompt_anonymity.data.build_dataset            # -> data/dist/<split>.
 python -m prompt_anonymity.data.validate_dataset         # integrity checks on what was built
 
 # 3. Turn documents into attack-ready vectors
-python -m prompt_anonymity.data.compute_features --source swe-chat --feature stylometrix
-python -m prompt_anonymity.data.compute_features --source swe-chat --feature gemini_embedding_2
+python -m prompt_anonymity.data.compute_features --source swe_chat --feature stylometrix
+python -m prompt_anonymity.data.compute_features --source swe_chat --feature gemini_embedding_2
 
 # 4. Defend the prompts, then attack the defended version
-python -m prompt_anonymity.data.apply_defenses   --source swe-chat --defense openanonymity
-python -m prompt_anonymity.data.compute_features --source swe-chat --defense openanonymity \
+python -m prompt_anonymity.data.apply_defenses   --source swe_chat --defense openanonymity
+python -m prompt_anonymity.data.compute_features --source swe_chat --defense openanonymity \
     --feature stylometrix
-python experiments/run_experiment_v2.py --source swe-chat --defense openanonymity \
+python experiments/run_experiment_v2.py --source swe_chat --defense openanonymity \
     --feature stylometrix
 
 # 5. Draw every figure from the CSVs the runs left behind (run it any time; --window to re-cut)
@@ -183,11 +183,11 @@ python experiments/run_experiment_v2.py --source wildchat --feature stylometrix 
 
 # semantic embeddings instead of style, one window (hyper-parameters are tuned by default,
 # per window, on that window's own known side; --no-tune uses the defaults instead)
-python experiments/run_experiment_v2.py --source swe-chat --feature gemini_embedding_2 \
+python experiments/run_experiment_v2.py --source swe_chat --feature gemini_embedding_2 \
     --known-fractions 0.5 --window 0.25 --attacks rlsc
 
 # open-set: score everything, with an explicit reject class
-python experiments/run_experiment_v2.py --source swe-chat --feature stylometrix --ood reject
+python experiments/run_experiment_v2.py --source swe_chat --feature stylometrix --ood reject
 ```
 
 Two things to read carefully in the output:
@@ -268,7 +268,7 @@ prompt still gets the same answer — the one part of the package that still cal
 
 ```bash
 python experiments/run_experiment.py --dataset wildchat
-python experiments/run_experiment.py --dataset swe-chat --model-owner Anthropic
+python experiments/run_experiment.py --dataset swe_chat --model-owner Anthropic
 python experiments/run_experiment.py --dataset wildchat --feature stylometrix function_words
 ```
 

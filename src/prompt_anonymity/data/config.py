@@ -171,7 +171,7 @@ def cache_dir() -> Path:
 
 
 def source_config(source: str) -> dict:
-    """The config table for one source (``wildchat``, ``swe-chat``)."""
+    """The config table for one source (``wildchat``, ``swe_chat``)."""
     config, config_path = load_config()
     sources = config.get("sources") or {}
     if source not in sources:
@@ -223,7 +223,7 @@ def _download_from_hub(source: str, settings: dict) -> Path:
 
 
 def _env_source(source: str) -> str:
-    """Source name as it appears in an environment variable (``swe-chat`` -> ``SWE_CHAT``)."""
+    """Source name as it appears in an environment variable (``swe_chat`` -> ``SWE_CHAT``)."""
     return source.upper().replace("-", "_")
 
 
@@ -233,7 +233,7 @@ def raw_path(source: str, explicit: str | Path | None = None) -> Path:
     Parameters
     ----------
     source : str
-        ``"wildchat"`` or ``"swe-chat"`` (any key in the config's ``[sources]`` table).
+        ``"wildchat"`` or ``"swe_chat"`` (any key in the config's ``[sources]`` table).
     explicit : str or pathlib.Path, optional
         A caller-supplied path (a CLI flag), which wins over everything else.
 

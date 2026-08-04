@@ -118,11 +118,19 @@ FINAL_COLUMNS = [
 # ``large_string`` interoperate across splits regardless). See :func:`_with_arrow_string_columns`.
 STRING_COLUMNS = tuple(c for c in FINAL_COLUMNS if c not in ("turns", "num_turns"))
 
-SOURCES = ("wildchat", "swe-chat")
-# Each source becomes one HuggingFace split. Split names must match ``^\w+$`` (no hyphens), so
-# ``swe-chat`` is written as the ``swe_chat`` split/file while the ``source`` column keeps its
-# canonical ``swe-chat`` value.
-SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
+#: The sources, named the way every CLI, config key, split, parquet and results directory in the
+#: project names them. HuggingFace split names must match ``^\w+$`` (no hyphens), which is why
+#: this corpus is ``swe_chat`` and not ``swe-chat``: one spelling, so a ``--source`` value, a
+#: ``[sources.*]`` table, ``swe_chat.parquet`` and ``swe_chat_base_..._nearest_neighbor/`` all say
+#: the same word. There is no source -> split mapping any more; the source name *is* the split.
+#:
+#: **The ``source`` column is a different string and deliberately still ``swe-chat``.** That value
+#: is data, not a name: :func:`~prompt_anonymity.data.identity.hash_author_id` hashes it into
+#: every ``author_id`` (which is also prefixed with it, ``swe-chat-<16 hex>``), so respelling it
+#: would silently change every id in the published dataset, in every feature parquet, and in
+#: every results CSV already computed. The adapters set it themselves
+#: (:mod:`~prompt_anonymity.data.sources_swe_chat`), so it does not follow this constant.
+SOURCES = ("wildchat", "swe_chat")
 
 # Rows per parquet row group. A row group is the smallest unit a reader can skip to, so writing
 # one giant group forces any consumer to materialize the whole file: pyarrow's default (1024*1024
@@ -241,8 +249,8 @@ def load_source(
             raw_path("wildchat", wildchat_raw), ua_map, models=WILDCHAT_MODELS, min_docs=min_docs,
             drop_programmatic=drop_programmatic, max_batches=wildchat_max_batches,
         )
-    if source == "swe-chat":
-        return load_swe_chat_documents(raw_path("swe-chat", swe_raw))
+    if source == "swe_chat":
+        return load_swe_chat_documents(raw_path("swe_chat", swe_raw))
     raise ValueError(f"unknown source: {source!r}")
 
 
@@ -489,10 +497,10 @@ def build_source(
     # SWE-chat additionally masks opaque ids (UUIDs / commit SHAs -> <ID>) and shell logins
     # (user@host -> <HOST>), which pervade agentic/terminal logs. WildChat leaves these off
     # for now, so its committed output is unaffected.
-    frame = clean_documents(frame, workers, mask_ids=(source == "swe-chat"))
+    frame = clean_documents(frame, workers, mask_ids=(source == "swe_chat"))
 
     consec_removed = 0
-    if source == "swe-chat":
+    if source == "swe_chat":
         turns_before = int(frame["turns"].map(len).sum())
         frame = dedup_consecutive_turns(frame, max_len=consec_dup_max_len, min_occ=consec_dup_min_occ)
         consec_removed = turns_before - int(frame["turns"].map(len).sum())
@@ -507,7 +515,7 @@ def build_source(
     # -- injected non-human templates are stripped at the turn level (see sources_swe_chat), so
     # only exact duplicates are removed. WildChat keeps the full affix dedup (heavy cross-author
     # templating, not stripped per turn).
-    affix_dedup = source != "swe-chat"
+    affix_dedup = source != "swe_chat"
     frame = run_dedup(frame, affix_len=affix_len, max_per_affix=max_per_affix, affix_dedup=affix_dedup)
     n_after_dedup = len(frame)
 
@@ -527,7 +535,7 @@ def build_source(
     # (a third empty, some CJK mislabeled English), so we re-detect it with Lingua and fall back to
     # upstream only where the detector abstains; WildChat's labels are trusted, so it just splits
     # its existing list into the two columns -- a schema update, not a relabel of the primary.
-    frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe-chat"))
+    frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe_chat"))
     print(f"[{source}] languages: {lang_stats['n_lingua']:,} by detector, "
           f"{lang_stats['n_fallback']:,} from upstream, {lang_stats['n_default']:,} defaulted to English")
 
@@ -631,7 +639,7 @@ def write_outputs(frames: dict[str, pd.DataFrame], out_dir: str | Path) -> None:
         (out_dir / stale).unlink(missing_ok=True)
 
     for source, frame in frames.items():
-        path = out_dir / f"{SPLIT_NAMES[source]}.parquet"
+        path = out_dir / f"{source}.parquet"
         _with_arrow_string_columns(frame).to_parquet(
             path,
             index=False,
@@ -648,7 +656,7 @@ def build_stats(frames: dict[str, pd.DataFrame], combined: pd.DataFrame) -> dict
     """Aggregate stats for the console report, plus per-source pipeline counts."""
     stats = summarize(combined)
     stats["counts_pipeline"] = {src: f.attrs.get("counts", {}) for src, f in frames.items()}
-    stats["splits"] = {SPLIT_NAMES[src]: int(len(f)) for src, f in frames.items()}
+    stats["splits"] = {src: int(len(f)) for src, f in frames.items()}
     return stats
 
 
@@ -712,8 +720,7 @@ def main() -> None:
     p.add_argument("--swe-raw", default=None,
                    help="raw SWE-chat conversations.parquet (default: $PROMPT_ANONYMITY_"
                         "SWE_CHAT_RAW, else the config file, else downloaded from HuggingFace)")
-    p.add_argument("--sources", nargs="+", default=["wildchat", "swe-chat"],
-                   choices=["wildchat", "swe-chat"])
+    p.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
     p.add_argument("--min-docs", type=int, default=2,
                    help="minimum documents per author (default 2; set 1 to keep single-doc authors)")
     p.add_argument("--keep-programmatic-clients", action="store_true",

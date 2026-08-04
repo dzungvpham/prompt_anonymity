@@ -281,8 +281,12 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 #: ``experiments/plot_results.py`` parses the same word.
 NO_DEFENSE_TAG = "base"
 
-# source -> split / parquet base name (must match build_dataset.py SPLIT_NAMES).
-SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
+#: The corpora, named the way everything downstream names them: a ``--source`` value is also
+#: the split, the parquet base name (``swe_chat.parquet``) and the dataset part of the results
+#: directory :func:`output_tag` builds. Must match ``build_dataset.SOURCES``. (The ``source``
+#: *column* inside the parquets still reads ``swe-chat``; it is hashed into every ``author_id``,
+#: so it is data rather than a name and did not follow this spelling.)
+SOURCES = ("wildchat", "swe_chat")
 
 # The extra class: "this document's author is not among the known authors". Not a valid
 # author_id (those are ``<source>-<16 hex>``), so it can never collide with a real one.
@@ -388,10 +392,9 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     ``undated="known"`` instead treats them as the oldest documents, so they are always on the
     known side -- the reading that an attacker holding undated history would get.
     """
-    split = SPLIT_NAMES[source]
     defended = "" if defense == "none" else f"_{defense}"
-    documents_path = Path(data_dir) / f"{split}.parquet"
-    features_path = Path(data_dir) / f"{split}{defended}_{feature}.parquet"
+    documents_path = Path(data_dir) / f"{source}.parquet"
+    features_path = Path(data_dir) / f"{source}{defended}_{feature}.parquet"
     for path in (documents_path, features_path):
         if not path.exists():
             raise SystemExit(f"{path} not found -- build it first with\n"
@@ -1721,8 +1724,8 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source", default="swe-chat", choices=sorted(SPLIT_NAMES),
-                        help="Which built split to attack (default: swe-chat).")
+    parser.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
+                        help="Which built split to attack (default: swe_chat).")
     parser.add_argument("--feature", default="stylometrix",
                         help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: stylometrix).")
     parser.add_argument("--defense", default="none", choices=sorted(DEFENSES),
@@ -1904,6 +1907,11 @@ def output_tag(args: argparse.Namespace) -> str:
     positionally, with :data:`NO_DEFENSE_TAG` standing in when there is no defense so the shape
     never changes. That is the name ``experiments/plot_results.py`` parses, and a run named this
     way is one it will put on a comparison figure.
+
+    The dataset part is ``args.source`` verbatim, which is why :data:`SOURCES` spells the corpus
+    ``swe_chat``: one name for it across the flag, the parquets and the results tree. It also
+    leaves the hyphen free -- it is this function's separator for a multi-attack run, so a source
+    containing one was a character doing two jobs.
 
     Every *non-default* choice that changes the numbers is then appended, so two runs that differ
     in any of them cannot overwrite each other's results. Those extra qualifiers deliberately

@@ -4,7 +4,7 @@
 Selects a dataset, an optional defense, and an attack -- all by name -- using the
 ``prompt_anonymity`` package, and writes CSV results::
 
-    python experiments/run_experiment.py --dataset swe-chat
+    python experiments/run_experiment.py --dataset swe_chat
     python experiments/run_experiment.py --dataset wildchat --language English \
         --attack nearest_neighbor --defense none
 
@@ -55,7 +55,9 @@ from prompt_anonymity.fidelity import FIDELITY_METRICS, run_fidelity
 # Dataset files live in the repo next to this script; the package itself is path-agnostic
 # and takes the directory as an argument.
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIRS = {"wildchat": REPO_ROOT / "wildchat", "swe-chat": REPO_ROOT / "swe-chat"}
+# Dataset name -> the repo directory its CSVs live in. The name is the one every script and
+# results directory uses (``swe_chat``); the *directory* it reads keeps its own older spelling.
+DATA_DIRS = {"wildchat": REPO_ROOT / "wildchat", "swe_chat": REPO_ROOT / "swe-chat"}
 # StyloMetrix language model code per WildChat language subset (SWE-chat is English-only).
 STYLOMETRIX_LANGUAGE_CODES = {"English": "en", "Russian": "ru"}
 
@@ -63,6 +65,7 @@ STYLOMETRIX_LANGUAGE_CODES = {"English": "en", "Russian": "ru"}
 #: positionally, so the undefended case needs a name of its own rather than an empty slot;
 #: ``experiments/plot_results.py`` parses the same word.
 NO_DEFENSE_TAG = "base"
+
 
 
 def build_featurizers(args: argparse.Namespace) -> list:

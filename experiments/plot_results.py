@@ -83,12 +83,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
 PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
 
-#: Where the built dataset lives, and the split parquet each dataset's documents come from --
-#: the same defaults ``run_experiment_v2.py`` attacks. Only the temporal figure reads them, and
-#: only for two columns: a document's ``ended_at`` is metadata that never depended on the attack,
-#: so it is joined back on ``doc_id`` rather than copied into every run's predictions.
+#: Where the built dataset lives -- the same default ``run_experiment_v2.py`` attacks. Only the
+#: temporal figure reads it, and only for two columns: a document's ``ended_at`` is metadata that
+#: never depended on the attack, so it is joined back on ``doc_id`` rather than copied into every
+#: run's predictions. A dataset's parquet is ``<dataset>.parquet``, because the dataset part of a
+#: results directory name *is* the split name (see :data:`DATASETS`).
 DATA_DIR = REPO_ROOT / "data" / "hf"
-SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
 
 
 # --- the vocabulary a results directory name is built from -------------------
@@ -101,7 +101,12 @@ SPLIT_NAMES = {"wildchat": "wildchat", "swe-chat": "swe_chat"}
 # `prompt_anonymity.attacks.ATTRIBUTION_ATTACKS`. A run whose name uses a value missing here is
 # skipped, not guessed at -- so adding a new defense or attack means adding it here too.
 
-DATASETS = ("wildchat", "swe-chat")
+#: Datasets, spelled the one way the whole project spells them: the same string as the runners'
+#: ``--source``, the split, the corpus parquet's basename in :data:`DATA_DIR`, and the dataset
+#: part of a results directory. The plots directory follows: ``plots/swe_chat/``. (Only the
+#: ``source`` *column* inside the parquets differs, still ``swe-chat`` -- it is hashed into every
+#: ``author_id``, so it is data rather than a name. Nothing here reads it.)
+DATASETS = ("wildchat", "swe_chat")
 
 #: How an undefended run spells its defense. Written out rather than omitted so that every
 #: directory name has the same four parts and can be parsed positionally.
@@ -144,7 +149,9 @@ ATTACKS = (
     "xgboost",
 )
 
-DATASET_LABELS = {"wildchat": "WildChat", "swe-chat": "SWE-chat"}
+#: Keyed by the directory spelling, valued by how the corpus is written in prose and on a figure
+#: -- which is the hyphenated "SWE-chat", and stays that way; only the filename changed.
+DATASET_LABELS = {"wildchat": "WildChat", "swe_chat": "SWE-chat"}
 DEFENSE_LABELS = {
     NO_DEFENSE: "No defense",
     "styleremix": "StyleRemix",
@@ -210,7 +217,7 @@ BASELINE_DASH = (0, (4, 3))
 #: and the *feature/attack* has to keep the colour so the same method is one colour across
 #: datasets. Dash then carries the dataset. Nowhere else does a measured line dash -- every other
 #: figure is one dataset throughout, so there would be nothing for the channel to say.
-DATASET_DASHES = {"wildchat": (), "swe-chat": (7, 2, 1.5, 2)}
+DATASET_DASHES = {"wildchat": (), "swe_chat": (7, 2, 1.5, 2)}
 
 LINE_WIDTH = 2.0
 MARKER_SIZE = 6.0  # >= 8px on the page once the 2px surface ring is added
@@ -329,7 +336,7 @@ class Run:
 def parse_run_name(name: str) -> tuple[str, str, str, str] | None:
     """Split ``<dataset>_<defense>_<feature>_<attack>`` into its four parts, or return ``None``.
 
-    Every part may itself contain underscores (``swe-chat``, ``dp_mlm_pii``,
+    Every part may itself contain underscores (``swe_chat``, ``dp_mlm_pii``,
     ``gemini_embedding_2``, ``nearest_neighbor``), so the name cannot be split on ``_``. Instead
     each part is matched against the vocabulary above, from both ends inwards; a candidate that
     leaves an unrecognised remainder is rejected and the next one tried, which is what
@@ -1195,7 +1202,8 @@ def document_end_times(dataset: str) -> pd.Series | None:
     """
     if dataset in _END_TIMES:
         return _END_TIMES[dataset]
-    path = DATA_DIR / f"{SPLIT_NAMES[dataset]}.parquet"
+    # The dataset part of a run's name is the split name, so it is also the parquet's basename.
+    path = DATA_DIR / f"{dataset}.parquet"
     times = None
     if path.exists():
         frame = pd.read_parquet(path, columns=["doc_id", "ended_at"])

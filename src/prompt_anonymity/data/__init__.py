@@ -54,7 +54,7 @@ from .wildchat import load_wildchat
 # Registry so callers can select a dataset by name (e.g. from a CLI argument).
 DATASET_LOADERS = {
     "wildchat": load_wildchat,
-    "swe-chat": load_swe_chat,
+    "swe_chat": load_swe_chat,
 }
 
 
@@ -64,7 +64,7 @@ def load_dataset(name: str, data_dir, **options) -> AttackData:
     Parameters
     ----------
     name : str
-        Dataset key in ``DATASET_LOADERS`` (e.g. ``"wildchat"`` or ``"swe-chat"``).
+        Dataset key in ``DATASET_LOADERS`` (e.g. ``"wildchat"`` or ``"swe_chat"``).
     data_dir : str or pathlib.Path
         Directory holding that dataset's files.
     **options

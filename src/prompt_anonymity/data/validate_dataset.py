@@ -23,8 +23,18 @@ from .build_dataset import CONSECUTIVE_DUP_MAX_LEN
 from .config import dist_dir
 from .sources_swe_chat import HUMAN_TURN_MAX_LEN, is_scaffolding_turn
 
-# source -> split/parquet file name (must match build_dataset.SPLIT_NAMES).
-SPLIT_FILES = {"wildchat": "wildchat.parquet", "swe-chat": "swe_chat.parquet"}
+# source -> its parquet file. The source name is also the split name (see build_dataset.SOURCES),
+# so the filename is just the source; the mapping is kept for the one thing it still buys, an
+# explicit list of the files this module expects to find.
+SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat")}
+
+#: source -> the value its ``source`` **column** holds, which is *not* always the source's name:
+#: ``swe_chat`` is stored as ``"swe-chat"``. That string is data rather than a name --
+#: :func:`~prompt_anonymity.data.identity.hash_author_id` hashes it into every ``author_id`` and
+#: prefixes it there (``swe-chat-<16 hex>``) -- so it did not follow the rename of the CLI/split
+#: spelling, and respelling it now would change every id in the published dataset. The two checks
+#: below therefore compare the column against *this*, not against the key.
+SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat"}
 EXPECTED_COLUMNS = [
     "doc_id", "source", "author_id",
     "turns", "num_turns",
@@ -73,10 +83,11 @@ def main(dist: str | Path | None = None) -> int:
         df = pd.read_parquet(path)
         per_source[source] = df
         check(f"[{fname}] file exists", True)
-        check(f"[{fname}] holds exactly source={source!r}",
-              set(df["source"].unique()) == {source}, str(sorted(df["source"].unique())))
-        check(f"[{fname}] author_id prefixed '{source}-'",
-              df["author_id"].str.startswith(f"{source}-").all())
+        value = SOURCE_VALUES[source]
+        check(f"[{fname}] holds exactly source={value!r}",
+              set(df["source"].unique()) == {value}, str(sorted(df["source"].unique())))
+        check(f"[{fname}] author_id prefixed '{value}-'",
+              df["author_id"].str.startswith(f"{value}-").all())
         check(f"[{fname}] doc_id unique within file", df["doc_id"].is_unique)
         # Schema + language columns are checked per file, so a source still on the old single
         # `languages` list (a not-yet-rebuilt source, e.g. WildChat during the transition) is

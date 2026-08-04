@@ -33,7 +33,7 @@ hf_revision = "c827c6df8fcf008219ffaffa4d1dd77491099367"
 hf_dir = "data"
 # path = "/local/copy/of/WildChat-4.8M/data"
 
-[sources."swe-chat"]
+[sources.swe_chat]
 # https://huggingface.co/datasets/SALT-NLP/SWE-chat -- one parquet of agent sessions.
 hf_repo = "SALT-NLP/SWE-chat"
 hf_revision = "f66cca95b14caaa4177f7ed5eaa424608dadcffa"
