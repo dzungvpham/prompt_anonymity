@@ -9,25 +9,42 @@ accuracy out -- but two things about the experiment differ:
    ``prompt_anonymity/data/compute_features.py``). No
    featurization, no defense, no GPU: this script only reads vectors that already exist.
 
-2. **Rolling chronological known sides.** Documents are ordered by ``ended_at`` and cut at
-   fractions of that timeline. For a ``--known-fractions`` value *f* the first *f* of the corpus is
-   **known** and everything after it is **unknown**, so the attacker never sees the future. The
-   default (``0.25 0.50 0.75``) gives three independent attacks.
+2. **Interval known sides against one held-out test set.** Documents are ordered by ``ended_at``.
+   The **final ``--test-fraction`` of the corpus (default 25%) is held out from every known side**
+   and is the set every configuration is compared on; each ``--known-windows`` entry is an
+   *interval* ``[start, end)`` of the timeline that the attacker is given, written ``XXYY`` in
+   whole percents (``0025`` = the first quarter, ``2550`` = the second). Every known side ends at
+   or before the test set, so the attacker never sees the future.
 
-   There is no ``--window`` here: the attack is fitted on the known side alone, so the old
-   *f* x *w* grid re-fitted one model per known fraction to score three nested prefixes of a
-   single prediction set. Each document's ``true_author_rank`` and ``position`` go into
-   ``predictions_*.csv`` instead, and ``experiments/plot_results.py --window`` cuts the windows
-   from those in seconds without re-running anything.
+   The default six are the complete set of quartile-aligned intervals that do not touch the test
+   quarter, and they exist to separate two things a single "known fraction" welds together:
 
-   The two axes ask different questions. *More history* (larger *f*) grows the attacker's
-   training set and the candidate pool. *A longer window* (larger *w*) grows the number of
-   **target** users, because more people show up over a longer stretch of time -- which is why
-   there is no random candidate-pool sweep here any more: sweeping the window varies the pool
-   with real data instead of resampling one window's users. The trade-off is that the window
-   axis is not a clean control -- a longer window also reaches further into the future -- so
-   read a falling line as "larger pool *and* more drift", and compare against the per-window
-   random baseline rather than across windows.
+   ==========  =============  ======  =====================
+   config      interval       size    gap to the test set
+   ==========  =============  ======  =====================
+   ``0025``    [0, 0.25)      25%     2 quarters
+   ``2550``    [0.25, 0.50)   25%     1 quarter
+   ``5075``    [0.50, 0.75)   25%     0
+   ``0050``    [0, 0.50)      50%     1 quarter
+   ``2575``    [0.25, 0.75)   50%     0
+   ``0075``    [0, 0.75)      75%     0
+   ==========  =============  ======  =====================
+
+   Read the gap-0 rows against each other for the **volume** effect at fixed recency, and the
+   three 25%-size rows for the **staleness** effect at fixed volume. Under the old prefix sweep
+   both moved together and neither could be measured. The grid is triangular by necessity -- a
+   75%-size known side cannot also be two quarters stale -- so there is no seventh cell.
+
+   Each configuration still **scores its whole remaining future**, not just the test set: it costs
+   only a matmul and it is what feeds the weekly temporal-decay figure. Restricting to the shared
+   test set is a *plot-time* choice, made on the ``position`` column.
+
+   Comparing configurations on their own in-set documents mixes attack strength with
+   **enrollment reach**: a larger or fresher known side enrolls more users, so it scores more
+   test documents, and the extra ones are systematically easier. Measured on swe-chat, tripling
+   the known side lifts top-1 by +0.133 unpaired but only +0.008 on the documents all
+   configurations can score. ``plot_results.py`` therefore reports per-config accuracy as the
+   headline and every *claim about an axis* on the paired intersection.
 
 3. **The candidate pool can be narrowed by language** (``--language-aware``, off by default).
    Language is metadata an attacker reads straight off an anonymous document, and prompt
@@ -137,9 +154,8 @@ Run (from the repo root)::
     python experiments/run_experiment_v2.py --ood reject --ood-calibration far
     # only score a document against authors who write its language:
     python experiments/run_experiment_v2.py --source wildchat --language-aware
-    # one known fraction; trace the target pool finely at plot time, not here:
-    python experiments/run_experiment_v2.py --known-fractions 0.5
-    python experiments/plot_results.py --window 0.05 0.1 0.2 0.3 0.4 0.5
+    # one known side only (takes the run out of the comparable set):
+    python experiments/run_experiment_v2.py --known-windows 2575
     # compare the three trainable attacks, each tuned per window on that window's known side:
     python experiments/run_experiment_v2.py --attacks logistic svm xgboost
 
@@ -177,28 +193,30 @@ The other resources sklearn can halve on are no better here: ``max_iter`` is not
 because lbfgs converges in 104-215 iterations, well inside the 3,000 it is allowed.
 
 The larger saving was never in the search but in how often it runs: it belongs to the known side,
-so it runs once per ``--known-fractions`` value and is reused (:func:`tuned_settings`). That used
-to mean 3 searches for 8 windows; now that the window axis is cut at plot time it is 3 searches for
-3 attacks, and the saving has been folded into the runner's shape rather than a cache. That is also
-what ``--tune-window`` exists for: the inner validation block is a fixed share of the known side
-rather than a copy of the outer window, which is what used to make otherwise identical searches
-differ.
+so it runs once per ``--known-windows`` value and is reused across the attacks that share it
+(:func:`tuned_settings`). That is also what ``--tune-window`` exists for: the inner validation
+block is a fixed share of the known side rather than a copy of the outer task, which is what used
+to make otherwise identical searches differ.
 
-Outputs (under ``--output-dir``), all carrying ``known_fraction`` and ``attack``
+Outputs (under ``--output-dir``), all carrying ``known_config`` and ``attack``
 columns, so a multi-attack run stays one tidy table per file:
 
-* ``rolling_results.csv`` -- one row per (known fraction, attack), every summary metric. Includes the
-  identity-level top-k (``id_acc<k>``, ``random_id<k>``, ``n_identities``); the per-k table these
-  come from is no longer written, because its other columns were already in the two files below.
-* ``cmc_results.csv`` -- one row per (known fraction, attack, k): document-level top-k at every
+* ``rolling_results.csv`` -- one row per (known config, attack), every summary metric, plus the
+  configuration itself (``known_start``, ``known_end``, ``known_size``, ``gap_fraction``,
+  ``gap_weeks``) and the identity-level top-k (``id_acc<k>``, ``random_id<k>``,
+  ``n_identities``). ``gap_weeks`` is the real elapsed time between the end of the known side and
+  the start of the test set, which is what a staleness axis should be labelled in: documents are
+  not uniformly dense, so one quarter of the corpus is 14.6 weeks on WildChat and 2.9 on
+  swe-chat.
+* ``cmc_results.csv`` -- one row per (known config, attack, k): document-level top-k at every
   k, over the whole unknown side.
 * ``predictions_<stem>.csv`` and ``author_report_<stem>.csv`` -- per document and per author
-  (risk and retrieval, sorted most-exposed first), where ``<stem>`` is ``<attack>_known<pct>``:
-  **one file per known side**, covering its whole unknown side. ``predictions_*.csv`` is the one
-  downstream code should read: ``position`` and ``true_author_rank`` are what let
-  ``plot_results.py --window`` rebuild any window's top-k curves without re-running the attack,
-  since top-k over a slice is the share of it with ``rank <= k``. The author report is aggregated
-  over the full unknown side and cannot be re-sliced.
+  (risk and retrieval, sorted most-exposed first), where ``<stem>`` is ``<attack>_known<XXYY>``:
+  **one file per known configuration**, covering its whole unknown side. ``predictions_*.csv`` is
+  the one downstream code should read: ``position`` and ``true_author_rank`` are what let
+  ``plot_results.py`` restrict to the shared test set, or to any slice, without re-running the
+  attack -- top-k over a subset is the share of it with ``rank <= k``. The author report is
+  aggregated over the full unknown side and cannot be re-sliced.
   ``--language-aware`` adds each document's ``languages`` and whether its own author survived the
   filter.
 * ``--ood reject`` adds ``ood_sweep.csv``, the open-set columns of ``rolling_results.csv``, and
@@ -217,6 +235,7 @@ from __future__ import annotations
 import argparse
 import sys
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -290,9 +309,9 @@ def _period(frame: pd.DataFrame) -> str:
 def filter_documents(frame: pd.DataFrame, model_owner: str = "all", language: str = "all") -> pd.DataFrame:
     """Restrict the corpus to one agent provider and/or one primary language.
 
-    Applied **before** the timeline is cut, so the window fractions are quartiles of the filtered
-    corpus rather than of the whole split -- otherwise a filter would silently shrink the windows
-    and leave gaps between them. Both default to ``"all"`` (no filter).
+    Applied **before** the timeline is cut, so a configuration's interval is a share of the
+    filtered corpus rather than of the whole split -- otherwise a filter would silently shrink the
+    known sides and leave gaps between them. Both default to ``"all"`` (no filter).
     """
     for column, value in (("model_owner", model_owner), ("language_primary", language)):
         if value and value.lower() != "all":
@@ -311,6 +330,39 @@ def filter_documents(frame: pd.DataFrame, model_owner: str = "all", language: st
 # load_documents_and_features). Columns absent from a split's schema are simply not read.
 DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "language_secondary",
                     "model_owner")
+
+
+#: Scratch column holding each document's row in the feature parquet. Dropped before the frame is
+#: returned, so nothing downstream can come to depend on it.
+FEATURE_ROW = "_feature_row"
+
+#: Feature columns read per pass in :func:`read_feature_matrix`. Only sets the size of the
+#: transient Arrow slab (256 x n_documents x 4 B, 177 MB on WildChat); the output is preallocated
+#: whole, so this trades a handful of extra reads of a columnar file against holding the table.
+FEATURE_COLUMN_BATCH = 256
+
+
+def read_feature_matrix(feature_file: pq.ParquetFile, columns: list[str],
+                        rows: np.ndarray) -> np.ndarray:
+    """The feature parquet as one ``float32`` ``[len(rows) x len(columns)]`` array, in ``rows`` order.
+
+    Built column-slab by column-slab into a preallocated output rather than through pandas. The
+    obvious ``read_parquet(...)[columns].to_numpy(dtype=float)`` holds three copies of the matrix
+    at once -- the Arrow table, its pandas frame, and a **float64** result at double the width --
+    which is 10 GB of peak on WildChat's Gemini vectors for numbers every attack immediately casts
+    back to float32 (see :mod:`prompt_anonymity.attacks.similarity.kernel`).
+
+    ``float32`` is therefore the width the vectors already have on disk and the width they are
+    used at; nothing downstream sees a different number. Rows are gathered as each column lands,
+    so the un-permuted matrix is never materialised either.
+    """
+    matrix = np.empty((len(rows), len(columns)), dtype=np.float32)
+    for start in range(0, len(columns), FEATURE_COLUMN_BATCH):
+        slab = feature_file.read(columns=columns[start:start + FEATURE_COLUMN_BATCH])
+        for offset, column in enumerate(slab.columns):
+            matrix[:, start + offset] = column.to_numpy()[rows]
+        del slab
+    return matrix
 
 
 def load_documents_and_features(data_dir, source: str, feature: str, undated: str = "drop",
@@ -357,24 +409,33 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     document_schema = pq.ParquetFile(documents_path).schema_arrow.names
     wanted = [column for column in DOCUMENT_COLUMNS if column in document_schema]
     documents = pd.read_parquet(documents_path, columns=wanted)
-    features = pd.read_parquet(features_path)
-    missing = set(documents["doc_id"]) - set(features["doc_id"])
-    if missing:
+
+    # The feature parquet mirrors some document metadata (``author_id``); keep only the columns
+    # that are genuinely features, so nothing but numbers reaches the matrix. Checked against the
+    # *full* document schema, not the narrowed frame above, so a feature named after a metadata
+    # column we skipped still cannot sneak into the matrix.
+    feature_file = pq.ParquetFile(features_path)
+    feature_columns = [column for column in feature_file.schema_arrow.names
+                       if column != "doc_id" and column not in document_schema]
+
+    # The join is an index lookup, and the vectors never enter the frame. A merged frame would
+    # carry all n_features columns through the filter, the undated cut, the sort and the
+    # reset_index, and pandas copies every column at every one of those steps -- 2.1 GB apiece on
+    # WildChat's 172,509 x 3,072 Gemini matrix, which is what OOM-killed this job. Here only the
+    # metadata moves around and the matrix is permuted exactly once, on the way out.
+    keys = pd.Index(pd.read_parquet(features_path, columns=["doc_id"])["doc_id"])
+    if not keys.is_unique:
+        raise SystemExit(f"{features_path} repeats a doc_id; the join to documents is one-to-one.")
+    documents[FEATURE_ROW] = keys.get_indexer(documents["doc_id"])
+    n_missing = int((documents[FEATURE_ROW] < 0).sum())
+    if n_missing:
         raise SystemExit(
-            f"{len(missing):,} of {len(documents):,} documents have no {feature} vector. "
+            f"{n_missing:,} of {len(documents):,} documents have no {feature} vector. "
             f"Recompute with `python -m prompt_anonymity.data.compute_features --source {source} "
             f"--feature {feature}" + (f" --defense {defense}" if defended else "") + "`."
         )
 
-    # The feature parquet mirrors some document metadata (``author_id``); keep only the columns
-    # that are genuinely features, so the merge cannot collide and the matrix stays numeric.
-    # Checked against the *full* document schema, not the narrowed frame above, so a feature
-    # named after a metadata column we skipped still cannot sneak into the matrix.
-    feature_columns = [column for column in features.columns
-                       if column != "doc_id" and column not in document_schema]
-    merged = documents.merge(features[["doc_id", *feature_columns]], on="doc_id", how="left",
-                             validate="one_to_one")
-    merged = filter_documents(merged, model_owner, language)
+    merged = filter_documents(documents, model_owner, language)
 
     n_undated = int(merged["ended_at"].isna().sum())
     if n_undated:
@@ -388,45 +449,134 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
             print(f"placing {n_undated:,} undated documents ({authors} authors) at the start of the timeline")
 
     merged = merged.sort_values(["ended_at", "doc_id"], kind="mergesort").reset_index(drop=True)
-    return merged, merged[feature_columns].to_numpy(dtype=float)
+    return merged, read_feature_matrix(feature_file, feature_columns,
+                                       merged.pop(FEATURE_ROW).to_numpy())
 
 
-def rolling_windows(n_documents: int, known_fractions) -> list[tuple[float, slice, slice]]:
-    """``(fraction, known_slice, unknown_slice)`` for every runnable known fraction.
+#: The default known configurations: every quartile-aligned interval that does not touch the
+#: held-out test quarter. Ordered by size then start, so a run's output reads smallest-attacker
+#: first. See the module docstring for why these six and not others -- they are the complete set,
+#: and the grid they form is triangular because a large known side cannot also be far from the
+#: test set.
+DEFAULT_KNOWN_WINDOWS = ("0025", "2550", "5075", "0050", "2575", "0075")
 
-    The known side is everything up to ``fraction`` of the timeline and the unknown side is
-    **all of the rest**, so the attacker only ever sees documents that ended before the ones it
-    must attribute. Each fraction is its own independent experiment, not a fold of a partition.
+#: Share of the timeline held out of *every* known side and shared by every configuration as the
+#: set they are compared on. A run with a different value is not comparable to the default ones,
+#: which is why :func:`output_tag` puts it in the directory name.
+DEFAULT_TEST_FRACTION = 0.25
 
-    There is deliberately no second *window* axis any more. It never bought a second experiment:
-    the attack is fitted on the known side alone, so every window sharing a known fraction reused
-    one model and one hyper-parameter search and differed only in how much of the future was
-    scored -- three re-fits of the same thing to obtain three nested prefixes of one prediction
-    set. Scoring the whole remaining timeline once yields the same per-document predictions, and
-    ``experiments/plot_results.py --window`` cuts them into whatever windows a figure wants
-    (see the ``true_author_rank`` column of ``predictions_*.csv``, which is what makes the
-    top-k curves recoverable from a slice).
 
-    Degenerate fractions (fewer than two known documents, or nothing left to attribute) are
-    skipped, and it is an error only if nothing at all survives.
+@dataclass(frozen=True)
+class KnownConfig:
+    """One known side: the interval ``[start, end)`` of the timeline the attacker is given.
+
+    The whole design lives in this pair of numbers. ``size`` is how much labelled data the
+    attacker holds and ``gap`` is how stale it is when the test set begins -- the two factors a
+    single "known fraction" used to confound, because a prefix that is bigger is also, always,
+    fresher.
     """
-    windows, skipped = [], []
-    for fraction in known_fractions:
-        start = int(round(fraction * n_documents))
-        if start < 2 or start >= n_documents:
-            skipped.append(f"known {fraction:.0%} leaves an empty side "
-                           f"({start} known, {n_documents - start} unknown "
-                           f"of {n_documents} documents)")
-            continue
-        windows.append((fraction, slice(0, start), slice(start, n_documents)))
-    if skipped:
-        print(f"skipping {len(skipped)} known fraction(s): " + "; ".join(skipped))
-    if not windows:
+
+    start: float
+    end: float
+    #: Where the shared test set begins; the same for every configuration in a run, and carried
+    #: here so a config can describe its own staleness without the caller passing it around.
+    test_start: float
+
+    @property
+    def tag(self) -> str:
+        """``known<XX><YY>`` -- the filename and column form, whole percents, no separator."""
+        return f"known{_percent(self.start):02d}{_percent(self.end):02d}"
+
+    @property
+    def size(self) -> float:
+        """Share of the corpus the attacker holds."""
+        return self.end - self.start
+
+    @property
+    def gap(self) -> float:
+        """Share of the corpus between the end of the known side and the start of the test set."""
+        return self.test_start - self.end
+
+    @property
+    def label(self) -> str:
+        return f"{self.start:.0%}-{self.end:.0%}"
+
+
+def parse_known_window(spec: str, test_start: float) -> KnownConfig:
+    """Turn a ``XXYY`` spec into a :class:`KnownConfig`, or fail with a usable message.
+
+    Four digits, whole percents, start then end: ``0025`` is the first quarter and ``2575`` the
+    middle half. The same spelling is used for the CLI, the output filenames and the
+    ``known_config`` column, so there is one string to grep for when tracing a number back to the
+    configuration that produced it.
+    """
+    if not (len(spec) == 4 and spec.isdigit()):
+        raise SystemExit(f"--known-windows {spec!r}: expected four digits, start then end in "
+                         f"whole percents (e.g. 0025 for the first quarter).")
+    start, end = int(spec[:2]) / 100, int(spec[2:]) / 100
+    if start >= end:
+        raise SystemExit(f"--known-windows {spec!r}: start {start:.0%} is not before end {end:.0%}.")
+    if end > test_start + 1e-9:
         raise SystemExit(
-            f"no runnable value in --known-fractions {list(known_fractions)} "
-            f"over {n_documents} documents."
+            f"--known-windows {spec!r}: ends at {end:.0%}, inside the held-out test set that "
+            f"starts at {test_start:.0%}. The test set is held out of every known side so all "
+            f"configurations are compared on the same documents; lower --test-fraction to "
+            f"enlarge the space of usable known sides."
         )
-    return windows
+    return KnownConfig(start=start, end=end, test_start=test_start)
+
+
+def known_configurations(n_documents: int, specs, test_fraction: float
+                         ) -> list[tuple[KnownConfig, slice, slice]]:
+    """``(config, known_slice, unknown_slice)`` for every runnable known configuration.
+
+    The known side is the interval the configuration names; the unknown side is **everything
+    after it**, all the way to the end of the corpus, not just the shared test set. Scoring the
+    whole future costs one matmul over rows that were going to be loaded anyway, and it is what
+    keeps the weekly temporal-decay figure drawable -- a configuration restricted to the test
+    quarter could only ever show the last quarter's worth of staleness. Which documents a given
+    figure reads is decided at plot time from the ``position`` column.
+
+    Configurations that leave a degenerate side (fewer than two known documents, or nothing to
+    attribute) are skipped; it is an error only if nothing at all survives.
+    """
+    test_start = 1.0 - test_fraction
+    configurations, skipped = [], []
+    for spec in specs:
+        config = parse_known_window(spec, test_start)
+        start, end = int(round(config.start * n_documents)), int(round(config.end * n_documents))
+        if end - start < 2 or end >= n_documents:
+            skipped.append(f"{config.tag} leaves an empty side ({end - start} known, "
+                           f"{n_documents - end} unknown of {n_documents} documents)")
+            continue
+        configurations.append((config, slice(start, end), slice(end, n_documents)))
+    if skipped:
+        print(f"skipping {len(skipped)} known configuration(s): " + "; ".join(skipped))
+    if not configurations:
+        raise SystemExit(
+            f"no runnable value in --known-windows {list(specs)} over {n_documents} documents."
+        )
+    return configurations
+
+
+def gap_weeks(frame: pd.DataFrame, config: KnownConfig, known: slice) -> float:
+    """Real elapsed time between the end of ``config``'s known side and the test set's start.
+
+    The design's staleness axis is defined in *positions* -- equal document counts, which is what
+    holds the volume axis exactly fixed -- but positions are not time: documents are far denser
+    early in both corpora, so one quarter of WildChat is 14.6 weeks and one quarter of swe-chat is
+    2.9. Every figure and table should be labelled with this rather than with "quarters", and a
+    cross-dataset staleness axis has to use it. ``nan`` when either end has no usable timestamp.
+    """
+    test_index = int(round(config.test_start * len(frame)))
+    if known.stop < 1 or test_index >= len(frame):
+        return float("nan")
+    stamps = pd.to_datetime(pd.Series([frame["ended_at"].iloc[known.stop - 1],
+                                       frame["ended_at"].iloc[test_index]]),
+                            format="mixed", utc=True, errors="coerce")
+    if stamps.isna().any():
+        return float("nan")
+    return float((stamps.iloc[1] - stamps.iloc[0]).total_seconds() / (7 * 24 * 3600))
 
 
 def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -436,11 +586,29 @@ def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.
     of wide-range columns dominate any distance. Fitting the mean/scale on the known side alone
     keeps the unknown documents out of the attacker's view of the data. Zero-variance columns are
     left alone rather than divided by zero.
+
+    The statistics are accumulated in float64 and the result is written as float32 -- which is
+    exactly the arithmetic a float64 z-score followed by the attacks' float32 cast performed, so
+    the numbers are unchanged, at half the memory. The z-score itself runs in row chunks so the
+    float64 temporary is bounded rather than a second copy of the whole side.
     """
-    center = known.mean(axis=0)
-    scale = known.std(axis=0)
+    center = known.mean(axis=0, dtype=np.float64)
+    scale = known.std(axis=0, dtype=np.float64)
     scale = np.where(scale > 0, scale, 1.0)
-    return (known - center) / scale, (unknown - center) / scale
+    return _zscore(known, center, scale), _zscore(unknown, center, scale)
+
+
+#: Rows z-scored per pass. Sizes only the float64 temporary (8,192 x n_features), not the output.
+ZSCORE_ROW_BATCH = 8192
+
+
+def _zscore(block: np.ndarray, center: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """``(block - center) / scale`` in float64, returned as float32, a row chunk at a time."""
+    out = np.empty(block.shape, dtype=np.float32)
+    for start in range(0, len(block), ZSCORE_ROW_BATCH):
+        rows = slice(start, start + ZSCORE_ROW_BATCH)
+        out[rows] = (block[rows].astype(np.float64) - center) / scale
+    return out
 
 
 # --- language-aware candidate filtering (--language-aware) -------------------
@@ -814,12 +982,11 @@ def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
     fold still trains only on documents that precede the ones it is scored on. The subsample is
     drawn once per rung from a fixed seed, so all candidates at a rung see identical data.
 
-    This runs **once per known side** -- see :func:`tuned_settings`, which memoises it across the
-    windows that share one. It must not be run once for the whole experiment: a value tuned on the
-    75% known side and reused at 25% would have been selected on documents that are the *unknown*
-    side of the shorter window, which is exactly the leak the per-known-side search exists to
-    avoid. Sharing *within* one known fraction is safe because every such window is attacked from
-    the identical labelled set.
+    This runs **once per known configuration** -- see :func:`tuned_settings`, which memoises it
+    across the attacks that share one. It must not be run once for the whole experiment: the
+    configurations overlap, so a value tuned on ``known0075`` and reused for ``known0025`` would
+    have been selected partly on documents that ``known0025`` must attribute, which is exactly the
+    leak the per-configuration search exists to avoid.
 
     **What it costs, measured.** Against the exhaustive grid this replaced -- same eight windows,
     same folds, same criterion -- it is roughly a wash for a fifth less wall clock (63 vs ~75
@@ -869,22 +1036,21 @@ def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
     return best, trials
 
 
-def tuned_settings(name: str, fraction: float, embeddings: np.ndarray, labels: np.ndarray,
+def tuned_settings(name: str, tag: str, embeddings: np.ndarray, labels: np.ndarray,
                    args: argparse.Namespace, cache: dict) -> tuple[dict, pd.DataFrame]:
-    """:func:`tune_on_known`, run at most once per ``(attack, known fraction)``.
+    """:func:`tune_on_known`, run at most once per ``(attack, known configuration)``.
 
-Kept memoised even though the runner now visits each known fraction once, because ``--attacks``
-    can name several attacks and the calibration path refits: the cache is what guarantees one
-    search per (attack, known side) however often that side is revisited. It is also the reason
-    the window axis could be removed at all -- the search, like the fit, never depended on how much
-    of the future was about to be scored.
+    ``tag`` is the configuration's :attr:`KnownConfig.tag`, and it is the cache key: two
+    configurations that hold overlapping documents are still different known sides and must not
+    share a search. Kept memoised even though the runner visits each configuration once, because
+    ``--attacks`` can name several attacks and the calibration path refits.
 
     ``cache`` is owned by the caller (:func:`main`) so that its lifetime is one experiment and the
     sharing is visible in the driver rather than hidden in module state. The trials table is
     returned only on a miss, so ``tuning_trials.csv`` holds one block per search instead of the
-    same rows repeated once per window.
+    same rows repeated once per attack.
     """
-    key = (name, fraction)
+    key = (name, tag)
     if key in cache:
         return cache[key], pd.DataFrame()
     settings, trials = tune_on_known(name, embeddings, labels, args)
@@ -1255,10 +1421,10 @@ def identity_level_scores(headline: pd.DataFrame) -> dict:
 
 # --- driver -----------------------------------------------------------------
 
-def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
+def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
                tuning_cache: dict, languages: np.ndarray | None = None):
-    """Run one (known fraction, attack) combination end to end: calibrate, attribute, score.
+    """Run one (known configuration, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
     one-row summary of the window, the per-document decisions, the accept/reject trade-off curve,
@@ -1268,7 +1434,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     covers only the in-set documents.
 
     ``tuning_cache`` is passed through to :func:`tuned_settings`; see there for why sharing a
-    search between windows of the same known fraction is sound.
+    search between attacks of the same known configuration is sound.
 
     ``languages`` (``--language-aware``, off by default) turns on the candidate filter: the
     attack is still fitted **once** on the whole known side, and the filter then marks the
@@ -1290,7 +1456,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     in_set = np.isin(unknown_labels, known_authors)
     if not in_set.any():
         raise SystemExit(
-            f"known fraction {fraction}: none of the {len(unknown_labels):,} unknown documents "
+            f"{config.tag}: none of the {len(unknown_labels):,} unknown documents "
             f"has an author on the known side, so nothing can be scored."
         )
 
@@ -1299,7 +1465,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     # unknown_embeddings.
     settings, trials = ({}, pd.DataFrame())
     if args.tune:
-        settings, trials = tuned_settings(attack, fraction, known_embeddings, known_labels,
+        settings, trials = tuned_settings(attack, config.tag, known_embeddings, known_labels,
                                           args, tuning_cache)
 
     # Fit the attack on the known side (documents + labels, all of which the attacker holds) and
@@ -1332,18 +1498,35 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     # CSV and every aggregate below, so the two can never disagree about the same document. This
     # is the column that makes the top-k curves *re-derivable from a slice*: top-k accuracy over
     # any subset of documents is just the share of that subset with rank <= k, which is how
-    # ``plot_results.py --window`` rebuilds a window's CMC without re-running the attack. Documents
+    # ``plot_results.py`` rebuilds the shared test set's CMC without re-running the attack. Documents
     # whose author is not on the known side have no rank (no correct answer exists) and stay NaN.
     document_ranks = np.full(len(unknown_labels), np.nan)
+    # The in-set rows are taken **once** and the full matrix released. At WildChat's scale the
+    # matrix is 4.7 GB (86,255 unknown x 13,694 authors, float32) and every `author_scores[in_set]`
+    # is a fresh copy of most of it, so slicing it in three places -- here, for the closed-set
+    # table, and for the CMC -- put four multi-gigabyte arrays live at once and was killed by the
+    # 16 GB job cap. Nothing below this point reads the full matrix.
+    in_set_scores = author_scores[in_set]
+    in_set_labels = unknown_labels[in_set]
+    del author_scores
     if in_set.any():
         pruned = ~true_author_is_candidate[in_set]      # unattributable: below every candidate
         document_ranks[in_set] = np.where(
             pruned, np.asarray(candidate_counts)[in_set] + 1,
-            true_author_ranks(author_scores[in_set], fitted.authors, unknown_labels[in_set]))
+            true_author_ranks(in_set_scores, fitted.authors, in_set_labels))
 
     scores = {
-        "known_fraction": fraction,
+        "known_config": config.tag,
         "attack": attack,
+        # The configuration itself, so every downstream reader has the design in the table
+        # rather than having to parse it back out of the tag. `gap_weeks` is the axis a
+        # staleness figure should be labelled with: a quarter of the corpus is a different
+        # number of weeks in each dataset, and a different number at each end of one timeline.
+        "known_start": config.start,
+        "known_end": config.end,
+        "known_size": config.size,
+        "gap_fraction": config.gap,
+        "gap_weeks": gap_weeks(frame, config, known),
         # Rounded because the search now samples continuous ranges: an unrounded C prints 17
         # digits of a number whose third one is noise. tuning_trials.csv keeps the exact value.
         "hyperparameters": ", ".join(
@@ -1375,20 +1558,19 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
         **language_stats,
     }
     predictions = pd.DataFrame({
-        # Index of the document in the whole chronologically ordered corpus. Carried so a window
-        # can be cut downstream *exactly* where this script used to cut it: the old runner's
-        # unknown side ran to `round((fraction + window) * n_documents)`, which is not the same
-        # document as "round(window * n_documents) rows in" once both ends are rounded. With the
-        # absolute position there is no rounding to reproduce -- and since the unknown side always
-        # runs to the end of the corpus, `position.max() + 1` recovers n_documents too.
+        # Index of the document in the whole chronologically ordered corpus. This is what lets
+        # every configuration be restricted downstream to the *same* documents: the shared test
+        # set is `position >= round(test_start * n_documents)`, cut on an integer index with no
+        # rounding to reproduce. Since the unknown side always runs to the end of the corpus,
+        # `position.max() + 1` recovers n_documents too, so the cut needs nothing but this file.
         "position": np.arange(unknown.start, unknown.stop),
         "doc_id": unknown_frame["doc_id"].to_numpy(),
         "true_author": unknown_labels,
         "author_in_known": in_set,
         "best_author": predicted_author,
         "accept_score": accept_score,
-        # Rows stay in timeline order, so a chronological prefix of this table is exactly the
-        # window that used to be its own run -- see `rolling_windows` and `plot_results --window`.
+        # Rows stay in timeline order, so any chronological slice of this table -- the shared
+        # test set, or one week of it -- is a subset whose top-k is the share with rank <= k.
         "true_author_rank": document_ranks,
         "n_candidate_authors": candidate_counts,
     })
@@ -1402,7 +1584,9 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     if args.ood != "none":
         folds = open_set_folds(known_labels, held_out_fraction=args.ood_holdout,
                                n_folds=args.ood_folds, seed=args.seed)
-        prior = (estimate_ood_prior(known_labels, fraction, 1.0 - fraction)
+        # The forecast replays this configuration's own known:future ratio inside the known
+        # side, so a small early known side is not handed a large known side's prior.
+        prior = (estimate_ood_prior(known_labels, config.size, 1.0 - config.end)
                  if args.ood_prior is None else args.ood_prior)
         threshold, diagnostics = calibrate_threshold(
             factory, known_embeddings, known_labels, folds,
@@ -1423,7 +1607,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
         )
         ood_sweep = ood_threshold_sweep(accept_score, predicted_author, unknown_labels, known_authors)
         ood_sweep.insert(0, "attack", attack)
-        ood_sweep.insert(0, "known_fraction", fraction)
+        ood_sweep.insert(0, "known_config", config.tag)
     else:
         scores.update({
             "n_in_set": int(in_set.sum()),
@@ -1436,11 +1620,12 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     # known document), so `conv_acc` is "true author within the top k authors" -- exactly the
     # document-level top-k of this attack -- and `id_acc` is the identity-level version.
     in_set_counts = candidate_counts[in_set]
-    headline = closed_set_table(-author_scores[in_set], fitted.authors, unknown_labels[in_set],
+    # `closed_set_table` wants distances, so the scores are negated -- in a temporary that is
+    # dropped as soon as it returns, rather than by keeping a second signed copy alive.
+    headline = closed_set_table(-in_set_scores, fitted.authors, in_set_labels,
                                 in_set_counts, args)
     scores.update(identity_level_scores(headline))
 
-    in_set_scores, in_set_labels = author_scores[in_set], unknown_labels[in_set]
     cmc, author_report = closed_set_detail(in_set_scores, fitted.authors, in_set_labels,
                                            in_set_counts, document_ranks[in_set],
                                            args, scores)
@@ -1451,12 +1636,12 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, fraction: float,
     # different unknown periods would be indistinguishable once concatenated.
     for table in (headline, cmc, author_report, predictions):
         table.insert(0, "attack", attack)
-        table.insert(0, "known_fraction", fraction)
+        table.insert(0, "known_config", config.tag)
     # The search belongs to the known side, not to any one scored document, which is why it is
     # empty on every attack after the first that shares a known fraction.
     if not trials.empty:
         trials.insert(0, "attack", attack)
-        trials.insert(0, "known_fraction", fraction)
+        trials.insert(0, "known_config", config.tag)
     return scores, predictions, ood_sweep, headline, cmc, author_report, trials
 
 
@@ -1555,13 +1740,24 @@ def parse_args() -> argparse.Namespace:
                              "built rather than the published copy.")
     parser.add_argument("--metric", default="cosine",
                         help="Distance metric (any scipy cdist metric; default: cosine).")
-    parser.add_argument("--known-fractions", type=float, nargs="+", default=[0.25, 0.50, 0.75],
-                        help="Fraction of the timeline that is known (default: 0.25 0.5 0.75). "
-                             "One experiment per value; the unknown side is everything after the "
-                             "cut. There is no --window here any more -- the attack is fitted on "
-                             "the known side alone, so shorter windows were re-fitting one model "
-                             "to score nested prefixes of one prediction set. Cut them at plot "
-                             "time instead: experiments/plot_results.py --window.")
+    parser.add_argument("--known-windows", nargs="+", default=list(DEFAULT_KNOWN_WINDOWS),
+                        metavar="XXYY",
+                        help="Known sides, each an interval of the timeline written as four "
+                             "digits -- start then end, whole percents (0025 = the first "
+                             "quarter, 2575 = the middle half). Default: the six quartile-aligned "
+                             "intervals that do not touch the held-out test set, which is the "
+                             "complete set of them. One experiment per value; every one is "
+                             "scored against the same test set, and each scores its whole "
+                             "remaining future so the temporal figures stay drawable. Reading "
+                             "them by (size, gap to the test set) is the point of the design: "
+                             "0025/2550/5075 differ only in staleness, 5075/2575/0075 only in "
+                             "volume.")
+    parser.add_argument("--test-fraction", type=float, default=DEFAULT_TEST_FRACTION,
+                        help="Final share of the timeline held out of every known side and "
+                             "shared by every configuration as the set they are compared on "
+                             "(default: 0.25). No --known-windows entry may reach into it. "
+                             "Changing it makes a run incomparable to the defaults, so it is "
+                             "stamped on the output directory name.")
     parser.add_argument("--model-owner", default="all",
                         help="Restrict to one agent provider, e.g. 'Anthropic' (default: all).")
     parser.add_argument("--language", default="all",
@@ -1617,10 +1813,9 @@ def parse_args() -> argparse.Namespace:
                              "configurations (default: on; --no-tune uses the defaults instead). "
                              "The search runs on chronological folds *inside the "
                              "known side*, so it never sees the documents it will be evaluated "
-                             "on. It runs once per (attack, known fraction) and is shared by the "
-                             "windows that start from that known side; it is never shared across "
-                             "known fractions, because the 75%% known side contains the 25%% "
-                             "one's unknown documents. Overrides --regularization / --balanced / "
+                             "on. It runs once per (attack, known configuration) and is never "
+                             "shared across configurations, because they hold different (and "
+                             "overlapping) documents. Overrides --regularization / --balanced / "
                              "--shrinkage. Writes every (candidate, rung) pair to "
                              "tuning_trials.csv, one block per search, and the chosen settings to "
                              "the hyperparameters column of rolling_results.csv. No-op for the "
@@ -1631,11 +1826,9 @@ def parse_args() -> argparse.Namespace:
                              "(default: 3).")
     parser.add_argument("--tune-window", type=float, default=0.25,
                         help="Validation block of each tuning fold, as a fraction of the known "
-                             "side (default: 0.25). Independent of --window on purpose: the two "
-                             "are in different units, so tying them together never made the "
-                             "inner simulation match the outer task and only forced a separate "
-                             "search per window. Keeping it fixed lets every window of one known "
-                             "fraction share a single search.")
+                             "side (default: 0.25). A share of the known side rather than a copy "
+                             "of the outer task, so the search does not have to be repeated for "
+                             "every configuration that happens to hold the same documents.")
     parser.add_argument("--tune-candidates", type=int, default=6,
                         help="Configurations sampled per --tune search, i.e. the width of the "
                              "first halving rung (default: 6). This is the main speed dial. A "
@@ -1724,12 +1917,16 @@ def output_tag(args: argparse.Namespace) -> str:
     language = "" if args.language.lower() == "all" else f"_{args.language.lower()}"
     language_aware = "_langaware" if args.language_aware else ""
     openset = "" if args.ood == "none" else f"_openset_{args.ood_calibration}"
-    fractions = ("" if args.known_fractions == [0.25, 0.50, 0.75]
-                 else "_k" + "-".join(str(_percent(f)) for f in args.known_fractions))
+    fractions = ("" if tuple(args.known_windows) == DEFAULT_KNOWN_WINDOWS
+                 else "_k" + "-".join(args.known_windows))
+    # The test set is what every configuration is compared on, so a run that held out a different
+    # one is not a point on anyone else's curve, however identical the rest of its flags.
+    held_out = ("" if abs(args.test_fraction - DEFAULT_TEST_FRACTION) < 1e-9
+                else f"_test{_percent(args.test_fraction)}")
     defense = NO_DEFENSE_TAG if args.defense == "none" else args.defense
     attacks = "-".join(args.attacks)
     return (f"{args.source}_{defense}_{args.feature}_{attacks}"
-            f"{owner}{language}{language_aware}{fractions}{openset}{metric}{scaled}")
+            f"{owner}{language}{language_aware}{fractions}{held_out}{openset}{metric}{scaled}")
 
 
 def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFrame,
@@ -1742,8 +1939,10 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
     different story from the document-weighted ones above them.
     """
     tuned = "" if scores["hyperparameters"] == "default" else f"  [tuned: {scores['hyperparameters']}]"
-    print(f"\n=== [{scores['attack']}] known {scores['known_fraction']:.0%} "
-          f"({scores['known_period']}) -> unknown rest {1 - scores['known_fraction']:.0%} "
+    print(f"\n=== [{scores['attack']}] {scores['known_config']} "
+          f"= known {scores['known_start']:.0%}-{scores['known_end']:.0%} "
+          f"({scores['known_period']}), {scores['gap_weeks']:.1f} weeks before the test set "
+          f"-> unknown rest {1 - scores['known_end']:.0%} "
           f"({scores['unknown_period']}){tuned}")
     print(f"  {scores['n_known_docs']:,} known docs / {scores['n_known_authors']:,} authors  ->  "
           f"{scores['n_unknown_docs']:,} unknown docs / {scores['n_unknown_authors']:,} authors")
@@ -1842,30 +2041,50 @@ def main() -> None:
               f"unknown document will be scored only against known authors who write one of its "
               f"languages")
 
-    results, predictions, ood_sweeps, cmcs, author_reports, all_trials = [], {}, [], [], {}, []
-    # One hyper-parameter search per (attack, known fraction), shared by every window that starts
-    # from that known side. Lives here rather than in run_window so its scope is one experiment.
-    tuning_cache: dict[tuple[str, float], dict] = {}
-    windows = rolling_windows(len(frame), args.known_fractions)
-    for fraction, known, unknown in windows:
+    results, ood_sweeps, cmcs, all_trials, stems = [], [], [], [], []
+    output_dir = (Path(args.output_dir) if args.output_dir
+                  else REPO_ROOT / "experiments" / "results" / output_tag(args))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Clear this run's previous per-configuration files **before** the loop, because each one is
+    # now written as soon as its configuration finishes rather than at the end. Rewriting alone is
+    # not enough: these are named after what the run produced, so a directory that used to emit
+    # `<attack>_known25.csv` would leave it beside a fresh `<attack>_known0025.csv`, and
+    # `plot_results.py` globs the pattern. Scoped to the two globs this owns, so
+    # `rolling_results.csv` and friends are untouched.
+    for previous in (*output_dir.glob("predictions_*.csv"),
+                     *output_dir.glob("author_report_*.csv")):
+        previous.unlink()
+    # One hyper-parameter search per (attack, known configuration). Lives here rather than in
+    # run_window so its scope is one experiment.
+    tuning_cache: dict[tuple[str, str], dict] = {}
+    configurations = known_configurations(len(frame), args.known_windows, args.test_fraction)
+    print(f"held-out test set: final {args.test_fraction:.0%} of the timeline "
+          f"({len(frame) - int(round((1 - args.test_fraction) * len(frame))):,} documents), "
+          f"shared by all {len(configurations)} known configuration(s): "
+          + ", ".join(f"{config.tag} (size {config.size:.0%}, gap {config.gap:.0%})"
+                      for config, _, _ in configurations))
+    for config, known, unknown in configurations:
         for attack in args.attacks:
-            outcome = run_window(frame, embeddings, fraction, attack, known, unknown,
+            outcome = run_window(frame, embeddings, config, attack, known, unknown,
                                  args, tuning_cache, languages)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
-            # Keyed by known side only: the windows that share one are collected into a single
-            # file, in the order they were run (shortest window first).
-            predictions.setdefault((fraction, attack), []).append(window_predictions)
             cmcs.append(cmc)
-            author_reports.setdefault((fraction, attack), []).append(author_report)
             if ood_sweep is not None:
                 ood_sweeps.append(ood_sweep)
             if not trials.empty:
                 all_trials.append(trials)
             report_window(scores, headline, author_report, args)
+            # Written now, not accumulated: holding six configurations' worth of per-document
+            # tables while the largest score matrices are live is how a WildChat run reaches the
+            # 16 GB cap. It also means a job killed part way leaves the configurations it did
+            # finish, rather than nothing.
+            stem = f"{attack}_{config.tag}"
+            window_predictions.to_csv(output_dir / f"predictions_{stem}.csv", index=False)
+            author_report.to_csv(output_dir / f"author_report_{stem}.csv", index=False)
+            stems.append(stem)
+            del window_predictions, author_report
 
-    output_dir = Path(args.output_dir) if args.output_dir else REPO_ROOT / "experiments" / "results" / output_tag(args)
-    output_dir.mkdir(parents=True, exist_ok=True)
     all_cmcs = pd.concat(cmcs, ignore_index=True)
     pd.DataFrame(results).to_csv(output_dir / "rolling_results.csv", index=False)
     all_cmcs.to_csv(output_dir / "cmc_results.csv", index=False)
@@ -1874,35 +2093,6 @@ def main() -> None:
     if all_trials:
         pd.concat(all_trials, ignore_index=True).to_csv(output_dir / "tuning_trials.csv", index=False)
 
-    def stem(fraction: float, attack: str) -> str:
-        """``<attack>_known<pct>`` -- one file per known side, holding every window run from it.
-
-        The window is a *column* rather than part of the name. Splitting on it too wrote eight
-        near-identical files per run whose only difference was a constant, and reading a run back
-        meant globbing and concatenating them anyway; the axes are stamped on every row (see
-        :func:`run_window`), so nothing is lost by joining them here. The known fraction stays in
-        the name because it is the one axis that changes what the attacker was given.
-        """
-        return f"{attack}_known{_percent(fraction)}"
-
-    # Clear this run's previous per-known-side files before writing the new ones. Rewriting alone
-    # is not enough: these are named after what the run produced, so a configuration that used to
-    # emit `<attack>_known25_window10.csv` leaves those behind when it now emits
-    # `<attack>_known25.csv`, and `plot_results.py` globs the pattern -- it would read a stale
-    # window beside a fresh known side and average them as if both were this run's. Scoped to the
-    # two globs this function owns, so `rolling_results.csv` and friends are untouched.
-    for previous in (*output_dir.glob("predictions_*.csv"),
-                     *output_dir.glob("author_report_*.csv")):
-        previous.unlink()
-
-    for key, frames in predictions.items():
-        pd.concat(frames, ignore_index=True).to_csv(
-            output_dir / f"predictions_{stem(*key)}.csv", index=False)
-    for key, frames in author_reports.items():
-        pd.concat(frames, ignore_index=True).to_csv(
-            output_dir / f"author_report_{stem(*key)}.csv", index=False)
-
-    stems = [stem(*key) for key in predictions]
     print(f"\nWrote results to {output_dir}/")
     print("  rolling_results.csv, cmc_results.csv"
           + (", ood_sweep.csv" if ood_sweeps else ""))
