@@ -32,6 +32,13 @@ CONDA_MODULE="${PROMPT_ANONYMITY_CONDA_MODULE:-conda/latest}"
 
 cd "$PROJECT"
 
+# Python block-buffers stdout when it is a file rather than a terminal, which is exactly what
+# --output makes it: a run's progress then sits in an 8 KB buffer and lands in the log all at once
+# when the process exits. That turns `tail -f` into "nothing is happening" for an hour, and a job
+# killed by its time limit loses the buffer entirely -- the two moments a log is most needed.
+# Unbuffering costs nothing at this volume (a few hundred lines per run).
+export PYTHONUNBUFFERED=1
+
 # Each step is conditional because how conda arrives differs per cluster, and an unconditional
 # `module load` is a hard failure on a site that has no Lmod at all. sbatch exports the submitting
 # environment by default, so on Unity `module` is usually already here; ~/.bashrc is the fallback
