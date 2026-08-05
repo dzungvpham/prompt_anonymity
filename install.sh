@@ -192,9 +192,18 @@ case "$ACCEL" in
     log "Downloading NLTK data for dp_mlm.py (punkt, stopwords, wordnet) ..."
     "$PYTHON" -m nltk.downloader -q punkt punkt_tab stopwords wordnet || \
       warn "NLTK data download failed; dp_mlm.py will retry it lazily on first use (needs network)."
-    # style_distance featurizer: sentence-transformers (reuses torch from [styleremix]).
+    # style_distance and luar featurizers: sentence-transformers + transformers + einops (all
+    # reusing torch from [styleremix]). einops is there for LUAR's Hub-side modeling code, not for
+    # ours -- see the [features] comment in pyproject.toml.
     pip_install -e "$SCRIPT_DIR[features]" -c "$CONSTRAINTS_FILE"
     FEATURES_EXTRA="with"
+    # Fetch LUAR's weights, tokenizer and modeling code now rather than on first use, so a compute
+    # node with no outbound network can run --feature luar. The model id and pinned revision are
+    # read from the featurizer itself to keep one source of truth; importing it costs nothing here
+    # because it imports torch/transformers lazily.
+    log "Downloading the LUAR checkpoint for the luar featurizer ..."
+    "$PYTHON" -c 'from huggingface_hub import snapshot_download as fetch; from prompt_anonymity.features.luar import DEFAULT_MODEL_ID as model, DEFAULT_REVISION as revision; fetch(model, revision=revision)' || \
+      warn "LUAR checkpoint download failed; the luar featurizer will retry it lazily on first use (needs network)."
     # rtt_argos defense: argostranslate. Non-fatal -- other defenses are unaffected.
     if pip_install -e "$SCRIPT_DIR[argos]" -c "$CONSTRAINTS_FILE"; then
       ARGOS_EXTRA="with"

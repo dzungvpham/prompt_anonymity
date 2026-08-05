@@ -65,11 +65,18 @@ dpmlm-pii = [
 argos = [
     "argostranslate",
 ]
-# style_distance.py: the style_distance featurizer (StyleDistance sentence-transformer embeddings).
-# Reuses torch from [styleremix]; lazy-imported so only --featurizer style_distance needs it.
+# Model-backed featurizers: style_distance.py (StyleDistance sentence-transformer embeddings) and
+# luar.py (LUAR authorship embeddings, loaded straight from transformers with trust_remote_code).
+# Both reuse torch from [styleremix] and are lazy-imported, so only --feature style_distance / luar
+# needs this extra. transformers is listed explicitly rather than leaned on transitively, since
+# luar.py imports it directly. einops is NOT imported by our code: LUAR ships its own modeling code
+# on the Hub and that file imports einops, so trust_remote_code loading dies with ModuleNotFoundError
+# without it -- at first GPU use, long after install. Nothing else here pulls einops in transitively.
 features = [
     "prompt-anonymity[styleremix]",
     "sentence-transformers",
+    "transformers",
+    "einops",
 ]
 defenses = [
     "prompt-anonymity[styleremix]",

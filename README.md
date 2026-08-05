@@ -49,6 +49,9 @@ python experiments/run_experiment.py --dataset swe-chat --model-owner all
 
 # Combine featurizers: concatenate StyloMetrix with function-word frequencies
 python experiments/run_experiment.py --dataset wildchat --feature stylometrix function_words
+
+# LUAR: neural authorship embeddings, the strongest available adversary
+python experiments/run_experiment.py --dataset swe-chat --feature luar --metric cosine
 ```
 
 The default run (`--defense none`) reuses the committed StyloMetrix vectors and is a pure, **GPU-free** pass-through that reproduces the published numbers exactly. StyloMetrix is invoked only when a defense rewrites the prompt text (the rewritten conversations are re-featurized); that step uses the GPU when one is available and otherwise falls back to CPU, which can be very slow.
@@ -69,7 +72,7 @@ Common options (run with `--help` for the full list):
 | `--attack` | `nearest_neighbor` | Attack to run (any key in the `ATTACKS` registry). |
 | `--metric` | `cosine` | Distance metric the attack uses to compare vectors (`cosine`, `euclidean`, or any scipy `cdist` metric). Decoupled from the featurizer. |
 | `--defense` | `none` | Defense applied before the attack (`none`, `example_normalization`, …). |
-| `--feature` | `stylometrix` | Conversation representation(s). Name several (e.g. `--feature stylometrix function_words`) to concatenate their feature vectors into one. Gemini embeddings are planned. |
+| `--feature` | `stylometrix` | Conversation representation(s). Name several (e.g. `--feature stylometrix function_words`) to concatenate their feature vectors into one. `luar` is the frozen `LUAR-MUD` authorship model applied zero-shot — run it with `--metric cosine`, the similarity its contrastive objective was trained under. Gemini embeddings are planned. |
 | `--language` | `English` | WildChat language subset (`English` / `Russian`). |
 | `--model-owner` | `Anthropic` | SWE-chat: restrict to one agent provider, or `all`. |
 | `--top-ks` | `1 5 10` | k values for the headline table. |
@@ -94,7 +97,7 @@ Each stage is its own subpackage, and most expose a name→implementation regist
 
 - **`data/`** — dataset loaders and split rules. `load_dataset(name, dir, **opts)` returns an `AttackData`. WildChat splits *by model* (one model labeled, another anonymous); SWE-chat splits *by time* (each user's last session is the unknown). Registry: `DATASET_LOADERS`.
 - **`defenses/`** — optional transforms that rewrite the conversation *text* to resist linkage, run before the attack. `none` is the baseline; costly rewrites (e.g. round-trip translation) use a disk-cached `CachedDefense`. Registry: `DEFENSES`; entry point `apply_defense`.
-- **`features/`** — turn the (possibly defended) text into attack-ready vectors. `StyloMetrixFeaturizer`, `FunctionWordFeaturizer`, `CharacterStatisticsFeaturizer`. Runs after the defense, and reuses the committed vectors wherever the text is unchanged — so a no-defense run never invokes StyloMetrix (and needs no GPU); GPU is used for any recompute when available, else CPU (much slower). `apply_featurizer` also accepts several featurizers at once and concatenates their vectors column-wise, each one reusing its own cache. Registry: `FEATURIZERS`; entry point `apply_featurizer`.
+- **`features/`** — turn the (possibly defended) text into attack-ready vectors. `StyloMetrixFeaturizer`, `FunctionWordFeaturizer`, `CharacterStatisticsFeaturizer`, `CharNgramTfidfFeaturizer`, `StyleDistanceFeaturizer`, `LuarFeaturizer`. Runs after the defense, and reuses the committed vectors wherever the text is unchanged — so a no-defense run never invokes StyloMetrix (and needs no GPU); GPU is used for any recompute when available, else CPU (much slower). `apply_featurizer` also accepts several featurizers at once and concatenates their vectors column-wise, each one reusing its own cache. Registry: `FEATURIZERS`; entry point `apply_featurizer`.
 - **`attacks/`** — score each unknown conversation against all known ones, producing an `[n_unknown × n_known]` distance matrix. `nearest_neighbor`. Registry: `ATTACKS`; entry point `run_attack`.
 - **`evaluation/`** — `LinkageRanking` sorts each unknown's candidates once and then scores any sub-pool cheaply; `headline_accuracy` and `pool_size_sweep` build the result tables.
 - **`metrics/`** — stateless `top_k_accuracy` and the `random_guessing_accuracy` chance baseline.
