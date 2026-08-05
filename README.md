@@ -20,8 +20,12 @@ python -m prompt_anonymity.data.download
 # 2. Run a specific experiment
 python experiments/run_experiment.py --source swe_chat --feature stylometrix --attacks nearest_neighbor
 
-# 2b. Run all eligible experiments
+# 2b. Run all eligible experiments (skipping the ones already on disk)
 python experiments/run_all_experiments.py
+
+# 2c. ...or submit one SLURM job per experiment, GPU only where it helps.
+#     --dry-run prints the sbatch command lines without submitting anything.
+python experiments/run_all_experiments.py --slurm --dry-run
 
 # 3. Draw the figures from every result on disk
 python experiments/plot_results.py
@@ -134,6 +138,40 @@ spent). That featurizer embeds each document once, from its first 8,192 tokens (
 prefixed with `task: sentence similarity | query: ` — so its vectors describe a document's opening
 rather than all of it. `--task clustering` (or `classification`) changes that prefix and writes a
 separate file, so tasks can be compared side by side.
+
+### Running the experiment grid on a cluster
+
+`run_all_experiments.py --slurm` submits **one job per experiment** rather than running them
+locally — a GPU only for the `xgboost` cells, plain CPU for everything else. It only submits, so it
+belongs on a login node. Two files hold everything cluster-specific, and they are the only ones to
+edit for a different site:
+
+| file | what it holds |
+|---|---|
+| `scripts/slurm.toml` | resource profile → `sbatch` flags: partitions, memory, time, accounting |
+| `scripts/slurm_job.sh` | how a batch shell builds a working conda env (no `#SBATCH` directives) |
+
+The launcher itself never names a partition. It only decides which *class* of machine a cell needs
+(`resource_profile`: `gpu` for xgboost, `cpu_large` for WildChat's larger score matrices, `cpu`
+otherwise) and the config file says what that class costs here. Check a change before spending
+anything:
+
+```bash
+python experiments/run_all_experiments.py --slurm --dry-run      # print the sbatch lines, submit nothing
+python experiments/run_all_experiments.py --slurm                # submit the missing cells
+python experiments/run_all_experiments.py --slurm --slurm-arg=--account=my-account   # one-off flags
+```
+
+Flags in the config are environment-expanded — from your shell or from the same `.env` the data
+pipeline reads — so nothing personal has to be committed. The two forms differ in what an unset
+variable means: `--account=$SLURM_ACCOUNT` fails with a message naming the variable (a missing
+account is a rejected job), while `--mail-user=${EMAIL:-}` simply drops the flag. SLURM has no
+user directory to ask for an address — `sacctmgr` stores none, and `MailDomain` is unset on Unity —
+so set `EMAIL` if you want job mail.
+
+Point `--slurm-config` (or `$PROMPT_ANONYMITY_SLURM_CONFIG`) at a file of your own to keep local
+settings uncommitted. Jobs are named after their results directory, so a cell already pending or
+running is skipped rather than submitted twice; `scancel` it first to resubmit.
 
 ## Defenses
 
