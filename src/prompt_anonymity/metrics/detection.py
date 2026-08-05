@@ -27,6 +27,7 @@ Reading order
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 from scipy.special import softmax
 from sklearn.metrics import brier_score_loss, roc_auc_score, roc_curve
 
@@ -39,8 +40,25 @@ def max_softmax_confidence(scores) -> np.ndarray:
     a distance- or similarity-based scorer it is a monotone rescaling rather than a real
     posterior, which is precisely why :func:`calibration_metrics` is worth running before
     treating it as one.
+
+    Computed in row blocks, because the obvious ``softmax(scores).max(axis=1)`` needs two full
+    float64 copies of the score matrix to return one number per document -- over 10 GB at
+    86,000 documents against 7,500 authors, which is enough to lose a 16 GB job. Only the top
+    probability is wanted, and it has a closed form that never materialises the rest:
+    ``max_j softmax(s)_j = 1 / sum_j exp(s_j - max_j s)``.
     """
-    return softmax(np.asarray(scores, dtype=float), axis=1).max(axis=1)
+    scores = np.asarray(scores)
+    if scores.ndim != 2:
+        raise ValueError(f"scores must be 2-D (n_documents, n_candidates); got {scores.shape}.")
+
+    confidence = np.empty(len(scores))
+    block_rows = max(1, 2 ** 28 // max(scores.shape[1] * 8, 1))     # ~256 MB per block
+    for start in range(0, len(scores), block_rows):
+        block = scores[start:start + block_rows].astype(np.float64)
+        block -= block.max(axis=1, keepdims=True)
+        np.exp(block, out=block)
+        confidence[start:start + block_rows] = 1.0 / block.sum(axis=1)
+    return confidence
 
 
 def detection_auroc(rejection_scores, is_out_of_set) -> float:
@@ -158,6 +176,74 @@ def c_at_1(correct, answered) -> float:
     n_correct = int((correct & answered).sum())
     n_unanswered = int((~answered).sum())
     return float((n_correct + n_unanswered * n_correct / n) / n)
+
+
+def selective_classification(confidence, correct,
+                             coverages=(0.10, 0.25, 0.50, 0.75, 1.00)) -> pd.DataFrame:
+    """Precision when the attack answers only its most confident documents.
+
+    The trade-off Narayanan et al. reported as the real result of their 100,000-author attack:
+    top-1 accuracy was ~20%, but *choosing when to speak* lifted precision past 80% while still
+    identifying half of the authors it would have identified by always guessing. An attack that
+    is usually wrong but knows when it is right is a far sharper privacy threat than its headline
+    accuracy suggests, and no single-threshold number shows that -- hence a curve.
+
+    This is the closed-set companion to
+    :func:`detection_identification_rate`. DIR@FAR asks "of the documents whose author is
+    enrolled, how many are accepted *and* correct, while holding impostor acceptance to a fixed
+    rate" -- an open-set question that needs out-of-set documents to define its false alarm rate.
+    This function asks the simpler one that applies to in-set documents alone: rank by confidence,
+    answer the top fraction, and report how often those answers are right.
+
+    Parameters
+    ----------
+    confidence : array-like of shape (n_documents,)
+        Per-document confidence in the top-ranked author, higher = more confident. Any monotone
+        confidence works: :func:`max_softmax_confidence`, or the negated
+        :func:`~prompt_anonymity.attacks.rejection.rejection_score`, whose cohort-normalised
+        margin is a variant of the "gap statistic" that paper used.
+    correct : array-like of shape (n_documents,)
+        Whether the top-ranked author is the true one.
+    coverages : sequence of float
+        Fractions of documents to answer, each in (0, 1].
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per coverage, with columns ``coverage`` (requested), ``n_answered``,
+        ``precision`` (accuracy among answered) and ``recall`` -- correct answers retained as a
+        fraction of those made at full coverage, which is the sense in which the original reports
+        "50% recall". ``recall`` is 1.0 at full coverage by construction.
+    """
+    confidence = np.asarray(confidence, dtype=float)
+    correct = np.asarray(correct, dtype=bool)
+    if len(confidence) != len(correct):
+        raise ValueError(
+            f"confidence has {len(confidence)} entries but correct has {len(correct)}."
+        )
+
+    # Descending confidence; ties broken arbitrarily but deterministically.
+    order = np.argsort(-confidence, kind="stable")
+    ordered_correct = correct[order]
+    cumulative_correct = np.cumsum(ordered_correct)
+    total_correct = int(correct.sum())
+
+    rows = []
+    for coverage in coverages:
+        n_answered = max(1, int(round(coverage * len(correct)))) if len(correct) else 0
+        n_answered = min(n_answered, len(correct))
+        if n_answered == 0:
+            rows.append({"coverage": coverage, "n_answered": 0,
+                         "precision": float("nan"), "recall": float("nan")})
+            continue
+        n_correct = int(cumulative_correct[n_answered - 1])
+        rows.append({
+            "coverage": coverage,
+            "n_answered": n_answered,
+            "precision": n_correct / n_answered,
+            "recall": n_correct / total_correct if total_correct else float("nan"),
+        })
+    return pd.DataFrame(rows)
 
 
 def calibration_metrics(confidence, correct, n_bins: int = 10) -> dict:

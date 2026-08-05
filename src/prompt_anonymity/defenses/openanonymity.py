@@ -1,50 +1,92 @@
 """OpenAnonymity privacy-scrubber rewrite defense (port of scrubberService.js's REDACT step).
 
-A remote model rewrites each user turn to (1) redact PII / org / project / place identifiers behind
+A model rewrites each user turn to (1) redact PII / org / project / place identifiers behind
 stable placeholders (``[PERSON_1]``, ``[ORG_1]``, ...) and (2) de-identify writing STYLE -- strip
 signatures, catchphrases, emoji, unusual casing, idiosyncratic phrasing -- while keeping intent and
 content. Both halves serve unlinkability: the style de-identification erases the per-user
 stylometric fingerprint, and the placeholders inject standardized tokens that converge prompts
 toward a shared identity. The featurize stage re-derives features from the scrubbed text.
 
-Unlike the on-device defenses this calls a remote API (OpenRouter), so it needs network access and
-``OPENROUTER_API_KEY`` (loaded from a ``.env``); the key is checked lazily on first use and fails
-fast if missing. The prompt is sent in the clear, so the rewriter itself must be trusted.
+The scrubber runs **locally, through vLLM** -- ``gpt-oss-safeguard-120b`` from a checkpoint on this
+machine by default (:data:`OPENANON_MODEL`), a safety-tuned sibling of ``gpt-oss-120b`` sharing its
+architecture, tokenizer and harmony chat format, so the backend needs no special handling for it --
+not against a hosted API. Two things follow. Cost is GPU
+hours rather than per-token billing, which is what makes a whole-corpus run affordable: scrubbing
+WildChat per turn is ~600K generations, and the prompts are dominated by the ~1K-token system
+prompt that a local model re-reads for free. And the prompts never leave the cluster, so the
+scrubber does not itself have to be trusted with the data it de-identifies.
+
+It needs a GPU large enough for the model (gpt-oss-120b is a 61 GB MXFP4 checkpoint -- one 80 GB
+A100/H100, or several smaller GPUs via :data:`OPENANON_TENSOR_PARALLEL_SIZE`). The model is built
+lazily on first use, so a fully-cached run loads nothing and needs no GPU at all.
 
 Granularity note: this standalone defense scrubs **per user turn** (the package's text-rewrite
-spine), which calls the paid API once per turn. The combined StyleRemix+OpenAnonymity defense
-instead scrubs once per whole conversation to cut API cost ~5x; if per-turn cost is a concern here,
-that is the knob to revisit.
+spine), one generation per distinct turn. The combined StyleRemix+OpenAnonymity defense instead
+scrubs once per whole conversation, which was a cost decision made when this called a paid API;
+locally the per-turn cost is just time.
 """
 
 from __future__ import annotations
 
+import math
 import os
-import random
 import re
-import time
+from pathlib import Path
 
-from ._backends import PerTurnBatchRewriteDefense
+from ._backends import (
+    PerTurnBatchRewriteDefense,
+    configure_cuda_toolkit,
+    model_path,
+    resolve_model_path,
+    shutdown_vllm,
+)
 
-OPENANON_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-#: EDIT ME — any OpenRouter chat model id. Part of the cache key, so a swap re-caches.
-OPENANON_MODEL = "openai/gpt-oss-120b"
-OPENANON_API_KEY_ENV = "OPENROUTER_API_KEY"
+#: The scrubber model: a directory holding a checkpoint, a HuggingFace hub *cache* entry
+#: (``.../models--<org>--<name>/``, resolved to its snapshot by :func:`resolve_model_path`), or a
+#: hub repo id for vLLM to fetch. Configured in ``models.toml`` (``$OPENANON_MODEL`` overrides --
+#: see :func:`~prompt_anonymity.defenses._backends.model_path`), not hardcoded here, since it is a
+#: machine-specific path. Part of the cache key, so a swap re-caches.
+OPENANON_MODEL = model_path("openanonymity", "OPENANON_MODEL")
 OPENANON_TEMPERATURE = 0.0   # greedy -> deterministic, reproducible
 OPENANON_TOP_P = 1.0
-OPENANON_MAX_TOKENS = 2048
 OPENANON_OUTPUT_TAG = "scrubbed_prompt"
-# Requests are network I/O-bound, so fan them out across threads. Concurrency has NO effect on the
-# rewrites (temperature 0), so raising it never invalidates the cache.
-OPENANON_MAX_WORKERS = int(os.environ.get("OPENANON_MAX_WORKERS", "8"))
-# gpt-oss-120b's context window. A rare huge turn is token-chunked to fit rather than truncated (so
-# no content is dropped); MARGIN covers tokenizer drift plus the wrapper.
-OPENANON_CONTEXT_LIMIT = int(os.environ.get("OPENANON_CONTEXT_LIMIT", "131072"))
-OPENANON_TOKEN_MARGIN = int(os.environ.get("OPENANON_TOKEN_MARGIN", "1024"))
-# Transient transport hiccups (dropped TLS, read timeouts, 5xx, 429) are retried with jittered
-# exponential backoff so a blip costs seconds, not the run.
-OPENANON_MAX_RETRIES = int(os.environ.get("OPENANON_MAX_RETRIES", "8"))
-OPENANON_BACKOFF_CAP = float(os.environ.get("OPENANON_BACKOFF_CAP", "30"))
+
+# --- vLLM engine knobs (env-tunable) ---
+# Context window to serve. Well under gpt-oss's native 131,072 because the KV cache competes with
+# the weights for GPU memory and a user turn needs nothing like that much; raise it only if turns
+# are routinely being chunked (the run says so when it chunks).
+OPENANON_MAX_MODEL_LEN = int(os.environ.get("OPENANON_MAX_MODEL_LEN", "32768"))
+#: Fraction of GPU memory vLLM may hold (weights + KV cache). Lower it when another model shares the
+#: GPU -- notably the combined StyleRemix+OpenAnonymity defense, which loads two.
+OPENANON_GPU_MEM_UTIL = float(os.environ.get("OPENANON_GPU_MEM_UTIL", "0.92"))
+#: GPUs to shard the model across; 0 = every visible GPU. A 61 GB checkpoint does not fit on one
+#: 40 GB card, so a smaller-GPU node needs this (and it is how the model is split, not replicated).
+OPENANON_TENSOR_PARALLEL_SIZE = int(os.environ.get("OPENANON_TENSOR_PARALLEL_SIZE", "0"))
+#: Skip vLLM's startup compile (torch.compile + CUDA-graph capture): minutes faster to start, slower
+#: per token, so it is worth setting for a short run or a smoke test and not for a corpus. (A node
+#: with no CUDA toolkit does not need this -- see
+#: :func:`~prompt_anonymity.defenses._backends.configure_cuda_toolkit`.)
+OPENANON_ENFORCE_EAGER = os.environ.get("OPENANON_ENFORCE_EAGER", "0") == "1"
+
+# --- generation budget ---
+#: How hard gpt-oss thinks before answering (``low``/``medium``/``high``). Scrubbing is a rewrite,
+#: not a reasoning problem, and every reasoning token is generated at the same cost as an output
+#: one, so the default is ``low``. It changes the output, so it is part of the cache key.
+OPENANON_REASONING_EFFORT = os.environ.get("OPENANON_REASONING_EFFORT", "low")
+#: Tokens reserved on top of the rewrite itself for the model's chain of thought.
+OPENANON_REASONING_BUDGET = int(os.environ.get("OPENANON_REASONING_BUDGET", "1024"))
+#: How much longer than its input a rewrite is allowed to be. Placeholders (``[MEDICAL_RECORD_
+#: NUMBER_1]``) are longer than what they replace, so the scrub can grow; 1.5x leaves room without
+#: letting a runaway generation consume the window.
+OPENANON_OUTPUT_RATIO = float(os.environ.get("OPENANON_OUTPUT_RATIO", "1.5"))
+#: Slack for the wrapper/template tokens the budget arithmetic cannot see exactly.
+OPENANON_TOKEN_MARGIN = int(os.environ.get("OPENANON_TOKEN_MARGIN", "256"))
+#: Rows defended between cache flushes. A run over a full corpus takes hours, so it checkpoints: a
+#: killed run resumes from the last flush instead of restarting (see
+#: :meth:`~prompt_anonymity.caching.IndexedRowCache.apply`). Each flush rewrites the cache table
+#: whole, so flushing too often is quadratic in the table's size -- another reason a large corpus
+#: wants to be run in shards, which bound that table as well as the runtime.
+OPENANON_CHECKPOINT_EVERY = int(os.environ.get("OPENANON_CHECKPOINT_EVERY", "1000"))
 
 OPENANON_SYSTEM_PROMPT = """
 You are PrivacyScrubber, a privacy-preserving prompt rewrite model.
@@ -163,195 +205,295 @@ def extract_tagged_output(raw_text, tag_name: str) -> str:
     return match.group(1).strip() if match else raw_text.strip()
 
 
+#: gpt-oss speaks the *harmony* format: one token stream carrying several labelled CHANNELS, of
+#: which ``analysis`` is the chain of thought and ``final`` is the answer. Generating with
+#: ``skip_special_tokens=False`` keeps the labels visible so the answer can be separated from the
+#: thinking -- which matters here because the system prompt shows worked examples, and a model
+#: reasoning about them frequently drafts a ``<scrubbed_prompt>`` block mid-thought.
+HARMONY_FINAL_CHANNEL = re.compile(r"<\|channel\|>\s*final\s*<\|message\|>", re.IGNORECASE)
+#: Any remaining harmony control token (``<|end|>``, ``<|return|>``, ``<|start|>``, ...).
+HARMONY_CONTROL_TOKEN = re.compile(r"<\|[a-z_]+\|>", re.IGNORECASE)
+
+
+def final_channel_text(raw_text: str) -> str:
+    """The model's ``final`` channel: its answer, with the chain of thought dropped.
+
+    Splits at the LAST final-channel marker (a stream may open the channel more than once) and
+    strips the control tokens around it. Two cases are deliberately distinguished:
+
+    * **No markers at all** -> the text is returned as-is, so this is a no-op for a model that does
+      not speak harmony, or when the channels have already been parsed out upstream.
+    * **Markers, but no ``final`` channel** -> ``""``. A generation cut off while still thinking has
+      only an ``analysis`` channel, and returning that would hand the model's chain of thought back
+      as if it were the rewritten prompt.
+    """
+    parts = HARMONY_FINAL_CHANNEL.split(raw_text)
+    if len(parts) == 1 and HARMONY_CONTROL_TOKEN.search(raw_text):
+        return ""
+    return HARMONY_CONTROL_TOKEN.sub("", parts[-1]).strip()
+
+
+def parse_scrubbed_output(raw_text: str, fallback: str) -> str:
+    """The scrubbed prompt from one raw generation: final channel, then the tagged block.
+
+    ``fallback`` (the fragment's original text) is returned whenever the generation cannot be
+    trusted -- empty, still mid-thought, or with a ``<scrubbed_prompt>`` block that was opened and
+    never closed, which is what a rewrite truncated at the token cap looks like. Handing back the
+    input unchanged is the honest failure: the turn is visibly *undefended* rather than silently
+    replaced by half a rewrite (or by the model's reasoning about one), and the backend reports how
+    often it happened.
+
+    A model that skips the wrapper entirely but answers anyway is still taken at its word, which is
+    the same latitude the JS original allowed.
+    """
+    answer = final_channel_text(raw_text or "")
+    if not answer:
+        return fallback
+    closed = re.search(rf"<{OPENANON_OUTPUT_TAG}>\s*([\s\S]*?)\s*</{OPENANON_OUTPUT_TAG}>",
+                       answer, re.IGNORECASE)
+    if closed:
+        return closed.group(1).strip() or fallback
+    if f"<{OPENANON_OUTPUT_TAG}".lower() in answer.lower():
+        return fallback  # opened but never closed -> truncated mid-rewrite
+    return answer.strip() or fallback
+
+
 class _OpenAnonBackend:
-    """OpenRouter scrubber client: token-budget chunking (never truncates), context-length re-split,
-    jittered exponential backoff, and a thread pool to fan requests out."""
+    """Local scrubber served by vLLM: one generation per turn, batched, with length-aware budgets.
 
-    class ContextTooLong(RuntimeError):
-        """A fragment was rejected for length even though our token estimate said it fit; caught and
-        re-split smaller by :meth:`_scrub_within_budget`."""
+    Built lazily by the defense, because constructing it loads the model. Three things it handles
+    that a plain "prompt in, text out" wrapper does not:
 
-    _UNSET = object()  # sentinel: tokenizer not yet lazily loaded
+    * **Nothing is truncated.** A turn too long for the context window is split into contiguous
+      token fragments that are each scrubbed and concatenated back, so a 250K-token WildChat turn
+      is defended in full rather than cut off (:meth:`_fragments`).
+    * **The output budget follows the input** (:meth:`_max_new_tokens`). A single fixed cap has to
+      be set for the longest turn, and one set for the *typical* turn silently truncates the long
+      ones -- which corrupts the rewrite rather than shortening it, since the closing
+      ``</scrubbed_prompt>`` never arrives.
+    * **The batch is flat.** Every fragment of every turn goes into one :meth:`~vllm.LLM.chat`
+      call, so vLLM's continuous batching keeps the GPU saturated instead of idling between turns.
+    """
 
-    def __init__(self, model, system_prompt, *, base_url=OPENANON_BASE_URL,
-                 api_key_env=OPENANON_API_KEY_ENV, temperature=OPENANON_TEMPERATURE,
-                 top_p=OPENANON_TOP_P, max_tokens=OPENANON_MAX_TOKENS, timeout=120,
-                 max_retries=OPENANON_MAX_RETRIES, max_workers=OPENANON_MAX_WORKERS,
-                 context_limit=OPENANON_CONTEXT_LIMIT, token_margin=OPENANON_TOKEN_MARGIN,
-                 backoff_cap=OPENANON_BACKOFF_CAP):
-        import requests
-        from dotenv import load_dotenv
+    def __init__(self, model=OPENANON_MODEL, system_prompt=OPENANON_SYSTEM_PROMPT, *,
+                 max_model_len=OPENANON_MAX_MODEL_LEN, gpu_memory_utilization=OPENANON_GPU_MEM_UTIL,
+                 tensor_parallel_size=OPENANON_TENSOR_PARALLEL_SIZE,
+                 enforce_eager=OPENANON_ENFORCE_EAGER, reasoning_effort=OPENANON_REASONING_EFFORT,
+                 temperature=OPENANON_TEMPERATURE, top_p=OPENANON_TOP_P,
+                 reasoning_budget=OPENANON_REASONING_BUDGET, output_ratio=OPENANON_OUTPUT_RATIO,
+                 token_margin=OPENANON_TOKEN_MARGIN):
+        configure_cuda_toolkit()  # must precede the import: vLLM reads the environment at import
+        from vllm import LLM, SamplingParams
 
-        self._requests = requests
-        self.model = model
+        self._sampling_params = SamplingParams
         self.system_prompt = system_prompt
-        self.base_url = base_url
+        self.max_model_len = max_model_len
+        self.reasoning_effort = reasoning_effort
         self.temperature = temperature
         self.top_p = top_p
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.max_workers = max_workers
-        self.backoff_cap = backoff_cap
+        self.reasoning_budget = reasoning_budget
+        self.output_ratio = output_ratio
+        self.token_margin = token_margin
 
-        # tiktoken is only needed to split a RARE oversized turn; load it lazily (see _get_encoder)
-        # so the common run never pays the vocab download. The fixed overhead uses a cheap estimate.
-        self._encoder = self._UNSET
-        wrapper = render_template(OPENANON_INPUT_TEMPLATE, {"INPUT_PROMPT": ""})
-        self.text_token_budget = (
-            context_limit - max_tokens - self._estimate_tokens(system_prompt)
-            - self._estimate_tokens(wrapper) - token_margin
+        path = resolve_model_path(model)
+        print(f"OpenAnonymity scrubber loading '{path}' with vLLM "
+              f"(context {max_model_len:,}, reasoning_effort={reasoning_effort!r})...")
+        self.llm = LLM(
+            model=path, max_model_len=max_model_len,
+            gpu_memory_utilization=gpu_memory_utilization, enforce_eager=enforce_eager,
+            **({"tensor_parallel_size": tensor_parallel_size} if tensor_parallel_size else {}),
+        )
+        self.tokenizer = self.llm.get_tokenizer()
+
+        # What one request costs before any of the user's text: the system prompt, the wrapper and
+        # the chat template's own tokens. Measured through the real template rather than estimated,
+        # since it is subtracted from the window every request.
+        self.fixed_prompt_tokens = self._render_tokens("")
+        # The longest turn fragment that leaves room for its own rewrite. Prompt and completion
+        # share one window, so a fragment of T tokens needs fixed + T for the prompt and up to
+        # ratio*T + reasoning for the answer: solve for T rather than reserving a constant.
+        self.text_token_budget = int(
+            (max_model_len - self.fixed_prompt_tokens - reasoning_budget - token_margin)
+            / (1 + output_ratio)
         )
         if self.text_token_budget <= 0:
             raise RuntimeError(
                 f"OpenAnonymity token budget is non-positive ({self.text_token_budget}); "
-                f"context_limit={context_limit} is too small for max_tokens={max_tokens}."
+                f"OPENANON_MAX_MODEL_LEN={max_model_len} is too small for the {self.fixed_prompt_tokens}-"
+                f"token system prompt plus a {reasoning_budget}-token reasoning budget."
             )
+        print(f"OpenAnonymity ready: {self.fixed_prompt_tokens:,} fixed prompt tokens, "
+              f"{self.text_token_budget:,}-token turn budget.")
 
-        load_dotenv()  # walks up from cwd, so the key can live in DS_env/.env or the repo root
-        self.api_key = os.environ.get(api_key_env)
-        if not self.api_key:
-            raise RuntimeError(
-                f"{api_key_env} not set. Add it to a .env file (e.g. '{api_key_env}=sk-or-...') "
-                "so the OpenAnonymity defense can call OpenRouter."
-            )
-        print(f"OpenAnonymity rewriter using OpenRouter model '{model}'.")
+    # --- prompt construction ---
 
-    def _backoff(self, attempt: int) -> None:
-        delay = min(self.backoff_cap, 2 ** attempt)
-        time.sleep(random.uniform(0, delay))  # full jitter de-synchronizes concurrent workers
+    def _render_tokens(self, text: str) -> int:
+        """Token length of the full chat request for ``text`` -- system prompt, wrapper, template.
 
-    @staticmethod
-    def _estimate_tokens(s: str) -> int:
-        """Cheap upper-bound token estimate (chars/3), no tokenizer -> callers stay conservative."""
-        return -(-len(s) // 3)
+        Called once at startup, on the empty prompt, to measure the fixed part. Per request the
+        length is *added up* instead (:attr:`fixed_prompt_tokens` + the text's own tokens) rather
+        than re-rendered: the template never changes, so re-templating it for every turn would
+        re-tokenize the ~1K-token system prompt hundreds of thousands of times to learn a number
+        that is already known. The seam between the two is what :attr:`token_margin` covers.
 
-    def _get_encoder(self):
-        if self._encoder is self._UNSET:
-            try:
-                import tiktoken
-                self._encoder = tiktoken.get_encoding("o200k_base")
-            except Exception:  # noqa: BLE001 - missing dep / download failure -> char heuristic
-                self._encoder = None
-        return self._encoder
+        ``apply_chat_template`` returns either a list of ids or a ``BatchEncoding`` depending on the
+        tokenizer and transformers version -- and ``len()`` of the latter is its *field count* (2),
+        not a token count, which would silently hand back a fixed cost of 2 tokens for a 1,000-token
+        prompt and leave every generation budget over-sized. Unwrap it explicitly.
+        """
+        rendered = self.tokenizer.apply_chat_template(
+            self._conversation(text), add_generation_prompt=True, tokenize=True,
+            reasoning_effort=self.reasoning_effort,
+        )
+        if hasattr(rendered, "keys"):          # BatchEncoding / dict
+            rendered = rendered["input_ids"]
+        if rendered and isinstance(rendered[0], (list, tuple)):   # batched: one conversation
+            rendered = rendered[0]
+        return len(rendered)
 
-    def _ntokens(self, s: str) -> int:
-        enc = self._get_encoder()
-        return len(enc.encode_ordinary(s)) if enc is not None else self._estimate_tokens(s)
+    def _conversation(self, text: str) -> list[dict]:
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": render_template(OPENANON_INPUT_TEMPLATE,
+                                                        {"INPUT_PROMPT": text})},
+        ]
 
-    def _split_to_budget(self, text: str, budget: int) -> list[str]:
-        """Split ``text`` into >=2 contiguous pieces each holding at most ``budget`` tokens; pieces
-        concatenate back to the original so no content is dropped."""
-        enc = self._get_encoder()
-        if enc is not None:
-            ids = enc.encode_ordinary(text)
-            budget = max(1, min(budget, len(ids) - 1))
-            return [enc.decode(ids[i:i + budget]) for i in range(0, len(ids), budget)]
-        char_window = max(1, min(budget * 3, len(text) - 1))
-        return [text[i:i + char_window] for i in range(0, len(text), char_window)]
+    # --- length handling ---
+
+    def _ntokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def _fragments(self, text: str) -> list[str]:
+        """``text`` split into contiguous pieces that each fit :attr:`text_token_budget`.
+
+        Returns ``[text]`` unchanged for the overwhelming majority of turns. The pieces concatenate
+        back to the original, so splitting costs the model some cross-fragment context but never
+        loses content -- the alternative for a turn larger than the window is to drop its tail.
+        """
+        # A token is at least one character, so a turn with fewer characters than the budget cannot
+        # exceed it: skip tokenizing the common short turn entirely.
+        if len(text) <= self.text_token_budget or self._ntokens(text) <= self.text_token_budget:
+            return [text]
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        pieces = [self.tokenizer.decode(ids[i:i + self.text_token_budget])
+                  for i in range(0, len(ids), self.text_token_budget)]
+        print(f"OpenAnonymity: turn is {len(text):,} chars / {len(ids):,} tokens "
+              f"(> {self.text_token_budget:,} budget); scrubbing in {len(pieces)} fragments.")
+        return pieces
+
+    def _max_new_tokens(self, text_tokens: int) -> int:
+        """Generation cap for one fragment: room for its rewrite plus the chain of thought.
+
+        Bounded by what is left of the context window once the prompt is in it, so a request can
+        never be built that the engine would then reject for length.
+        """
+        wanted = math.ceil(text_tokens * self.output_ratio) + self.reasoning_budget
+        room = self.max_model_len - self.fixed_prompt_tokens - text_tokens - self.token_margin
+        return max(16, min(wanted, room))
+
+    # --- generation ---
 
     def scrub(self, text: str) -> str:
-        # A blank turn has nothing to scrub and 400s some providers; short-circuit it.
-        if not text.strip():
-            return text
-        return self._scrub_within_budget(text, self.text_token_budget)
+        """Scrub a single turn (convenience wrapper over :meth:`rewrite_batch`)."""
+        return self.rewrite_batch([text])[0]
 
-    def _scrub_within_budget(self, text: str, budget: int) -> str:
-        # Fast char gate: a token is >=1 char, so a turn with fewer chars than the budget cannot
-        # exceed it -> skip tokenizing (and loading tiktoken) for the common normal-sized turn.
-        if len(text) > budget and self._ntokens(text) > budget and len(text) > 1:
-            pieces = self._split_to_budget(text, budget)
-            print(f"OpenAnonymity: turn is {len(text)} chars / ~{self._ntokens(text)} tokens "
-                  f"(> {budget} budget); scrubbing in {len(pieces)} chunks.")
-            return "".join(self._scrub_within_budget(p, budget) for p in pieces)
-        try:
-            return self._scrub_fragment(text)
-        except self.ContextTooLong:
-            smaller = min(int(budget * 0.8), max(1, self._ntokens(text) - 1))
-            if len(text) <= 1 or smaller >= budget:
-                raise  # cannot reduce further -> genuinely un-scrubbable, surface it
-            print(f"OpenAnonymity: fragment rejected for length at budget {budget}; retrying at {smaller}.")
-            return self._scrub_within_budget(text, smaller)
-
-    def _scrub_fragment(self, text: str) -> str:
-        user_text = render_template(OPENANON_INPUT_TEMPLATE, {"INPUT_PROMPT": text})
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": self.temperature, "top_p": self.top_p, "max_tokens": self.max_tokens,
-        }
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-
-        last_err = None
-        for attempt in range(self.max_retries):
-            try:
-                resp = self._requests.post(self.base_url, headers=headers, json=payload, timeout=self.timeout)
-                resp.raise_for_status()
-                content = resp.json()["choices"][0]["message"]["content"]
-                return extract_tagged_output(content, OPENANON_OUTPUT_TAG) or text
-            except self._requests.exceptions.HTTPError as err:
-                status = err.response.status_code
-                body = err.response.text
-                last_err = RuntimeError(f"{status} {err.response.reason}: {body}")
-                # 429 (rate-limit) is transient and retryable; other 4xx are client errors that fail
-                # identically on retry, so fail fast with the offending fragment for diagnosis.
-                if 400 <= status < 500 and status != 429:
-                    if status == 400 and "maximum context length" in body.lower():
-                        raise self.ContextTooLong(body) from err  # caller re-splits smaller
-                    snippet = text[:200].replace("\n", " ")
-                    raise RuntimeError(
-                        f"OpenRouter rejected the request (HTTP {status}) for model {self.model!r}; "
-                        f"not retrying. Offending fragment: {len(text)} chars, starts {snippet!r}. "
-                        f"Response body: {body}"
-                    ) from err
-                if attempt < self.max_retries - 1:
-                    self._backoff(attempt)
-            except Exception as err:  # noqa: BLE001 - network/JSON errors are all retryable
-                last_err = err
-                if attempt < self.max_retries - 1:
-                    self._backoff(attempt)
-        raise RuntimeError(f"OpenRouter request failed after {self.max_retries} attempts: {last_err}")
+    def close(self) -> None:
+        """Shut the engine down and hand its GPU memory back (see :func:`shutdown_vllm`)."""
+        if getattr(self, "llm", None) is not None:
+            shutdown_vllm(self.llm)
+            self.llm = None
 
     def rewrite_batch(self, texts: list[str]) -> list[str]:
-        """Scrub a batch of turns concurrently, preserving input order. Network I/O-bound, so a
-        thread pool gives near-linear speedup; a turn that still fails after retries raises."""
-        from concurrent.futures import ThreadPoolExecutor
+        """Scrub a batch of turns, preserving input order.
 
+        Blank turns pass through untouched (there is nothing to redact, and an empty prompt only
+        wastes a generation).
+        """
         texts = list(texts)
-        if not texts:
-            return []
-        workers = max(1, min(self.max_workers, len(texts)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self.scrub, texts))  # preserves order, re-raises first failure
+        fragments: list[str] = []
+        owners: list[int] = []
+        for position, text in enumerate(texts):
+            if not text.strip():
+                continue
+            for fragment in self._fragments(text):
+                fragments.append(fragment)
+                owners.append(position)
+        if not fragments:
+            return texts
+
+        scrubbed = self._generate(fragments)
+
+        # Re-assemble: a turn's fragments concatenate back in order; a blank turn keeps its text.
+        rejoined: dict[int, list[str]] = {}
+        for position, piece in zip(owners, scrubbed):
+            rejoined.setdefault(position, []).append(piece)
+        return ["".join(rejoined[i]) if i in rejoined else text
+                for i, text in enumerate(texts)]
+
+    def _generate(self, fragments: list[str]) -> list[str]:
+        """Run every fragment through the model in one batched call and parse the answers out."""
+        sampling = [
+            self._sampling_params(
+                temperature=self.temperature, top_p=self.top_p,
+                max_tokens=self._max_new_tokens(self._ntokens(fragment)),
+                # Keep the harmony channel markers in the text so the answer can be told apart from
+                # the chain of thought (see `final_channel_text`).
+                skip_special_tokens=False,
+            )
+            for fragment in fragments
+        ]
+        outputs = self.llm.chat(
+            [self._conversation(fragment) for fragment in fragments], sampling,
+            chat_template_kwargs={"reasoning_effort": self.reasoning_effort},
+        )
+        results, truncated = [], 0
+        for output, fragment in zip(outputs, fragments):
+            completion = output.outputs[0]
+            truncated += completion.finish_reason == "length"
+            results.append(parse_scrubbed_output(completion.text, fallback=fragment))
+        if truncated:
+            # Not fatal -- a fragment whose rewrite never closed falls back to its original text --
+            # but it means the budget is mis-set for this corpus, so say so rather than degrade
+            # quietly. These turns are cached in that state, so fix the budget and re-run the shard.
+            print(f"OpenAnonymity: WARNING {truncated:,}/{len(fragments):,} fragments hit the "
+                  f"generation cap; any whose <{OPENANON_OUTPUT_TAG}> block did not close are left "
+                  f"UNDEFENDED. Raise OPENANON_OUTPUT_RATIO or OPENANON_REASONING_BUDGET.")
+        return results
 
 
 class OpenAnonymityDefense(PerTurnBatchRewriteDefense):
-    """Scrub every user turn via a remote OpenRouter model (redact identifiers + de-identify style).
+    """Scrub every user turn with a local model (redact identifiers + de-identify style).
 
-    The client is built lazily on first use (so a fully-cached run makes no API calls and needs no
-    key), then fans requests out across threads. The active model is part of :meth:`params`, so a
-    model swap re-caches.
+    The model is loaded lazily on first use, so a fully-cached run loads nothing and needs no GPU.
+    Long runs checkpoint every :data:`OPENANON_CHECKPOINT_EVERY` conversations, so an interrupted
+    one resumes where it stopped. The active model and reasoning effort are part of :meth:`params`,
+    so changing either re-caches.
     """
 
     name = "openanonymity"
-    version = "1"
+    # 2: the scrubber moved from the OpenRouter API to a local vLLM model. The rewrites differ, and
+    # the class source hash would have caught it anyway -- this is the explicit record of why.
+    version = "2"
+    checkpoint_every = OPENANON_CHECKPOINT_EVERY
 
-    def __init__(self, *, model: str = OPENANON_MODEL, system_prompt: str = OPENANON_SYSTEM_PROMPT):
+    def __init__(self, *, model: str = OPENANON_MODEL, system_prompt: str = OPENANON_SYSTEM_PROMPT,
+                 reasoning_effort: str = OPENANON_REASONING_EFFORT):
         self.model = model
         self.system_prompt = system_prompt
+        self.reasoning_effort = reasoning_effort
         self._backend = None
 
     def params(self) -> dict:
-        # Model + system prompt fully determine the (greedy) scrub. The prompt is a module constant,
-        # not covered by the class source hash, so include it so an edit re-caches.
-        return {"model": self.model, "system_prompt": self.system_prompt}
+        # What determines the (greedy) scrub: the model, the prompt it is given, and how much it
+        # thinks first. The prompt is a module constant, not covered by the class source hash, so
+        # include it verbatim so an edit re-caches.
+        return {"model": self.model, "system_prompt": self.system_prompt,
+                "reasoning_effort": self.reasoning_effort}
 
     def _get_backend(self) -> _OpenAnonBackend:
         if self._backend is None:
-            self._backend = _OpenAnonBackend(self.model, self.system_prompt)
+            self._backend = _OpenAnonBackend(self.model, self.system_prompt,
+                                             reasoning_effort=self.reasoning_effort)
         return self._backend
 
     def rewrite_batch(self, texts: list[str]) -> list[str]:

@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from scipy.stats import rankdata
 from sklearn.metrics import f1_score
 
 
@@ -56,8 +55,18 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
         keeps every metric below unbiased under ties instead of rewarding or punishing whichever
         order the sort happened to produce -- which matters for attacks whose scores are coarse
         or saturate.
+
+    Notes
+    -----
+    Only the true author's rank is computed, never the full ranking. Sorting each row would
+    build an ``(n_documents, n_candidates)`` rank matrix -- 6 GB at 50,000 documents over 15,000
+    candidates -- and then discard all but one entry per row. Counting how many candidates beat
+    the true author gives the identical number (ties included, see below) in a single pass, which
+    is both faster and bounded by one boolean array rather than a float64 one.
     """
-    scores = np.asarray(scores, dtype=float)
+    scores = np.asarray(scores)
+    if not np.issubdtype(scores.dtype, np.floating):
+        scores = scores.astype(float)
     candidate_authors = np.asarray(candidate_authors)
     true_authors = np.asarray(true_authors)
     if scores.ndim != 2:
@@ -81,22 +90,52 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
             f"(e.g. {sorted(missing)[:3]}). Restrict to in-set documents first."
         )
 
-    # rankdata ranks smallest-first, so negate to rank the highest score as 1.
-    all_ranks = rankdata(-scores, method="average", axis=1)
     true_columns = np.array([column_of[author] for author in true_authors])
-    return all_ranks[np.arange(len(true_authors)), true_columns]
+    true_scores = scores[np.arange(len(true_authors)), true_columns][:, None]
+
+    # A value beaten by ``better`` candidates and tied with ``tied`` others (itself excluded)
+    # occupies ranks better+1 ... better+tied+1, whose average is better + 1 + tied/2. This is
+    # exactly scipy's method="average", without sorting anything.
+    better = (scores > true_scores).sum(axis=1)
+    tied = (scores == true_scores).sum(axis=1) - 1
+    return better + 1.0 + tied / 2.0
 
 
-def ranking_summary(ranks, n_candidates: int) -> dict:
+def _candidate_pool(n_candidates, ranks) -> np.ndarray:
+    """Broadcast a candidate-pool size to one entry per document, and validate it.
+
+    Accepts either a single size shared by every document (the usual case) or a per-document
+    array, which is what a **candidate filter** produces: ``run_experiment.py
+    --language-aware`` restricts each document to the authors who write its language, so the
+    pool -- and therefore every chance baseline computed from it -- differs from document to
+    document. Passing a scalar reproduces the constant-pool formulas exactly.
+    """
+    ranks = np.asarray(ranks, dtype=float)
+    pool = np.asarray(n_candidates, dtype=float)
+    if pool.ndim == 0:
+        pool = np.full(ranks.shape, float(pool))
+    elif pool.shape != ranks.shape:
+        raise ValueError(
+            f"n_candidates has shape {pool.shape} but ranks has shape {ranks.shape}; pass one "
+            "pool size for every document, or a single size shared by all of them."
+        )
+    if pool.size and pool.min() < 1:
+        raise ValueError(f"every candidate-pool size must be a positive integer (got {pool.min()}).")
+    return pool
+
+
+def ranking_summary(ranks, n_candidates) -> dict:
     """Whole-ranking summary statistics, each paired with its uniform-random baseline.
 
     Parameters
     ----------
     ranks : array-like of shape (n_documents,)
         Output of :func:`true_author_ranks`.
-    n_candidates : int
+    n_candidates : int or array-like of shape (n_documents,)
         Size of the candidate pool the attack ranked (the number of columns it scored, not the
         number of authors that happen to appear in the documents). This sets every baseline.
+        Pass one size per document when a candidate filter gives each document its own pool
+        (see :func:`_candidate_pool`); the baselines are then averaged over the documents.
 
     Returns
     -------
@@ -124,28 +163,36 @@ def ranking_summary(ranks, n_candidates: int) -> dict:
             ``(n_candidates + 1) / 2``, the median rank under uniform-random ordering.
     """
     ranks = np.asarray(ranks, dtype=float)
-    if n_candidates < 1:
-        raise ValueError(f"n_candidates must be a positive integer (got {n_candidates}).")
+    pool = _candidate_pool(n_candidates, ranks)
     if ranks.size == 0:
         return dict.fromkeys(
             ("mrr", "random_mrr", "mean_percentile_rank", "median_rank", "mean_rank",
              "random_median_rank"), float("nan"))
 
-    harmonic = float(np.sum(1.0 / np.arange(1, n_candidates + 1)))
-    # A single-candidate pool makes the percentile rank degenerate (everything is first).
-    percentile = (np.ones_like(ranks) if n_candidates == 1
-                  else 1.0 - (ranks - 1.0) / (n_candidates - 1))
+    # One harmonic number per *distinct* pool size rather than per document: a candidate filter
+    # produces as many distinct sizes as it has filter groups, far fewer than there are documents.
+    sizes, inverse = np.unique(pool.astype(np.int64), return_inverse=True)
+    harmonic = np.array([np.sum(1.0 / np.arange(1, size + 1)) for size in sizes])[inverse]
+    # A single-candidate pool makes the percentile rank degenerate (everything is first). The
+    # clip only bites on a rank *past* the pool, which is how a caller says "the true author was
+    # never a candidate for this document" (see run_experiment.py --language-aware): that is a
+    # percentile of 0, not a negative one. Ranks produced by true_author_ranks are always within
+    # the pool, so this is a no-op unless a caller has substituted one.
+    percentile = np.clip(
+        np.where(pool == 1, (ranks <= 1).astype(float),
+                 1.0 - (ranks - 1.0) / np.maximum(pool - 1.0, 1.0)),
+        0.0, 1.0)
     return {
         "mrr": float(np.mean(1.0 / ranks)),
-        "random_mrr": harmonic / n_candidates,
+        "random_mrr": float(np.mean(harmonic / pool)),
         "mean_percentile_rank": float(np.mean(percentile)),
         "median_rank": float(np.median(ranks)),
         "mean_rank": float(np.mean(ranks)),
-        "random_median_rank": (n_candidates + 1) / 2,
+        "random_median_rank": float(np.mean((pool + 1.0) / 2.0)),
     }
 
 
-def cmc_curve(ranks, n_candidates: int, ks=None) -> pd.DataFrame:
+def cmc_curve(ranks, n_candidates, ks=None) -> pd.DataFrame:
     """Cumulative match characteristic: top-k accuracy at *every* cutoff k.
 
     The CMC curve is the re-identification literature's name for the top-k accuracy curve, and
@@ -157,10 +204,13 @@ def cmc_curve(ranks, n_candidates: int, ks=None) -> pd.DataFrame:
     ----------
     ranks : array-like of shape (n_documents,)
         Output of :func:`true_author_ranks`.
-    n_candidates : int
-        Candidate-pool size, i.e. where the curve necessarily reaches 1.0.
+    n_candidates : int or array-like of shape (n_documents,)
+        Candidate-pool size, i.e. where the curve necessarily reaches 1.0. Pass one size per
+        document when a candidate filter gives each document its own pool
+        (see :func:`_candidate_pool`); the curve then runs to the largest of them and
+        ``random`` is averaged over the documents.
     ks : sequence of int, optional
-        Cutoffs to evaluate. Defaults to every ``k`` from 1 to ``n_candidates``.
+        Cutoffs to evaluate. Defaults to every ``k`` from 1 to the largest pool.
 
     Returns
     -------
@@ -171,12 +221,16 @@ def cmc_curve(ranks, n_candidates: int, ks=None) -> pd.DataFrame:
         cutoff its averaged rank reaches -- the conservative reading.
     """
     ranks = np.asarray(ranks, dtype=float)
+    pool = _candidate_pool(n_candidates, ranks)
     if ks is None:
-        ks = range(1, int(n_candidates) + 1)
+        # Read off ``n_candidates`` rather than the broadcast pool so an empty ``ranks`` still
+        # traces the full curve (of NaNs) it did before per-document pools were allowed.
+        largest = np.asarray(n_candidates, dtype=float)
+        ks = range(1, (int(largest.max()) if largest.size else 0) + 1)
     rows = []
     for k in ks:
         accuracy = float(np.mean(ranks <= k)) if ranks.size else float("nan")
-        chance = min(int(k), n_candidates) / n_candidates
+        chance = float(np.mean(np.minimum(int(k), pool) / pool)) if pool.size else float("nan")
         rows.append({"k": int(k), "accuracy": accuracy, "random": chance,
                      "advantage": accuracy - chance})
     return pd.DataFrame(rows)
