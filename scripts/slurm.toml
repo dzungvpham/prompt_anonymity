@@ -27,11 +27,6 @@
 #     "--account=$SLURM_ACCOUNT"     unset -> error naming the variable (a wrong account is a
 #                                    rejected job or someone else's allocation)
 #     "--mail-user=${EMAIL:-}"       unset -> the flag is left out entirely (no address, no mail)
-#
-# SLURM itself has no user directory to ask: `sacctmgr show user` carries no email, and the only
-# related mechanism is MailDomain in slurm.conf, which is null on Unity -- so an unqualified
-# --mail-user resolves to the bare local username and goes nowhere.
-
 # --- applied to every job ----------------------------------------------------
 #
 # Deliberately no --time, --mem or --partition here: those differ per profile, and a --time in
@@ -83,13 +78,11 @@ sbatch = [
 sbatch = [
     "--partition=gpu-preempt",
     "--gpus=1",
-    # Turing or newer: the installed torch/xgboost are CUDA 13 builds with no kernels for Pascal
-    # (sm_61) or Volta (sm_70). A bare VRAM constraint matches a 1080 Ti too, which is how a
-    # previous array lost 250 of 256 tasks.
-    "--constraint=sm_75|sm_80|sm_86|sm_89|sm_90",
+    "--constraint=a100|l40s|h100|h200",
     "--cpus-per-task=8",
     "--mem=24g",
-    "--time=0-04:00:00",
+    "--qos=short",
+    "--time=0-03:59:59",
 ]
 
 # --- per-cell exceptions (optional) ------------------------------------------

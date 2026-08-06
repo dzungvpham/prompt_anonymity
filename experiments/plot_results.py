@@ -17,7 +17,7 @@ part must be a name this file knows (:data:`DATASETS`, :data:`DEFENSES`, :data:`
 skipped with a note, which is how exploratory output (``tuned_comparison/`` and friends) stays out
 of the figures.
 
-Output is ``experiments/plots/<dataset>/``. Four curve types are drawn, one directory each, and
+Output is ``experiments/plots/<dataset>/``. Six curve types are drawn, one directory each, and
 every one of them gets the same two views: ``by_defense/<feature>_<attack>.pdf`` (attack fixed, a
 line per defense -- *does the defense work?*) and ``by_attack/<defense>.pdf`` (defense fixed, a
 line per feature+attack -- *which attack is strongest?*). The layout is uniform on purpose: the
@@ -35,8 +35,25 @@ same run appears at the same relative path under every curve type.
     **Scale** -- top-1 accuracy against the size of the candidate pool. Whether the threat is an
     artefact of a small pool. Drawn only for the attacks in :data:`POOL_INTERPOLABLE_ATTACKS`,
     the ones whose scores do not depend on which other authors are enrolled.
+``openset/risk_coverage/by_{defense,attack}/``
+    **Open-set precision-coverage** -- the figure above, with the strangers put back. Same
+    confidence, same axes, every test document in the denominator, and a stranger counted wrong
+    at every coverage. Flipping between this and ``risk_coverage/`` is the cost of the open world.
+``openset/detection/by_{defense,attack}/``
+    **Stranger detection** -- an ROC over ``accept_score``: can the attack tell somebody it has
+    never seen from somebody it enrolled? A curve on the diagonal means no reject threshold could
+    beat answering everything.
 
-Three figures have no ``by_defense``/``by_attack`` split. ``accuracy/macro_micro.pdf`` puts every
+The whole ``openset/`` family reads the documents every other figure drops -- on WildChat that is
+63-87% of the test quarter, some 6,200 unenrolled authors against ~970 enrolled. It rests on two
+columns those rows do carry: ``author_in_known`` (the ground truth) and ``accept_score`` (the
+cohort-normalised margin, which ``run_experiment.py`` writes for every unknown document whether
+or not ``--ood reject`` was on). **Every operating point it shows is an oracle one**: these runs
+were ``--ood none``, so the threshold the runner would have calibrated is not recoverable
+without re-running. The curves are threshold-free and unaffected; a point read off one is what a
+perfect calibrator could reach, not what the runner's achieved.
+
+Five figures have no ``by_defense``/``by_attack`` split. ``accuracy/macro_micro.pdf`` puts every
 run's top-1 next to itself counted three ways -- per document, per user, per identity -- because
 which one a paper leads with is a claim about what "anonymity failed" means, not a detail; it
 lives under ``accuracy/`` because it is the same number those curves start from.
@@ -44,11 +61,21 @@ lives under ``accuracy/`` because it is the same number those curves start from.
 the whole unknown side rather than the shared test quarter.
 ``plots/cross_dataset/scaling.pdf`` is the only figure outside the per-dataset folders: pool size
 is the single axis along which the corpora are the same experiment at different scales, so filing
-it under either one would imply it belonged to that one.
+it under either one would imply it belonged to that one. ``openset/reach.pdf`` is the share of
+the test set each known side can attempt at all, in documents and in users -- a property of the
+corpus rather than of any attack, and the denominator every other figure is conditioned on.
+``openset/separation/<run>.pdf`` is per run because its two series are cohorts (enrolled vs
+stranger) rather than runs, so it cannot carry a line per defense.
 
 ``per_run/<run>/`` keeps the per-run figures the runners used to write themselves -- the
 per-window CMC curves, the window sweep, and the top-k bars -- so one experiment's own detail is
-still available, now regenerated rather than baked in at run time.
+still available, now regenerated rather than baked in at run time. It is **drawn only under
+``--per-run``**: those are 160 of the 262 figures a full sweep writes and none of them compares
+runs, so they are diagnostics to reach for rather than output to pay for every time.
+
+Every figure is written as a PDF, and as a PNG beside it under ``--png``. Both halves of the work
+-- building the curves and drawing the figures -- run across ``--jobs`` processes; see
+:func:`run_jobs` for why the job table is a module global and the start method is pinned to fork.
 
 Every comparison figure is a **3x3 triangular facet grid, one panel per known configuration**,
 rows = known-side size, columns = staleness. **Nothing is averaged across the grid**: the
@@ -65,7 +92,10 @@ draw shared by every configuration and run of a dataset. Every figure is written
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -81,6 +111,66 @@ from matplotlib.ticker import MaxNLocator  # noqa: E402  (whole-week ticks on th
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
 PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
+
+
+# --- running independent work across cores -----------------------------------
+#
+# Both halves of this script are embarrassingly parallel -- a run's curves do not depend on any
+# other run's, and a figure does not depend on any other figure -- so both are dispatched through
+# the one helper below.
+#
+# THE JOB TABLE IS A MODULE GLOBAL AND THAT IS THE POINT. `ProcessPoolExecutor` pickles whatever
+# it is handed, and these jobs carry the expensive things: a comparison figure's arguments hold
+# every curve it draws (14 MB for one WildChat CMC panel set), and a curve job holds a whole
+# predictions table. Sending those down a pipe would cost more than the work. Instead the jobs are
+# parked in `_JOBS` *before* the pool forks, the children inherit them copy-on-write, and the only
+# thing crossing the pipe is an integer each way plus the small result. That is also why the start
+# method is pinned to "fork" rather than left to the platform default: under "spawn" the child
+# re-imports this module with an empty `_JOBS` and every argument would have to be pickled after
+# all. Linux-only by construction, which this cluster is.
+
+#: Jobs the current pool is executing, as ``(callable, args, kwargs)``. Set by :func:`run_jobs`
+#: immediately before the pool is created, read by the forked children, meaningless otherwise.
+_JOBS: list[tuple] = []
+
+
+def _execute_job(index: int):
+    """Run one parked job in a worker. Takes an index so nothing large is pickled inbound."""
+    function, args, kwargs = _JOBS[index]
+    return function(*args, **kwargs)
+
+
+def run_jobs(jobs: list[tuple], workers: int) -> list:
+    """Run ``(callable, args, kwargs)`` jobs across processes, results in submission order.
+
+    Falls back to running them in this process when there is one worker or one job, which is what
+    ``--jobs 1`` is for: a traceback from a forked child loses the frames above the fork, so
+    debugging a drawing routine is far easier serially.
+    """
+    if workers <= 1 or len(jobs) <= 1:
+        return [function(*args, **kwargs) for function, args, kwargs in jobs]
+
+    global _JOBS
+    _JOBS = jobs
+    try:
+        # Created after `_JOBS` is populated: the workers are forked on first submit, so this
+        # ordering is what puts the jobs in their memory.
+        with ProcessPoolExecutor(max_workers=min(workers, len(jobs)),
+                                 mp_context=multiprocessing.get_context("fork")) as pool:
+            return list(pool.map(_execute_job, range(len(jobs))))
+    finally:
+        _JOBS = []
+
+
+def default_workers() -> int:
+    """Cores to use unless ``--jobs`` says otherwise.
+
+    Capped rather than "every core": each worker holds its own ``(replicates x documents)`` weight
+    matrix -- 172 MB on WildChat's open-set tables -- on top of the tables it inherited, and this
+    cluster's jobs run under a 16 GB cap that has killed runs before.
+    """
+    return max(1, min(8, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+                      else (os.cpu_count() or 1)))
 
 #: Where the built dataset lives -- the same default ``run_experiment.py`` attacks. Only the
 #: temporal figure reads it, and only for two columns: a document's ``ended_at`` is metadata that
@@ -296,11 +386,21 @@ def add_legend(axes, **options):
     return legend
 
 
+#: Whether :func:`save_figure` writes a PNG beside each PDF. **Off by default**, and set from
+#: ``--png``. The PDF is the artefact -- it is what a paper includes -- and the PNG was only ever
+#: for a quick look, but it is the more expensive of the two: measured over a full sweep, the PNGs
+#: cost 79 s against the PDFs' 47 s, because a 200 dpi raster has to be rendered *and* deflated
+#: where the PDF only serialises vectors. Writing both by default meant a quarter of every run went
+#: on the copy nobody publishes.
+WRITE_PNG = False
+
+
 def save_figure(figure, stem: Path) -> Path:
-    """Write ``figure`` as both PDF (for papers) and PNG (for a quick look), return the PDF."""
+    """Write ``figure`` as a PDF (and a PNG when :data:`WRITE_PNG`), return the PDF."""
     stem.parent.mkdir(parents=True, exist_ok=True)
     pdf_path = stem.parent / f"{stem.name}.pdf"
-    for path in (pdf_path, stem.parent / f"{stem.name}.png"):
+    paths = [pdf_path] + ([stem.parent / f"{stem.name}.png"] if WRITE_PNG else [])
+    for path in paths:
         figure.savefig(path, dpi=200, facecolor=SURFACE, bbox_inches="tight")
     plt.close(figure)
     return pdf_path
@@ -442,7 +542,7 @@ def parse_config_tag(tag: str) -> KnownConfig | None:
     return config if 0 <= config.start < config.end <= TEST_START + 1e-9 else None
 
 
-def config_predictions(run: Run) -> dict[str, pd.DataFrame]:
+def config_predictions(run: Run, in_set_only: bool = True) -> dict[str, pd.DataFrame]:
     """``run``'s per-document predictions on the **shared test set**, one table per configuration.
 
     The single source every comparison figure derives from, and it makes two restrictions that
@@ -453,15 +553,25 @@ def config_predictions(run: Run) -> dict[str, pd.DataFrame]:
       comparison if they are scored on the same documents -- otherwise a fresher known side is
       also being asked an easier question. The cut is ``position >= round(TEST_START * n)``, an
       integer index, so there is no rounding to reproduce.
-    * **In-set documents only.** A document whose author is absent from that configuration's
-      known side has no correct answer available, so it has no rank; counting it would cap the
-      curve below 1 for a reason the attack cannot control. How many there are is itself a
-      result -- it is reported per panel, because it is exactly the *reach* that grows with the
-      known side.
+    * **In-set documents only**, under the default ``in_set_only=True``. A document whose author
+      is absent from that configuration's known side has no correct answer available, so it has
+      no rank; counting it would cap the curve below 1 for a reason the attack cannot control.
+      How many there are is itself a result -- it is reported per panel, because it is exactly
+      the *reach* that grows with the known side.
+
+    ``in_set_only=False`` keeps those documents, which is what the ``openset/`` family is built
+    from: there the question is not "who wrote this?" but "is this anyone the attacker knows?",
+    and a document with no correct answer is the *positive* class rather than an inconvenience.
+    Only that family may pass it -- every figure documented as in-set stays in-set, and the two
+    populations are never mixed inside one panel. The extra rows carry ``true_author_rank = NaN``
+    by construction, so any caller of the unfiltered tables has to say what a miss means rather
+    than inheriting it; ``accept_score`` is required there because it is the only column those
+    rows have anything to say through.
 
     Empty for a run written before this design (a prefix sweep, or the older per-window files);
     those are skipped with a note rather than reinterpreted.
     """
+    required = {"true_author_rank", "position"} | (set() if in_set_only else {"accept_score"})
     tables: dict[str, pd.DataFrame] = {}
     for path in sorted(run.directory.glob(f"predictions_{run.attack}_known*.csv")):
         config = parse_config_tag(path.stem[len(f"predictions_{run.attack}_"):])
@@ -470,11 +580,16 @@ def config_predictions(run: Run) -> dict[str, pd.DataFrame]:
         table = pd.read_csv(path)
         if "attack" in table.columns:
             table = table[table["attack"] == run.attack]
-        if table.empty or not {"true_author_rank", "position"}.issubset(table.columns):
+        if table.empty or not required.issubset(table.columns):
             continue
         n_documents = int(table["position"].max()) + 1     # the future always runs to the end
         table = table[table["position"] >= round(TEST_START * n_documents)]
-        table = table[table["author_in_known"].astype(bool) & table["true_author_rank"].notna()]
+        if in_set_only:
+            table = table[table["author_in_known"].astype(bool) & table["true_author_rank"].notna()]
+        else:
+            # A non-finite score cannot be ranked against the others, so it would silently take
+            # whichever end of the sort numpy puts it at. There are none in practice.
+            table = table[np.isfinite(table["accept_score"].to_numpy(dtype=float))]
         if not table.empty:
             tables[config.tag] = table
     return tables
@@ -532,8 +647,8 @@ class AuthorBootstrap:
                        .astype(np.float32) if size and self.n_replicates else
                        np.empty((0, size), dtype=np.float32))
 
-    def document_weights(self, author_labels) -> np.ndarray:
-        """``(n_replicates, n_documents)`` multiplicities for one panel's documents.
+    def multiplicities(self, author_labels) -> np.ndarray:
+        """``(n_replicates, len(author_labels))`` counts for any sequence of author labels.
 
         Users outside the drawn universe (impossible for panels built from the same dataset)
         would weigh zero, which is the correct behaviour rather than an error.
@@ -543,6 +658,52 @@ class AuthorBootstrap:
         block = self.counts[:, weights]
         return np.where(index >= 0, block, 0.0)
 
+    def document_weights(self, author_labels) -> np.ndarray:
+        """``(n_replicates, n_documents)`` multiplicities, one column per document."""
+        return self.multiplicities(author_labels)
+
+
+class PanelWeights:
+    """One table's bootstrap multiplicities, built once and shared by every curve type.
+
+    Seven curve types are computed from the same predictions table, and each used to ask the
+    bootstrap for its own copy of the same ``(replicates x documents)`` matrix -- 63 MB on
+    WildChat's in-set tables, 172 MB on its open-set ones, rebuilt four and three times over.
+    Building it once and passing this object down instead took a measured 24 s to about 7 s, and
+    -- the reason that matters more here -- stopped several copies of it being live at once under
+    the 16 GB cap.
+    """
+
+    def __init__(self, bootstrap: AuthorBootstrap, author_labels) -> None:
+        self.bootstrap = bootstrap
+        #: ``(replicates x documents)``: each document weighted by its own author's multiplicity.
+        self.documents = bootstrap.document_weights(author_labels)
+
+    def for_authors(self, author_labels) -> np.ndarray:
+        """``(replicates x authors)`` multiplicities, for a curve whose unit is the user.
+
+        Not cached: only :func:`config_author_risk` needs it, and it asks with that panel's
+        distinct users rather than with the table's one-row-per-document labels.
+        """
+        return self.bootstrap.multiplicities(author_labels)
+
+
+def band_from_replicates(replicates: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pointwise 95% percentile interval from an already-built ``(replicates x grid)`` matrix.
+
+    Split out from :func:`bootstrap_band` so the curve types that can compute every replicate in
+    one vectorised pass share the same summary step instead of reimplementing it.
+
+    **``np.percentile`` wherever it is safe.** ``nanpercentile`` is a uniform ~3x slower on this
+    numpy whether or not the array actually holds a NaN, and instrumenting a full sweep found all
+    831 bands NaN-free: the curves that *can* emit one (a cohort some replicate emptied) never did
+    on real data. The check costs one pass against the partition it guards, so the NaN path stays
+    rather than being asserted away.
+    """
+    percentile = np.nanpercentile if np.isnan(replicates).any() else np.percentile
+    low, high = percentile(replicates, [2.5, 97.5], axis=0)
+    return np.clip(low, 0.0, 1.0), np.clip(high, 0.0, 1.0)
+
 
 def bootstrap_band(values, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Pointwise 95% percentile interval for a curve, from one panel's replicate weights.
@@ -551,13 +712,14 @@ def bootstrap_band(values, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     the curve on a fixed grid. Intervals are **pointwise**, not a simultaneous band over the whole
     curve: two curves whose bands overlap at every k are not resolved by this data, but the
     converse is a per-point statement.
+
+    Curve types whose inner loop is a prefix sum over a *sorted* order (risk-coverage, detection)
+    stay on this per-replicate path deliberately -- see :func:`weighted_selective`.
     """
-    replicates = np.stack([values(row) for row in weights]) if len(weights) else None
-    if replicates is None or not len(replicates):
+    if not len(weights):
         point = values(np.ones(weights.shape[1] if weights.ndim == 2 else 0))
         return point, point
-    low, high = np.nanpercentile(replicates, [2.5, 97.5], axis=0)
-    return np.clip(low, 0.0, 1.0), np.clip(high, 0.0, 1.0)
+    return band_from_replicates(np.stack([values(row) for row in weights]))
 
 
 def weighted_cmc(ranks: np.ndarray, pools: np.ndarray, ks: np.ndarray,
@@ -578,6 +740,59 @@ def weighted_cmc(ranks: np.ndarray, pools: np.ndarray, ks: np.ndarray,
     histogram = np.bincount(ranks.astype(np.int64), weights=weights,
                             minlength=int(ks[-1]) + 2)
     return np.cumsum(histogram)[ks] / total
+
+
+#: Replicates folded per pass in :func:`grouped_sums`. Bounds the float64 working copy of the
+#: weight matrix to a few tens of MB, which matters with several workers live at once.
+REPLICATE_BLOCK = 256
+
+
+def grouped_sums(labels: np.ndarray, weights: np.ndarray
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    """Every replicate's weighted histogram at once: the labels present, and their sums.
+
+    The batched form of ``np.bincount(labels, weights=row)``, and the reason two of the curve
+    types no longer cost a Python call per replicate. Sorting the documents by label *once* turns
+    each replicate's histogram into a single ``np.add.reduceat`` over the whole weight matrix, so
+    a thousand replicates are one pass rather than a thousand.
+
+    Returns ``(present, sums)`` -- the distinct labels in ascending order and an
+    ``(n_replicates, len(present))`` array against them -- rather than a dense histogram over
+    every possible label, because the callers' label spaces are sparse: a WildChat CMC ranges over
+    19,711 possible ranks of which only a few thousand are ever occupied.
+
+    Replicates are folded in blocks because the accumulation wants float64 (``reduceat`` would
+    otherwise carry the weights' float32 through a cumulative sum tens of thousands of terms long)
+    and a float64 copy of a whole weight matrix would be 126 MB per call.
+    """
+    order = np.argsort(labels, kind="stable")
+    sorted_labels = labels[order]
+    starts = np.flatnonzero(np.r_[True, np.diff(sorted_labels) != 0])
+    present = sorted_labels[starts]
+    sums = np.empty((len(weights), len(present)))
+    for begin in range(0, len(weights), REPLICATE_BLOCK):
+        block = weights[begin:begin + REPLICATE_BLOCK][:, order].astype(np.float64)
+        sums[begin:begin + REPLICATE_BLOCK] = np.add.reduceat(block, starts, axis=1)
+    return present, sums
+
+
+def cmc_replicates(ranks: np.ndarray, ks: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """:func:`weighted_cmc` for every replicate at once: ``(n_replicates, len(ks))``.
+
+    The same quantity as calling it in a loop, computed in one pass over :func:`grouped_sums`.
+    The cumulative sum runs over the ranks actually present rather than over every integer up to
+    the pool size, and ``ks`` is then read off it by ``searchsorted``. Measured 2.2x faster than
+    the loop on WildChat's largest cell, agreeing with it to 3e-8.
+    """
+    if not len(ranks) or not len(weights):
+        return np.zeros((len(weights), len(ks)))
+    present, sums = grouped_sums(ranks.astype(np.int64), weights)
+    cumulative = np.cumsum(sums, axis=1)
+    totals = cumulative[:, -1:]                 # every document counted, whatever its rank
+    # Where each k falls among the ranks present; -1 means "before the smallest", i.e. no hits.
+    lookup = np.searchsorted(present, ks, side="right") - 1
+    counted = np.where(lookup >= 0, cumulative[:, np.clip(lookup, 0, None)], 0.0)
+    return np.divide(counted, totals, out=np.zeros_like(counted), where=totals > 0)
 
 
 def chance_cmc(pools: np.ndarray, ks: np.ndarray) -> np.ndarray:
@@ -614,14 +829,14 @@ class ConfigCmc:
         return float(self.curve["accuracy"].iloc[0])
 
 
-def config_cmc(table: pd.DataFrame, bootstrap: AuthorBootstrap) -> ConfigCmc:
+def config_cmc(table: pd.DataFrame, weights: PanelWeights) -> ConfigCmc:
     """CMC curve plus bootstrap band for one configuration's in-set test documents."""
     ranks = table["true_author_rank"].to_numpy(dtype=float)
     pools = table["n_candidate_authors"].to_numpy(dtype=float)
     ks = np.arange(1, int(pools.max()) + 1)
     accuracy = weighted_cmc(ranks, pools, ks)
-    low, high = bootstrap_band(lambda weights: weighted_cmc(ranks, pools, ks, weights),
-                               bootstrap.document_weights(table["true_author"]))
+    low, high = (band_from_replicates(cmc_replicates(ranks, ks, weights.documents))
+                 if len(weights.documents) else (accuracy, accuracy))
     curve = pd.DataFrame({"k": ks, "accuracy": accuracy, "random": chance_cmc(pools, ks),
                           "ci_low": low, "ci_high": high})
     return ConfigCmc(curve=curve, n_documents=len(table),
@@ -665,6 +880,11 @@ def weighted_selective(confidence: np.ndarray, correct: np.ndarray, order: np.nd
     resampled documents, so the cut-off is found on the running weight rather than on a row
     count. ``recall`` is correct answers retained as a fraction of those made at full coverage,
     the sense in which Narayanan et al. reported ">80% precision at 50% recall".
+
+    **This one stays a per-replicate loop on purpose.** Folding the replicates into one matrix of
+    cumulative sums, as :func:`cmc_replicates` does, was measured 2.5x *slower* here: the cut-off
+    is a ``searchsorted`` into each replicate's own running total, which has no batched form, and
+    the row-at-a-time search plus the float64 working copy cost more than the prefix sums saved.
     """
     weights = np.ones(len(correct)) if weights is None else weights
     ordered_weights = weights[order]
@@ -678,7 +898,7 @@ def weighted_selective(confidence: np.ndarray, correct: np.ndarray, order: np.nd
     return precision, (hits[cut] / hits[-1] if hits[-1] > 0 else np.full(len(cut), np.nan))
 
 
-def config_risk_coverage(table: pd.DataFrame, bootstrap: AuthorBootstrap) -> ConfigRiskCoverage:
+def config_risk_coverage(table: pd.DataFrame, weights: PanelWeights) -> ConfigRiskCoverage:
     """Risk-coverage curve plus bootstrap band for one configuration.
 
     This is the figure Narayanan et al. led with, and it catches what top-1 cannot: an attack
@@ -697,8 +917,7 @@ def config_risk_coverage(table: pd.DataFrame, bootstrap: AuthorBootstrap) -> Con
     order = np.argsort(-confidence, kind="stable")
     precision, recall = weighted_selective(confidence, correct, order)
     low, high = bootstrap_band(
-        lambda weights: weighted_selective(confidence, correct, order, weights)[0],
-        bootstrap.document_weights(table["true_author"]))
+        lambda row: weighted_selective(confidence, correct, order, row)[0], weights.documents)
     curve = pd.DataFrame({"coverage": COVERAGE_GRID, "precision": precision, "recall": recall,
                           "ci_low": low, "ci_high": high})
     return ConfigRiskCoverage(curve=curve, n_documents=len(table),
@@ -726,17 +945,21 @@ class ConfigAuthorRisk:
     never_identified: float
 
 
-def weighted_exposure(per_author: np.ndarray, author_weights: np.ndarray | None = None
-                      ) -> np.ndarray:
+def weighted_exposure(per_author: np.ndarray, author_weights: np.ndarray | None = None,
+                      order: np.ndarray | None = None) -> np.ndarray:
     """The exposure curve: each user's own top-1 accuracy, sorted, read off a percentile grid.
 
     Users are weighted by their bootstrap multiplicity, so a replicate that drew one user twice
     gives them twice the width on the population axis -- the same curve a real duplicate of that
     user would produce. Positions are the midpoints of each user's slice, so the curve is anchored
     at the centre of a user's width rather than its edge and does not depend on the user count.
+
+    ``order`` is the most-exposed-first ordering of ``per_author``. It is a property of the users'
+    accuracies alone, which no replicate changes -- only the widths move -- so the caller sorts
+    once and passes it in rather than paying for the same sort on every replicate.
     """
     weights = np.ones(len(per_author)) if author_weights is None else author_weights
-    order = np.argsort(per_author)[::-1]
+    order = np.argsort(per_author)[::-1] if order is None else order
     values, widths = per_author[order], weights[order]
     total = widths.sum()
     if total <= 0:
@@ -745,7 +968,7 @@ def weighted_exposure(per_author: np.ndarray, author_weights: np.ndarray | None 
     return np.interp(EXPOSURE_GRID, position, values)
 
 
-def config_author_risk(table: pd.DataFrame, bootstrap: AuthorBootstrap) -> ConfigAuthorRisk:
+def config_author_risk(table: pd.DataFrame, weights: PanelWeights) -> ConfigAuthorRisk:
     """How re-identification risk is distributed across users, not averaged over them.
 
     A mean accuracy says nothing about who carries it. Sorting each configuration's users from
@@ -761,15 +984,287 @@ def config_author_risk(table: pd.DataFrame, bootstrap: AuthorBootstrap) -> Confi
     values = per_author.to_numpy(dtype=float)
     # The bootstrap acts on users directly here -- the curve *is* a distribution over users, so
     # the multiplicity is the width each one occupies rather than a document weight.
-    index = bootstrap.authors.get_indexer(pd.Index(per_author.index))
-    weights = bootstrap.counts[:, np.where(index >= 0, index, 0)] if len(bootstrap.counts) else \
-        np.empty((0, len(values)), dtype=np.float32)
-    weights = np.where(index >= 0, weights, 0.0) if len(weights) else weights
-    low, high = bootstrap_band(lambda row: weighted_exposure(values, row), weights)
-    curve = pd.DataFrame({"percentile": EXPOSURE_GRID, "accuracy": weighted_exposure(values),
+    author_weights = weights.for_authors(per_author.index)
+    order = np.argsort(values)[::-1]
+    low, high = bootstrap_band(lambda row: weighted_exposure(values, row, order), author_weights)
+    curve = pd.DataFrame({"percentile": EXPOSURE_GRID,
+                          "accuracy": weighted_exposure(values, order=order),
                           "ci_low": low, "ci_high": high})
     return ConfigAuthorRisk(curve=curve, n_documents=len(table), n_users=len(values),
                             never_identified=float((values == 0).mean()))
+
+
+# --- the open world: the documents nobody the attacker knows wrote -----------
+#
+# Every figure above answers "which known author wrote this?" on the documents where that
+# question has an answer. In this corpus that is the minority: 41% of swe-chat's test quarter and
+# 63-87% of WildChat's was written by somebody absent from the known side, and WildChat's test
+# quarter holds roughly 6,200 such strangers against ~970 enrolled users. The figures in this
+# section put them back, using the two columns their rows do carry -- `author_in_known`, which is
+# the ground-truth label, and `accept_score`, the attack's cohort-normalised margin, which
+# `run_experiment.py` writes for *every* unknown document whether or not `--ood reject` was on.
+#
+# THE OPERATING POINTS HERE ARE ORACLE ONES. All of these runs were `--ood none`, so the
+# threshold `calibrate_threshold` would have chosen is not recoverable -- it needs the known-side
+# embeddings and a refit. AUROC and the two curves are threshold-free and so unaffected, but any
+# point read off them (an EER, a FAR) is picked knowing the true labels. Read them as what a
+# perfect calibrator could reach, never as what the runner's calibrator achieved.
+
+
+#: False-accept rates the detection curve is evaluated at: the share of *enrolled* users wrongly
+#: flagged as strangers. Dense and linear because unlike a CMC this curve has no privileged decade
+#: -- the whole trade-off is the result.
+DETECTION_GRID = np.linspace(0.0, 1.0, 101)
+
+
+@dataclass
+class ConfigOpenSetCoverage:
+    """One (run, configuration) precision-coverage curve over the **whole** test set.
+
+    The in-set twin of this is :class:`ConfigRiskCoverage`; the difference between the two is the
+    entire cost of the open world, and it is why they are drawn as separate figures at matching
+    paths rather than as two lines in one panel.
+    """
+
+    curve: pd.DataFrame
+    n_documents: int
+    n_users: int
+    n_ood: int
+
+    @property
+    def ood_rate(self) -> float:
+        return self.n_ood / self.n_documents if self.n_documents else float("nan")
+
+    @property
+    def full_coverage_precision(self) -> float:
+        return float(self.curve["precision"].iloc[-1])
+
+
+def config_openset_coverage(table: pd.DataFrame, weights: PanelWeights
+                            ) -> ConfigOpenSetCoverage:
+    """Precision against coverage when the attacker must answer for strangers too.
+
+    Identical machinery to :func:`config_risk_coverage` -- same confidence, same
+    :func:`weighted_selective` -- on the unfiltered table, and that is the point: the only thing
+    that changes is which documents are in the denominator. A stranger's document is scored as an
+    error at every coverage, because naming any known author for it *is* an error; there is no
+    reject option in these runs to abstain with.
+
+    So the right edge is not top-1 accuracy but top-1 accuracy times the in-set share, and the
+    left edge answers the question that actually matters to someone deciding whether to publish:
+    if the attacker only acts on its most confident tenth, are those documents real
+    re-identifications or strangers it happened to feel sure about?
+    """
+    confidence = -table["accept_score"].to_numpy(dtype=float)
+    in_set = table["author_in_known"].to_numpy(dtype=bool)
+    # A stranger is wrong by construction, whatever rank the file records (it records NaN).
+    correct = np.where(in_set, table["true_author_rank"].to_numpy(dtype=float) <= 1, False
+                       ).astype(float)
+    order = np.argsort(-confidence, kind="stable")
+    precision, recall = weighted_selective(confidence, correct, order)
+    low, high = bootstrap_band(
+        lambda row: weighted_selective(confidence, correct, order, row)[0], weights.documents)
+    curve = pd.DataFrame({"coverage": COVERAGE_GRID, "precision": precision, "recall": recall,
+                          "ci_low": low, "ci_high": high})
+    return ConfigOpenSetCoverage(curve=curve, n_documents=len(table),
+                                 n_users=int(table["true_author"].nunique()),
+                                 n_ood=int((~in_set).sum()))
+
+
+@dataclass
+class ConfigDetection:
+    """One (run, configuration) stranger-detection ROC, plus its area.
+
+    ``curve`` has one row per :data:`DETECTION_GRID` point with the true-accept rate and its band.
+    ``auroc`` is the exact weighted area, not a trapezoid over that grid.
+    """
+
+    curve: pd.DataFrame
+    auroc: float
+    n_documents: int
+    n_users: int
+    n_ood: int
+
+
+def weighted_roc(is_ood: np.ndarray, order: np.ndarray, weights: np.ndarray | None = None
+                 ) -> tuple[np.ndarray, float]:
+    """Detection rate on :data:`DETECTION_GRID`, and the exact weighted AUROC.
+
+    Evaluated on a **pre-sorted** order (most stranger-looking first) for the same reason as
+    :func:`weighted_selective`: a bootstrap replicate then costs two prefix sums rather than
+    another sort of 43,000 documents.
+
+    The area is computed from the same two cumulative sums rather than by integrating the
+    interpolated curve -- for each enrolled document, the stranger weight ranked above it, summed
+    and divided by the weight of all cross pairs. That is the Mann-Whitney identity, so it is
+    exact where a trapezoid over 101 grid points would not be. Its one approximation is that a
+    tied pair is credited to whichever side the sort put first rather than half each: verified
+    against ``sklearn.metrics.roc_auc_score``, that is an exact match on WildChat and a 2e-6
+    disagreement on swe-chat, where a couple of documents share a margin.
+    """
+    weights = np.ones(len(is_ood)) if weights is None else weights
+    ordered_weights = weights[order]
+    ood = is_ood[order]
+    ood_weights = ordered_weights * ood
+    in_set_weights = ordered_weights * ~ood
+    detected = np.cumsum(ood_weights)          # strangers flagged at this threshold
+    false_alarm = np.cumsum(in_set_weights)    # enrolled users wrongly flagged
+    total_ood, total_in_set = detected[-1], false_alarm[-1]
+    if total_ood <= 0 or total_in_set <= 0:
+        return np.full(len(DETECTION_GRID), np.nan), float("nan")
+    curve = np.interp(DETECTION_GRID,
+                      np.concatenate([[0.0], false_alarm / total_in_set]),
+                      np.concatenate([[0.0], detected / total_ood]))
+    # `detected` includes the current row, which contributes 0 whenever that row is enrolled, so
+    # for the enrolled rows it is exactly the stranger weight ranked strictly above them.
+    auroc = float((in_set_weights * detected).sum() / (total_ood * total_in_set))
+    return curve, auroc
+
+
+def config_detection(table: pd.DataFrame, weights: PanelWeights) -> ConfigDetection:
+    """Can the attack tell a stranger from an enrolled user at all?
+
+    A different question from every other figure here, and the one an open-set claim rests on: an
+    attacker who cannot reject has to name a known author for all of them, which is what caps the
+    open-set precision curve. The diagonal is the whole baseline -- a detector at chance means no
+    threshold on ``accept_score`` can beat "accept everything" or "reject everything", so a reject
+    option would buy nothing.
+
+    Measured, this is where the feature axis separates hardest: Gemini embeddings reach 0.65-0.84
+    on swe-chat while StyloMetrix sits at 0.49-0.60 on both corpora, i.e. at chance. The same
+    margin that carries no information about *correctness* on the risk-coverage figure carries
+    none about *membership* either -- one statistic failing two different ways.
+    """
+    is_ood = ~table["author_in_known"].to_numpy(dtype=bool)
+    score = table["accept_score"].to_numpy(dtype=float)
+    order = np.argsort(-score, kind="stable")   # most stranger-looking first
+    detection, auroc = weighted_roc(is_ood, order)
+    low, high = bootstrap_band(lambda row: weighted_roc(is_ood, order, row)[0], weights.documents)
+    curve = pd.DataFrame({"false_accept_rate": DETECTION_GRID, "detection_rate": detection,
+                          "ci_low": low, "ci_high": high})
+    return ConfigDetection(curve=curve, auroc=auroc, n_documents=len(table),
+                           n_users=int(table["true_author"].nunique()),
+                           n_ood=int(is_ood.sum()))
+
+
+#: Bin edges behind the separation histogram. Forty bins is enough to show a shape without
+#: resolving individual documents in a sparse panel.
+SEPARATION_EDGES = 41
+
+#: Percentiles the histogram's range is clipped to. A handful of extreme margins would otherwise
+#: stretch the axis until both distributions collapsed into the leftmost bins.
+SEPARATION_RANGE = (0.5, 99.5)
+
+
+@dataclass
+class ConfigSeparation:
+    """One (run, configuration) pair of ``accept_score`` distributions, enrolled vs stranger.
+
+    ``curve`` holds one row per bin with both densities and their bands. This is the diagnostic
+    *behind* :class:`ConfigDetection`: the AUROC is a summary of how far these two curves have
+    come apart, and only the histogram says whether the overlap is a shifted-but-wide pair (a
+    threshold would trade off) or two curves sitting on top of each other (no threshold helps).
+    """
+
+    curve: pd.DataFrame
+    auroc: float
+    n_in_set: int
+    n_ood: int
+
+
+def config_separation(table: pd.DataFrame, weights: PanelWeights) -> ConfigSeparation:
+    """The two score distributions the detection curve summarises.
+
+    Each cohort is normalised to its own density rather than plotted as counts: strangers
+    outnumber enrolled documents three to one on WildChat, so raw counts would draw one visible
+    curve and one flat line along the axis, and the question here is about *shape*, not size.
+    """
+    score = table["accept_score"].to_numpy(dtype=float)
+    is_ood = ~table["author_in_known"].to_numpy(dtype=bool)
+    low_edge, high_edge = np.percentile(score, SEPARATION_RANGE)
+    if not np.isfinite(low_edge) or high_edge <= low_edge:
+        high_edge = low_edge + 1.0
+    edges = np.linspace(low_edge, high_edge, SEPARATION_EDGES)
+    centres = (edges[:-1] + edges[1:]) / 2
+    binned = np.clip(np.digitize(score, edges) - 1, 0, len(centres) - 1)
+    # One label per (cohort, bin) cell, so both histograms come out of a single pass: a document
+    # falls in exactly one cohort, so the two are disjoint halves of one label space.
+    cells = np.where(is_ood, len(centres), 0) + binned
+
+    def densities(document_weights: np.ndarray) -> np.ndarray:
+        """Both cohorts' densities end to end, so one bootstrap pass covers the pair."""
+        stacked = []
+        for cohort in (~is_ood, is_ood):
+            histogram = np.bincount(binned, weights=document_weights * cohort,
+                                    minlength=len(centres))
+            total = histogram.sum()
+            stacked.append(histogram / total if total > 0 else np.full(len(centres), np.nan))
+        return np.concatenate(stacked)
+
+    def density_replicates(replicate_weights: np.ndarray) -> np.ndarray:
+        """:func:`densities` for every replicate at once, via one :func:`grouped_sums` pass."""
+        present, sums = grouped_sums(cells, replicate_weights)
+        histograms = np.zeros((len(replicate_weights), 2 * len(centres)))
+        histograms[:, present] = sums
+        halves = histograms.reshape(len(replicate_weights), 2, len(centres))
+        totals = halves.sum(axis=2, keepdims=True)
+        # A replicate that drew none of a cohort's users has no density to report, not a zero one.
+        normalised = np.divide(halves, totals, out=np.full_like(halves, np.nan), where=totals > 0)
+        return normalised.reshape(len(replicate_weights), 2 * len(centres))
+
+    point = densities(np.ones(len(score)))
+    band_low, band_high = (band_from_replicates(density_replicates(weights.documents))
+                           if len(weights.documents) else (point, point))
+    half = len(centres)
+    curve = pd.DataFrame({
+        "accept_score": centres,
+        "in_set_density": point[:half], "in_set_ci_low": band_low[:half],
+        "in_set_ci_high": band_high[:half],
+        "ood_density": point[half:], "ood_ci_low": band_low[half:],
+        "ood_ci_high": band_high[half:],
+    })
+    order = np.argsort(-score, kind="stable")
+    return ConfigSeparation(curve=curve, auroc=weighted_roc(is_ood, order)[1],
+                            n_in_set=int((~is_ood).sum()), n_ood=int(is_ood.sum()))
+
+
+def openset_reach(tables: dict[Run, dict[str, pd.DataFrame]]) -> pd.DataFrame:
+    """How much of the test set each known side can even attempt, in documents and in users.
+
+    A property of the *corpus and the configuration*, not of the attack: who wrote what and when
+    is fixed, and a defense rewrites text rather than authorship, so every run of a dataset sees
+    the same split. It is read from whichever run carries each configuration and cross-checked
+    against the rest; a disagreement would mean two runs were scored on different documents under
+    one name, which is worth a printed warning rather than a silently averaged number.
+
+    This is the number the per-panel notes have been carrying all along, promoted to a figure
+    because it is the answer to "what does a bigger known side buy?" -- reach, not strength.
+    """
+    rows: dict[str, dict] = {}
+    for run, run_tables in tables.items():
+        for tag, table in run_tables.items():
+            in_set = table["author_in_known"].to_numpy(dtype=bool)
+            authors = table["true_author"]
+            measured = {
+                "n_documents": len(table),
+                "n_in_set_documents": int(in_set.sum()),
+                "n_users": int(authors.nunique()),
+                "n_enrolled_users": int(authors[in_set].nunique()),
+            }
+            if tag in rows and any(rows[tag][key] != value for key, value in measured.items()):
+                print(f"  {run.directory.name}: {tag} covers a different test set from an earlier "
+                      f"run of this dataset -- reach figure keeps the first")
+                continue
+            rows.setdefault(tag, {"known_config": tag, **measured})
+    frame = pd.DataFrame(rows.values())
+    if frame.empty:
+        return frame
+    frame["document_reach"] = frame["n_in_set_documents"] / frame["n_documents"]
+    frame["user_reach"] = frame["n_enrolled_users"] / frame["n_users"]
+    configs = [parse_config_tag(tag) for tag in frame["known_config"]]
+    frame["known_size"] = [config.size for config in configs]
+    frame["gap"] = [config.gap for config in configs]
+    return frame.sort_values(["known_size", "gap"]).reset_index(drop=True)
 
 
 # --- the comparison figures: one panel per known configuration ----------------
@@ -1049,7 +1544,98 @@ def draw_scaling_panel(axes, series: list[Series], handles: dict) -> pd.DataFram
     return pd.concat(rows, ignore_index=True)
 
 
-#: The four curve types, each as (panel drawer, subdirectory, x label, y label, subtitle).
+def draw_openset_coverage_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
+    """One cell's open-set precision-coverage curves: every test document is in the denominator.
+
+    The same geometry as :func:`draw_risk_coverage_panel` on purpose -- the two figures sit at
+    matching paths and the difference between them, read by flipping from one to the other, is
+    what the open world costs. They are not overlaid: colour is the only channel carrying series
+    identity here, so a second line per series would have to dash, and a dash on these figures
+    means "not a measurement".
+
+    The panel note carries the out-of-set rate, because unlike the in-set figures the denominator
+    is no longer the thing every panel has in common.
+    """
+    rows = []
+    for item, slot in zip(series, resolve_slots([item.slot for item in series])):
+        curve = item.curve.curve
+        color = series_style(slot)
+        axes.fill_between(curve["coverage"], curve["ci_low"], curve["ci_high"], color=color,
+                          alpha=BAND_ALPHA, linewidth=0, zorder=2)
+        axes.plot(curve["coverage"], curve["precision"], color=color, linewidth=LINE_WIDTH,
+                  solid_capstyle="round", zorder=3)
+        handles.setdefault(item.label, Line2D([], [], color=color, linewidth=LINE_WIDTH))
+        rows.append(curve.assign(series=item.label))
+    axes.set_xlim(0, 1.0)
+    axes.set_ylim(0, 1.02)
+    panel_note(axes, f"{series[0].curve.n_documents:,} docs · {series[0].curve.n_users:,} users\n"
+                     f"{series[0].curve.ood_rate:.0%} written by strangers")
+    return pd.concat(rows, ignore_index=True)
+
+
+def draw_detection_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
+    """One cell's stranger-detection ROC curves, with the chance diagonal.
+
+    Reading the curve: x is the share of *enrolled* users the attacker would have to discard, y
+    is the share of strangers it correctly refuses. A curve on the diagonal is a detector that
+    knows nothing -- and since the diagonal is the figure's only dashed line, "hugging the dash"
+    reads directly as "not measuring anything".
+
+    The AUROC goes in the panel note rather than the legend when one series owns the panel: it
+    differs in every cell, and a legend is shared across the whole grid.
+    """
+    rows = []
+    for item, slot in zip(series, resolve_slots([item.slot for item in series])):
+        curve = item.curve.curve
+        color = series_style(slot)
+        axes.fill_between(curve["false_accept_rate"], curve["ci_low"], curve["ci_high"],
+                          color=color, alpha=BAND_ALPHA, linewidth=0, zorder=2)
+        axes.plot(curve["false_accept_rate"], curve["detection_rate"], color=color,
+                  linewidth=LINE_WIDTH, solid_capstyle="round", zorder=3)
+        handles.setdefault(item.label, Line2D([], [], color=color, linewidth=LINE_WIDTH))
+        rows.append(curve.assign(series=item.label, auroc=item.curve.auroc))
+    axes.plot([0, 1], [0, 1], color=TEXT_MUTED, linewidth=1.2, linestyle=BASELINE_DASH, zorder=2)
+    axes.set_xlim(0, 1.0)
+    axes.set_ylim(0, 1.02)
+    area = f" · AUROC {series[0].curve.auroc:.3f}" if len(series) == 1 else ""
+    panel_note(axes, f"{series[0].curve.n_ood:,} strangers · "
+                     f"{series[0].curve.n_documents - series[0].curve.n_ood:,} enrolled{area}")
+    return pd.concat(rows, ignore_index=True)
+
+
+#: The two cohorts of the separation figure, as (column prefix, label, colour slot). Fixed slots
+#: rather than per-figure ones: these two are the same two things in every panel of every run.
+SEPARATION_COHORTS = (("in_set", "Enrolled user", 0), ("ood", "Stranger", 1))
+
+
+def draw_separation_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
+    """One cell's two ``accept_score`` densities: enrolled users against strangers.
+
+    The only panel drawer whose series are **cohorts rather than runs**, which is why the figure
+    it belongs to is drawn per run: putting eight defenses in a panel would put sixteen lines in
+    it. One :class:`ConfigSeparation` carries both cohorts and this draws both, so the panel gets
+    exactly two lines however many runs the directory holds.
+    """
+    separation = series[0].curve
+    curve = separation.curve
+    for prefix, label, slot in SEPARATION_COHORTS:
+        color = series_style(slot)
+        axes.fill_between(curve["accept_score"], curve[f"{prefix}_ci_low"],
+                          curve[f"{prefix}_ci_high"], color=color, alpha=BAND_ALPHA,
+                          linewidth=0, zorder=2)
+        axes.plot(curve["accept_score"], curve[f"{prefix}_density"], color=color,
+                  linewidth=LINE_WIDTH, solid_capstyle="round", zorder=3)
+        handles.setdefault(label, Line2D([], [], color=color, linewidth=LINE_WIDTH))
+    axes.set_ylim(bottom=0)
+    panel_note(axes, f"AUROC {separation.auroc:.3f}\n"
+                     f"{separation.n_ood:,} strangers · {separation.n_in_set:,} enrolled")
+    return curve.assign(auroc=separation.auroc)
+
+
+#: The curve types, each as (panel drawer, subdirectory, x label, y label, subtitle). The first
+#: four are drawn by both comparison families; ``separation`` is per run only (see
+#: :func:`draw_separation_panel`), and is registered here so it inherits the same grid, legend,
+#: companion CSV and path scheme as the rest.
 CURVE_TYPES = {
     "cmc": (draw_cmc_panel, "accuracy", "k (candidate authors returned)", "Top-k accuracy",
             "Shaded: 95% bootstrap CI over users (gallery fixed). Grey dashes: random guessing"),
@@ -1062,6 +1648,21 @@ CURVE_TYPES = {
     "scaling": (draw_scaling_panel, "scaling", "Candidate users the attack ranks over",
                 "Top-1 accuracy",
                 "Line interpolates down to smaller galleries; rings are the pools actually run"),
+    "openset_coverage": (draw_openset_coverage_panel, "openset/risk_coverage",
+                         "Coverage (share of documents answered)", "Precision",
+                         "All test documents: naming any known author for a stranger is an error"),
+    "detection": (draw_detection_panel, "openset/detection",
+                  "False-accept rate (enrolled users refused)",
+                  "Strangers correctly refused",
+                  "Threshold-free; grey dashes are a detector that knows nothing"),
+    # The x label is kept short deliberately: a facet column is a third of the figure wide, and
+    # the long form ran off the right-hand panel and past the left edge of the figure. What it
+    # used to say lives in the subtitle, which has the full width.
+    "separation": (draw_separation_panel, "openset/separation",
+                   "Rejection score (higher = stranger-like)",
+                   "Share of that cohort's documents",
+                   "Score is the attack's cohort-normalised margin; each cohort normalised to "
+                   "its own density, since strangers outnumber enrolled documents"),
 }
 
 
@@ -1149,6 +1750,88 @@ def plot_attack_comparisons(dataset: str, runs: list[Run], curves: dict, kind: s
             legend_title="Feature / attack",
             stem=output_dir / CURVE_TYPES[kind][1] / "by_attack" / defense))
     return written
+
+
+def plot_separation_figures(dataset: str, runs: list[Run], separation: dict, output_dir: Path
+                            ) -> list[Path]:
+    """One separation figure per run: the two score distributions, one panel per configuration.
+
+    Per run rather than per family because its two series are the *cohorts*, not the runs -- see
+    :func:`draw_separation_panel`. It is the only open-set figure that does not compare runs, and
+    it is what a reader turns to when a detection curve sits on the diagonal and they want to see
+    whether the two distributions are shifted-and-wide or simply the same distribution twice.
+    """
+    written = []
+    for run in sorted(runs, key=lambda run: (DEFENSE_SLOTS[run.defense], METHOD_SLOTS[run.method])):
+        curves = separation.get(run)
+        if not curves:
+            continue
+        panels = {tag: [Series(run.method_label, 0, curve)] for tag, curve in curves.items()}
+        written.append(plot_config_comparison(
+            "separation", panels,
+            title=f"{DATASET_LABELS[dataset]}: who looks like a stranger? "
+                  f"{run.defense_label}, {run.method_label}",
+            legend_title="Document's author",
+            stem=output_dir / CURVE_TYPES["separation"][1] / run.directory.name))
+    return written
+
+
+def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> list[Path]:
+    """What share of the test set each known side can attempt at all, in documents and in users.
+
+    Both bars are shares of the same test quarter, so they share one axis -- two measures on two
+    y scales would be a different figure pretending to be one. The absolute counts ride as direct
+    labels instead, in text ink rather than the bar's colour, because the denominator is what
+    makes a share mean anything here: WildChat's test quarter is 43,127 documents and the largest
+    known side reaches barely a third of them.
+
+    This is the figure that keeps the rest of the project honest. Every accuracy elsewhere is
+    conditioned on the documents in these bars, and the bars are also the confound behind any
+    cross-configuration comparison: a bigger known side scores better partly because it enrols
+    more of the test set's users, and the extra ones are the people with longer histories.
+    """
+    if reach.empty:
+        return []
+    figure, axes = plt.subplots(figsize=(7.8, 1.6 + 0.78 * len(reach)))
+    figure.patch.set_facecolor(SURFACE)
+
+    positions = np.arange(len(reach))
+    height, offsets = 0.32, (-0.20, 0.20)   # 0.08 of surface between the two bars of a group
+    columns = (("document_reach", "Documents", "n_in_set_documents", "n_documents"),
+               ("user_reach", "Users", "n_enrolled_users", "n_users"))
+    for index, ((share, label, part, whole), offset) in enumerate(zip(columns, offsets)):
+        axes.barh(positions + offset, reach[share], height=height, color=series_style(index),
+                  zorder=3, label=label)
+        for row, value in zip(reach.itertuples(), reach[share]):
+            axes.annotate(f"{getattr(row, part):,} / {getattr(row, whole):,}",
+                          xy=(value, row.Index + offset), xytext=(5, 0),
+                          textcoords="offset points", va="center", ha="left",
+                          color=TEXT_SECONDARY, fontsize=8)
+
+    # Rows are ordered by known-side size then staleness, the facet grid's own reading order, so
+    # the tick leads with those two rather than with the interval -- otherwise three rows all
+    # reading "25% of the corpus" are only told apart by an interval the reader has to decode.
+    axes.set_yticks(positions)
+    axes.set_yticklabels([f"{config.size:.0%} known, {config.gap_label}\n({config.label})"
+                          for config in (parse_config_tag(tag) for tag in reach["known_config"])])
+    axes.invert_yaxis()   # smallest, freshest known side at the top
+    style_axes(axes, "Share of the shared test set the known side reaches", "",
+               f"{DATASET_LABELS[dataset]}: what a bigger known side buys is reach",
+               "Everything outside these bars was written by someone the attacker never saw, "
+               "and is excluded from every in-set figure")
+    axes.set_xlim(0, 1.15)   # headroom for the direct labels
+    axes.set_xticks(np.linspace(0, 1, 6))
+    axes.grid(False, axis="y")
+    # Below the axes rather than inside it: every interior corner is reachable by some bar's
+    # direct label (swe-chat's largest known side runs to 0.82 and its label past that), and a
+    # legend that collides on one dataset but not the other is a layout waiting to break.
+    add_legend(axes, loc="upper right", bbox_to_anchor=(1.0, -0.10), ncol=2, title="Counted as")
+    figure.tight_layout()
+
+    stem = output_dir / "openset" / "reach"
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    reach.to_csv(stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
 
 
 # --- temporal decay: does the attack go stale? -------------------------------
@@ -1429,7 +2112,7 @@ COUNTING_MODES = (
 HEADLINE_CONFIG = "known0075"
 
 
-def counting_modes(tables: dict[str, pd.DataFrame], bootstrap: AuthorBootstrap
+def counting_modes(tables: dict[str, pd.DataFrame], weights: dict[str, PanelWeights]
                    ) -> pd.DataFrame | None:
     """The same result counted three ways, all from one table so they cannot disagree.
 
@@ -1444,32 +2127,33 @@ def counting_modes(tables: dict[str, pd.DataFrame], bootstrap: AuthorBootstrap
     describe exactly the same documents and share one bootstrap resample.
     """
     table = tables.get(HEADLINE_CONFIG)
-    if table is None or table.empty:
+    panel = weights.get(HEADLINE_CONFIG)
+    if table is None or table.empty or panel is None:
         return None
     hits = (table["true_author_rank"].to_numpy(dtype=float) <= 1).astype(float)
     authors = pd.Index(table["true_author"])
     author_index = pd.factorize(authors)[0]
     n_authors = author_index.max() + 1
 
-    def modes(weights: np.ndarray) -> np.ndarray:
+    def modes(document_weights: np.ndarray) -> np.ndarray:
         """(micro, macro, identity) under one set of document weights."""
-        per_author_hits = np.bincount(author_index, weights=weights * hits, minlength=n_authors)
-        per_author_docs = np.bincount(author_index, weights=weights, minlength=n_authors)
+        per_author_hits = np.bincount(author_index, weights=document_weights * hits,
+                                      minlength=n_authors)
+        per_author_docs = np.bincount(author_index, weights=document_weights, minlength=n_authors)
         present = per_author_docs > 0
-        if not present.any() or weights.sum() <= 0:
+        if not present.any() or document_weights.sum() <= 0:
             return np.full(3, np.nan)
         rates = per_author_hits[present] / per_author_docs[present]
         # Users weigh their multiplicity in the two per-user modes: a user drawn twice counts
         # twice, exactly as a duplicate of that person in the corpus would.
         author_weight = per_author_docs[present] / np.maximum(
             np.bincount(author_index, minlength=n_authors)[present], 1)
-        return np.array([float(weights @ hits / weights.sum()),
+        return np.array([float(document_weights @ hits / document_weights.sum()),
                          float(np.average(rates, weights=author_weight)),
                          float(np.average(rates > 0, weights=author_weight))])
 
-    weights = bootstrap.document_weights(table["true_author"])
     point = modes(np.ones(len(hits)))
-    low, high = bootstrap_band(modes, weights)
+    low, high = bootstrap_band(modes, panel.documents)
     return pd.DataFrame({
         "mode": [name for name, _, _ in COUNTING_MODES],
         "label": [label for _, label, _ in COUNTING_MODES],
@@ -1613,7 +2297,7 @@ def subpool_weights(n_candidates: int, pool_sizes: np.ndarray) -> np.ndarray:
     return weights
 
 
-def config_scaling(run: Run, table: pd.DataFrame, bootstrap: AuthorBootstrap
+def config_scaling(run: Run, table: pd.DataFrame, weights: PanelWeights
                    ) -> ScalingCurve | None:
     """Top-1 accuracy against the number of candidate users, interpolated down from one cell.
 
@@ -1635,7 +2319,7 @@ def config_scaling(run: Run, table: pd.DataFrame, bootstrap: AuthorBootstrap
     ranks = table["true_author_rank"].to_numpy(dtype=float)
     n_candidates = int(table["n_candidate_authors"].max())
     pool_sizes = pool_lattice(n_candidates)
-    weights = subpool_weights(n_candidates, pool_sizes)
+    interpolation = subpool_weights(n_candidates, pool_sizes)
     ks = np.arange(1, n_candidates + 1)
 
     def curve_for(document_weights: np.ndarray | None = None) -> np.ndarray:
@@ -1643,9 +2327,20 @@ def config_scaling(run: Run, table: pd.DataFrame, bootstrap: AuthorBootstrap
         # each rank; the shortfall from 1 is the documents whose author was never a candidate,
         # which are wrong at every pool size.
         cmc = weighted_cmc(ranks, None, ks, document_weights)
-        return np.diff(cmc, prepend=0.0) @ weights
+        return np.diff(cmc, prepend=0.0) @ interpolation
 
-    low, high = bootstrap_band(curve_for, bootstrap.document_weights(table["true_author"]))
+    # The bootstrap skips the CMC entirely: `grouped_sums` already *is* the rank distribution the
+    # differencing above recovers, so a replicate is its share of each occupied rank times the
+    # interpolation rows for those ranks. That never materialises the 19,711-wide cumulative curve
+    # for a thousand replicates, which was the largest single array this file built.
+    replicate_weights = weights.documents
+    if len(replicate_weights):
+        present, sums = grouped_sums(ranks.astype(np.int64), replicate_weights)
+        totals = sums.sum(axis=1, keepdims=True)
+        mass = np.divide(sums, totals, out=np.zeros_like(sums), where=totals > 0)
+        low, high = band_from_replicates(mass @ interpolation[present - 1])
+    else:
+        low = high = curve_for()
     curve = pd.DataFrame({"n_candidates": pool_sizes, "accuracy": curve_for(),
                           "random": 1.0 / pool_sizes.astype(float),
                           "ci_low": low, "ci_high": high})
@@ -1937,10 +2632,60 @@ def parse_args() -> argparse.Namespace:
                              f"dataset, so a replicate that drops a user drops them from every "
                              f"panel at once. Lower it for a fast redraw, not for a figure "
                              f"anyone will read.")
+    parser.add_argument("--jobs", type=int, default=default_workers(), metavar="N",
+                        help=f"Worker processes for the curve and figure passes (default: "
+                             f"{default_workers()}, capped rather than every core because each "
+                             f"worker holds its own replicate weight matrix). 1 runs everything "
+                             f"in this process, which is what to use when a drawing routine "
+                             f"raises -- a traceback from a forked child loses its outer frames.")
+    parser.add_argument("--png", action="store_true",
+                        help="Also write a 200 dpi PNG beside every PDF. Off by default: the "
+                             "PNGs cost more than the PDFs they accompany (79 s against 47 s "
+                             "over a full sweep) and only the PDF goes into a paper.")
+    parser.add_argument("--per-run", action="store_true",
+                        help="Also draw per_run/<run>/ -- each run's own CMC, pool-growth and "
+                             "top-k bar figures. Off by default: they are 160 of the 262 figures "
+                             "a full sweep writes and none of them compares runs, so they are "
+                             "diagnostics rather than results.")
     return parser.parse_args()
 
 
-def build_curves(runs: list[Run], bootstrap_replicates: int):
+def run_curves(run: Run, tables: dict[str, pd.DataFrame], bootstrap: AuthorBootstrap,
+               open_tables: dict[str, pd.DataFrame], open_bootstrap: AuthorBootstrap) -> dict:
+    """Every curve one run contributes, keyed by curve family then by configuration.
+
+    The unit of work :func:`build_curves` hands to a worker. It is one *run* rather than one
+    (run, configuration) cell because the counting-mode figure needs the run's whole table set to
+    pick :data:`HEADLINE_CONFIG` out of it, and because a cell is small enough that per-job
+    overhead would start to show.
+
+    Each table's replicate weights are built **once** here and shared by every curve family that
+    reads it -- see :class:`PanelWeights` for why that matters.
+    """
+    curves: dict[str, dict] = {family: {} for family in
+                               ("cmc", "selective", "exposure", "scaling",
+                                "coverage", "detection", "separation")}
+    weights = {tag: PanelWeights(bootstrap, table["true_author"])
+               for tag, table in tables.items()}
+    for tag, table in tables.items():
+        panel = weights[tag]
+        curves["cmc"][tag] = config_cmc(table, panel)
+        curves["selective"][tag] = config_risk_coverage(table, panel)
+        curves["exposure"][tag] = config_author_risk(table, panel)
+        pool_curve = config_scaling(run, table, panel)
+        if pool_curve is not None:
+            curves["scaling"][tag] = pool_curve
+    curves["modes"] = counting_modes(tables, weights)
+
+    for tag, table in open_tables.items():
+        panel = PanelWeights(open_bootstrap, table["true_author"])
+        curves["coverage"][tag] = config_openset_coverage(table, panel)
+        curves["detection"][tag] = config_detection(table, panel)
+        curves["separation"][tag] = config_separation(table, panel)
+    return curves
+
+
+def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
     """Every curve every figure needs, built once per (run, configuration).
 
     One pass over the predictions: the same table feeds the CMC, risk-coverage, per-user risk,
@@ -1948,6 +2693,20 @@ def build_curves(runs: list[Run], bootstrap_replicates: int):
     families rather than rebuilt for each. Runs whose files predate the configuration design are
     reported and skipped -- their known sides were prefixes scored on different documents, so
     they are not cells of this grid.
+
+    **Two populations, two bootstraps.** The in-set figures resample the users the attack could
+    have attributed; the ``openset/`` figures resample the users who *appear* in the test set,
+    which on WildChat is eight times as many. They are deliberately separate draws rather than
+    one draw over the union: the in-set bootstrap's universe is what makes its six panels paired
+    (a replicate that drops a user drops them from all of them at once), and widening that
+    universe with users no in-set panel contains would change every band on every existing figure
+    to no purpose. Within each family the one-draw property is preserved.
+
+    **The tables are read here and the curves are built in workers.** Reading stays in this
+    process because both bootstraps have to be drawn over the union of every run's users before
+    any curve can be computed, and because the tables are the one thing too big to want to send
+    anywhere -- the workers inherit them through :func:`run_jobs`'s fork instead. What comes back
+    is only the curves, which are a few MB per run.
     """
     tables = {run: config_predictions(run) for run in runs}
     stale = [run for run in runs if not tables[run]]
@@ -1960,31 +2719,71 @@ def build_curves(runs: list[Run], bootstrap_replicates: int):
                for author in table["true_author"].unique()}
     bootstrap = AuthorBootstrap(authors, n_replicates=bootstrap_replicates)
 
+    open_tables = {run: config_predictions(run, in_set_only=False) for run in runs}
+    open_authors = {author for run in runs for table in open_tables[run].values()
+                    for author in table["true_author"].unique()}
+    open_bootstrap = AuthorBootstrap(open_authors, n_replicates=bootstrap_replicates)
+
+    live = [run for run in runs if tables[run]]
+    jobs = [(run_curves, (run, tables[run], bootstrap, open_tables[run], open_bootstrap), {})
+            for run in live]
+    results = run_jobs(jobs, workers)
+
     cmc, selective, exposure, scaling, modes = {}, {}, {}, {}, {}
-    for run in runs:
-        if not tables[run]:
-            continue
-        cmc[run] = {tag: config_cmc(table, bootstrap) for tag, table in tables[run].items()}
-        selective[run] = {tag: config_risk_coverage(table, bootstrap)
-                          for tag, table in tables[run].items()}
-        exposure[run] = {tag: config_author_risk(table, bootstrap)
-                         for tag, table in tables[run].items()}
-        pools = {tag: config_scaling(run, table, bootstrap)
-                 for tag, table in tables[run].items()}
-        pools = {tag: curve for tag, curve in pools.items() if curve is not None}
-        if pools:
-            scaling[run] = pools
+    coverage, detection, separation = {}, {}, {}
+    for run, curves in zip(live, results):
+        cmc[run] = curves["cmc"]
+        selective[run] = curves["selective"]
+        exposure[run] = curves["exposure"]
+        if curves["scaling"]:
+            scaling[run] = curves["scaling"]
         elif run.attack not in POOL_INTERPOLABLE_ATTACKS:
             print(f"  {run.directory.name}: {ATTACK_LABELS[run.attack]} refits against the "
                   f"gallery, so sub-pool interpolation is not exact -- scaling skipped")
-        counted = counting_modes(tables[run], bootstrap)
-        if counted is not None:
-            modes[run] = counted
-    return tables, bootstrap, cmc, selective, exposure, scaling, modes
+        if curves["modes"] is not None:
+            modes[run] = curves["modes"]
+        if curves["coverage"]:
+            coverage[run] = curves["coverage"]
+            detection[run] = curves["detection"]
+            separation[run] = curves["separation"]
+    reach = openset_reach({run: open_tables[run] for run in runs if open_tables[run]})
+    return (tables, bootstrap, cmc, selective, exposure, scaling, modes,
+            coverage, detection, separation, reach)
+
+
+def dataset_figure_jobs(dataset: str, runs: list[Run], curves_by_kind: dict, modes: dict,
+                        reach: pd.DataFrame, separation: dict, decay: dict, output_dir: Path,
+                        per_run: bool) -> list[tuple]:
+    """One dataset's figures as ``(callable, args, kwargs)`` jobs, not yet drawn.
+
+    Splitting the *deciding* from the *drawing* is what lets every figure in the project be drawn
+    by one pool: the jobs from both corpora are pooled together before any of them runs, so a
+    worker that finishes swe-chat's cheap panels picks up a WildChat one instead of idling.
+
+    The two comparison families are already one job per (curve type, view). The separation family
+    is sharded here to one job per run -- it draws one figure per run anyway, and as a single job
+    it was the longest pole in the pass at 11 s.
+    """
+    jobs = []
+    for kind, curves in curves_by_kind.items():
+        jobs.append((plot_defense_comparisons, (dataset, runs, curves, kind, output_dir), {}))
+        jobs.append((plot_attack_comparisons, (dataset, runs, curves, kind, output_dir), {}))
+    jobs.append((plot_macro_micro, (dataset, runs, modes, output_dir), {}))
+    jobs.append((plot_openset_reach, (dataset, reach, output_dir), {}))
+    jobs += [(plot_separation_figures, (dataset, [run], separation, output_dir), {})
+             for run in runs if run in separation]
+    if decay:
+        jobs.append((plot_temporal_decay, (dataset, [run for run in runs if run in decay],
+                                           decay, output_dir), {}))
+    if per_run:
+        jobs += [(plot_run_detail, (run, output_dir), {}) for run in runs]
+    return jobs
 
 
 def main() -> None:
-    replicates = parse_args().bootstrap
+    args = parse_args()
+    global WRITE_PNG
+    WRITE_PNG = args.png
 
     if not RESULTS_DIR.exists():
         raise SystemExit(f"{RESULTS_DIR} does not exist -- run an experiment first.")
@@ -1997,7 +2796,7 @@ def main() -> None:
     for run in runs:
         by_dataset[run.dataset].append(run)
 
-    total = 0
+    jobs: list[tuple] = []
     all_scaling: dict[Run, dict[str, ScalingCurve]] = {}
     for dataset in DATASETS:
         dataset_runs = by_dataset.get(dataset, [])
@@ -2006,8 +2805,9 @@ def main() -> None:
         output_dir = PLOTS_DIR / dataset
         print(f"\n[{DATASET_LABELS[dataset]}] {len(dataset_runs)} run(s) -> {output_dir}/")
 
-        tables, bootstrap, cmc, selective, exposure, scaling, modes = build_curves(
-            dataset_runs, replicates)
+        (tables, bootstrap, cmc, selective, exposure, scaling, modes,
+         coverage, detection, separation, reach) = build_curves(dataset_runs, args.bootstrap,
+                                                                args.jobs)
         all_scaling.update(scaling)
 
         decay = {}
@@ -2019,31 +2819,26 @@ def main() -> None:
             else:
                 decay[run] = staleness
 
-        written = []
-        for kind, curves in (("cmc", cmc), ("risk_coverage", selective),
-                             ("author_risk", exposure), ("scaling", scaling)):
-            written += plot_defense_comparisons(dataset, dataset_runs, curves, kind, output_dir)
-            written += plot_attack_comparisons(dataset, dataset_runs, curves, kind, output_dir)
-        written += plot_macro_micro(dataset, dataset_runs, modes, output_dir)
-        if decay:
-            written += plot_temporal_decay(dataset, [run for run in dataset_runs if run in decay],
-                                           decay, output_dir)
-        for run in dataset_runs:
-            written += plot_run_detail(run, output_dir)
-
-        for path in written:
-            print(f"  {path.relative_to(PLOTS_DIR)}")
-        total += len(written)
+        jobs += dataset_figure_jobs(
+            dataset, dataset_runs,
+            {"cmc": cmc, "risk_coverage": selective, "author_risk": exposure, "scaling": scaling,
+             "openset_coverage": coverage, "detection": detection},
+            modes, reach, separation, decay, output_dir, args.per_run)
 
     # Figures that span datasets go to plots/cross_dataset/ rather than under either corpus:
     # pool size is the one axis where the two are the same experiment at different scales, and
     # filing that under one of them would imply it belongs to that one.
-    across = plot_scaling_across_datasets(runs, all_scaling, PLOTS_DIR)
-    for path in across:
-        print(f"\n{path.relative_to(PLOTS_DIR)}")
-    total += len(across)
+    jobs.append((plot_scaling_across_datasets, (runs, all_scaling, PLOTS_DIR), {}))
 
-    print(f"\nWrote {total} figure(s) (PDF + PNG) to {PLOTS_DIR}/")
+    print(f"\nDrawing {len(jobs)} figure group(s) across {min(args.jobs, len(jobs))} process(es)")
+    written = [path for group in run_jobs(jobs, args.jobs) for path in group]
+    for path in sorted(written):
+        print(f"  {path.relative_to(PLOTS_DIR)}")
+
+    formats = "PDF + PNG" if WRITE_PNG else "PDF"
+    print(f"\nWrote {len(written)} figure(s) ({formats}) to {PLOTS_DIR}/")
+    if not args.per_run:
+        print("per_run/ diagnostics skipped -- pass --per-run to draw them")
 
 
 if __name__ == "__main__":
