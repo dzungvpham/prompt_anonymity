@@ -1,0 +1,95 @@
+# Resources for `python experiments/run_all_experiments.py --slurm`.
+#
+# THIS IS THE FILE TO EDIT FOR A DIFFERENT CLUSTER. It is the only place partitions, limits and
+# accounting flags appear; the launcher itself knows nothing about them. Everything here is
+# `sbatch` flags, passed through verbatim -- there is no schema of our own to learn, and anything
+# sbatch accepts works. Point elsewhere with `--slurm-config PATH` or
+# `$PROMPT_ANONYMITY_SLURM_CONFIG` (e.g. an uncommitted file of your own).
+#
+# Check what a change produces without submitting anything:
+#
+#     python experiments/run_all_experiments.py --slurm --dry-run
+#
+# Flags are concatenated in this order, and sbatch's own last-one-wins rule does the merging:
+#
+#     --job-name / --output (set per cell by the launcher)
+#     [defaults].sbatch
+#     [profiles.<name>].sbatch      <- the profile `resource_profile(cell)` chose
+#     [overrides.<tag>].sbatch      <- optional, keyed by results-directory name
+#     --slurm-arg=... from the command line
+#
+# So a later table can override an earlier one, and a one-off command-line flag overrides the file.
+# The values below are for UMass Unity; job names must be left alone (see [defaults]).
+#
+# Flags are environment-expanded, so nothing personal or machine-specific has to be committed
+# here. A `.env` beside the project is read, the same one the data pipeline uses:
+#
+#     "--account=$SLURM_ACCOUNT"     unset -> error naming the variable (a wrong account is a
+#                                    rejected job or someone else's allocation)
+#     "--mail-user=${EMAIL:-}"       unset -> the flag is left out entirely (no address, no mail)
+# --- applied to every job ----------------------------------------------------
+#
+# Deliberately no --time, --mem or --partition here: those differ per profile, and a --time in
+# both places is how a job ends up asking for 8 hours under a QOS that caps at 4 and is rejected
+# at submit time.
+[defaults]
+sbatch = [
+    "--nodes=1",
+    "--open-mode=append",
+    "--mail-type=ALL",
+    # Set EMAIL in your shell or .env. Without it this flag is dropped and SLURM falls back to
+    # the local username, which on a cluster with no MailDomain is not a routable address --
+    # i.e. --mail-type stays on but nothing arrives, which is the intended "no mail" outcome.
+    "--mail-user=${EMAIL:-}",
+]
+
+# --- one per resource class the launcher asks for ----------------------------
+#
+# The names are `run_all_experiments.resource_profile`'s return values. That function encodes what
+# the *experiment* needs (an accelerator, a lot of memory); this file encodes what that costs
+# here. A missing profile is a hard error naming the cell that wanted it, not a silent default.
+
+# Everything but xgboost: BLAS on the CPU, and one process. A GPU would sit idle.
+[profiles.cpu]
+sbatch = [
+    "--partition=cpu-preempt",
+    "--cpus-per-task=8",       # --tune-jobs stays 1; the threads go to BLAS
+    "--mem=16g",
+    "--time=0-04:00:00",
+]
+
+# WildChat, non-xgboost. The score matrix is the binding constraint: known0050 is
+# 86,255 x 13,694 float32 = 4.72 GB on its own, a StyloMetrix nearest-neighbor run measured a
+# 14.6 GB peak, and Gemini's 3,072-d vectors add ~2 GB of features on top. Runs have been
+# OOM-killed at 16 GB, so this asks for room rather than the measured peak. If a cell still dies,
+# shard it by known configuration (`--known-windows 0050` as its own job -- each writes its own
+# files into the same directory).
+[profiles.cpu_large]
+sbatch = [
+    "--partition=cpu-preempt",
+    "--cpus-per-task=8",
+    "--mem=24g",
+    "--time=0-04:00:00",
+]
+
+# xgboost only. Measured 17x on the shape these cells have -- 1,000 documents x 3,072 features
+# over 81 authors, 22.1 s CPU against 1.29 s on one A100.
+[profiles.gpu]
+sbatch = [
+    "--partition=gpu-preempt",
+    "--gpus=1",
+    "--constraint=a100|l40s|h100|h200",
+    "--cpus-per-task=8",
+    "--mem=24g",
+    "--qos=short",
+    "--time=0-03:59:59",
+]
+
+# --- per-cell exceptions (optional) ------------------------------------------
+#
+# Keyed by the results-directory tag, i.e. `<dataset>_<defense>_<feature>_<attack>`. For the one
+# cell that needs something its profile does not give it; delete these rather than growing a
+# profile that only ever applies to a single run.
+#
+# [overrides.wildchat_openanonymity_gemini_embedding_2_nearest_neighbor]
+# sbatch = ["--mem=32g"]
