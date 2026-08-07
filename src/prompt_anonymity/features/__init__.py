@@ -43,6 +43,7 @@ from .luar import LuarFeaturizer
 # classes (not instances) because a featurizer may need configuration -- e.g. StyloMetrix's
 # language_code -- supplied when it is built; see :func:`get_featurizer`.
 FEATURIZERS: dict[str, type[Featurizer]] = {
+    "gemini_embedding_2": GeminiEmbedding2Featurizer,
     "stylometrix": StyloMetrixFeaturizer,
     "character_statistics": CharacterStatisticsFeaturizer,
     "function_words": FunctionWordFeaturizer,
