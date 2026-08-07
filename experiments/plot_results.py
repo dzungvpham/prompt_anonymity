@@ -52,6 +52,16 @@ fixed, a line per feature+attack -- *which attack is strongest?*).
     level is the only curve in the file that is **bracketed rather than estimated**: the ranks do
     not determine it, so the line is an attained lower bound and the band carries the analytic
     gap as well as the bootstrap (see :func:`author_subpool_bounds`).
+``accuracy_by_known_ndocs/`` and ``accuracy_by_test_ndocs/``
+    **Accuracy against documents per author**, binned, drawn over the histogram of that
+    distribution. The axis the configuration grid cannot isolate: a bigger known side hands the
+    attacker more documents *per user* and more users to confuse them with at once, and
+    ``scaling/`` answers only the second half of that. Here the candidate pool is fixed inside a
+    panel and what varies is how much of a given user's writing exists -- on the known side (what
+    the attacker holds) or on the test side (what is under attack). Both are **observational**: a
+    user with 30 documents is not a user with 3 who was given more history, they are a heavier
+    user. The grey bars are each bin's share of the panel, on the same 0-1 axis rather than a
+    second y scale, so a bar is the weight its own point carries.
 ``temporal/``
     **Temporal decay** -- accuracy against whole weeks elapsed since the attacker's data ends. The
     only figure whose x axis is time, the only one that reads the whole unknown side rather than
@@ -1443,6 +1453,213 @@ def config_author_risk(table: pd.DataFrame, weights: PanelWeights) -> ConfigAuth
                             never_identified=float((values == 0).mean()))
 
 
+# --- how much writing does it take? accuracy against documents per author -----
+#
+# The axis the configuration grid cannot isolate. Moving from a 25% known side to a 75% one hands
+# the attacker more documents *per user* and more users to confuse them with at the same time, so
+# a difference between two panels cannot be attributed to either; `scaling/` answers the second
+# half of that by shrinking the candidate pool while holding the text fixed, and this family
+# answers the first. The pool is whatever the configuration enrolled and stays fixed inside a
+# panel -- what varies along the x axis is how much of a given user's writing exists.
+#
+# IT IS OBSERVATIONAL, and every reading has to carry that: a user with 30 known documents is not
+# a user with 3 who was given more history, they are a heavier user, and heavier users differ in
+# *what* they write as well as how much. The bins compare people, not interventions. The
+# proportional baseline is drawn for exactly this reason -- it rises across the bins too, because
+# a prolific author is a likelier guess, so the gap between the curve and the dashes is the part
+# of the trend that is not simply the prior.
+#
+# Two sides, two families. `known` bins a user by how much the *attacker* holds for them (the
+# evidence behind the gallery entry); `test` bins them by how much of their own traffic is under
+# attack. They answer different questions and the second one partly measures the metric: "linked
+# at least once" gets more chances the more a user writes. The baseline makes the same statement
+# at the same level, which is what keeps that visible rather than hidden.
+
+#: Left edge of each per-author document-count bin. Singletons at 1 and 2 because that is where
+#: most of both corpora sits -- WildChat's median author writes 3 documents -- then doubling,
+#: which is what keeps the later bins populated on a distribution whose tail reaches 509. The
+#: edges are fixed rather than per-panel quantiles so every panel, level, side and corpus shares
+#: one x axis and the bins mean the same thing everywhere.
+NDOCS_BIN_EDGES = (1, 2, 3, 5, 9, 17, 33)
+
+
+def ndocs_bin_labels(edges: tuple[int, ...]) -> tuple[str, ...]:
+    """Tick labels for :data:`NDOCS_BIN_EDGES`: ``1``, ``2``, ``3-4``, ... , ``33+``.
+
+    Derived from the edges rather than written out beside them, so re-binning cannot leave the
+    axis claiming the old ranges.
+    """
+    labels = []
+    for index, low in enumerate(edges):
+        high = edges[index + 1] if index + 1 < len(edges) else None
+        labels.append(f"{low}+" if high is None else
+                      str(low) if high - low == 1 else f"{low}-{high - 1}")
+    return tuple(labels)
+
+
+NDOCS_BIN_LABELS = ndocs_bin_labels(NDOCS_BIN_EDGES)
+
+#: Users a bin needs before its accuracy is drawn. The bootstrap's resampling unit is the user,
+#: so a bin standing on three of them is noise however many documents they wrote between them --
+#: which is why the gate counts users at *both* levels. The bar stays either way: the population
+#: is a result, and a bin dropped for thinness should still be visible as the handful it was.
+MIN_AUTHORS_PER_BIN = 5
+
+
+@dataclass
+class ConfigNdocs:
+    """One (run, configuration) accuracy curve against how many documents an author has.
+
+    ``curve`` is one row per bin: ``bin`` (its position on the axis) and ``bin_label``, the
+    ``accuracy`` with its ``ci_low``/``ci_high`` band, both baselines (``random`` uniform and
+    ``random_proportional``, the one drawn), and the bin's population as ``n_authors`` /
+    ``n_documents`` with ``share`` the one the bars draw. ``share`` follows the level --
+    documents at the document level, users at the author level -- so a bar is always the weight
+    its own point carries in the panel's overall number.
+
+    ``side`` is which corpus side the count comes from: ``"known"`` bins users by how much the
+    attacker enrolled for them, ``"test"`` by how much of theirs is under attack. ``level`` is
+    ``"document"`` (share of that bin's documents attributed) or ``"author"`` (share of that
+    bin's users linked at least once).
+    """
+
+    curve: pd.DataFrame
+    n_documents: int
+    n_users: int
+    side: str = "known"
+    level: str = "document"
+
+
+def bin_means(bins: np.ndarray, values: np.ndarray, n_bins: int) -> np.ndarray:
+    """Unweighted mean of ``values`` within each bin; NaN where the bin holds nothing.
+
+    NaN rather than zero, because an empty bin has no mean -- drawing one at zero would put a
+    point on the floor of the axis where there is no measurement.
+    """
+    totals = np.bincount(bins, minlength=n_bins).astype(float)
+    sums = np.bincount(bins, weights=np.asarray(values, dtype=float), minlength=n_bins)
+    return np.divide(sums, totals, out=np.full(n_bins, np.nan), where=totals > 0)
+
+
+def binned_rate(bins: np.ndarray, hit: np.ndarray, weights: np.ndarray, n_bins: int
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-bin hit rate and its bootstrap band, at either counting level.
+
+    ``bins`` and ``hit`` carry one entry per counted unit -- a document at the document level, a
+    user at the author level -- and ``weights`` is that unit's ``(replicates x units)``
+    multiplicity matrix, so one implementation serves both.
+
+    The band goes through :func:`grouped_sums` twice over the **same** label array: once for the
+    denominators and once for the numerators, with the hits folded into the weights rather than
+    selected out of them. Subsetting the columns instead would hand the two calls different label
+    sets the moment a bin holds no hits, and their results have to be divided by each other.
+    """
+    accuracy = bin_means(bins, hit, n_bins)
+    if not len(weights):
+        return accuracy, accuracy, accuracy
+    present, denominators = grouped_sums(bins, weights)
+    _, numerators = grouped_sums(bins, weights * hit.astype(weights.dtype))
+    rate = np.divide(numerators, denominators, out=np.full_like(numerators, np.nan),
+                     where=denominators > 0)
+    low, high = np.full(n_bins, np.nan), np.full(n_bins, np.nan)
+    low[present], high[present] = band_from_replicates(rate)
+    return accuracy, low, high
+
+
+def config_ndocs(table: pd.DataFrame, weights: PanelWeights, dataset: str, known_config: str,
+                 side: str = "known", level: str = "document") -> ConfigNdocs | None:
+    """Accuracy against the number of documents an author has, binned, for one configuration.
+
+    The counts come from one of two places and the choice is what ``side`` names. ``"known"``
+    reads :func:`known_author_counts` -- the corpus, sliced to the interval this configuration
+    enrolled -- so the x axis is the evidence behind the attacker's gallery entry for that user.
+    ``"test"`` counts the user's rows in this panel's own scored table, so the x axis is how much
+    of their traffic is under attack. Neither is derivable from the other: the two sides are
+    disjoint slices of the timeline.
+
+    Both baselines are binned the same way round as the curve above them, which is the split
+    :func:`config_baseline` already makes: the document level averages ``p_a`` over the bin's
+    documents, and the author level averages ``1 - (1 - p_a) ** m_a`` over its users, with
+    ``m_a`` that user's documents in the scored table. That matters most on the ``"test"``
+    family, where the metric itself improves with ``m_a`` -- the dashed line rises for the same
+    mechanical reason the curve does, so the gap between them is what the attack contributed.
+
+    ``None`` when ``side="known"`` and the corpus parquet is not on disk to reconstruct the known
+    side; the ``"test"`` family needs nothing but the predictions and is always available.
+    """
+    if side == "known":
+        per_author = known_author_counts(dataset, known_config)
+        if per_author is None:
+            return None
+    else:
+        per_author = table["true_author"].value_counts()
+
+    sizes = table["true_author"].map(per_author)
+    # An in-set document's author is enrolled by definition, so a missing count would mean the
+    # reconstructed known side disagrees with the run that wrote the file. Dropped rather than
+    # left to bin as NaN, which is the defensive stance `config_baseline` takes for the same case.
+    keep = sizes.notna().to_numpy()
+    if not keep.any():
+        return None
+    table, sizes = table[keep], sizes[keep]
+    document_weights = weights.documents[:, keep] if len(weights.documents) else weights.documents
+
+    shares = known_author_shares(dataset, known_config)
+    pool = table["n_candidate_authors"].to_numpy(dtype=float)
+    prior = (table["true_author"].map(shares).to_numpy(dtype=float) if shares is not None
+             else 1.0 / pool)
+    n_bins = len(NDOCS_BIN_EDGES)
+    document_bins = np.searchsorted(NDOCS_BIN_EDGES, sizes.to_numpy(dtype=float),
+                                    side="right") - 1
+
+    # One row per user, carrying the bin they fall in (a property of the user, so any of their
+    # rows will do) and how many chances a per-document guesser gets at them.
+    people = pd.DataFrame({"author": table["true_author"].to_numpy(),
+                           "rank": table["true_author_rank"].to_numpy(dtype=float),
+                           "bin": document_bins, "prior": prior, "pool": pool})
+    per_user = people.groupby("author", sort=True).agg(
+        best=("rank", "min"), bin=("bin", "first"), prior=("prior", "first"),
+        pool=("pool", "max"), n_documents=("rank", "size"))
+
+    n_authors = np.bincount(per_user["bin"].to_numpy(), minlength=n_bins).astype(float)
+    n_documents = np.bincount(document_bins, minlength=n_bins).astype(float)
+
+    if level == "author":
+        chances = per_user["n_documents"].to_numpy(dtype=float)
+        bins = per_user["bin"].to_numpy()
+        hit = per_user["best"].to_numpy(dtype=float) <= 1
+        unit_weights = weights.for_authors(per_user.index)
+        proportional = 1.0 - (1.0 - per_user["prior"].to_numpy(dtype=float)) ** chances
+        uniform = 1.0 - (1.0 - 1.0 / per_user["pool"].to_numpy(dtype=float)) ** chances
+        population = n_authors
+    else:
+        bins = document_bins
+        hit = table["true_author_rank"].to_numpy(dtype=float) <= 1
+        unit_weights = document_weights
+        proportional, uniform = prior, 1.0 / pool
+        population = n_documents
+
+    accuracy, low, high = binned_rate(bins, hit, unit_weights, n_bins)
+    thin = n_authors < MIN_AUTHORS_PER_BIN
+    accuracy, low, high = (np.where(thin, np.nan, value) for value in (accuracy, low, high))
+    total = population.sum()
+    curve = pd.DataFrame({
+        "bin": np.arange(n_bins),
+        "bin_label": list(NDOCS_BIN_LABELS),
+        "accuracy": accuracy,
+        # Both baselines stay ungated: they are properties of the bin's population rather than
+        # measurements of the attack, so a thin bin still has them and the CSV keeps them. It is
+        # the *drawing* that follows the accuracy's gaps -- see `draw_ndocs_panel`.
+        "random": bin_means(bins, uniform, n_bins),
+        "random_proportional": bin_means(bins, proportional, n_bins),
+        "ci_low": low, "ci_high": high,
+        "n_authors": n_authors.astype(int), "n_documents": n_documents.astype(int),
+        "share": population / total if total else population,
+    })
+    return ConfigNdocs(curve=curve, n_documents=int(len(table)), n_users=int(len(per_user)),
+                       side=side, level=level)
+
+
 # --- the open world: the documents nobody the attacker knows wrote -----------
 #
 # Every figure above answers "which known author wrote this?" on the documents where that
@@ -1864,6 +2081,13 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str) -> None:
                        xlabel if row == rows[-1] else "",
                        f"known side = {size:.0%}\n{ylabel}" if column == 0 else "",
                        header if row == rows[0] and row == 0 else "", "")
+            if row == rows[-1]:
+                # `sharex` hides the tick labels on every row but the grid's last one, and the
+                # triangle's outer edge is not its last row. Without this the lowest panel of the
+                # two right-hand columns carries an x label over unlabelled ticks -- survivable
+                # on a log-k axis a reader can infer, not on a categorical one whose ticks are
+                # the only thing naming the bins.
+                axes.tick_params(labelbottom=True)
 
 
 def panel_note(axes, text: str) -> None:
@@ -2061,6 +2285,57 @@ def draw_author_risk_panel(axes, series: list[Series], handles: dict) -> pd.Data
     never = (f" · {series[0].curve.never_identified:.0%} never identified"
              if len(series) == 1 else "")
     panel_note(axes, f"{series[0].curve.n_users:,} users{never}")
+    return pd.concat(rows, ignore_index=True)
+
+
+def draw_ndocs_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
+    """One cell's accuracy against binned per-author document count, over its own histogram.
+
+    The bars are the population each point stands on -- the histogram the request asked the
+    accuracy to be overlaid on -- and they are **not a second y axis**. They are a *share* of the
+    panel, which puts them on the same 0-1 scale as the accuracy above them honestly rather than
+    by an arbitrary alignment of two ranges, and the share is of whatever the level counts
+    (documents at ``doc/``, users at ``author/``), so a bar is the weight its own point carries in
+    the panel's overall number. Absolute counts ride in the panel note and in the companion CSV,
+    which is where a number that needs to be exact belongs.
+
+    Drawn once per panel in recessive grey, like the temporal figure's weekly population: the
+    distribution of documents per author is a property of the corpus and the configuration, so
+    every line in a cell stands on the same one -- a defense rewrites text, not how much of it
+    somebody wrote.
+
+    The x axis is **categorical**. The bins are unequal in width by construction (``1``, ``2``,
+    ``3-4``, ... ``33+``), so they are drawn at equal spacing and named on the ticks rather than
+    placed on a count axis where the last bin would be five sixths of the width.
+
+    The baseline follows the accuracy's gaps: where a bin was dropped for thinness there is no
+    measurement to compare against, and a lone dashed segment over an empty stretch reads as one.
+    """
+    population = series[0].curve.curve
+    axes.bar(population["bin"], population["share"], width=0.72, color=TEXT_MUTED, alpha=0.22,
+             linewidth=0.8, edgecolor=SURFACE, zorder=1)
+    rows = []
+    for item, slot in zip(series, resolve_slots([item.slot for item in series])):
+        curve = item.curve.curve
+        color = series_style(slot)
+        axes.fill_between(curve["bin"], curve["ci_low"], curve["ci_high"], color=color,
+                          alpha=BAND_ALPHA, linewidth=0, zorder=2)
+        # Markers throughout: there are seven of them, and each one is a bin rather than a sample
+        # of a continuum -- the line between two of them interpolates nothing.
+        axes.plot(curve["bin"], curve["accuracy"], color=color, linewidth=LINE_WIDTH,
+                  marker="o", markersize=MARKER_SIZE, markeredgecolor=SURFACE, markeredgewidth=2,
+                  solid_capstyle="round", zorder=3)
+        handles.setdefault(item.label, Line2D([], [], color=color, linewidth=LINE_WIDTH))
+        rows.append(curve.assign(series=item.label))
+    baseline = series[0].curve.curve
+    drawn = ("random_proportional" if baseline["random_proportional"].notna().all()
+             else "random")
+    axes.plot(baseline["bin"], baseline[drawn].where(baseline["accuracy"].notna()),
+              color=TEXT_MUTED, linewidth=1.2, linestyle=BASELINE_DASH, zorder=2)
+    axes.set_xticks(np.arange(len(NDOCS_BIN_LABELS)), labels=list(NDOCS_BIN_LABELS))
+    axes.set_xlim(-0.6, len(NDOCS_BIN_LABELS) - 0.4)
+    axes.set_ylim(0, 1.02)
+    panel_note(axes, f"{series[0].curve.n_documents:,} docs · {series[0].curve.n_users:,} users")
     return pd.concat(rows, ignore_index=True)
 
 
@@ -2314,6 +2589,33 @@ CURVE_TYPES = {
     "author_risk": (draw_author_risk_panel, "author_risk",
                     "Share of users, most exposed first (%)", "That user's own top-1 accuracy",
                     "A cliff means the risk sits with a few users, not with the average one"),
+    # The bars are explained in the subtitle rather than in the y label: the label is prefixed
+    # with the row's known-side size and stacked in a 3-inch column, so a parenthetical there
+    # runs over the panel above it.
+    "ndocs_known": (draw_ndocs_panel, "accuracy_by_known_ndocs/doc",
+                    "Documents the attacker holds for that author",
+                    "Top-1 accuracy (per document)",
+                    "How much of a user's writing the attacker needs, at a fixed candidate pool. "
+                    "Bars: that bin's share of the panel's documents. Observational -- a heavier "
+                    "user is a different person, not the same one given more history"),
+    "ndocs_known_authors": (draw_ndocs_panel, "accuracy_by_known_ndocs/author",
+                            "Documents the attacker holds for that author",
+                            "Share of users linked at least once",
+                            "How much of a user's writing the attacker needs, at a fixed "
+                            "candidate pool. Bars: that bin's share of the panel's users. "
+                            "Observational -- a heavier user is a different person, not the "
+                            "same one given more history"),
+    "ndocs_test": (draw_ndocs_panel, "accuracy_by_test_ndocs/doc",
+                   "That author's documents in the test set",
+                   "Top-1 accuracy (per document)",
+                   "The gallery is unchanged across the bins -- this splits the target, not the "
+                   "attacker. Bars: that bin's share of the panel's documents"),
+    "ndocs_test_authors": (draw_ndocs_panel, "accuracy_by_test_ndocs/author",
+                           "That author's documents in the test set",
+                           "Share of users linked at least once",
+                           "Being linked at least once gets more chances the more a user writes, "
+                           "and the dashed baseline rises for that reason too -- the gap between "
+                           "them is what the attack contributed. Bars: share of the panel's users"),
     "scaling": (draw_scaling_panel, "scaling/doc", "Candidate users the attack ranks over",
                 "Top-1 accuracy (per document)",
                 "Line interpolates down to smaller galleries; rings are the pools actually run"),
@@ -2367,6 +2669,10 @@ CURVE_FAMILIES = {
     "selective": "risk_coverage",
     "selective_authors": "risk_coverage_authors",
     "exposure": "author_risk",
+    "ndocs_known": "ndocs_known",
+    "ndocs_known_authors": "ndocs_known_authors",
+    "ndocs_test": "ndocs_test",
+    "ndocs_test_authors": "ndocs_test_authors",
     "scaling": "scaling",
     "scaling_authors": "scaling_authors",
     "coverage": "openset_coverage",
@@ -2641,23 +2947,49 @@ def document_end_times(dataset: str) -> pd.Series | None:
     return pd.Series(frame["ended_at"].to_numpy(), index=frame["doc_id"].to_numpy())
 
 
-def known_author_shares(dataset: str, known_config: str) -> pd.Series | None:
-    """Each known author's share of the known side's documents: the prior the baseline guesses on.
+def known_author_counts(dataset: str, known_config: str) -> pd.Series | None:
+    """How many documents each author wrote on ``known_config``'s known side.
 
     The known side is the interval ``known_config`` names, taken over the dated corpus in
     chronological order -- ``round(fraction * n_documents)`` at each end, the same arithmetic
-    ``known_configurations`` uses, so this is the pool the attack really searched rather than an
-    approximation of it.
+    ``known_configurations`` uses, so this is the gallery the attack really searched rather than
+    an approximation of it.
+
+    Two figures read it and they want different things from the same slice: the proportional
+    baseline needs it as a *distribution* (:func:`known_author_shares`), and
+    ``accuracy_by_known_ndocs/`` needs the raw per-author count as its x axis. Memoised, because
+    every run of a dataset asks for the same six known sides and the slice costs a sort of the
+    whole corpus -- 172,509 rows on WildChat. :func:`warm_baselines` fills this memo in the
+    parent process as a side effect of warming the baselines, so the curve workers inherit it.
     """
-    frame = corpus_documents(dataset)
-    if frame is None:
-        return None
-    dated = frame[frame["ended_at"].notna()].sort_values(["ended_at", "doc_id"], kind="mergesort")
-    config = parse_config_tag(known_config)
-    start = int(round(config.start * len(dated)))
-    end = int(round(config.end * len(dated)))
-    known = dated["author_id"].iloc[start:end]
-    return known.value_counts(normalize=True) if len(known) else None
+    key = (dataset, known_config)
+    if key not in _KNOWN_COUNTS:
+        frame = corpus_documents(dataset)
+        if frame is None:
+            _KNOWN_COUNTS[key] = None
+        else:
+            dated = frame[frame["ended_at"].notna()].sort_values(["ended_at", "doc_id"],
+                                                                 kind="mergesort")
+            config = parse_config_tag(known_config)
+            start = int(round(config.start * len(dated)))
+            end = int(round(config.end * len(dated)))
+            known = dated["author_id"].iloc[start:end]
+            _KNOWN_COUNTS[key] = known.value_counts() if len(known) else None
+    return _KNOWN_COUNTS[key]
+
+
+#: Memo for :func:`known_author_counts`, one entry per (dataset, known configuration).
+_KNOWN_COUNTS: dict[tuple[str, str], pd.Series | None] = {}
+
+
+def known_author_shares(dataset: str, known_config: str) -> pd.Series | None:
+    """Each known author's share of the known side's documents: the prior the baseline guesses on.
+
+    :func:`known_author_counts` normalised, and kept as its own function because it is the form
+    every baseline wants and normalising at each call site would invite one of them to forget.
+    """
+    counts = known_author_counts(dataset, known_config)
+    return None if counts is None else counts / counts.sum()
 
 
 def temporal_accuracy(run: Run, known_config: str = TEMPORAL_KNOWN_CONFIG,
@@ -3638,6 +3970,14 @@ def run_curves(run: Run, tables: dict[str, pd.DataFrame], bootstrap: AuthorBoots
         curves["selective"][tag] = config_risk_coverage(table, panel)
         curves["selective_authors"][tag] = config_risk_coverage_authors(table, bootstrap)
         curves["exposure"][tag] = config_author_risk(table, panel)
+        # Two sides x two counting levels, all four from the same table and the same weights.
+        # The `known` pair needs the corpus parquet and is absent without it (`warm_baselines`
+        # is what reports that); the `test` pair reads nothing but the predictions.
+        for side in ("known", "test"):
+            for level, suffix in (("document", ""), ("author", "_authors")):
+                ndocs = config_ndocs(table, panel, run.dataset, tag, side=side, level=level)
+                if ndocs is not None:
+                    curves[f"ndocs_{side}{suffix}"][tag] = ndocs
         pool_curve = config_scaling(run, table, panel)
         if pool_curve is not None:
             curves["scaling"][tag] = pool_curve
