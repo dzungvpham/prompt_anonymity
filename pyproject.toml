@@ -48,6 +48,8 @@ qwen = [
 ]
 # dp_mlm.py: DP-MLM rewriting. Reuses torch/transformers from [styleremix]; adds nltk for the
 # word tokenizer/detokenizer + stopwords (NLTK data is fetched lazily on first backend build).
+# Covers every non-PII variant: --defense dp_mlm, the dp_mlm_eps<eps> sweep, and the adaptive-length
+# dp_mlm_var_a<A> entries, which need no dependency of their own (their coins are stdlib `random`).
 dpmlm = [
     "prompt-anonymity[styleremix]",
     "nltk",

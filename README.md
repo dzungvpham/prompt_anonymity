@@ -61,7 +61,7 @@ accept anything registered, and adding one makes it selectable with no change to
 | --- | --- |
 | `FEATURIZERS` | `stylometrix`, `function_words`, `character_statistics`, `char_ngram_tfidf`, `style_distance`, `gemini_embedding_2`, `gemini_embedding_001` |
 | `ATTRIBUTION_ATTACKS` | `nearest_neighbor`, `cosine`, `wccn`, `lda`, `plda`, `logistic`, `svm`, `rlsc`, `xgboost` |
-| `DEFENSES` | `none`, `openanonymity`, `styleremix`, `styleremix_openanon`, `qwen_rewrite`, `dp_mlm` (+ `dp_mlm_eps<ε>` sweep), `rtt_argos`, `example_normalization` |
+| `DEFENSES` | `none`, `openanonymity`, `styleremix`, `styleremix_openanon`, `qwen_rewrite`, `dp_mlm` (+ `dp_mlm_eps<ε>` sweep, + `dp_mlm_var_a<A>` adaptive length), `rtt_argos`, `example_normalization` |
 
 ## Installation
 
@@ -148,7 +148,8 @@ whole split with `apply_defenses`; the result is a drop-in replacement for the s
 | `styleremix` | steers text along interpretable style axes (formality, voice, length, …) with per-axis LoRA adapters merged into one, over Llama-3-8B (Fisher et al., EMNLP 2024) | GPU (~20 GB) |
 | `styleremix_openanon` | both, strictly in sequence: restyle everything, release the GPU, then scrub the restyled text | 80 GB GPU |
 | `qwen_rewrite` | rewrites every prompt into one fixed neutral style | GPU, or CPU via GGUF |
-| `dp_mlm`, `dp_mlm_eps<ε>` | differentially-private word-level rewriting at a given ε | GPU |
+| `dp_mlm`, `dp_mlm_eps<ε>` | differentially-private word-level rewriting at a given per-word ε (default ε=100; below that the rewrite stops being readable). Sweep with `experiments/run_dpmlm_sweep.sh` | GPU |
+| `dp_mlm_var_a10`, `dp_mlm_var_a25` | the same at ε=100 **plus the paper's adaptive-length mode** (Algorithm 3): words are dropped with probability `D`=0.05 and extra DP-drawn words inserted with probability `A`, so the rewrite no longer preserves word count or text length | GPU |
 | `rtt_argos` | round-trip translation | — |
 
 **The model-backed defenses run locally**, through vLLM, against checkpoints on disk — no API keys,

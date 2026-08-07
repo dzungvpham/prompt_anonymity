@@ -59,11 +59,27 @@ DEFENSES: dict[str, Defense] = {
 #: epsilon writes to its OWN results directory, and each caches separately since epsilon is in
 #: ``params()``. The paper's set is {10,25,50,100,250}; the
 #: higher values are added because DP-MLM only becomes near-readable at large epsilon (weaker privacy
-#: -- the point of sweeping). Keep this in sync with experiments/run_dpmlm_sweep.sh.
+#: -- the point of sweeping). ``dp_mlm`` itself defaults to eps=100, the readable end of the paper's
+#: set, so it and ``dp_mlm_eps100`` produce the same output and share a cache entry (the cache is
+#: keyed on the defense's ``name`` + ``params()``, not on the registry key).
+#: Keep this in sync with experiments/run_dpmlm_sweep.sh.
 DPMLM_SWEEP_EPSILONS = (10, 25, 50, 100, 250, 500, 1000)
 for _eps in DPMLM_SWEEP_EPSILONS:
     DEFENSES[f"dp_mlm_eps{_eps}"] = DPMLMDefense(epsilon=_eps)
 del _eps
+
+#: DP-MLM adaptive-length variants (the paper's Algorithm 3): at the default eps, each eligible word
+#: is deleted with probability ``del_prob`` and followed by an extra DP-drawn word with probability
+#: ``add_prob``, so the rewrite no longer preserves word count. Registered as ``dp_mlm_var_a<A*100>``
+#: at the paper's Appendix C grid (A in {0.1, 0.25}, D = 0.05); the plain ``dp_mlm`` and the epsilon
+#: sweep above stay fixed-length, so "same eps, with vs without length variability" is a clean A/B.
+DPMLM_VARLEN_ADD_PROBS = (0.1, 0.25)
+DPMLM_VARLEN_DEL_PROB = 0.05
+for _add in DPMLM_VARLEN_ADD_PROBS:
+    DEFENSES[f"dp_mlm_var_a{int(round(_add * 100))}"] = DPMLMDefense(
+        add_prob=_add, del_prob=DPMLM_VARLEN_DEL_PROB
+    )
+del _add
 
 
 def get_defense(name: str) -> Defense:

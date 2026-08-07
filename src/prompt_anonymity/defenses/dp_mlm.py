@@ -7,12 +7,15 @@ sentence pair (the paper's "contextualization" trick), read the vocab logits at 
 **clip** them to a calibrated ``[clip_min, clip_max]`` (sensitivity ``Δu = |clip_max − clip_min|``),
 scale by ``1/(2·Δu/ε)``, softmax, and **sample** a replacement token. This is a faithful port of
 the reference ``src/dpmlm/core.py`` (``privatize_batch`` / ``dpmlm_rewrite_batch``); the math and
-defaults match. Unlike the other defenses here (heuristic/LM rewriters), DP-MLM comes with a formal
-DP guarantee -- it is the reason to add it.
+the clip bounds match. Unlike the other defenses here (heuristic/LM rewriters), DP-MLM comes with a
+formal DP guarantee -- it is the reason to add it.
 
 Privacy accounting is per word: a text with ``n`` privatized words spends ``n·ε`` by sequential
 composition (reported, not enforced -- as in the paper). We use the authors' published roberta-base
-clip bounds.
+clip bounds. The one default we do *not* inherit is ε: this defense runs at **ε=100** per word,
+because below ~ε=100 the sampled words are mostly unrelated to the originals and the defended text
+stops being usable prompt text (see ``DPMLM_EPSILON``). The ``dp_mlm_eps<ε>`` registry entries sweep
+around it.
 
 Two deliberate deviations from the reference, both required by this framework:
 
@@ -26,7 +29,50 @@ Two deliberate deviations from the reference, both required by this framework:
 * **Scope.** We port the paper's headline mode (rewrite every content word) plus the optional Presidio
   PII toggle (``pii=True`` == the reference ``PII=True, hybrid=False``: detected entities become kept
   ``<ENTITY_TYPE>`` placeholders, everything else is still DP-rewritten). The reference's IPI/NER and
-  ``hybrid_budget`` modes and ``dpmlm_rewrite_plus`` (add/delete tokens) are omitted.
+  ``hybrid_budget`` modes are omitted.
+
+**Adaptive length (the paper's Algorithm 3, "Text Rewriting +-").** Plain DP-MLM emits exactly one
+word per input word, so the rewrite preserves word count and text length perfectly -- which the paper
+calls its "primary limitation" (§7) and which matters here because length and word count are literal
+features in the stylometric vectors the attacks use. Setting ``add_prob`` (the paper's ``A``) and/or
+``del_prob`` (``D``) above zero enables the fix: each eligible word is **deleted** with probability
+``D`` (no MLM call, no budget), and each surviving privatized word is followed by an **added** word
+with probability ``A``, drawn by inserting a ``<mask>`` into the context and running DP-MLM as usual
+at the same ε. Both default to ``0.0``, so ``dp_mlm`` and the ``dp_mlm_eps<ε>`` sweep are unaffected;
+the ``dp_mlm_var_a<A>`` registry entries turn it on. Budget becomes ``2·n·ε`` worst case (an addition
+for every word) and ``(1 − D + A)·n·ε`` in expectation -- the paper's stated "``(A − D)nε``" appears
+to drop the base ``n`` term. The add/delete coins are data-independent Bernoulli draws, so they spend
+no budget themselves.
+
+Deviations from the reference ``dpmlm_rewrite_plus`` in this mode:
+
+1. **Context is the original (deletion-applied) text, never the running privatized copy.** The
+   reference's plus path privatizes sequentially and mutates ``working_tokens``, so later words see
+   earlier *replacements*. Batching forbids that -- and this is the same deviation already taken for
+   the plain path, since we port the reference's own batch path (its non-batch ``dpmlm_rewrite``
+   likewise defaults to ``REPLACE=False``, i.e. original context). Deletions *are* reflected in the
+   context, as in the reference.
+2. **No ``<mask>`` ever appears in the CONCAT clean segment.** The reference leaves one there for an
+   addition (a side effect of passing the mutated list to both sides); we keep the clean side as
+   unmasked context, so exactly one mask exists per encoded input and the mask-position lookup is
+   unambiguous. This matches the paper's Algorithm 1, whose context segment is the original tokens.
+3. **The coins are drawn over every non-punctuation, non-PII token** -- function words included, as in
+   the reference -- while *privatization* still follows the usual eligible set. Deleting stopwords is
+   deliberate: function-word frequency is the classic authorship signal. Note the consequence: the
+   coin set is larger than the ``n`` we privatize, so the perturbation rate is not a like-for-like
+   match with a fixed-length run at the same ε.
+4. **The last surviving token is never deleted**, so a turn can never be emptied. (The reference only
+   guards the final *token*, usually punctuation, so its guard rarely fires.)
+5. **Added words are lowercased and empty decodes dropped**; the reference appends the decoded token
+   raw. An addition has no original word to inherit case from, and capitalization ratios are
+   themselves stylometric features.
+6. **An addition whose mask is truncated away is dropped**, so pathological turns realize a slightly
+   lower effective ``A``.
+7. **Determinism**, as above: the coins come from a ``random.Random`` seeded per turn on a stream
+   *separate* from the sampling generator, so ``add_prob=del_prob=0`` reproduces fixed-length output
+   exactly and ``A``/``D`` act as nested thresholds on a fixed uniform stream (the A=0.1 additions are
+   a subset of the A=0.25 ones). Both coins are drawn for every eligible token regardless of the
+   delete outcome -- distributionally identical to the reference, but it decouples the two knobs.
 
 Needs the ``[dpmlm]`` extra (adds ``nltk`` on top of torch/transformers); the ``pii=True`` variant
 also needs the ``[dpmlm-pii]`` extra (``presidio-analyzer`` + spaCy). NLTK data is fetched lazily on
@@ -38,6 +84,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import string
 
 from ._backends import PerTurnBatchRewriteDefense, gpu_dtype
@@ -50,12 +97,31 @@ DPMLM_MODEL = "FacebookAI/roberta-base"
 DPMLM_CLIP_MIN = -3.2093127
 DPMLM_CLIP_MAX = 16.304797887802124
 
-#: Per-word privacy budget (a text with n privatized words spends n·ε). The README's worked
-#: example uses ε=25; sweep it by registering / instantiating with different values.
-DPMLM_EPSILON = float(os.environ.get("DPMLM_EPSILON", "25"))
+#: Per-word privacy budget (a text with n privatized words spends n·ε). Default ε=100: at the
+#: paper's ε=25 the clip floor sits near the logit mean, so the exponential mechanism's tail over the
+#: 50k vocab draws mostly unrelated words and the rewrite is not usable as text. ε=100 is the lowest
+#: value in the paper's set {10,25,50,100,250} whose output stays readable -- weaker privacy, which
+#: is the tradeoff the sweep exists to measure. Sweep it via the registered ``dp_mlm_eps<ε>``
+#: defenses, this env var, or by instantiating with a different value.
+DPMLM_EPSILON = float(os.environ.get("DPMLM_EPSILON", "100"))
 
 #: Seed folded into the per-turn RNG so identical turns rewrite reproducibly (cache-safe).
 DPMLM_SEED = int(os.environ.get("DPMLM_SEED", "0"))
+
+#: Adaptive-length probabilities (the paper's Algorithm 3 ``A`` and ``D``): per eligible word, chance
+#: of adding a word after it / of deleting it. Both ``0.0`` == the fixed-length headline mode, so the
+#: plain ``dp_mlm`` and the ε sweep keep one-word-in-one-word-out. The paper evaluates A ∈ {0.1, 0.25}
+#: with D = 0.05 (Appendix C); the reference code defaults to A=0.15. In ``params()``, so each
+#: setting caches separately.
+DPMLM_ADD_PROB = float(os.environ.get("DPMLM_ADD_PROB", "0.0"))
+DPMLM_DEL_PROB = float(os.environ.get("DPMLM_DEL_PROB", "0.0"))
+
+#: The two kinds of masked-position job. A REPLACE job masks the word at the anchor index (plain
+#: DP-MLM); an INSERT job masks a *new* slot immediately after the anchor (adaptive length). Both run
+#: through the same batching, and ``(anchor, kind)`` ordering puts an added word right after the word
+#: it follows.
+_JOB_REPLACE = 0
+_JOB_INSERT = 1
 
 #: MLM forward-pass batch size over masked positions (output-neutral; not in params()). Default is
 #: sized for an A100 -- masked positions from all turns are pooled and length-sorted, and only the
@@ -80,7 +146,7 @@ class _DPMLMBackend:
     """
 
     def __init__(self, *, model, clip_min, clip_max, epsilon, seed, concat, stop, pii, batch_size,
-                 flush_positions=DPMLM_FLUSH_POSITIONS):
+                 add_prob=0.0, del_prob=0.0, flush_positions=DPMLM_FLUSH_POSITIONS):
         import nltk
         import torch
         from nltk.corpus import stopwords
@@ -103,6 +169,16 @@ class _DPMLMBackend:
         self.stop_flag = bool(stop)  # STOP=True means "also privatize stopwords".
         self.batch_size = int(batch_size)
         self.flush_positions = int(flush_positions)
+
+        self.add_prob = float(add_prob)
+        self.del_prob = float(del_prob)
+        for label, prob in (("add_prob", self.add_prob), ("del_prob", self.del_prob)):
+            if not 0.0 <= prob <= 1.0:
+                raise ValueError(f"DP-MLM {label} must be in [0, 1]; got {prob}.")
+        #: True when the adaptive-length mode is on; plain mode short-circuits every coin draw.
+        self.varlen = self.add_prob > 0.0 or self.del_prob > 0.0
+        #: Diagnostic counters for the current rewrite_batch (cache misses in this process only).
+        self._stats = {"total": 0, "perturbed": 0, "added": 0, "deleted": 0}
 
         self.clip_min = float(clip_min)
         self.clip_max = float(clip_max)
@@ -203,19 +279,29 @@ class _DPMLMBackend:
 
     # -- building masked inputs + batched MLM forward ---------------------------------------------
 
-    def _build_input(self, tokens, idx, clean_full=None):
+    def _build_input(self, tokens, idx, clean_full=None, insert=False):
         """Encoded input ids for masking word ``idx`` of ``tokens`` (sliding window + CONCAT).
 
         ``clean_full`` is the whole turn already detokenized; reused as the clean segment when the
         sliding window spans the whole turn (short/medium turns), so the clean side is detokenized
         once per turn instead of once per word.
+
+        With ``insert=True`` the mask does not replace word ``idx`` but takes a *new* slot right
+        after it (adaptive length): the window is still taken around ``idx`` on the unmodified
+        ``tokens``, and the mask is spliced into the window copy only. Keeping the window mask-free
+        is what preserves the ``clean_full`` fast path and guarantees the encoded pair holds exactly
+        one mask -- in the masked segment, never in the clean one.
         """
         lower_w, upper_w = self.sliding_window(tokens, idx, self.max_context)
         chunk_tokens = tokens[lower_w:upper_w]
         rel_idx = idx - lower_w
 
         masked_chunk = list(chunk_tokens)
-        masked_chunk[rel_idx] = self.tokenizer.mask_token
+        if insert:
+            # One token over max_context, which its 32-token margin absorbs.
+            masked_chunk.insert(rel_idx + 1, self.tokenizer.mask_token)
+        else:
+            masked_chunk[rel_idx] = self.tokenizer.mask_token
 
         if clean_full is not None and lower_w == 0 and upper_w == len(tokens):
             clean_sent = clean_full
@@ -268,8 +354,18 @@ class _DPMLMBackend:
     # -- per-turn planning ------------------------------------------------------------------------
 
     def _plan_turn(self, text):
-        """``(sentence, tokens, indices)`` for a turn: word tokens and the content-word indices to
-        privatize (skipping stopwords/punctuation, and PII placeholders in ``pii`` mode)."""
+        """``(sentence, tokens, jobs)`` for a turn: the word tokens to emit and the masked-position
+        jobs to run over them.
+
+        ``jobs`` is a list of ``(anchor, kind)`` in ascending order -- ``_JOB_REPLACE`` to privatize
+        ``tokens[anchor]`` (the content words: stopwords, punctuation and ``pii`` placeholders are
+        skipped), and, in adaptive-length mode, ``_JOB_INSERT`` to draw an extra word after it. That
+        order is the sampling order in :meth:`_process_chunk`, so it must not depend on batching.
+
+        In adaptive-length mode ``tokens`` is the turn *minus its deleted words*: the coins are
+        resolved here, before any batching, and deletions are applied to the token list itself so
+        everything downstream just sees a shorter turn.
+        """
         sentence = " ".join(str(text).split("\n"))
 
         pii_ranges = []
@@ -290,16 +386,65 @@ class _DPMLMBackend:
                 if any(max(t_start, p_start) < min(t_end, p_end) for p_start, p_end in pii_ranges):
                     pii_mask[i] = True
 
-        indices = []
+        indices, coin_indices = [], []
         for i, tok in enumerate(tokens):
             if pii_mask[i]:
                 continue
             if tok in string.punctuation:
                 continue
+            # The add/delete coins cover function words too (as the reference plus path does), even
+            # though we only ever *privatize* the content words below.
+            coin_indices.append(i)
             if not self.stop_flag and tok.lower() in self.stop:
                 continue
             indices.append(i)
-        return sentence, tokens, indices
+
+        if not self.varlen:
+            return sentence, tokens, [(i, _JOB_REPLACE) for i in indices]
+
+        # -- adaptive length (Algorithm 3) ---------------------------------------------------------
+        # The coins are data-independent Bernoulli draws, so they can be resolved here, before any
+        # batching -- which is what lets an added word ride through the GPU pass as an ordinary job
+        # instead of forcing the reference's sequential per-word loop. Own RNG stream, seeded from
+        # this turn's text: independent of chunking, and it leaves the sampling stream untouched so
+        # add_prob=del_prob=0 still reproduces fixed-length output exactly.
+        rng = random.Random(int.from_bytes(
+            hashlib.sha256(f"{self.seed}:varlen:{sentence}".encode("utf-8")).digest()[:8], "big"
+        ))
+        delete_at, add_after = set(), set()
+        last_coin = coin_indices[-1] if coin_indices else None
+        for i in coin_indices:
+            # Draw both coins for every token whatever the outcome, so A and D stay independent
+            # thresholds on one fixed stream (the A=0.1 additions are a subset of the A=0.25 ones).
+            u_del, u_add = rng.random(), rng.random()
+            if u_del < self.del_prob and i != last_coin:  # last one stays: never empty a turn.
+                delete_at.add(i)
+                continue
+            if self.add_prob > 0.0 and u_add <= self.add_prob:  # `<=`: random() can return 0.0.
+                add_after.add(i)
+
+        # Apply the deletions to the token list and re-base the jobs onto what survives.
+        if delete_at:
+            base, remap = [], {}
+            for i, tok in enumerate(tokens):
+                if i in delete_at:
+                    continue
+                remap[i] = len(base)
+                base.append(tok)
+        else:
+            base, remap = tokens, None
+
+        privatize_at = {i for i in indices if i not in delete_at}
+        jobs = []
+        for i in sorted(privatize_at | add_after):  # add_after and delete_at are disjoint.
+            b = i if remap is None else remap[i]
+            if i in privatize_at:
+                jobs.append((b, _JOB_REPLACE))
+            if i in add_after:
+                jobs.append((b, _JOB_INSERT))
+
+        self._stats["deleted"] += len(delete_at)
+        return sentence, base, jobs
 
     # -- chunked, GPU-saturating rewriting --------------------------------------------------------
 
@@ -316,20 +461,22 @@ class _DPMLMBackend:
         torch = self._torch
         mask_id = self.tokenizer.mask_token_id
 
-        # Phase 1: build masked inputs for every position in the chunk.
-        chunk_positions = sum(len(indices) for _ti, _s, _tok, indices in chunk)
+        # Phase 1: build masked inputs for every job in the chunk (replacements and additions alike).
+        chunk_positions = sum(len(jobs) for _ti, _s, _tok, jobs in chunk)
         flat_ids, flat_mpos, flat_meta = [], [], []
-        for pos, (_ti, _sentence, tokens, indices) in enumerate(chunk):
+        for pos, (_ti, _sentence, tokens, jobs) in enumerate(chunk):
             clean_full = self.detokenizer.detokenize(tokens) if len(tokens) <= self.max_context else None
-            for idx in indices:
-                input_ids = self._build_input(tokens, idx, clean_full)
+            for anchor, kind in jobs:
+                input_ids = self._build_input(tokens, anchor, clean_full, insert=(kind == _JOB_INSERT))
                 try:
                     m_pos = input_ids.index(mask_id)
                 except ValueError:
-                    continue  # mask truncated away -> keep original (no forward, no draw).
+                    # Mask truncated away -> no forward, no draw. A replacement keeps the original
+                    # word; an addition simply does not happen.
+                    continue
                 flat_ids.append(input_ids)
                 flat_mpos.append(m_pos)
-                flat_meta.append((pos, idx))
+                flat_meta.append((pos, anchor, kind))
         if progress is not None:  # count the kept-original positions (never forwarded) up front.
             progress.update(chunk_positions - len(flat_ids))
 
@@ -352,57 +499,75 @@ class _DPMLMBackend:
         # Phase 3: per-conversation seeded sampling on the GPU (exponential mechanism).
         scale = 2 * self.sensitivity / self.epsilon
         gen = torch.Generator(device=self.device)
-        for pos, (ti, sentence, tokens, indices) in enumerate(chunk):
+        for pos, (ti, sentence, tokens, jobs) in enumerate(chunk):
             repl: dict = {}
-            word_idx = [idx for idx in indices if (pos, idx) in row_of]  # index order == draw order.
-            if word_idx:
+            live = [job for job in jobs if (pos, *job) in row_of]  # job order == draw order.
+            if live:
                 # Stable per-conversation seed (builtin hash() is per-process randomized).
                 seed = int.from_bytes(
                     hashlib.sha256(f"{self.seed}:{sentence}".encode("utf-8")).digest()[:8], "big"
                 ) & 0x7FFFFFFFFFFFFFFF
                 gen.manual_seed(seed)
 
-                rows = torch.as_tensor([row_of[(pos, idx)] for idx in word_idx], device=self.device)
+                rows = torch.as_tensor([row_of[(pos, *job)] for job in live], device=self.device)
                 # Pr[v] ∝ exp(ε·u(v) / (2·Δu)): clip, scale, softmax, sample -- all on-device.
                 block = chunk_logits[rows].float().clamp_(self.clip_min, self.clip_max).div_(scale)
                 probs = torch.softmax(block, dim=-1)
                 chosen = torch.multinomial(probs, 1, generator=gen).squeeze(1).tolist()
-                for idx, cid in zip(word_idx, chosen):
-                    repl[idx] = self.tokenizer.decode(cid).strip()
+                for job, cid in zip(live, chosen):
+                    repl[job] = self.tokenizer.decode(cid).strip()
 
             out = []
-            for i, tok in enumerate(tokens):
-                r = repl.get(i)
+            for i, tok in enumerate(tokens):  # deleted words are already gone from `tokens`.
+                r = repl.get((i, _JOB_REPLACE))
                 if r is None:  # skipped/kept -> original word, original case.
                     out.append(tok)
                 else:  # restore the original word's capitalization.
                     out.append(r.capitalize() if tok[:1].isupper() else r.lower())
+                    self._stats["total"] += 1
+                    if r.lower() != tok.lower():
+                        self._stats["perturbed"] += 1
+                added = repl.get((i, _JOB_INSERT))
+                if added:  # an added word has no original case to inherit; empty decode -> drop it.
+                    out.append(added.lower())
+                    self._stats["added"] += 1
             outputs[ti] = self.detokenizer.detokenize(out)
 
     def rewrite_batch(self, texts):
         from tqdm.auto import tqdm
 
         outputs: list = [None] * len(texts)
+        self._stats = {"total": 0, "perturbed": 0, "added": 0, "deleted": 0}
 
         # Plan all turns; accumulate whole turns into a chunk until it holds ~flush_positions masked
-        # positions, so peak memory is bounded but GPU batches still fill.
+        # positions, so peak memory is bounded but GPU batches still fill. Counting *jobs* (not
+        # eligible words) keeps that bound honest when additions are switched on.
         plans = [self._plan_turn(t) for t in texts]
-        total_positions = sum(len(indices) for _s, _tok, indices in plans)
+        total_positions = sum(len(jobs) for _s, _tok, jobs in plans)
 
         progress = tqdm(total=total_positions, desc="DP-MLM words", unit="word", leave=False)
         chunk, chunk_positions = [], 0
-        for ti, (sentence, tokens, indices) in enumerate(plans):
+        for ti, (sentence, tokens, jobs) in enumerate(plans):
             if not tokens:
                 outputs[ti] = sentence
                 continue
-            chunk.append((ti, sentence, tokens, indices))
-            chunk_positions += len(indices)
+            chunk.append((ti, sentence, tokens, jobs))
+            chunk_positions += len(jobs)
             if chunk_positions >= self.flush_positions:
                 self._process_chunk(chunk, outputs, progress)
                 chunk, chunk_positions = [], 0
         if chunk:
             self._process_chunk(chunk, outputs, progress)
         progress.close()
+
+        if self.varlen:
+            # Realized rates for the turns actually rewritten here (cache misses only, and
+            # rewrite_batch sees *distinct* turns) -- a diagnostic, not a privacy audit trail.
+            s = self._stats
+            spent = (s["total"] + s["added"]) * self.epsilon
+            print(f"[dp_mlm] A={self.add_prob} D={self.del_prob}: {s['total']} words privatized "
+                  f"({s['perturbed']} changed), {s['added']} added, {s['deleted']} deleted; "
+                  f"budget spent {spent:.0f} (= {s['total'] + s['added']} draws x eps={self.epsilon:g})")
         return outputs
 
 
@@ -411,6 +576,8 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
 
     The backend is built lazily, so a fully-cached run loads no model. Set ``pii=True`` to also
     scrub Presidio-detected entities to ``<ENTITY_TYPE>`` placeholders before rewriting the rest.
+    Set ``add_prob``/``del_prob`` above zero for the paper's adaptive-length mode (Algorithm 3), in
+    which the rewrite no longer preserves the input's word count -- see the module docstring.
     """
 
     name = "dp_mlm"
@@ -420,7 +587,8 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
     def __init__(self, *, model: str = DPMLM_MODEL, epsilon: float = DPMLM_EPSILON,
                  clip_min: float = DPMLM_CLIP_MIN, clip_max: float = DPMLM_CLIP_MAX,
                  seed: int = DPMLM_SEED, concat: bool = True, stop: bool = False,
-                 pii: bool = False, batch_size: int = DPMLM_BATCH_SIZE):
+                 pii: bool = False, batch_size: int = DPMLM_BATCH_SIZE,
+                 add_prob: float = DPMLM_ADD_PROB, del_prob: float = DPMLM_DEL_PROB):
         self.model = model
         self.epsilon = float(epsilon)
         self.clip_min = float(clip_min)
@@ -430,6 +598,8 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
         self.stop = bool(stop)
         self.pii = bool(pii)
         self.batch_size = int(batch_size)
+        self.add_prob = float(add_prob)
+        self.del_prob = float(del_prob)
         self._backend = None
 
     def params(self) -> dict:
@@ -444,6 +614,8 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
             "concat": self.concat,
             "stop": self.stop,
             "pii": self.pii,
+            "add_prob": self.add_prob,
+            "del_prob": self.del_prob,
         }
 
     def _get_backend(self) -> _DPMLMBackend:
@@ -452,6 +624,7 @@ class DPMLMDefense(PerTurnBatchRewriteDefense):
                 model=self.model, clip_min=self.clip_min, clip_max=self.clip_max,
                 epsilon=self.epsilon, seed=self.seed, concat=self.concat, stop=self.stop,
                 pii=self.pii, batch_size=self.batch_size,
+                add_prob=self.add_prob, del_prob=self.del_prob,
             )
         return self._backend
 

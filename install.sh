@@ -163,7 +163,9 @@ pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 #                build (needing CUDA_HOME / the CUDA toolkit, not just a driver) when no prebuilt
 #                wheel matches your CUDA version. Installed separately and non-fatally so a vllm
 #                build failure can't take peft/transformers down with it.
-#   [dpmlm]      nltk (on top of [styleremix]'s torch/transformers) for dp_mlm.py (--defense dp_mlm).
+#   [dpmlm]      nltk (on top of [styleremix]'s torch/transformers) for dp_mlm.py (--defense dp_mlm,
+#                the dp_mlm_eps<eps> sweep, and the adaptive-length dp_mlm_var_a<A> variants -- all
+#                one extra; the variants add no dependency of their own).
 #                Plain wheels; the NLTK data files it needs are fetched right after.
 #   [dpmlm-pii]  presidio-analyzer + spaCy for the --defense dp_mlm_pii variant's PII detection.
 #                Heavier (Presidio needs a spaCy pipeline; we fetch en_core_web_lg, its default);
