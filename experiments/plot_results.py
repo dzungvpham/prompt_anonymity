@@ -2692,12 +2692,19 @@ def temporal_accuracy(run: Run, known_config: str = TEMPORAL_KNOWN_CONFIG,
 
     ``random`` is that week's proportional-guessing rate: a guesser that knows each known author's
     document share ``p_a`` and nothing else names a document's author with probability
-    ``p_{a(doc)}``, so the week's baseline is the mean of that over its documents. This is the
-    k = 1 case of :func:`prior_inclusion`, computed in closed form because at k = 1 successive
-    proportional sampling is just one draw from ``p``. Per week rather than per figure because the
-    weeks hold different authors, and a property of the pool rather than of the attack, so every
-    line in a panel shares it. Falls back to uniform ``1 / n_candidate_authors`` when the corpus
-    parquet cannot supply the prior.
+    ``p_{a(doc)}``. This is the k = 1 case of :func:`prior_inclusion`, computed in closed form
+    because at k = 1 successive proportional sampling is just one draw from ``p``. Per week rather
+    than per figure because the weeks hold different authors, and a property of the pool rather
+    than of the attack, so every line in a panel shares it. Falls back to uniform
+    ``1 / n_candidate_authors`` when the corpus parquet cannot supply the prior.
+
+    It is counted the same way round as the curve it sits under, which is the same split
+    :func:`config_baseline` makes: the document level is the mean of ``p_{a(doc)}`` over the week's
+    documents, and the author level is ``mean_a [1 - (1 - p_a) ** m_a]`` over the week's users,
+    with ``m_a`` that author's documents *in that week* -- the guesser gets one try per document
+    and links the person if any one of them lands. Averaging ``p_a`` over users instead would have
+    the baseline answering "is one document guessed" while the curve answers "is the person linked
+    at all", and would understate it for anyone who wrote several times in a week.
 
     A hit is ``best_author == true_author`` rather than ``true_author_rank <= 1`` -- the same
     statement, but those columns are in *every* predictions file this project has written, so this
@@ -2746,8 +2753,15 @@ def temporal_accuracy(run: Run, known_config: str = TEMPORAL_KNOWN_CONFIG,
         # attributed to them. The week stays the bucket -- this is not "linked at any point", it
         # is "linked while they were writing that week", which is what keeps the axis a decay
         # curve rather than a cumulative one.
+        #
+        # The baseline has to make the same "at least once" statement or it is answering a
+        # different question from the curve above it: `chance` is the constant `p_a` on every one
+        # of an author's rows, so the guesser gets one independent try per document that week and
+        # misses the person only if it misses all of them.
         per_user = weekly.groupby(["week", "author"]).agg(hit=("hit", "max"),
-                                                          chance=("chance", "max"))
+                                                          share=("chance", "first"),
+                                                          n_documents=("hit", "size"))
+        per_user["chance"] = 1.0 - (1.0 - per_user["share"]) ** per_user["n_documents"]
         grouped = per_user.reset_index().groupby("week")
     curve = pd.DataFrame({"accuracy": grouped["hit"].mean(),
                           "random": grouped["chance"].mean(),
@@ -2807,7 +2821,6 @@ def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_
     style_axes(axes, "", "Share of users linked" if level == "author" else "Top-1 accuracy",
                "", "")
     axes.set_ylim(bottom=0)
-    panel_note(axes, f"proportional guessing ≈ {baseline['random'].mean():.2%}")
 
     per_week = (series[0].curve.counts.set_index("week")["n_users"]
                 .reindex(range(limit + 1), fill_value=0).to_numpy())
@@ -2820,8 +2833,7 @@ def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_
 
     known = parse_config_tag(series[0].curve.known_config)
     subtitle = (f"Attacker holds {known.start:.0%}-{known.end:.0%} of the timeline; whole unknown "
-                f"side, disjoint weekly buckets. Grey dashes: guessing in proportion to each "
-                f"known author's document count")
+                f"side, disjoint weekly buckets")
     return finish_facets(figure, handles, legend_title, title, subtitle, stem,
                          pd.concat(rows, ignore_index=True))
 
