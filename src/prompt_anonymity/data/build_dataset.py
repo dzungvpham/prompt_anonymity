@@ -1,21 +1,29 @@
-"""Build the unified, public-ready prompt dataset from the raw WildChat and SWE-chat sources.
+"""Build the unified, public-ready prompt dataset from the raw WildChat, SWE-chat and ShareChat sources.
 
 Each source is built **independently** through the same shared stages and written to its own
-parquet file, so the two are separate HuggingFace splits (``wildchat`` and ``swe_chat``) of one
-dataset rather than a single combined file. Building per source is exactly equivalent to the
-old combined run: the only cross-source coupling was boilerplate dedup, and no affix is shared
+parquet file, so they are separate HuggingFace splits (``wildchat``, ``swe_chat``, ``sharechat``)
+of one dataset rather than a single combined file. Building per source is exactly equivalent to
+the old combined run: the only cross-source coupling was boilerplate dedup, and no affix is shared
 *solely* across sources, so the split changes the **layout, not the data**.
 
-Pipeline per source (identical treatment for both, except one SWE-chat-only step noted below;
-see the per-module docstrings for detail):
+Pipeline per source (identical treatment for all three, except the source-specific steps noted
+below; see the per-module docstrings for detail):
 
     load one source (raw turns; WildChat: drop programmatic clients; SWE-chat: keep only
-      human-authored turns)  ->  clean turns in parallel
+      human-authored turns; ShareChat: group per-message rows into conversations and strip its
+      upstream Presidio markers)  ->  clean turns in parallel
       ->  [SWE-chat only] collapse consecutive-duplicate turns  ->  drop empty
       ->  pseudonymize author_id  ->  unified dedup  ->  [WildChat only] drop relay authors
       ->  min-docs-per-author filter
       ->  resolve languages (primary + secondary)
       ->  finalize (sort, unique doc_ids, select columns)  ->  one parquet per source
+
+**ShareChat has no author, and every author-keyed stage above is skipped for it** (see
+:data:`UNIDENTIFIED_SOURCES`): its ``author_id`` column is null throughout, pseudonymization and
+the ``min_docs`` floor do not run, and dedup goes through :func:`run_dedup_unidentified` instead.
+That makes it useless as a labeled side of a linkage experiment and exactly right as a pool of
+**out-of-set documents** for the open-set attacks -- traffic whose author is, by construction, on
+nobody's known side.
 
 The SWE-chat consecutive-duplicate-turn step removes a user turn that exactly repeats the one
 before it when the repeat looks like an artifact or boilerplate (same source turn_id, no agent
@@ -99,6 +107,7 @@ from .language_detection import (
     add_secondary_languages,
     resolve_document_languages,
 )
+from .sources_sharechat import load_sharechat_documents
 from .sources_swe_chat import is_scaffolding_turn, load_swe_chat_documents
 from .sources_wildchat import WILDCHAT_MODELS, load_wildchat_documents
 from .text_cleaning import clean_prompt
@@ -130,7 +139,21 @@ STRING_COLUMNS = tuple(c for c in FINAL_COLUMNS if c not in ("turns", "num_turns
 #: would silently change every id in the published dataset, in every feature parquet, and in
 #: every results CSV already computed. The adapters set it themselves
 #: (:mod:`~prompt_anonymity.data.sources_swe_chat`), so it does not follow this constant.
-SOURCES = ("wildchat", "swe_chat")
+#: ``sharechat`` was added after that lesson and spells its column the same as its name.
+SOURCES = ("wildchat", "swe_chat", "sharechat")
+
+#: Sources that publish no author identity, so every author-keyed stage is skipped for them and
+#: their ``author_id`` column is null throughout: no :func:`pseudonymize`, no
+#: :func:`filter_min_docs`, no :func:`drop_relay_authors`, and dedup runs the unidentified variant
+#: (:func:`run_dedup_unidentified`).
+#:
+#: ShareChat is the only one. It is a corpus of *shared conversation links*, and a share link
+#: identifies the conversation, not the person -- two links may or may not be the same author and
+#: the upstream data cannot say. Inventing one author per link would have been convenient (every
+#: groupby keeps working) but it asserts something unverified, so the column stays null and the
+#: split is what it honestly is: a pool of documents with **no known author**, which is exactly what
+#: an out-of-set / distractor population for an open-set attack needs to be.
+UNIDENTIFIED_SOURCES = frozenset({"sharechat"})
 
 # Rows per parquet row group. A row group is the smallest unit a reader can skip to, so writing
 # one giant group forces any consumer to materialize the whole file: pyarrow's default (1024*1024
@@ -229,18 +252,20 @@ def _uniquify_doc_ids(doc_id: pd.Series) -> pd.Series:
 # small named function is what lets the per-source builder share the pipeline end to end.
 
 def load_source(
-    source: str, *, wildchat_raw: str | None, swe_raw: str | None, ua_map: dict | None,
-    min_docs: int, drop_programmatic: bool, wildchat_max_batches: int | None,
+    source: str, *, wildchat_raw: str | None, swe_raw: str | None, sharechat_raw: str | None,
+    ua_map: dict | None, min_docs: int, drop_programmatic: bool, wildchat_max_batches: int | None,
 ) -> pd.DataFrame:
     """Load one source's raw (uncleaned) documents into the common column layout.
 
-    ``wildchat_raw`` / ``swe_raw`` are optional overrides of where that source's raw data is;
-    ``None`` (the default) lets :func:`~prompt_anonymity.data.config.raw_path` resolve it from the
-    environment, the config file, or a HuggingFace download. Only the source being loaded is
-    resolved, so building one source never fetches the other.
+    ``wildchat_raw`` / ``swe_raw`` / ``sharechat_raw`` are optional overrides of where that
+    source's raw data is; ``None`` (the default) lets
+    :func:`~prompt_anonymity.data.config.raw_path` resolve it from the environment, the config
+    file, or a HuggingFace download. Only the source being loaded is resolved, so building one
+    source never fetches the others.
 
     ``drop_programmatic`` applies to WildChat only -- SWE-chat sessions have no user-agent (they
-    are all agent-CLI traffic by construction, with their non-human turns removed per turn).
+    are all agent-CLI traffic by construction, with their non-human turns removed per turn), and
+    ShareChat's conversations were scraped from share *pages*, which carry no client metadata.
     """
     if source == "wildchat":
         if ua_map is None:
@@ -251,7 +276,32 @@ def load_source(
         )
     if source == "swe_chat":
         return load_swe_chat_documents(raw_path("swe_chat", swe_raw))
+    if source == "sharechat":
+        return load_sharechat_documents(raw_path("sharechat", sharechat_raw))
     raise ValueError(f"unknown source: {source!r}")
+
+
+def drop_empty_turns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop individual turns that are empty after cleaning (ShareChat only).
+
+    Removing ShareChat's upstream Presidio markers
+    (:func:`~prompt_anonymity.data.sources_sharechat.strip_upstream_redactions`) empties any turn
+    that was *entirely* redacted -- a message that was nothing but a name or a phone number. Such
+    a turn carries no text but still counts toward ``num_turns``, so it would report a length the
+    document does not have. Measured on the raw ShareChat conversations that is 1.4% of turns,
+    against 0.003% in WildChat and 0 in SWE-chat, which is why this runs for ShareChat alone:
+    those two have no redaction stage to empty a turn, and applying it to them would rewrite
+    already-published documents for a handful of rows.
+
+    Documents are never dropped here; one left with no turns at all is removed immediately after
+    by :func:`drop_empty_documents`.
+    """
+    frame = frame.copy()
+    before = int(frame["turns"].map(len).sum())
+    frame["turns"] = frame["turns"].map(lambda ts: [t for t in ts if t])
+    removed = before - int(frame["turns"].map(len).sum())
+    print(f"  empty turns removed: {removed:,} of {before:,}")
+    return frame
 
 
 def drop_empty_documents(frame: pd.DataFrame) -> pd.DataFrame:
@@ -371,6 +421,47 @@ def run_dedup(frame: pd.DataFrame, *, affix_len: int, max_per_affix: int,
     return deduped.drop(columns="_dedup_text")
 
 
+def run_dedup_unidentified(frame: pd.DataFrame, *, affix_len: int) -> pd.DataFrame:
+    """Dedup for a source with no author labels (:data:`UNIDENTIFIED_SOURCES`).
+
+    :func:`run_dedup` keys every rule on the author, which ShareChat does not have, so the two
+    rules that still mean something are run explicitly and each is given the identity column that
+    makes it do its one job:
+
+    1. **Global exact duplicates.** With no author, "the same person said this twice" is not
+       expressible; what is, is "this exact text appears twice in the corpus". Run under a single
+       constant identity so :func:`~prompt_anonymity.data.dedup.deduplicate`'s step 1 collapses
+       every repeat to its earliest occurrence, corpus-wide.
+    2. **Shared-affix boilerplate.** Run again with ``doc_id`` as the identity -- every document is
+       then its own identity, so the cross-identity rule (step 2) drops any document whose leading
+       or trailing ``affix_len``-char slice is shared with *another document*. The per-identity
+       steps (1 and 3) are no-ops under unique ids, which is why the first pass is needed at all.
+
+    This is deliberately stricter than WildChat's, which keeps up to ``max_per_affix`` documents
+    per (author, affix) on the grounds that a habitual opening is genuine style. Without authors
+    that exemption cannot be granted -- there is no way to tell one person's repeated template from
+    a template many people pasted -- and for a distractor pool the strict reading is the safe one:
+    templated text is exactly what should not be in it.
+    """
+    frame = frame.copy()
+    frame["_dedup_text"] = frame["turns"].map("\n".join)
+    frame["_one"] = ""  # a single constant identity, so step 1 runs corpus-wide
+
+    exact = deduplicate(
+        frame, identity_col="_one", text_col="_dedup_text",
+        order_cols=("started_at", "doc_id"), affix_dedup=False,
+    )
+    n_exact = len(frame) - len(exact)
+
+    deduped = deduplicate(
+        exact, identity_col="doc_id", text_col="_dedup_text",
+        order_cols=("started_at", "doc_id"), affix_len=affix_len, max_per_affix=1,
+    )
+    print(f"  unidentified dedup: {n_exact:,} exact duplicates, "
+          f"{len(exact) - len(deduped):,} shared-affix boilerplate documents removed")
+    return deduped.drop(columns=["_dedup_text", "_one"])
+
+
 def filter_min_docs(frame: pd.DataFrame, min_docs: int) -> pd.DataFrame:
     """Keep authors with at least ``min_docs`` documents (a *count* filter, not a length filter).
 
@@ -444,11 +535,19 @@ def drop_relay_authors(frame: pd.DataFrame, *, min_scaffold_docs: int = MIN_SCAF
 def finalize(frame: pd.DataFrame) -> pd.DataFrame:
     """Sort deterministically, uniquify doc_ids, select the final columns.
 
+    Documents are grouped by author and ordered in time within each; a source with no authors
+    (:data:`UNIDENTIFIED_SOURCES`, whose ``author_id`` is null throughout) drops that key and is
+    ordered by time alone. ``doc_id`` is the final tiebreak either way, so the order is total
+    even where the timestamps are missing or tie.
+
     No known/unknown split is assigned -- the dataset ships without a ``split_role`` column
     while the split is being redesigned (see the module docstring).
     """
     frame = frame.copy()
-    frame = frame.sort_values(["source", "author_id", "started_at", "doc_id"]).reset_index(drop=True)
+    keys = ["source", "author_id", "started_at", "doc_id"]
+    if frame["author_id"].isna().all():
+        keys.remove("author_id")
+    frame = frame.sort_values(keys).reset_index(drop=True)
     frame["doc_id"] = _uniquify_doc_ids(frame["doc_id"])
     return frame[FINAL_COLUMNS]
 
@@ -460,6 +559,7 @@ def build_source(
     *,
     wildchat_raw: str | None = None,
     swe_raw: str | None = None,
+    sharechat_raw: str | None = None,
     ua_map: dict | None = None,
     min_docs: int = 2,
     drop_programmatic: bool = True,
@@ -476,19 +576,22 @@ def build_source(
 ) -> pd.DataFrame:
     """Run the full pipeline for **one** source and return its finished dataset frame.
 
-    All sources share the stage functions above; only :func:`load_source` differs, plus two
+    All sources share the stage functions above; only :func:`load_source` differs, plus three
     source-specific stages: the SWE-chat consecutive-duplicate-turn dedup (which needs that
-    source's per-turn metadata) and the WildChat secondary-language pass (the ``secondary_*``
-    knobs). ``ua_map`` may be passed in to avoid reloading the user-agent map when building
-    multiple sources. The per-stage row counts are attached to ``frame.attrs["counts"]``.
+    source's per-turn metadata), the WildChat secondary-language pass (the ``secondary_*`` knobs),
+    and -- for a source in :data:`UNIDENTIFIED_SOURCES` -- the author-free dedup that stands in for
+    every author-keyed stage. ``ua_map`` may be passed in to avoid reloading the user-agent map
+    when building multiple sources. The per-stage row counts are attached to
+    ``frame.attrs["counts"]``.
     """
     if workers is None:
         workers = available_cpus()
+    unidentified = source in UNIDENTIFIED_SOURCES
 
     print(f"[{source}] loading ...")
     frame = load_source(
-        source, wildchat_raw=wildchat_raw, swe_raw=swe_raw, ua_map=ua_map,
-        min_docs=min_docs, drop_programmatic=drop_programmatic,
+        source, wildchat_raw=wildchat_raw, swe_raw=swe_raw, sharechat_raw=sharechat_raw,
+        ua_map=ua_map, min_docs=min_docs, drop_programmatic=drop_programmatic,
         wildchat_max_batches=wildchat_max_batches,
     )
     n_loaded = len(frame)
@@ -506,17 +609,30 @@ def build_source(
         consec_removed = turns_before - int(frame["turns"].map(len).sum())
         print(f"[{source}] consecutive-dup turns removed: {consec_removed:,}")
 
+    # ShareChat's redaction stripping can empty a whole turn; the other two sources have nothing
+    # that does, so they keep their turn lists exactly as published. See drop_empty_turns.
+    if source == "sharechat":
+        frame = drop_empty_turns(frame)
+
     frame = drop_empty_documents(frame)
     n_after_empty = len(frame)
     frame["num_turns"] = frame["turns"].map(len)
 
-    frame = pseudonymize(frame)
-    # SWE-chat: do NOT drop a whole conversation just because it shares a templated prefix/suffix
-    # -- injected non-human templates are stripped at the turn level (see sources_swe_chat), so
-    # only exact duplicates are removed. WildChat keeps the full affix dedup (heavy cross-author
-    # templating, not stripped per turn).
-    affix_dedup = source != "swe_chat"
-    frame = run_dedup(frame, affix_len=affix_len, max_per_affix=max_per_affix, affix_dedup=affix_dedup)
+    # ShareChat publishes no user id, so there is nothing to pseudonymize and author_id stays null;
+    # its dedup, relay and min-docs stages are all skipped or replaced below.
+    if unidentified:
+        frame = frame.copy()
+        frame["author_id"] = None
+        frame = run_dedup_unidentified(frame, affix_len=affix_len)
+    else:
+        frame = pseudonymize(frame)
+        # SWE-chat: do NOT drop a whole conversation just because it shares a templated prefix/suffix
+        # -- injected non-human templates are stripped at the turn level (see sources_swe_chat), so
+        # only exact duplicates are removed. WildChat keeps the full affix dedup (heavy cross-author
+        # templating, not stripped per turn).
+        affix_dedup = source != "swe_chat"
+        frame = run_dedup(frame, affix_len=affix_len, max_per_affix=max_per_affix,
+                          affix_dedup=affix_dedup)
     n_after_dedup = len(frame)
 
     # Relays put many people under one author_id. WildChat only: a SWE-chat author is a code-host
@@ -528,21 +644,35 @@ def build_source(
         frame = drop_relay_authors(frame)
         n_relay_docs = before - len(frame)
 
-    frame = filter_min_docs(frame, min_docs)
+    # A count of documents *per author* has no meaning without authors, so an unidentified source
+    # skips the floor entirely rather than being filtered against a single null group.
+    if not unidentified:
+        frame = filter_min_docs(frame, min_docs)
     n_after_mindocs = len(frame)
 
     # Resolve language_primary / language_secondary. SWE-chat's upstream labels are unreliable
     # (a third empty, some CJK mislabeled English), so we re-detect it with Lingua and fall back to
-    # upstream only where the detector abstains; WildChat's labels are trusted, so it just splits
-    # its existing list into the two columns -- a schema update, not a relabel of the primary.
+    # upstream only where the detector abstains; WildChat's and ShareChat's are trusted, so they
+    # just split the existing list into the two columns -- a schema update, not a relabel of the
+    # primary. ShareChat's labels were checked against Lingua on a 2,000-conversation sample across
+    # all five platforms and agreed 98.7% of the time, which is why it gets WildChat's policy and
+    # not SWE-chat's.
     frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe_chat"))
     print(f"[{source}] languages: {lang_stats['n_lingua']:,} by detector, "
           f"{lang_stats['n_fallback']:,} from upstream, {lang_stats['n_default']:,} defaulted to English")
 
-    # WildChat ships one language per conversation, so the split above leaves it no secondary; it is
-    # detected here, keeping the trusted primary (SWE-chat already got its secondary from the
+    # WildChat labels one language per conversation, so the split above leaves it no secondary; it
+    # is detected here, keeping the trusted primary (SWE-chat already got its secondary from the
     # re-detection). Single-process and Lingua-bound -- a few minutes on the full WildChat corpus.
-    if source == "wildchat":
+    #
+    # ShareChat labels *per message*, so the split above does hand it an upstream secondary -- and
+    # this pass deliberately overwrites it. That upstream signal is per-message detection on short
+    # messages and it shows: 5.8% of conversations have turns labelled with different languages,
+    # and the lists include things like ('English', 'Latin', 'Malayalam') -- exactly the "a rare
+    # confusable steals a short span" failure that `observed_language_detector`'s restricted
+    # candidate set exists to prevent. The vetted pass puts it at 1.6%, in line with WildChat's
+    # 0.9%, on plausible pairs.
+    if source in ("wildchat", "sharechat"):
         frame, _ = add_secondary_languages(
             frame, threshold=secondary_threshold,
             primary_floor=secondary_primary_floor, cap=secondary_cap,
@@ -568,6 +698,7 @@ def build_all(
     *,
     wildchat_raw: str | None = None,
     swe_raw: str | None = None,
+    sharechat_raw: str | None = None,
     min_docs: int = 2,
     drop_programmatic: bool = True,
     drop_relays: bool = True,
@@ -588,7 +719,8 @@ def build_all(
     ua_map = load_ua_device_map() if "wildchat" in sources else None
     return {
         source: build_source(
-            source, wildchat_raw=wildchat_raw, swe_raw=swe_raw, ua_map=ua_map,
+            source, wildchat_raw=wildchat_raw, swe_raw=swe_raw, sharechat_raw=sharechat_raw,
+            ua_map=ua_map,
             min_docs=min_docs, drop_programmatic=drop_programmatic, drop_relays=drop_relays,
             affix_len=affix_len, max_per_affix=max_per_affix,
             consec_dup_max_len=consec_dup_max_len, consec_dup_min_occ=consec_dup_min_occ,
@@ -673,6 +805,9 @@ def summarize(frame: pd.DataFrame) -> dict:
                         if isinstance(s, str))
     else:
         pairs = Counter()
+    # `nunique`/`groupby` both drop nulls, so a source with no authors (ShareChat) contributes 0
+    # authors and no docs-per-author mass rather than one giant null group -- which is the honest
+    # reading, but means the author lines of this report describe only the identified sources.
     docs_per_author = frame.groupby("author_id")["doc_id"].size()
 
     def per_source(fn):
@@ -682,6 +817,7 @@ def summarize(frame: pd.DataFrame) -> dict:
         "counts_pipeline": frame.attrs.get("counts", {}),
         "documents": int(len(frame)),
         "authors": int(frame["author_id"].nunique()),
+        "documents_without_author": int(frame["author_id"].isna().sum()),
         "documents_per_source": frame["source"].value_counts().to_dict(),
         "authors_per_source": per_source(lambda g: int(g["author_id"].nunique())),
         "docs_per_author": {k: round(float(v), 2) for k, v in
@@ -701,7 +837,8 @@ def _print_report(stats: dict) -> None:
     print("\n" + "=" * 64 + "\nUNIFIED PROMPT DATASET — SUMMARY\n" + "=" * 64)
     print("pipeline row counts (per source):", s["counts_pipeline"])
     print("splits (files):", s["splits"])
-    print(f"documents: {s['documents']:,}   authors: {s['authors']:,}")
+    print(f"documents: {s['documents']:,}   authors: {s['authors']:,}   "
+          f"documents with no author: {s['documents_without_author']:,}")
     print("documents per source:", s["documents_per_source"])
     print("authors per source:", s["authors_per_source"])
     print("docs/author:", s["docs_per_author"])
@@ -720,6 +857,10 @@ def main() -> None:
     p.add_argument("--swe-raw", default=None,
                    help="raw SWE-chat conversations.parquet (default: $PROMPT_ANONYMITY_"
                         "SWE_CHAT_RAW, else the config file, else downloaded from HuggingFace)")
+    p.add_argument("--sharechat-raw", default=None,
+                   help="directory of the five raw ShareChat per-platform CSVs (default: "
+                        "$PROMPT_ANONYMITY_SHARECHAT_RAW, else the config file, else downloaded "
+                        "from HuggingFace)")
     p.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
     p.add_argument("--min-docs", type=int, default=2,
                    help="minimum documents per author (default 2; set 1 to keep single-doc authors)")
@@ -756,7 +897,7 @@ def main() -> None:
 
     frames = build_all(
         tuple(args.sources),
-        wildchat_raw=args.wildchat_raw, swe_raw=args.swe_raw,
+        wildchat_raw=args.wildchat_raw, swe_raw=args.swe_raw, sharechat_raw=args.sharechat_raw,
         min_docs=args.min_docs, drop_programmatic=not args.keep_programmatic_clients,
         drop_relays=not args.keep_relay_authors,
         affix_len=args.affix_len, max_per_affix=args.max_per_affix,

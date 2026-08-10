@@ -17,13 +17,12 @@ multi-user repo -> dropped).
 from __future__ import annotations
 
 import re
-from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 import pyarrow.dataset as ds
 
-from .common import model_owner, normalize_language
+from .common import model_owner, normalize_language, ordered_languages
 
 # Turn types that represent the agent actually doing something in response to a user prompt
 # (an LLM reply, its thinking, a tool call, or that call's result) -- as opposed to bookkeeping
@@ -393,19 +392,6 @@ def _recover_identity(sessions: pd.DataFrame) -> pd.Series:
     return identity  # (>1-user-repo id-less sessions stay NA)
 
 
-def _ordered_languages(series) -> list[str]:
-    """Detected languages for a session with the **primary (most frequent) language first**.
-
-    Ties on frequency are broken by first appearance; remaining languages follow, sorted.
-    Empty list when no language was detected on any turn.
-    """
-    vals = [x for x in series if isinstance(x, str) and x]
-    if not vals:
-        return []
-    primary = Counter(vals).most_common(1)[0][0]
-    return [primary] + sorted(set(vals) - {primary})
-
-
 def _cum_agent_by_turn(dataset) -> pd.DataFrame:
     """Cumulative count of agent turns before each turn, keyed by ``(session_id, turn_number)``.
 
@@ -485,7 +471,7 @@ def load_swe_chat_documents(raw_path: str | Path) -> pd.DataFrame:
         user_id=("user_id", "first"),
         repo_id=("repo_id", lambda s: next((x for x in s if pd.notna(x)), None)),
         agent=("agent", "first"),
-        languages=("_lang", _ordered_languages),
+        languages=("_lang", ordered_languages),
         started_at=("timestamp", "min"),    # earliest user-prompt turn (conversation start)
         ended_at=("timestamp", "max"),      # latest user-prompt turn (conversation end)
         turns_raw=("content", list),        # raw user-prompt turns, in conversation order

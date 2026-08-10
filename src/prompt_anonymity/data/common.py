@@ -1,6 +1,8 @@
-"""Small shared helpers used by both source adapters (model ownership, language names)."""
+"""Small shared helpers used by the source adapters (model ownership, language names)."""
 
 from __future__ import annotations
+
+from collections import Counter
 
 
 def model_owner(model: str | None) -> str:
@@ -35,3 +37,19 @@ def normalize_language(name: str | None) -> str | None:
     if not name or not isinstance(name, str) or name.strip().lower() in {"", "nan", "none"}:
         return None
     return name.strip().title()
+
+
+def ordered_languages(series) -> list[str]:
+    """Detected languages for a document with the **primary (most frequent) language first**.
+
+    Both SWE-chat and ShareChat label language *per turn*, so a document's label is a vote over
+    its turns: ties on frequency are broken by first appearance, and the remaining languages
+    follow, sorted. Returns an empty list when no turn carried a language, which is what
+    :func:`~prompt_anonymity.data.language_detection.resolve_document_languages` reads as
+    "upstream has no label here".
+    """
+    values = [x for x in series if isinstance(x, str) and x]
+    if not values:
+        return []
+    primary = Counter(values).most_common(1)[0][0]
+    return [primary] + sorted(set(values) - {primary})

@@ -39,3 +39,13 @@ hf_repo = "SALT-NLP/SWE-chat"
 hf_revision = "f66cca95b14caaa4177f7ed5eaa424608dadcffa"
 hf_file = "conversations.parquet"
 # path = "/local/copy/of/SWE-chat/conversations.parquet"
+
+[sources.sharechat]
+# https://huggingface.co/datasets/tucnguyen/ShareChat -- five CSVs at the repo root, one per
+# platform (chatgpt, claude, gemini, grok, perplexity), each a turn-level export. The adapter
+# needs all five, so no `hf_file`/`hf_dir` is set and the whole repo (~3.9 GB) is snapshotted.
+# Auto-gated: accept the ShareChat Dataset License Agreement on the dataset page and log in
+# (`hf auth login`, or set HF_TOKEN) before the download will work.
+hf_repo = "tucnguyen/ShareChat"
+hf_revision = "a57c741e002684939f577594fdae1559832a584d"
+# path = "/local/copy/of/ShareChat"

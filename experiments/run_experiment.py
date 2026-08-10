@@ -289,9 +289,18 @@ NO_DEFENSE_TAG = "base"
 
 #: The corpora, named the way everything downstream names them: a ``--source`` value is also
 #: the split, the parquet base name (``swe_chat.parquet``) and the dataset part of the results
-#: directory :func:`output_tag` builds. Must match ``build_dataset.SOURCES``. (The ``source``
-#: *column* inside the parquets still reads ``swe-chat``; it is hashed into every ``author_id``,
-#: so it is data rather than a name and did not follow this spelling.)
+#: directory :func:`output_tag` builds. (The ``source`` *column* inside the parquets still reads
+#: ``swe-chat``; it is hashed into every ``author_id``, so it is data rather than a name and did
+#: not follow this spelling.)
+#:
+#: **This is deliberately a subset of ``build_dataset.SOURCES``, which also has ``sharechat``.**
+#: That split publishes no user id -- its ``author_id`` column is null throughout, because a
+#: shared conversation link identifies the conversation and not the person -- and every stage of
+#: this runner is keyed on the author: it enrolls a known side per author, scores an
+#: ``[n_documents x n_authors]`` matrix, and reports per-author metrics. Handed nulls it would
+#: either fail or silently treat the whole corpus as one author. ShareChat exists as a pool of
+#: **out-of-set documents** for the open-set work; adding it here needs code that consumes an
+#: author-less pool on purpose, not a name in this tuple.
 SOURCES = ("wildchat", "swe_chat")
 
 # The extra class: "this document's author is not among the known authors". Not a valid

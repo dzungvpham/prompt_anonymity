@@ -19,14 +19,15 @@ from pathlib import Path
 
 import pandas as pd
 
-from .build_dataset import CONSECUTIVE_DUP_MAX_LEN
+from .build_dataset import CONSECUTIVE_DUP_MAX_LEN, UNIDENTIFIED_SOURCES
 from .config import dist_dir
+from .sources_sharechat import UPSTREAM_REDACTION_TOKENS
 from .sources_swe_chat import HUMAN_TURN_MAX_LEN, is_scaffolding_turn
 
 # source -> its parquet file. The source name is also the split name (see build_dataset.SOURCES),
 # so the filename is just the source; the mapping is kept for the one thing it still buys, an
 # explicit list of the files this module expects to find.
-SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat")}
+SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat", "sharechat")}
 
 #: source -> the value its ``source`` **column** holds, which is *not* always the source's name:
 #: ``swe_chat`` is stored as ``"swe-chat"``. That string is data rather than a name --
@@ -34,7 +35,7 @@ SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat"
 #: prefixes it there (``swe-chat-<16 hex>``) -- so it did not follow the rename of the CLI/split
 #: spelling, and respelling it now would change every id in the published dataset. The two checks
 #: below therefore compare the column against *this*, not against the key.
-SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat"}
+SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat", "sharechat": "sharechat"}
 EXPECTED_COLUMNS = [
     "doc_id", "source", "author_id",
     "turns", "num_turns",
@@ -86,8 +87,20 @@ def main(dist: str | Path | None = None) -> int:
         value = SOURCE_VALUES[source]
         check(f"[{fname}] holds exactly source={value!r}",
               set(df["source"].unique()) == {value}, str(sorted(df["source"].unique())))
-        check(f"[{fname}] author_id prefixed '{value}-'",
-              df["author_id"].str.startswith(f"{value}-").all())
+        # A source that publishes no user id (ShareChat) must have the column and must have it
+        # *entirely* null -- a partially-filled one would mean the adapter invented an identity for
+        # some rows, which is the failure this check exists to catch.
+        if source in UNIDENTIFIED_SOURCES:
+            check(f"[{fname}] author_id null throughout (no upstream identity)",
+                  df["author_id"].isna().all(),
+                  f"{int(df['author_id'].notna().sum()):,} non-null")
+        else:
+            # `.str.startswith(...).all()` skips nulls, so it would pass an entirely unlabeled
+            # file; the non-null test is what actually holds the line for an identified source.
+            check(f"[{fname}] author_id non-null and prefixed '{value}-'",
+                  df["author_id"].notna().all()
+                  and bool(df["author_id"].str.startswith(f"{value}-").all()),
+                  f"{int(df['author_id'].isna().sum()):,} null")
         check(f"[{fname}] doc_id unique within file", df["doc_id"].is_unique)
         # Schema + language columns are checked per file, so a source still on the old single
         # `languages` list (a not-yet-rebuilt source, e.g. WildChat during the transition) is
@@ -110,15 +123,17 @@ def main(dist: str | Path | None = None) -> int:
 
     df = pd.concat(per_source.values(), ignore_index=True)
     joined = df["turns"].map(lambda ts: "\n".join(ts))  # cleaned turns concatenated (for scans)
+    # The author-level checks below apply only where authors exist; ShareChat's rows are excluded
+    # by the null test rather than by naming the source, so a future author-less source is covered.
+    identified = df[df["author_id"].notna()]
 
     # --- schema & pseudonymity --- (per-file column-schema checks are in the loop above)
     check("no raw identity/repo/user/original columns",
           not ({"identity", "repo_id", "user_id", "user_agent", "header", "turns_raw", "turns_original"} & set(df.columns)))
     check("doc_id globally unique", df["doc_id"].is_unique)
-    check("author_id source-prefixed & opaque",
-          df["author_id"].str.match(r"^(wildchat|swe-chat)-[0-9a-f]{16}$").all())
-    check("no null in core fields",
-          df[["doc_id", "source", "author_id"]].notna().all().all())
+    check("author_id source-prefixed & opaque (where present)",
+          identified["author_id"].str.match(r"^(wildchat|swe-chat)-[0-9a-f]{16}$").all())
+    check("no null in core fields", df[["doc_id", "source"]].notna().all().all())
 
     # --- turn-list integrity ---
     check("every doc has >= 1 turn", df["turns"].map(len).ge(1).all())
@@ -127,7 +142,7 @@ def main(dist: str | Path | None = None) -> int:
           df["turns"].map(lambda ts: any(t for t in ts)).all())
 
     # --- min docs per author (a count filter, not a length filter) ---
-    sizes = df.groupby("author_id")["doc_id"].size()
+    sizes = identified.groupby("author_id")["doc_id"].size()
     check("every author has >= 2 documents", (sizes >= 2).all(), f"min={int(sizes.min())}")
 
     swe = df[df.source == "swe-chat"]
@@ -161,6 +176,15 @@ def main(dist: str | Path | None = None) -> int:
     longest_swe = max((len(t) for t in swe_turns), default=0)
     check(f"SWE-chat: no turn >= {HUMAN_TURN_MAX_LEN} chars (human-length cap)",
           longest_swe < HUMAN_TURN_MAX_LEN, f"longest={longest_swe}")
+
+    # ShareChat anti-leak invariant: ShareChat was de-identified upstream with Presidio, whose
+    # <REDACTED> / <DATE_TIME> markers no other corpus carries -- so a survivor would be a literal
+    # string that separates this split from the other two. That matters more here than anywhere
+    # else, because ShareChat is the out-of-set pool an open-set detector is scored against: it
+    # would be detecting the corpus, not a stranger. See sources_sharechat.strip_upstream_redactions.
+    share_turns = "\n".join(joined[df["source"] == "sharechat"])
+    for token in UPSTREAM_REDACTION_TOKENS:
+        check(f"ShareChat: no upstream {token} markers survive", token not in share_turns)
 
     # --- scrubbing consistency (the anti-leak invariant) ---
     for src in df["source"].unique():

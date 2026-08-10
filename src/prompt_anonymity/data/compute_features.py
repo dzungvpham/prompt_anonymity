@@ -115,7 +115,7 @@ from .config import cache_dir, dist_dir, hf_dir
 # from ``build_dataset`` (which it must match): featurizing does not otherwise need the build
 # pipeline, and importing it would pull the whole raw-source and language-detection stack in
 # behind ``--help``.
-SOURCES = ("wildchat", "swe_chat")
+SOURCES = ("wildchat", "swe_chat", "sharechat")
 
 # A document's text is its turns joined by a blank line. The earlier per-source scripts joined
 # with "\n===\n"; that marker is not natural writing and leaves its own fingerprint in the
