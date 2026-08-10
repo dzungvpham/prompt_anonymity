@@ -21,7 +21,7 @@ from ..caching import IndexedRowCache, TransformCache, logic_hash, params_hash, 
 from ..core import AttackData
 from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
-from .collision_seeding import CollisionSeedingDefense
+from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .openanonymity import OpenAnonymityDefense
@@ -53,7 +53,7 @@ DEFENSES: dict[str, Defense] = {
     "styleremix_openanon": StyleRemixOpenAnonymityDefense(),
     "dp_mlm": DPMLMDefense(),
     "dp_mlm_pii": DPMLMDefense(pii=True),
-    "collision_seeding": CollisionSeedingDefense(),
+    "collision_seeding": CollisionSeedingDefense(marker_keys=SWE_CHAT_MARKERS),
 }
 
 #: Collision-seeding variants. Unlike every other defense here this one is pure Python string work
@@ -71,10 +71,19 @@ DEFENSES: dict[str, Defense] = {
 #:   possible signatures. The prediction is that it does worse than NO defense, because a
 #:   near-unique marker combination is a fingerprint. It is the control that shows the codebook is
 #:   doing the work.
-DEFENSES["collision_seeding_k4"] = CollisionSeedingDefense(n_profiles=4)
-DEFENSES["collision_seeding_k24"] = CollisionSeedingDefense(n_profiles=24)
-DEFENSES["collision_seeding_full"] = CollisionSeedingDefense(rate_min=1.0, rate_max=1.0)
-DEFENSES["collision_seeding_indep"] = CollisionSeedingDefense(independent=True)
+#: Every variant is wired to the audited marker set (see :data:`SWE_CHAT_MARKERS`) rather than the
+#: full 98-marker inventory. Without this the run would apply markers the audit rejected for having
+#: a base rate of exactly zero on this corpus -- the "perfect group indicator with no background to
+#: hide in" case the audit exists to catch. Re-point these at a ``WILDCHAT_MARKERS`` before running
+#: the WildChat arm.
+DEFENSES["collision_seeding_k4"] = CollisionSeedingDefense(
+    n_profiles=4, marker_keys=SWE_CHAT_MARKERS)
+DEFENSES["collision_seeding_k24"] = CollisionSeedingDefense(
+    n_profiles=24, marker_keys=SWE_CHAT_MARKERS)
+DEFENSES["collision_seeding_full"] = CollisionSeedingDefense(
+    rate_min=1.0, rate_max=1.0, marker_keys=SWE_CHAT_MARKERS)
+DEFENSES["collision_seeding_indep"] = CollisionSeedingDefense(
+    independent=True, marker_keys=SWE_CHAT_MARKERS)
 
 #: DP-MLM per-word privacy budgets exposed as a sweep. Each registers a ``dp_mlm_eps<eps>`` defense
 #: selectable via ``--defense``. Because run_experiment.py's output_tag embeds the defense name, every

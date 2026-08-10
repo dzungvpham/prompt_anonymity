@@ -579,8 +579,39 @@ PROFILE_POOLS: tuple[tuple[str, ...], ...] = (
 #: and capped at one per profile by pool structure.
 DIALECT_PROBABILITY = 0.4
 
+#: The markers that survived ``--audit`` on **SWE-chat** (4,334 documents / 157 authors), i.e. those
+#: whose quirk occurs naturally but not universally (base rate in ``(0, 0.25]``) and whose trigger
+#: appears in at least 5% of documents. 47 of the inventory's 98.
+#:
+#: **This set is corpus-specific and must not be reused for WildChat.** SWE-chat prose is short and
+#: technical, so every one of the 30 lexical misspellings failed for lack of coverage -- words like
+#: "definitely", "separate" and "environment" barely appear -- leaving the lexical slot to
+#: transposition typos and abbreviations. WildChat's longer prose should revive that class and drop
+#: others, so re-run the audit and add a ``WILDCHAT_MARKERS`` beside this one::
+#:
+#:     python -m prompt_anonymity.defenses.collision_seeding --audit --source wildchat
+#:
+#: Until then the registry's collision-seeding entries are wired to *this* set, which is the right
+#: default only while SWE-chat is the corpus under study.
+SWE_CHAT_MARKERS: tuple[str, ...] = (
+    'ab_pls', 'ab_smth', 'ab_thru', 'ab_u', 'ab_ur', 'ab_with', 'ab_without', 'all_lowercase',
+    'blank_line_sentences', 'bullet_star', 'caps_emphasis', 'cl_lmk', 'cl_make_sense', 'cl_pls',
+    'cl_thanks', 'cl_thx', 'cn_cuz', 'cn_wanna', 'dash_double', 'dialect_uk', 'double_bang',
+    'ellipsis_2dot', 'ellipsis_4dot', 'expand_contractions', 'hg_actually', 'hg_basically',
+    'hg_honestly', 'hg_imo', 'hg_tbh', 'hg_to_be_fair', 'lower_acronyms', 'lowercase_i',
+    'no_apostrophe', 'no_space_after_comma', 'numbered_paren', 'op_context_label', 'op_hey',
+    'op_ok_so', 'space_before_punct', 'tp_adn', 'tp_becuase', 'tp_jsut', 'tp_taht', 'tp_teh',
+    'tp_tihs', 'tp_waht', 'tp_wiht',
+)
+
 #: Number of profiles when ``independent=True`` is *not* used. The privacy knob: expected collision
 #: group is ``n_authors / n_profiles``.
+#:
+#: Note this is a *large* K for a small corpus. On SWE-chat's 157 authors it makes groups of ~13 and
+#: hands an attacker log2(12) = 3.58 bits of the 7.29 that identify an author -- and collision
+#: seeding is purely additive, so it never removes the natural style they would use to separate the
+#: 13. Whether that trade pays off is what the K sweep measures (``_k4`` gives 2.00 bits and groups
+#: of ~39); do not assume the default is on the right side of it.
 DEFAULT_N_PROFILES = 12
 
 #: Expected markers per author in the ``independent=True`` ablation, matched to the codebook's
@@ -903,6 +934,14 @@ def collision_manifest(author_ids, defense: CollisionSeedingDefense):
 #: absent by construction.
 MIN_BASE_RATE = 0.0
 
+#: The mirror of :data:`MIN_BASE_RATE`, and just as necessary. A quirk a large share of the corpus
+#: *already* has cannot make a group cohesive, because everyone outside the group has it too: it
+#: carries no signal to collide on, while still costing naturalness and utility. Measured on
+#: SWE-chat, ``no_terminal_period`` (55% of documents already end without one) and
+#: ``line_break_sentences`` (52%) are majority behaviour rather than quirks. 0.25 is set to catch
+#: those without touching the genuinely-uncommon-but-present band (10-22%) the design wants.
+MAX_BASE_RATE = 0.25
+
 #: A marker whose trigger appears in too few documents cannot cover an author even when assigned.
 MIN_TRIGGER_RATE = 0.05
 
@@ -945,15 +984,20 @@ def _would_change(marker: Marker, text: str, rng: random.Random) -> bool:
 
 
 def surviving_markers(rows: list[dict], *, min_base_rate: float = MIN_BASE_RATE,
+                      max_base_rate: float = MAX_BASE_RATE,
                       min_trigger_rate: float = MIN_TRIGGER_RATE) -> tuple[str, ...]:
-    """Marker keys that clear both audit thresholds, sorted.
+    """Marker keys that clear all three audit thresholds, sorted.
 
-    The base-rate cut is strict inequality against ``min_base_rate=0.0`` by default: a quirk seen
-    zero times in the corpus is dropped, one seen even rarely is kept.
+    The base rate has to land in a *band*, not just above a floor. Too low (default: seen zero
+    times) and the quirk has no background to hide in, so it is a perfect group indicator. Too high
+    (default: more than a quarter of documents) and it is the corpus norm rather than a quirk, so it
+    cannot distinguish a group from everyone else. The floor is a strict inequality -- a quirk seen
+    even once is kept -- while the ceiling is inclusive.
     """
     return tuple(sorted(
         row["marker"] for row in rows
-        if row["base_rate"] > min_base_rate and row["trigger_rate"] >= min_trigger_rate
+        if min_base_rate < row["base_rate"] <= max_base_rate
+        and row["trigger_rate"] >= min_trigger_rate
     ))
 
 
@@ -1148,9 +1192,14 @@ def main() -> None:
         keep = set(surviving_markers(rows))
         print(f"\n{'marker':<26} {'pool':<15} {'base':>8} {'trigger':>9}  verdict")
         for row in sorted(rows, key=lambda r: (-r["trigger_rate"], r["marker"])):
-            verdict = "keep" if row["marker"] in keep else (
-                "DROP (no base rate)" if row["base_rate"] <= MIN_BASE_RATE else "drop (no coverage)"
-            )
+            if row["marker"] in keep:
+                verdict = "keep"
+            elif row["base_rate"] <= MIN_BASE_RATE:
+                verdict = "DROP (no base rate)"
+            elif row["base_rate"] > MAX_BASE_RATE:
+                verdict = "DROP (already the norm)"
+            else:
+                verdict = "drop (no coverage)"
             print(f"{row['marker']:<26} {row['pool']:<15} {row['base_rate']:>7.2%} "
                   f"{row['trigger_rate']:>8.2%}  {verdict}")
         print(f"\n{len(keep)} of {len(rows)} markers survive on {args.source}.")

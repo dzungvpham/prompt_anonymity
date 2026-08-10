@@ -225,9 +225,26 @@ and each is easy to get wrong:
   flipped per document. Varying the rate *per author* matters as much as its level: at ~10 documents
   per author, estimating that rate has a standard error of ~0.157 against a prior spread of ~0.087,
   so the rate itself carries almost no information.
-- **Natural base rates.** A quirk that appears nowhere in the corpus has no background to blend
-  into. `--audit` measures each marker's base rate and trigger coverage on a source and prints the
-  set that survives; run it before trusting a marker inventory on a new corpus.
+- **Natural base rates.** The base rate has to land in a *band*. Too low (a quirk appearing nowhere
+  in the corpus) and there is no background to blend into, so it is a perfect group indicator; too
+  high and it is the corpus norm rather than a quirk, so it cannot distinguish a group from anyone
+  else. `--audit` measures each marker's base rate and trigger coverage on a source and prints the
+  surviving set.
+
+**The marker set is corpus-specific.** On SWE-chat (4,334 documents / 157 authors) 47 of the 98
+markers survive, and the registry is wired to exactly those (`SWE_CHAT_MARKERS`). Notably *every*
+lexical misspelling failed for lack of coverage — SWE-chat prose is short and technical, so
+"definitely", "separate" and "environment" barely occur — leaving the lexical slot to transposition
+typos and abbreviations. Re-run `--audit` and add a `WILDCHAT_MARKERS` before running WildChat;
+do not reuse this set.
+
+**Pick `K` against the author count.** `K` profiles partition `N` authors into groups of `N/K`, and
+that partition is information the attacker did not have before — collision seeding is purely
+additive, so it never removes the natural style they would use to separate authors *within* a group.
+On SWE-chat's 157 authors, `K=4` leaks 2.00 bits of the 7.29 that identify an author (groups of
+~39); the `K=12` default leaks 3.58 (groups of ~13) and `_k24` leaks 4.58 (groups of 3–11). Which
+side of that trade a given `K` falls on is what the sweep measures — don't assume the default is on
+the right one.
 
 `_full` (100% consistency) and `_indep` (independent draws) are ablations, not deployments — they
 exist to test those first two claims, and `_indep` is *predicted to do worse than no defense at all*.
