@@ -21,6 +21,7 @@ from ..caching import IndexedRowCache, TransformCache, logic_hash, params_hash, 
 from ..core import AttackData
 from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
+from .collision_seeding import CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .openanonymity import OpenAnonymityDefense
@@ -52,7 +53,28 @@ DEFENSES: dict[str, Defense] = {
     "styleremix_openanon": StyleRemixOpenAnonymityDefense(),
     "dp_mlm": DPMLMDefense(),
     "dp_mlm_pii": DPMLMDefense(pii=True),
+    "collision_seeding": CollisionSeedingDefense(),
 }
+
+#: Collision-seeding variants. Unlike every other defense here this one is pure Python string work
+#: (no model, no GPU, seconds not hours), so a variant costs nothing to add and nothing to run --
+#: only the featurize and attack stages after it are expensive.
+#:
+#: The two K variants sweep the privacy knob: the codebook size sets the expected collision group at
+#: ``n_authors / K``, so k4 buys larger groups (stronger anonymity, more text touched per group) and
+#: k24 smaller ones. The two ablations exist to be *compared against*, not deployed:
+#:
+#: * ``_full`` applies each marker to 100% of an author's documents. The prediction is that it does
+#:   WORSE than the default despite being a bigger edit, because perfect consistency is a perfectly
+#:   reliable feature -- which is the premise the 40-70% rate rests on.
+#: * ``_indep`` draws markers per author independently instead of from the codebook, giving ~C(M,4)
+#:   possible signatures. The prediction is that it does worse than NO defense, because a
+#:   near-unique marker combination is a fingerprint. It is the control that shows the codebook is
+#:   doing the work.
+DEFENSES["collision_seeding_k4"] = CollisionSeedingDefense(n_profiles=4)
+DEFENSES["collision_seeding_k24"] = CollisionSeedingDefense(n_profiles=24)
+DEFENSES["collision_seeding_full"] = CollisionSeedingDefense(rate_min=1.0, rate_max=1.0)
+DEFENSES["collision_seeding_indep"] = CollisionSeedingDefense(independent=True)
 
 #: DP-MLM per-word privacy budgets exposed as a sweep. Each registers a ``dp_mlm_eps<eps>`` defense
 #: selectable via ``--defense``. Because run_experiment.py's output_tag embeds the defense name, every
@@ -124,4 +146,5 @@ __all__ = [
     "OpenAnonymityDefense",
     "StyleRemixOpenAnonymityDefense",
     "DPMLMDefense",
+    "CollisionSeedingDefense",
 ]

@@ -119,9 +119,30 @@ SOURCES = ("wildchat", "swe_chat")
 #: runner's ``--defense`` flag, and no infix at all in the feature parquet's filename.
 NO_DEFENSE = "base"
 
-DEFENSES = (NO_DEFENSE, "styleremix", "openanonymity")
+#: The collision-seeding arm. ``collision_seeding`` is the defense; the other three are the
+#: comparisons that make its result readable, and all four are cheap to produce (the defense is
+#: pure string work -- only the featurize and attack stages here cost anything):
+#:
+#: * ``_k4`` sweeps the privacy knob to larger collision groups (K=4 rather than 12).
+#: * ``_full`` applies each marker to 100% of an author's documents instead of 40-70%. Expected to
+#:   do WORSE than the default despite the bigger edit, because perfect consistency is a perfectly
+#:   reliable feature.
+#: * ``_indep`` drops the profile codebook for independent per-author marker draws. Expected to do
+#:   worse than ``base``, i.e. worse than no defense, because a near-unique marker combination is a
+#:   fingerprint. It is the control showing the codebook is what does the work.
+#:
+#: ``_k24`` is registered but left out of the default grid: it sits between ``_k4`` and the default
+#: and adds a cell to every source without changing the story. Add it with ``--defenses``.
+COLLISION_SEEDING = ("collision_seeding", "collision_seeding_k4",
+                     "collision_seeding_full", "collision_seeding_indep")
 
-FEATURES = ("stylometrix", "gemini_embedding_2")
+DEFENSES = (NO_DEFENSE, "styleremix", "openanonymity") + COLLISION_SEEDING
+
+#: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
+#: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
+#: largest, while ``gemini_embedding_2`` is semantic and should barely move. ``stylometrix`` is what
+#: every earlier defense was measured on and is what keeps the numbers comparable to them.
+FEATURES = ("stylometrix", "char_ngram_tfidf", "gemini_embedding_2")
 
 #: In increasing cost order, which is the order cells are executed in. ``nearest_neighbor`` is a
 #: matmul; ``logistic`` and ``xgboost`` fit one decision function per author, so their cost grows

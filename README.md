@@ -65,7 +65,7 @@ accept anything registered, and adding one makes it selectable with no change to
 | --- | --- |
 | `FEATURIZERS` | `stylometrix`, `function_words`, `character_statistics`, `char_ngram_tfidf`, `style_distance`, `gemini_embedding_2`, `gemini_embedding_001` |
 | `ATTRIBUTION_ATTACKS` | `nearest_neighbor`, `cosine`, `wccn`, `lda`, `plda`, `logistic`, `svm`, `rlsc`, `xgboost` |
-| `DEFENSES` | `none`, `openanonymity`, `styleremix`, `styleremix_openanon`, `qwen_rewrite`, `dp_mlm` (+ `dp_mlm_eps<ε>` sweep, + `dp_mlm_var_a<A>` adaptive length), `rtt_argos`, `example_normalization` |
+| `DEFENSES` | `none`, `openanonymity`, `styleremix`, `styleremix_openanon`, `qwen_rewrite`, `dp_mlm` (+ `dp_mlm_eps<ε>` sweep, + `dp_mlm_var_a<A>` adaptive length), `collision_seeding` (+ `_k4`, `_k24`, `_full`, `_indep`), `rtt_argos`, `example_normalization` |
 
 ## Installation
 
@@ -189,6 +189,7 @@ whole split with `apply_defenses`; the result is a drop-in replacement for the s
 | `dp_mlm`, `dp_mlm_eps<ε>` | differentially-private word-level rewriting at a given per-word ε (default ε=100; below that the rewrite stops being readable). Sweep with `experiments/run_dpmlm_sweep.sh` | GPU |
 | `dp_mlm_var_a10`, `dp_mlm_var_a25` | the same at ε=100 **plus the paper's adaptive-length mode** (Algorithm 3): words are dropped with probability `D`=0.05 and extra DP-drawn words inserted with probability `A`, so the rewrite no longer preserves word count or text length | GPU |
 | `rtt_argos` | round-trip translation | — |
+| `collision_seeding` (+ `_k4`, `_k24`, `_full`, `_indep`) | the only **additive** defense here: instead of erasing style it manufactures *shared* style, giving one bundle of unusual-but-natural quirks (misspellings, punctuation and casing habits, openers/closers) to a whole group of unrelated authors, so an attacker who latches onto a quirk lands on a group rather than a person | — (pure string work, CPU, seconds) |
 
 **The model-backed defenses run locally**, through vLLM, against checkpoints on disk — no API keys,
 no data leaving the machine. Point them elsewhere with `OPENANON_MODEL` / `STYLEREMIX_BASE_MODEL`,
@@ -207,6 +208,46 @@ Two behaviours worth knowing:
 Long runs are slow (SWE-chat is ~26K generations, roughly an hour on an A100) but **resumable**: the
 cache checkpoints as it goes, so a preempted or killed run picks up where it stopped when
 re-submitted unchanged.
+
+### Collision seeding
+
+Every other defense above removes signal. `collision_seeding` adds it: a fixed codebook of `K`
+**profiles** (bundles of 3–5 quirks) is spread across the authors, so ~`N/K` unrelated people share
+each bundle and an attacker who keys on a quirk lands on a group. Three properties carry the design,
+and each is easy to get wrong:
+
+- **Profiles, not independent markers.** Drawing markers per author independently would give
+  `C(M, s)` distinct signatures — ~91,000 at M=40, s=4 — so nearly every author would end up with a
+  *unique* fingerprint and attribution would get **easier**. The codebook caps distinct signatures
+  at `K` by construction. `K` is the privacy knob (`_k4`, `_k24`).
+- **Inconsistency.** A marker applied to 100% of an author's documents is a cleaner signal than any
+  real habit. Each (author, marker) pair draws its own rate from `U[0.4, 0.7]` and the coin is
+  flipped per document. Varying the rate *per author* matters as much as its level: at ~10 documents
+  per author, estimating that rate has a standard error of ~0.157 against a prior spread of ~0.087,
+  so the rate itself carries almost no information.
+- **Natural base rates.** A quirk that appears nowhere in the corpus has no background to blend
+  into. `--audit` measures each marker's base rate and trigger coverage on a source and prints the
+  set that survives; run it before trusting a marker inventory on a new corpus.
+
+`_full` (100% consistency) and `_indep` (independent draws) are ablations, not deployments — they
+exist to test those first two claims, and `_indep` is *predicted to do worse than no defense at all*.
+
+Unlike the rest of the table this defense needs no model and no GPU; it is deterministic, seeded
+string work. Assignment is a pure function of `(seed, author_id)`, so it is unaffected by sharding
+and the manifest can be rebuilt offline rather than carried through the run.
+
+```bash
+python -m prompt_anonymity.defenses.collision_seeding --selftest              # correctness checks
+python -m prompt_anonymity.defenses.collision_seeding --audit    --source swe_chat
+python -m prompt_anonymity.defenses.collision_seeding --manifest --source swe_chat
+sbatch experiments/run_collision_seeding.sbatch                               # the whole arm
+```
+
+The manifest (`<source>_collision_manifest.parquet`) is what makes the mechanism measurable: joining
+it to `predictions_*.csv` gives the **within-group confusion rate** — among *misattributed*
+documents, the share whose wrong guess shares the true author's profile. Chance is `1/K`; above
+chance is direct evidence the seeded markers are what caught the attacker, rather than general
+confusion. Attribution accuracy alone cannot distinguish the two.
 
 ## Running re-identification experiments
 
