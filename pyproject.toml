@@ -20,6 +20,12 @@ dependencies = [
     "python-dotenv",
     "tqdm",
     "xgboost>=3.3.0",
+    # Language detection for the build pipeline. Unlike the heavy ML dependencies below/behind the
+    # extras, this one is imported at MODULE level (`data/language_detection.py`, which
+    # `build_dataset` imports at module level), so a missing wheel is not a lazy failure on one code
+    # path -- `python -m prompt_anonymity.data.build_dataset` dies on import. It belongs in the base
+    # dependencies for that reason.
+    "lingua-language-detector",
     # Remote-API HTTP + token counting for the OpenAnonymity defense and the utility judges
     # (both lazy-import these, so a missing wheel only crashes when that path is actually used).
     "requests",
