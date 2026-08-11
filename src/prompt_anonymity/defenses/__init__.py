@@ -24,6 +24,7 @@ from .base import CachedDefense, CachedTextRewriteDefense
 from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
+from .frame_pad import FramePadDefense
 from .frame_shift import SINGLE_FRAMING_KEY, FrameShiftDefense
 from .openanonymity import OpenAnonymityDefense
 from .qwen_rewrite import QwenRewriteDefense
@@ -41,7 +42,9 @@ def no_defense(data: AttackData) -> AttackData:
 
 # Registry of ready-to-use defenses, selectable by name (e.g. from a CLI argument). The
 # model-backed defenses build their (heavy) backend lazily on first use, so registering them here
-# is free -- selecting one never loads a model, and a fully-cached run loads none either.
+# is free -- selecting one never loads a model, and a fully-cached run loads none either. The same
+# goes for frame_pad's passage bank: it is resolved (and if absent, generated) on first use, so
+# importing this registry never reads a file or needs an API key.
 # RoundTripTranslationDefense is intentionally absent: it needs a translation model supplied by the
 # caller, so it cannot be a zero-config registry entry.
 DEFENSES: dict[str, Defense] = {
@@ -56,6 +59,7 @@ DEFENSES: dict[str, Defense] = {
     "dp_mlm_pii": DPMLMDefense(pii=True),
     "collision_seeding": CollisionSeedingDefense(marker_keys=SWE_CHAT_MARKERS),
     "frame_shift": FrameShiftDefense(),
+    "frame_pad": FramePadDefense(),
 }
 
 #: Frame shift's single-frame ablation: the whole corpus is rewritten into ONE scene instead of
@@ -67,6 +71,13 @@ DEFENSES: dict[str, Defense] = {
 #: Cheaper to run than the default, too: with one frame shared by every row, turn-level cache dedup
 #: is fully restored (see :meth:`~.frame_shift.FrameShiftDefense._rewrite_side`).
 DEFENSES["frame_shift_single"] = FrameShiftDefense(single_framing=SINGLE_FRAMING_KEY)
+
+#: Frame pad's single-scene ablation, the same control one level down: every document's appended turn
+#: is drawn from ONE scene's passages instead of from all 50 scenes', so the corpus circulates P pads
+#: rather than K x P. Read against ``frame_pad`` it asks whether pad *diversity* matters or only pad
+#: presence; read against ``frame_shift_single`` it holds the scene fixed and varies only whether the
+#: user's text was rewritten.
+DEFENSES["frame_pad_single"] = FramePadDefense(single_framing=SINGLE_FRAMING_KEY)
 
 #: Collision-seeding variants. Unlike every other defense here this one is pure Python string work
 #: (no model, no GPU, seconds not hours), so a variant costs nothing to add and nothing to run --
@@ -169,4 +180,5 @@ __all__ = [
     "DPMLMDefense",
     "CollisionSeedingDefense",
     "FrameShiftDefense",
+    "FramePadDefense",
 ]

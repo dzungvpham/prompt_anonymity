@@ -44,6 +44,13 @@ Each document is a list of user turns, and **each turn is defended on its own**,
 are re-assembled into a list of the same length -- so ``num_turns`` and the turn boundaries survive
 the rewrite, and a document's defended turns line up one-for-one with its originals.
 
+The one exception is a defense that *adds* turns rather than rewriting them (``frame_pad``, which
+appends a shared off-topic turn to each document). Such a defense declares ``appends_turns = True``
+and exposes ``extra_turns(doc_id)``; it never sees the existing turns, which are copied through
+byte-identical, and it is applied per DOCUMENT rather than through the per-turn path below -- that
+path structurally cannot add a turn, since it must return one output per input row. For those
+defenses, and only those, the defended document has MORE turns than the original.
+
 That is also the granularity the caching works at: the package's defense machinery caches one row
 per input it is handed (:class:`~prompt_anonymity.caching.IndexedRowCache`, keyed by the id passed
 in and verified against the source text), so handing it turns rather than whole conversations means
@@ -100,7 +107,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from prompt_anonymity.core import AttackData
-from prompt_anonymity.defenses import DEFENSES, apply_defense
+from prompt_anonymity.defenses import DEFENSES, apply_defense, get_defense
 from prompt_anonymity.defenses._backends import TURN_ID_SEPARATOR
 
 from .compute_features import (
@@ -188,6 +195,10 @@ def regroup_turns(defended: list[str], counts: list[int]) -> list[list[str]]:
     had -- ``num_turns`` and the turn boundaries are preserved by construction (a turn a defense
     emptied is still a turn). A length mismatch means a defense broke that contract, which would
     silently misalign every document after it, so it is raised rather than trimmed.
+
+    A defense that means to add a turn therefore cannot do it here: it declares ``appends_turns``
+    and is applied by :func:`append_extra_turns` instead, on documents that this function has
+    already put back together.
     """
     if len(defended) != sum(counts):
         raise ValueError(f"defense returned {len(defended):,} turns for {sum(counts):,} inputs; "
@@ -260,9 +271,41 @@ def report_workload(defense: str, n_documents: int, texts: list[str]) -> None:
           f"cached turns are not recomputed")
 
 
+def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str]]:
+    """Apply a turn-ADDING defense: copy each document's turns through and append what it asks for.
+
+    The path for a defense that declares ``appends_turns`` (``frame_pad``). It is document-level, so
+    it skips the per-turn machinery entirely -- no flatten, no cache, no backend. That is not just an
+    optimisation: the per-turn path caches one row per input turn and requires one output per input
+    turn, so it can neither express "one more turn" nor gain anything from caching a defense whose
+    transform is a dictionary lookup keyed by ``doc_id``.
+
+    The existing turns are never handed to the defense, which is the guarantee this kind of defense
+    is built on: whatever it appends, the user's own text is byte-identical to its input.
+    """
+    padded = [list(turns) + [str(turn) for turn in defense.extra_turns(doc_id)]
+              for doc_id, turns in zip(doc_ids, turn_lists)]
+    added = [new[len(old):] for new, old in zip(padded, turn_lists)]
+    characters = sum(len(turn) for turns in added for turn in turns)
+    print(f"[{name}] appending turns to {len(padded):,} documents: "
+          f"{sum(len(turns) for turns in added):,} turns / {characters:,} characters added; "
+          f"existing turns are copied through unchanged")
+    report = getattr(defense, "report", None)
+    if callable(report):
+        report()
+    return padded
+
+
 def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
                      *, cache_dir: str | Path) -> list[list[str]]:
     """Defend every turn of every document, returning the defended turn lists in input order."""
+    if not turn_lists:
+        return []
+    # A turn-adding defense (see append_extra_turns) works on documents, not on the per-turn stream.
+    registered = get_defense(defense)
+    if getattr(registered, "appends_turns", False):
+        return append_extra_turns(defense, registered, doc_ids, turn_lists)
+
     texts, ids, authors, counts = flatten_turns(doc_ids, author_ids, turn_lists)
     if not texts:
         return []
@@ -280,7 +323,9 @@ def build_defended_frame(metadata: pd.DataFrame, turn_lists: list[list[str]]) ->
     columns -- timestamps, language, model, agent -- are untouched by a defense, so they stay in
     ``<split>.parquet`` and are joined back on ``doc_id`` by whoever needs them; ``num_turns`` is
     likewise recoverable, since a per-turn rewrite returns one turn per turn
-    (see :func:`regroup_turns`).
+    (see :func:`regroup_turns`) -- with the exception of a turn-ADDING defense
+    (:func:`append_extra_turns`), whose documents carry more turns than the split records, so read
+    the count from this file rather than from ``<split>.parquet``'s ``num_turns``.
     """
     frame = metadata.reset_index(drop=True).copy()
     frame["turns"] = pd.Series(turn_lists, dtype=object)

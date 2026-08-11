@@ -264,6 +264,8 @@ DEFENSES = (
     "collision_seeding_indep",
     "frame_shift",
     "frame_shift_single",
+    "frame_pad",
+    "frame_pad_single",
     "dp_mlm",
     "dp_mlm_pii",
     "dp_mlm_var_a10",
@@ -316,6 +318,10 @@ DEFENSE_LABELS = {
     # figure about dilution versus convergence.
     "frame_shift": "Frame shift (50 frames)",
     "frame_shift_single": "Frame shift (single frame)",
+    # Frame pad adds a scene-flavoured turn and rewrites NOTHING, so a figure holding it beside
+    # frame_shift splits that defense in two: dilution by added content, versus the rewrite.
+    "frame_pad": "Frame pad (50 frames)",
+    "frame_pad_single": "Frame pad (single frame)",
     "dp_mlm": "DP-MLM",
     "dp_mlm_pii": "DP-MLM (PII only)",
     "dp_mlm_var_a10": "DP-MLM ± (A=0.1)",

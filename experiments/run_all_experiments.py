@@ -144,7 +144,16 @@ COLLISION_SEEDING = ("collision_seeding", "collision_seeding_k4",
 #: with ``--defenses frame_shift_single`` once the first numbers are in.
 FRAME_SHIFT = ("frame_shift",)
 
-DEFENSES = (NO_DEFENSE, "styleremix", "openanonymity") + COLLISION_SEEDING + FRAME_SHIFT
+#: The frame-pad arm: the same 50-scene codebook, but the document's own turns are left
+#: byte-identical and one dense, off-topic turn is APPENDED instead. It is frame_shift's other half
+#: on its own -- does added shared content dilute the author, with nothing rewritten? -- and it is
+#: effectively free to produce (the padding text is generated once into a bank of 400 passages, ~2
+#: cents, then reused across the whole corpus), so unlike frame_shift both it and its single-scene
+#: ablation could be run; only the main arm is in the default grid to keep the featurize bill down.
+FRAME_PAD = ("frame_pad",)
+
+DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
+            + COLLISION_SEEDING + FRAME_SHIFT + FRAME_PAD)
 
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
