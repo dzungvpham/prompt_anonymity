@@ -1021,8 +1021,20 @@ def _selftest() -> None:
 
 # --- preview -----------------------------------------------------------------
 
+#: Eligible turns :func:`_preview` takes from any ONE document. A preview's job is to show what the
+#: rewrites look like, and a second turn from the same document under the same frame shows almost
+#: nothing a first one did not -- while SWE-chat documents are agent sessions that can carry dozens
+#: to hundreds of user turns, so "all turns of 3 documents" is an unbounded and expensive sample that
+#: looks like a hang. Breadth across documents (and so across frames) is what is informative here.
+PREVIEW_TURNS_PER_DOC = 2
+#: Hard ceiling on preview rewrites per model, whatever ``--limit`` says. This is a paid endpoint and
+#: a preview is meant to cost cents.
+PREVIEW_MAX_JOBS = 12
+
+
 def _preview(source: str, dist_dir, limit: int, defense: FrameShiftDefense,
-             models: list[str] | None = None) -> None:
+             models: list[str] | None = None, *, per_doc: int = PREVIEW_TURNS_PER_DOC,
+             max_jobs: int = PREVIEW_MAX_JOBS) -> None:
     """Rewrite a handful of real documents and print before/after, optionally across several models.
 
     This is the step that catches a bad system prompt -- or a model too small for the contract -- for
@@ -1038,14 +1050,21 @@ def _preview(source: str, dist_dir, limit: int, defense: FrameShiftDefense,
         raise SystemExit(f"no documents in {source}")
     models = models or [defense.model]
 
-    jobs = []  # (doc_id, framing, turn)
+    jobs = []  # (doc_id, framing, turn) -- bounded: see PREVIEW_TURNS_PER_DOC / PREVIEW_MAX_JOBS
     for doc_id, turns in zip(doc_ids, turn_lists):
         framing = defense.framing_for(doc_id)
-        for turn in turns:
-            if len(turn.strip()) >= defense.min_defend_chars:
-                jobs.append((doc_id, framing, turn))
+        eligible = [t for t in turns if len(t.strip()) >= defense.min_defend_chars]
+        for turn in eligible[:per_doc]:
+            jobs.append((doc_id, framing, turn))
     if not jobs:
         raise SystemExit("every turn in the sample is below the defend threshold; raise --limit")
+    if len(jobs) > max_jobs:
+        print(f"preview: {len(jobs)} eligible turns in {len(doc_ids)} documents; "
+              f"sampling {max_jobs} (a preview is meant to cost cents -- raise --preview-max-jobs "
+              f"to see more)")
+        jobs = jobs[:max_jobs]
+    print(f"preview: {len(jobs)} rewrites x {len(models)} model(s) = "
+          f"{len(jobs) * len(models)} calls; nothing prints until each model's batch returns")
 
     scores: dict[str, list[dict]] = {}
     for model in models:
@@ -1097,7 +1116,14 @@ def main() -> None:
     p.add_argument("--dist-dir", default=None, help="directory holding the built parquets")
     p.add_argument("--out-dir", default=None, help="where --manifest writes (default: data/dist)")
     p.add_argument("--limit", type=int, default=5,
-                   help="documents to use for --preview / --manifest (default: 5; 0 = all)")
+                   help="DOCUMENTS to use for --preview / --manifest (default: 5; 0 = all). For "
+                        "--preview the turns actually rewritten are capped separately, since a "
+                        "SWE-chat document can carry hundreds of turns")
+    p.add_argument("--preview-turns-per-doc", type=int, default=PREVIEW_TURNS_PER_DOC,
+                   help=f"--preview: turns to take from each document (default: "
+                        f"{PREVIEW_TURNS_PER_DOC}); breadth across frames beats depth in one")
+    p.add_argument("--preview-max-jobs", type=int, default=PREVIEW_MAX_JOBS,
+                   help=f"--preview: hard cap on rewrites per model (default: {PREVIEW_MAX_JOBS})")
     p.add_argument("--seed", type=int, default=FRAME_SHIFT_SEED,
                    help=f"master seed (default: {FRAME_SHIFT_SEED})")
     p.add_argument("--model", default=FRAME_SHIFT_MODEL,
@@ -1122,7 +1148,8 @@ def main() -> None:
 
     if args.preview:
         models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
-        _preview(args.source, args.dist_dir, args.limit or 5, defense, models)
+        _preview(args.source, args.dist_dir, args.limit or 5, defense, models,
+                 per_doc=args.preview_turns_per_doc, max_jobs=args.preview_max_jobs)
 
     if args.manifest:
         from ..data.config import dist_dir
