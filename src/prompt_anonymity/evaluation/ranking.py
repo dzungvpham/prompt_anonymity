@@ -6,7 +6,7 @@ vectorized lookup instead of a fresh sort. This is the engine behind the pool-si
 sweep, where the same ranking is scored against hundreds of random sub-pools.
 
 For a one-off accuracy on the full pool, the stateless
-:func:`prompt_anonymity.metrics.top_k_accuracy` is simpler; this class produces the same
+:func:`prompt_anonymity.evaluation.metrics.top_k_accuracy` is simpler; this class produces the same
 numbers (verified) but pays the sort only once and scores sub-pools without re-sorting.
 
 Implementation note
@@ -104,7 +104,7 @@ class LinkageRanking:
     def top_k_accuracy(self, k: int = 1, *, level: str = "identity", candidate_identities=None) -> float:
         """Top-k accuracy over the full pool or a sub-pool of candidate identities.
 
-        See :func:`prompt_anonymity.metrics.top_k_accuracy` for the ``level`` semantics;
+        See :func:`prompt_anonymity.evaluation.metrics.top_k_accuracy` for the ``level`` semantics;
         results are identical to it when ``candidate_identities`` is ``None``, and match a
         freshly built distance matrix for the candidate users otherwise. Returns 0.0 if no
         candidate identity has an unknown conversation.
@@ -166,7 +166,7 @@ class LinkageRanking:
     def random_guessing_accuracy(self, k: int = 1, *, candidate_identities=None) -> float:
         """Uniform-random identity baseline for the same (sub-)pool.
 
-        Matches :func:`prompt_anonymity.metrics.random_guessing_accuracy` over the unknown
+        Matches :func:`prompt_anonymity.evaluation.metrics.random_guessing_accuracy` over the unknown
         labels of the candidate pool, so the baseline shrinks with the pool the same way
         the measured accuracy does.
         """

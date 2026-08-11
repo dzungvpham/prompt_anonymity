@@ -25,19 +25,17 @@ half that reads what the build wrote. One subpackage each:
     Score each unknown document against the known authors, producing an
     ``[n_documents x n_authors]`` score matrix (e.g.
     :class:`prompt_anonymity.attacks.NearestNeighbor`).
-``metrics``
-    Stateless scoring of an attack's output: :func:`~prompt_anonymity.metrics.top_k_accuracy`
-    and the chance baseline :func:`~prompt_anonymity.metrics.random_guessing_accuracy`.
 ``evaluation``
-    Rank once and reuse it: :class:`~prompt_anonymity.evaluation.LinkageRanking` and the
-    headline table.
-``utility``
-    The utility axis complementing the privacy metrics, via
-    :func:`~prompt_anonymity.utility.run_utility`: ``answer`` scores whether a defended prompt
-    still yields an equally-useful answer (the paper's PASS/FAIL predicate over a response
-    model's answers), and ``conversation`` scores 1-5 how much of the whole conversation
-    survives. Both compare a defended split against its pre-defense ``reference``. **It has no
-    caller today** -- see the note in that subpackage.
+    Everything that turns an attack's or a defense's output into a number, in three layers:
+    ``evaluation.metrics`` (stateless scoring of one score matrix --
+    :func:`~prompt_anonymity.evaluation.metrics.top_k_accuracy` and the chance baseline
+    :func:`~prompt_anonymity.evaluation.metrics.random_guessing_accuracy`),
+    :class:`~prompt_anonymity.evaluation.LinkageRanking` (rank once, reuse it), and
+    ``evaluation.utility`` -- the **other axis**, measuring what a defense cost rather than what
+    it hid. Driven by ``experiments/eval_utility.py``.
+
+    Absorbed the former top-level ``prompt_anonymity.metrics`` and ``prompt_anonymity.utility``
+    packages on 2026-08-11; those paths no longer exist.
 
 :class:`prompt_anonymity.core.AttackData` is the hand-off object between a defense and the text
 it rewrites; it is what ``data.apply_defenses`` hands each defense.

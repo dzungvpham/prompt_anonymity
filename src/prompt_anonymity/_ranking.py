@@ -1,7 +1,7 @@
 """Low-level ranking helpers shared by the metrics and the evaluation primitives.
 
 Kept in one private module so the stateless metrics
-(:mod:`prompt_anonymity.metrics`) and the precompute-once
+(:mod:`prompt_anonymity.evaluation.metrics`) and the precompute-once
 :class:`~prompt_anonymity.evaluation.LinkageRanking` rank candidates identically and
 cannot drift apart.
 """

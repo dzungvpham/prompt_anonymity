@@ -1,26 +1,34 @@
-"""Lean OpenRouter chat client shared by the utility metrics.
+"""Lean OpenRouter chat client shared by the LLM-judge attacks.
 
-The utility metrics make remote chat calls against OpenRouter -- generating a response model's
-answer to a prompt, asking a judge to rule PASS/FAIL on two answers, or asking one to score two
-whole conversations 1-5. This module holds the one client they all use: :class:`OpenRouterChat`, a
-thin wrapper over the chat-completions endpoint: a lazily read ``OPENROUTER_API_KEY`` (from a
-``.env``), jittered exponential backoff on transient failures, fail-fast on non-retryable 4xx, and
-a thread pool to fan a batch of requests out.
+:mod:`.euclidean_llm_judge` and :mod:`.bt_tournament` ask a remote model to decide which candidate
+author wrote an unknown conversation. This module holds the one client they share:
+:class:`OpenRouterChat`, a thin wrapper over the chat-completions endpoint -- a lazily read
+``OPENROUTER_API_KEY`` (from a ``.env``), jittered exponential backoff on transient failures,
+fail-fast on non-retryable 4xx, and a thread pool to fan a batch of requests out.
 
-The judges stay remote because a judge is meant to be a stronger, independent model than the one
-under test. They are no longer the only remote caller: the OpenAnonymity defense used to be one and
-now runs a local model through vLLM (:mod:`prompt_anonymity.defenses.openanonymity`), but the Frame
-Shift defense (:mod:`prompt_anonymity.defenses.frame_shift`) reuses this client to rewrite prompts
-through a hosted model. That second caller is why :meth:`OpenRouterChat.complete` takes a per-call
-``max_tokens``: a judge's reply is a fixed-size verdict, a rewrite's is as long as its input.
+**It lived in** :mod:`prompt_anonymity.evaluation.utility` **until the utility judge moved off OpenRouter**
+(first to a Microsoft Foundry Claude deployment, then to DeepSeek --
+:mod:`prompt_anonymity.evaluation.utility._deepseek`), which left the judge attacks as its main
+callers -- hence the move here. The two clients are deliberately not merged: they point at
+different providers under different credentials, and an attack's judge is a component of the thing
+being measured while a utility judge is the measuring instrument, so pinning them together would
+make one impossible to change without disturbing the other.
+
+**The judge attacks are not the only caller, despite where this module now sits.** The Frame Shift
+defense (:mod:`prompt_anonymity.defenses.frame_shift`) reuses this client to rewrite prompts through
+a hosted model, so a *defense* imports it across package boundaries -- worth knowing before moving
+it again. (The OpenAnonymity defense was a third caller and now runs a local model through vLLM,
+:mod:`prompt_anonymity.defenses.openanonymity`.) The judges stay remote because a judge is meant to
+be a stronger, independent model than the one under test.
+
+That second kind of caller is why :meth:`OpenRouterChat.complete` takes a per-call ``max_tokens``:
+a judge's reply is a fixed-size verdict, a rewrite's is as long as its input.
 
 One prompt is one request, with no token-budget chunking / context-length re-split (which the
-scrubber does do). That is safe for the per-turn callers, whose inputs are turn-sized and bounded;
-the conversation-level judge (:mod:`.prompt_judge`), which sends two whole conversations per call,
-is *not* inherently bounded, and relies on its own ``max_chars`` cap to stay under a context window
--- overrun there surfaces as a fail-fast 4xx that aborts the batch. ``requests`` and
-``python-dotenv`` are imported lazily so importing this module (e.g. to reach the prompt constants
-or the verdict parser) never requires the network deps or a key.
+scrubber does do). That is safe for both callers: a judge sees a shortlist of bounded snippets
+rather than whole conversations, and the rewriter is handed one user turn at a time.
+``requests`` and ``python-dotenv`` are imported lazily so importing this module
+(e.g. to reach the prompt constants or the verdict parser) never requires the network deps or a key.
 """
 
 from __future__ import annotations
@@ -82,9 +90,9 @@ class OpenRouterChat:
         if not self.api_key:
             raise RuntimeError(
                 f"{api_key_env} not set. Add it to a .env file (e.g. '{api_key_env}=sk-or-...') "
-                "so the utility metric can call OpenRouter."
+                "so the LLM-judge attack can call OpenRouter."
             )
-        print(f"Utility: OpenRouter client using model '{model}'.")
+        print(f"LLM judge: OpenRouter client using model '{model}'.")
 
     def _backoff(self, attempt: int) -> None:
         delay = min(self.backoff_cap, 2 ** attempt)

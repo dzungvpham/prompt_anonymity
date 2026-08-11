@@ -7,9 +7,9 @@ one known/unknown split rather than a configuration grid, and applied a *defense
 itself as part of the run. Defending is now a build-time step of its own
 (``prompt_anonymity.data.apply_defenses`` then ``compute_features --defense``), so ``--defense``
 here selects which already-defended vectors to attack and rewrites nothing. The one capability
-that left with the old script and has no replacement is ``--fidelity``, its LLM-judge scoring of
-how much of a prompt a defense preserved (:mod:`prompt_anonymity.fidelity` is still in the
-package, but nothing on the command line reaches it).
+that left with the old script was ``--fidelity``, its LLM-judge scoring of how much of a prompt a
+defense preserved; that subpackage is now :mod:`prompt_anonymity.evaluation.utility` and has its own driver,
+``experiments/eval_utility.py``, run separately over the same defended parquet.
 
 1. **Input is the built parquet pair.** ``<split>.parquet`` (documents) joined on ``doc_id`` to
    ``<split>_<feature>.parquet`` (precomputed vectors from
@@ -135,7 +135,7 @@ impostors, and score held-out documents from both. Two things make that simulati
 What gets measured
 ------------------
 Top-k accuracy is three samples of a ranking over 80-125 candidate authors, so the closed-set
-tables are backed by the fuller families in :mod:`prompt_anonymity.metrics` (all computed from
+tables are backed by the fuller families in :mod:`prompt_anonymity.evaluation.metrics` (all computed from
 the one score matrix, see :func:`closed_set_detail`):
 
 * **Whole ranking** -- ``mrr``, ``median_rank``, ``mean_percentile_rank``, and the complete CMC
@@ -256,7 +256,7 @@ from sklearn.model_selection import HalvingRandomSearchCV
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, rejection_score
 from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
-from prompt_anonymity.metrics import (
+from prompt_anonymity.evaluation.metrics import (
     author_query_metrics,
     c_at_1,
     calibration_metrics,
@@ -1327,7 +1327,7 @@ def between_author_mean(embeddings: np.ndarray, labels: np.ndarray, metric: str,
 def random_identity_accuracy(unknown_labels: np.ndarray, k: int, candidate_counts: np.ndarray) -> float:
     """Identity-level random baseline when each document has its own candidate pool.
 
-    Generalises :func:`prompt_anonymity.metrics.random_guessing_accuracy`, which assumes a single
+    Generalises :func:`prompt_anonymity.evaluation.metrics.random_guessing_accuracy`, which assumes a single
     pool shared by every document. A guesser shortlisting ``k`` of document *i*'s ``n_i``
     candidates names the true author with probability ``min(k, n_i) / n_i``, and an identity is
     re-identified if *any* of its documents' guesses lands, so its chance is
@@ -1673,7 +1673,7 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
     Fills ``scores`` in place with three families of summary numbers and returns the two tables
     that back them:
 
-    * **Whole-ranking** (:func:`~prompt_anonymity.metrics.ranking_summary`) -- ``mrr``,
+    * **Whole-ranking** (:func:`~prompt_anonymity.evaluation.metrics.ranking_summary`) -- ``mrr``,
       ``mean_percentile_rank``, ``median_rank``. The headline samples the ranking at three
       cutoffs; these use all of it, and ``mean_percentile_rank`` is the only accuracy-like
       number here that is comparable across windows whose candidate pools differ in size.
@@ -1682,7 +1682,7 @@ def closed_set_detail(scores_matrix: np.ndarray, authors: np.ndarray, true_autho
       is document-weighted, so a user who writes a fifth of the corpus can carry it on their
       own; these weight every user equally. The per-author table behind them is the risk
       distribution, which is what a privacy claim should actually rest on.
-    * **Retrieval** (:mod:`~prompt_anonymity.metrics.retrieval`) -- ``map`` and
+    * **Retrieval** (:mod:`~prompt_anonymity.evaluation.metrics.retrieval`) -- ``map`` and
       ``mean_r_precision``, running each known author as a *query* against the anonymous
       documents. A different attacker: "find everything this person wrote" rather than "who
       wrote this". Also the only direction in which MAP is not just MRR under another name.

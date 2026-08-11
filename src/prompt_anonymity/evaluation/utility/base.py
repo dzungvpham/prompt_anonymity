@@ -2,9 +2,10 @@
 
 A utility metric answers one question: *did the defense keep what mattered?* Each one scores a
 post-defense :class:`~prompt_anonymity.core.AttackData` against its pre-defense ``reference``, and
-they differ only in what they compare and what they report -- :mod:`.answer_judge` compares the
-**answers** two prompts elicit (per turn, PASS/FAIL), :mod:`.prompt_judge` compares the **prompts**
-themselves (per conversation, 1-5).
+they differ in what they compare and what they report. There is one today --
+:mod:`.prompt_judge`, which compares the two **conversations** and returns a 1-5 score -- and this
+base exists so a second (say, one that compares the *answers* two prompts elicit) is a subclass
+rather than a fork.
 
 A developer writing a new metric subclasses :class:`UtilityMetric` and implements
 :meth:`~UtilityMetric.score`; the base supplies the three things every metric needs and would
@@ -12,7 +13,8 @@ otherwise copy: side loading + validation (:meth:`~UtilityMetric._load_sides`), 
 for cheap calibration runs (the ``limit`` argument), and a ready
 :class:`~prompt_anonymity.caching.TransformCache` whose key is derived from the subclass's
 ``version`` and :meth:`~UtilityMetric.params` (:meth:`~UtilityMetric._cache`). Results subclass
-:class:`UtilityResult`, which supplies the shared ``__str__`` / ``to_csv`` behaviour.
+:class:`UtilityResult`, which supplies the shared ``__str__`` and the
+:meth:`~UtilityResult.scores` frame every metric contributes to the one output file.
 
 Cache invalidation deliberately differs from :class:`prompt_anonymity.defenses.base.CachedDefense`.
 A defense hashes its whole class hierarchy, so editing a base class invalidates every defense --
@@ -33,8 +35,8 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from ..caching import TransformCache, logic_hash, params_hash
-from ._openrouter import OpenRouterChat
+from ...caching import TransformCache, logic_hash, params_hash
+from ._deepseek import DeepSeekJudge
 
 #: Default RNG seed for ``limit`` sampling; matches the experiment driver's ``--seed``.
 DEFAULT_SEED = 47
@@ -46,9 +48,9 @@ class Sides(NamedTuple):
     Attributes
     ----------
     indices : list of int
-        Row positions in the *full* split that ``original`` / ``defended`` came from. Metrics put
-        these in their result table's ``conv_index`` so a sampled run stays joinable against a
-        full one.
+        Row positions in the *full* split that ``original`` / ``defended`` came from -- how a
+        metric recovers each sampled row's identity (its ``conv_id``) from the bundle it was
+        handed, so a sampled run's scores join against a full one's.
     original, defended : list of str
         Pre-defense and post-defense text, paired positionally.
     total : int
@@ -68,16 +70,19 @@ class Sides(NamedTuple):
 
 
 class UtilityResult:
-    """Shared behaviour for metric results: string form and a worst-first CSV dump.
+    """Shared behaviour for metric results: string form and the tidy per-conversation score frame.
 
     Not a dataclass -- subclasses declare their own fields with ``@dataclass`` and inherit these
     methods, which avoids the field-ordering constraints dataclass inheritance imposes. A subclass
     must provide the attributes ``n``, ``sampled_from``, ``table``, a :meth:`summary`, and
-    :attr:`sort_column`.
+    :attr:`score_columns`.
     """
 
-    #: Column of ``table`` that :meth:`to_csv` sorts on; override in the subclass.
-    sort_column: str = ""
+    #: Output column name -> the column of ``table`` it comes from. These are the *only* columns a
+    #: run contributes to the shared ``experiments/utility/<source>_<defense>.csv``; everything else
+    #: on ``table`` is working detail for interactive use. Names must be unique across metrics,
+    #: since every metric writes into the same file -- hence the ``judge_`` prefix on the judge's.
+    score_columns: dict[str, str] = {}
 
     n: int
     sampled_from: int | None
@@ -98,21 +103,20 @@ class UtilityResult:
             return ""
         return f"[SAMPLE {self.n}/{self.sampled_from}] "
 
-    def _sort_values(self) -> pd.Series:
-        """Sort key for :meth:`to_csv`; ascending order must put the *worst* rows first.
-        Override when the sort column is not already ordered that way."""
-        return self.table[self.sort_column]
-
     def __str__(self) -> str:
         return self.summary()
 
-    def to_csv(self, path) -> None:
-        """Write the per-row table to ``path``, worst rows first so spot-checking starts with the
-        rows most likely to reveal a broken defense (or a miscalibrated rubric)."""
-        order = self._sort_values()
-        self.table.assign(_o=order).sort_values("_o", na_position="first").drop(
-            columns="_o"
-        ).to_csv(path, index=False)
+    def scores(self) -> pd.DataFrame:
+        """``conv_id`` plus this metric's :attr:`score_columns`, renamed to their output names.
+
+        This is what :mod:`experiments.eval_utility` merges into the one score file a
+        (dataset, defense) pair gets. Every metric returns the same shape -- a key column and some
+        numbers -- so the driver merges them without knowing which metric ran, and a new metric
+        joins the file by declaring :attr:`score_columns` and nothing else.
+        """
+        return self.table[["conv_id", *self.score_columns.values()]].rename(
+            columns={source: output for output, source in self.score_columns.items()}
+        )
 
 
 class UtilityMetric:
@@ -143,13 +147,20 @@ class UtilityMetric:
         return {}
 
     def logic_classes(self) -> list:
-        """Classes whose source is hashed into the cache key.
+        """Classes whose source is hashed into the cache key. **Empty by default.**
 
-        Defaults to the API client alone, deliberately excluding the metric's own class -- see the
-        module docstring. Override only if a metric genuinely wants source-level invalidation and
-        is willing to pay for the recomputes.
+        This used to name the API client, which meant every edit to the client -- a new timeout
+        default, a log line, the usage accounting added on 2026-08-11 -- silently discarded every
+        cached verdict and re-bought it at full price. None of those edits change what a judge
+        replies; what does is the model, the rubric, and the effort, and all three are already in
+        :meth:`params` and therefore already in the key.
+
+        So invalidation here is entirely deliberate: bump :attr:`version` when the metric's
+        behaviour really changes. The risk that buys the saving is the stated one -- a behavioural
+        edit *without* a bump serves stale results -- and it is the cheaper mistake, because a
+        stale namespace can be deleted by hand while re-buying a corpus cannot be undone.
         """
-        return [OpenRouterChat]
+        return []
 
     def score(self, data, *, cache_dir, reference, side: str = "unknown",
               limit: int | None = None, seed: int = DEFAULT_SEED):
@@ -220,8 +231,9 @@ class UtilityMetric:
         """A cache for this metric under ``<cache_dir>/utility/``.
 
         ``name`` and ``params`` default to :attr:`name` and :meth:`params`; pass them explicitly
-        for a metric that needs a second, separately-keyed cache (e.g. :mod:`.answer_judge`, whose
-        response stage is keyed by prompt text independently of the judge stage).
+        for a metric that needs a second, separately-keyed cache -- e.g. a two-stage metric whose
+        first stage (generating a response to each prompt) should be keyed by the prompt alone, so
+        it is reused no matter which judge scores it.
         """
         return TransformCache(
             Path(cache_dir) / "utility",

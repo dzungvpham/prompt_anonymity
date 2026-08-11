@@ -5,7 +5,7 @@ much richer object than its top-1 guess: the **rank** of the true author says ho
 attack came even when it was wrong. Everything in this module is computed from those ranks, so
 a single :func:`true_author_ranks` call feeds the whole family cheaply.
 
-These answer two questions the top-k tables in :mod:`prompt_anonymity.metrics.accuracy` cannot:
+These answer two questions the top-k tables in :mod:`prompt_anonymity.evaluation.metrics.accuracy` cannot:
 
 * **How close was the attack overall?** ``top_k_accuracy`` samples the ranking at a handful of
   cutoffs. :func:`ranking_summary` reports the mean reciprocal rank and the mean percentile
@@ -23,7 +23,7 @@ Score orientation
 -----------------
 Everything here takes **scores, where higher means more likely** -- the orientation an
 attribution model produces. That is the opposite of the distance matrices consumed by
-:func:`prompt_anonymity.metrics.top_k_accuracy`; negate a distance matrix to use it here.
+:func:`prompt_anonymity.evaluation.metrics.top_k_accuracy`; negate a distance matrix to use it here.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
     true_authors : array-like of shape (n_documents,)
         True author of each row. Every one must appear in ``candidate_authors``: a document
         whose author is not a candidate has no rank at all, so filter those out first. They
-        are the out-of-set documents, scored by :mod:`prompt_anonymity.metrics.detection`.
+        are the out-of-set documents, scored by :mod:`prompt_anonymity.evaluation.metrics.detection`.
 
     Returns
     -------
@@ -245,7 +245,7 @@ def macro_top_k_accuracy(ranks, true_authors, k: int = 1) -> float:
     which a handful of heavy users can carry on their own, while this one answers "how well
     does the attack do against a typical user".
 
-    Not the same as identity-level accuracy in :func:`prompt_anonymity.metrics.top_k_accuracy`,
+    Not the same as identity-level accuracy in :func:`prompt_anonymity.evaluation.metrics.top_k_accuracy`,
     which counts an author as re-identified if *any single one* of their documents lands in the
     top k. That is the attacker's best case; this is their average case.
     """
@@ -289,7 +289,7 @@ def per_author_ranking(ranks, true_authors, top_ks=(1, 5, 10)) -> pd.DataFrame:
     document), ``median_rank``, and for each k in ``top_ks`` both ``top<k>_accuracy`` (the share
     of their documents ranked within k) and ``reidentified_top<k>`` (whether *any* of them was --
     the identity-level criterion). Join it with
-    :func:`prompt_anonymity.metrics.retrieval.author_query_metrics` on ``author`` for the
+    :func:`prompt_anonymity.evaluation.metrics.retrieval.author_query_metrics` on ``author`` for the
     matching retrieval view.
     """
     ranks = np.asarray(ranks, dtype=float)

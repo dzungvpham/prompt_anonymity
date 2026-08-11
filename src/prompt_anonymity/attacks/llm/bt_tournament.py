@@ -16,7 +16,7 @@ move. This makes it directly comparable to :class:`EuclideanLLMJudgeAttack`; the
 how the within-top-K order is decided (a rating tournament vs. a single forced choice).
 
 The judge runs on OpenRouter (default ``anthropic/claude-sonnet-5``, through the same
-:class:`~prompt_anonymity.utility._openrouter.OpenRouterChat` client) and its one-digit
+:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` client) and its one-digit
 pairwise verdicts are cached with :class:`~prompt_anonymity.caching.TransformCache` under
 ``<cache_dir>/attacks``, keyed by the prompt text -- so a Swiss *rematch* of the same pair
 (same presentation) is free on re-encounter, and a fully-cached run makes no API call.
@@ -41,7 +41,7 @@ import pandas as pd
 
 from ...caching import TransformCache, logic_hash, params_hash
 from ...core import AttackData
-from ...utility._openrouter import OpenRouterChat
+from ._openrouter import OpenRouterChat
 from .euclidean_llm_judge import _parse_choice
 from .candidates import author_candidates
 

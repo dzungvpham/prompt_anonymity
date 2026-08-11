@@ -26,10 +26,17 @@ dependencies = [
     # path -- `python -m prompt_anonymity.data.build_dataset` dies on import. It belongs in the base
     # dependencies for that reason.
     "lingua-language-detector",
-    # Remote-API HTTP + token counting for the OpenAnonymity defense and the utility judges
+    # Remote-API HTTP + token counting for the OpenAnonymity defense and the LLM-judge attacks
     # (both lazy-import these, so a missing wheel only crashes when that path is actually used).
     "requests",
     "tiktoken",
+    # The utility judge's client. DeepSeek serves an OpenAI-compatible endpoint, so the `openai`
+    # library is the transport -- it does not imply an OpenAI model. Lazy-imported
+    # (`utility/_deepseek.py`), so a missing wheel only bites when a judge run reaches the API.
+    "openai",
+    # The utility judge's rubric is a YAML file loaded at MODULE level by `utility/prompt_judge.py`,
+    # so this one is not a lazy failure: importing prompt_anonymity.utility needs it.
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
@@ -102,8 +109,14 @@ all = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# Non-Python files the package reads at runtime: the dataset build's default source locations
-# (prompt_anonymity/data/datasets.toml) and the user-agent -> device map WildChat identities are
-# built from. Without this they are missing from an installed (non-editable) copy.
+# Non-Python files the package reads at runtime. Without this they are missing from an installed
+# (non-editable) copy -- and each is read eagerly enough that its absence is an import-time or
+# first-call failure, not a degraded mode.
 [tool.setuptools.package-data]
+# The dataset build's default source locations, and the user-agent -> device map WildChat
+# identities are built from.
 "prompt_anonymity.data" = ["datasets.toml", "resources/*.json"]
+# The machine-independent checkpoint defaults for the vLLM defenses and the local utility scorers.
+"prompt_anonymity.defenses" = ["models.toml"]
+# The judge rubric (conversation_judge.yaml), read at import by prompt_judge.load_judge_prompt.
+"prompt_anonymity.evaluation.utility" = ["*.yaml"]

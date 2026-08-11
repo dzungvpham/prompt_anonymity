@@ -18,7 +18,7 @@ class GradientBoostedTrees:
     either way, but log-space is what the downstream machinery expects: cohort normalisation
     z-scores across authors (meaningful for log-odds-like quantities, not for probabilities that
     sum to 1), and it makes ``softmax(score)`` recover the model's own posterior exactly, so the
-    calibration metrics in :mod:`prompt_anonymity.metrics.detection` measure something real for
+    calibration metrics in :mod:`prompt_anonymity.evaluation.metrics.detection` measure something real for
     this attack.
 
     This is also the **most expensive** attack in the package, and the cost is driven by the

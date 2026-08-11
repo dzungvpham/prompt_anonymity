@@ -4,7 +4,7 @@ Every attack answers the same question -- *which known author wrote this unknown
 and every attack answers it in the same shape: an ``[n_documents x n_authors]`` **score** matrix
 where **higher means more likely this author**, with the author order in ``self.authors``.
 Identification is ``argmax``; :mod:`prompt_anonymity.attacks.ood` turns the same matrix into an
-accept/reject decision, and :mod:`prompt_anonymity.metrics` scores it.
+accept/reject decision, and :mod:`prompt_anonymity.evaluation.metrics` scores it.
 
 The author is the unit throughout. There is deliberately no conversation-level attack any more:
 a matrix over known *conversations* answers a different question from the one the metrics report,

@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .._ranking import first_k_distinct, rank_known_by_distance
+from ..._ranking import first_k_distinct, rank_known_by_distance
 
 
 def top_k_accuracy(

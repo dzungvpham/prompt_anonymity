@@ -10,7 +10,7 @@ scores low against *every* candidate and a distinctive one scores high against a
 thresholding a raw maximum mostly measures document length. Normalising within a document
 (:func:`cohort_normalize`) fixes that, and is worth about 0.09 of DIR@10% on swe-chat.
 
-Score the resulting decision with :mod:`prompt_anonymity.metrics.detection`.
+Score the resulting decision with :mod:`prompt_anonymity.evaluation.metrics.detection`.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ def _cohort_statistics(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     filter every entry is finite and this is the plain per-row mean and standard deviation.
 
     Computed in row blocks for the same reason as
-    :func:`prompt_anonymity.metrics.max_softmax_confidence`: the direct expression needs a full
+    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence`: the direct expression needs a full
     float64 copy of the score matrix -- 8 GB at 50,000 documents against 20,000 authors -- to
     return two numbers per document.
 

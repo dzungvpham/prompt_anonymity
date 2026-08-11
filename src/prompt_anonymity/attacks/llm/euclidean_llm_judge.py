@@ -14,8 +14,8 @@ whatever extra signal the LLM adds on top of the embedding distance at rank 1. A
 ``top_k=5`` the top-5 and top-10 accuracies are identical to the underlying
 nearest-neighbor attack by construction; only top-1 can move.
 
-The judge runs on OpenRouter (default ``anthropic/claude-sonnet-5``, through the same client
-the utility judges use -- :class:`~prompt_anonymity.utility._openrouter.OpenRouterChat`)
+The judge runs on OpenRouter (default ``anthropic/claude-sonnet-5``, through this package's
+shared client -- :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`)
 and its one-digit verdicts are cached with the package's content-addressed
 :class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/attacks``, keyed by the
 prompt text and namespaced by the judge model / prompt / presentation params, so re-runs and
@@ -49,7 +49,7 @@ import pandas as pd
 
 from ...caching import TransformCache, logic_hash, params_hash
 from ...core import AttackData
-from ...utility._openrouter import OpenRouterChat
+from ._openrouter import OpenRouterChat
 from .candidates import author_candidates
 
 #: Authorship-attribution judge rubric. A forced K-way choice returning a single digit; the
@@ -307,7 +307,7 @@ class EuclideanLLMJudgeAttack:
 def euclidean_llm_judge_attack(data: AttackData, *, cache_dir=None, **kwargs) -> pd.DataFrame:
     """Convenience wrapper: rerank ``data``'s nearest-neighbor top-K with a default judge.
 
-    Mirrors :func:`prompt_anonymity.utility.answer_utility`. Any
+    Mirrors :func:`prompt_anonymity.evaluation.utility.conversation_utility`. Any
     :class:`EuclideanLLMJudgeAttack` constructor argument (``judge_model``, ``top_k``,
     ``snippet_chars``, ``margin_quantile``, ``shuffle_candidates``, ``seed``, ...) may be
     passed through ``kwargs``.

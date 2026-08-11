@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 
-from ..defenses._backends import split_turns
+from ...defenses._backends import split_turns
 
 #: Opening / closing markdown code fences some models wrap JSON in.
 _FENCE_OPEN = re.compile(r"^```[a-zA-Z0-9]*\s*")
@@ -73,11 +73,12 @@ def render_turns(text, *, label: bool = False, drop_blank: bool = False,
         shown individually, where the label would be noise.
     drop_blank : bool, default False
         Drop whitespace-only turns. **Defaults off on purpose**: with both flags off this function
-        is byte-for-byte identical to the plain ``"\\n".join(split_turns(text))`` that
-        :mod:`.answer_judge` has always used, and that rendered text *is* the key of a cache full
-        of paid completions -- filtering by default would silently miss every row whose defended
-        turn came back whitespace-only. Turn on when rendering a whole conversation, where a blank
-        turn is just a delimiter artifact that would skew the ``[Turn i]`` numbering.
+        is byte-for-byte the plain ``"\\n".join(split_turns(text))``, which is what a caller
+        rendering turns individually wants -- a blank turn there is a real (empty) rewrite worth
+        seeing, not noise. Turn it on when rendering a whole conversation, where a blank turn is a
+        delimiter artifact that would skew the ``[Turn i]`` numbering. Note the rendered text is
+        the cache key for paid judge replies, so flipping either default silently orphans every
+        entry already on disk.
     max_chars : int, optional
         Truncate the result to this many characters, appending :data:`TRUNCATION_MARKER`. Applied
         per rendered side by the caller, so a truncated comparison stays fair.

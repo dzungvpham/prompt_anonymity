@@ -22,7 +22,7 @@ class SupportVectorAttribution:
 
     ``decision_function_shape="ovr"`` folds the pairwise votes back into one column per author, so
     the output has the same shape as every other attack's. Those margins are *not* posteriors --
-    :func:`prompt_anonymity.metrics.max_softmax_confidence` will report a near-uniform confidence
+    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence` will report a near-uniform confidence
     for them, so read this attack's calibration numbers as meaningless rather than as bad.
     """
 

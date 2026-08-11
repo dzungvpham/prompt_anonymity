@@ -45,8 +45,8 @@ key, identical turns in different documents are no longer computed once. ``apply
 exact for ``frame_shift_single``); this defense prints its own count before the first request.
 
 Rewrites run on a hosted model through OpenRouter, reusing the package's
-:class:`~prompt_anonymity.utility._openrouter.OpenRouterChat` client, so an ``OPENROUTER_API_KEY`` in
-a ``.env`` is required.
+:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` client, so an
+``OPENROUTER_API_KEY`` in a ``.env`` is required.
 
 **What this costs, and where the cost actually is.** Not in the corpus text -- in the *per-call fixed
 prompt*. The rewrite contract below is ~1,420 tokens and is resent on every call, which at WildChat
@@ -621,7 +621,7 @@ def output_budget(text: str, *, ratio: float = FRAME_SHIFT_OUTPUT_RATIO,
 class _FrameShiftBackend:
     """OpenRouter rewriter: one request per (frame, turn), fanned out across a thread pool.
 
-    Wraps :class:`~prompt_anonymity.utility._openrouter.OpenRouterChat` rather than reimplementing
+    Wraps :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` rather than reimplementing
     the HTTP layer -- it already has the lazily-read key, the full-jitter backoff on transient
     failures, the fail-fast on non-retryable 4xx with the response body attached, and the
     order-preserving batch pool. What this adds is the per-request framing, a length-proportional
@@ -633,7 +633,7 @@ class _FrameShiftBackend:
                  temperature: float = FRAME_SHIFT_TEMPERATURE, top_p: float = FRAME_SHIFT_TOP_P,
                  max_workers: int = FRAME_SHIFT_MAX_WORKERS,
                  max_retries: int = FRAME_SHIFT_MAX_RETRIES, timeout: float = FRAME_SHIFT_TIMEOUT):
-        from ..utility._openrouter import OpenRouterChat
+        from ..attacks.llm._openrouter import OpenRouterChat
 
         self.model = model
         self.client = OpenRouterChat(

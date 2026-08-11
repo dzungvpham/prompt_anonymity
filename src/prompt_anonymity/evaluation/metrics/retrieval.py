@@ -9,7 +9,7 @@ cares about, so it deserves its own numbers rather than being inferred from top-
 
 It also fixes a degeneracy. Identification has exactly one relevant item per query, which
 collapses mean average precision onto the mean reciprocal rank already reported by
-:mod:`prompt_anonymity.metrics.ranking` -- reporting both would be reporting one number twice.
+:mod:`prompt_anonymity.evaluation.metrics.ranking` -- reporting both would be reporting one number twice.
 In this direction a query has many relevant documents, so average precision is non-trivial and
 measures what it is meant to: whether the user's documents are concentrated at the top of the
 ranking or scattered through it.
@@ -29,7 +29,7 @@ def author_query_metrics(scores, candidate_authors, true_authors) -> pd.DataFram
     ----------
     scores : array-like of shape (n_documents, n_candidates)
         Attack score for every (document, candidate author) pair, higher = more likely. The
-        same matrix :func:`prompt_anonymity.metrics.ranking.true_author_ranks` consumes, read
+        same matrix :func:`prompt_anonymity.evaluation.metrics.ranking.true_author_ranks` consumes, read
         column-wise instead of row-wise.
     candidate_authors : array-like of shape (n_candidates,)
         Author identifier owning each column.
@@ -107,7 +107,7 @@ def retrieval_summary(table: pd.DataFrame) -> dict:
 
     Authors are weighted equally (macro averaging), which is the convention for MAP and is also
     the right choice here: weighting by document count would let a few prolific users decide the
-    number, exactly the skew the macro metrics in :mod:`prompt_anonymity.metrics.ranking` exist
+    number, exactly the skew the macro metrics in :mod:`prompt_anonymity.evaluation.metrics.ranking` exist
     to avoid.
     """
     if table.empty:

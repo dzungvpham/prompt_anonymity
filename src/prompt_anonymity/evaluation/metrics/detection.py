@@ -9,7 +9,7 @@ identification -- an attack can rank the right author first almost every time an
 unable to tell an enrolled user from a stranger.
 
 Everything takes a **rejection score, where higher means more likely out-of-set**. See
-:func:`prompt_anonymity.metrics.detection.max_softmax_confidence` for turning a raw score matrix
+:func:`prompt_anonymity.evaluation.metrics.detection.max_softmax_confidence` for turning a raw score matrix
 into the complementary confidence.
 
 Reading order

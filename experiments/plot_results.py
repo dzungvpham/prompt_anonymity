@@ -825,7 +825,7 @@ def weighted_cmc(ranks: np.ndarray, pools: np.ndarray, ks: np.ndarray,
                  weights: np.ndarray | None = None) -> np.ndarray:
     """Top-k accuracy at every ``ks``, with each document weighted by its author's multiplicity.
 
-    Mirrors :func:`prompt_anonymity.metrics.ranking.cmc_curve` -- the share of documents whose
+    Mirrors :func:`prompt_anonymity.evaluation.metrics.ranking.cmc_curve` -- the share of documents whose
     true author ranks within k -- but weighted, and written out here rather than imported to keep
     this script free of the package's heavy imports (the same reason its name vocabulary is
     literal). Computed as a weighted histogram over ranks plus a prefix sum, so one replicate
@@ -1270,7 +1270,7 @@ def weighted_selective(confidence: np.ndarray, correct: np.ndarray, order: np.nd
                        weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Precision and recall when only the most confident ``COVERAGE_GRID`` share is answered.
 
-    A local restatement of :func:`prompt_anonymity.metrics.detection.selective_classification`,
+    A local restatement of :func:`prompt_anonymity.evaluation.metrics.detection.selective_classification`,
     weighted by author multiplicity and evaluated on a **pre-sorted** order so a bootstrap
     replicate costs two prefix sums rather than another sort. Coverage is a share of the
     resampled documents, so the cut-off is found on the running weight rather than on a row
