@@ -136,7 +136,15 @@ NO_DEFENSE = "base"
 COLLISION_SEEDING = ("collision_seeding", "collision_seeding_k4",
                      "collision_seeding_full", "collision_seeding_indep")
 
-DEFENSES = (NO_DEFENSE, "styleremix", "openanonymity") + COLLISION_SEEDING
+#: The frame-shift arm. ``frame_shift`` rewrites each document into one of 50 topic-heavy scenes
+#: drawn by a keyed hash of its doc_id; ``frame_shift_single`` forces the whole corpus into ONE scene
+#: and is the convergence-vs-dilution control (and the control for plain length inflation, since both
+#: arms lengthen documents the same way). Unlike collision seeding these cost money to produce -- a
+#: hosted rewrite per (frame, turn) -- so only the main arm is in the default grid; add the ablation
+#: with ``--defenses frame_shift_single`` once the first numbers are in.
+FRAME_SHIFT = ("frame_shift",)
+
+DEFENSES = (NO_DEFENSE, "styleremix", "openanonymity") + COLLISION_SEEDING + FRAME_SHIFT
 
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be

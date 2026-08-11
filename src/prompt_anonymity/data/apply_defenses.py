@@ -101,6 +101,7 @@ import pyarrow.parquet as pq
 
 from prompt_anonymity.core import AttackData
 from prompt_anonymity.defenses import DEFENSES, apply_defense
+from prompt_anonymity.defenses._backends import TURN_ID_SEPARATOR
 
 from .compute_features import (
     READ_BATCH_ROWS,
@@ -129,8 +130,9 @@ CACHE_SUBDIR = "defended"
 
 # Separator between a document id and a turn's position within it, forming the cache key for one
 # turn. Any character absent from the built doc_ids (``sc-<date>-<uuid>`` / ``wc-<...>``) works; '#'
-# is chosen because it reads as a fragment reference and never appears in an id.
-TURN_ID_SEPARATOR = "#"
+# is chosen because it reads as a fragment reference and never appears in an id. Defined in
+# `defenses._backends` (imported above, and re-exported here) so a defense can read the doc_id back
+# out of a row id without importing this module, which imports the defense registry.
 
 
 # --- input ------------------------------------------------------------------

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import shutil
 import tomllib
 from dataclasses import replace
@@ -37,6 +38,38 @@ from .base import CachedDefense
 #: stored as the two-char sequence ``\n``, so the separator is the literal string ``\n===\n`` (four
 #: visible characters around ``===``), NOT actual newlines -- matching the WildChat preprocessing.
 TURN_DELIM = "\\n===\\n"
+
+#: Separator between a document's key and a turn's position within it, in the per-turn cache ids
+#: ``apply_defenses`` builds (``<doc_id>#<n>``). It lives here rather than in
+#: :mod:`prompt_anonymity.data.apply_defenses` because a defense may need to read the *document*
+#: back out of a row id -- ``frame_shift`` does, to give every turn of one document the same framing
+#: -- and ``apply_defenses`` imports the defense registry, so a defense cannot import it back.
+TURN_ID_SEPARATOR = "#"
+
+
+def document_id(row_id) -> str:
+    """The document a per-turn cache row belongs to: ``"abc#3"`` -> ``"abc"``.
+
+    A row id that carries no turn suffix (a whole-conversation row, or a loader that supplied no
+    ids at all, in which case the caller passes the row's position) is its own document, so it comes
+    back unchanged. Splitting on the FIRST separator, not the last, is deliberate: a ``doc_id``
+    containing a ``#`` would otherwise have its turns attributed to different documents.
+    """
+    return str(row_id).split(TURN_ID_SEPARATOR, 1)[0]
+
+
+def render_template(template: str, values: dict) -> str:
+    """Fill ``{{KEY}}`` placeholders in ``template`` from ``values`` (mirrors the JS helper)."""
+    return re.sub(r"\{\{([A-Z0-9_]+)\}\}", lambda m: str(values.get(m.group(1), "")), template)
+
+
+def extract_tagged_output(raw_text, tag_name: str) -> str:
+    """Pull the inner text of ``<tag_name>...</tag_name>``; fall back to the whole trimmed string if
+    the model omitted the wrapper (mirrors the JS helper)."""
+    if not isinstance(raw_text, str):
+        return ""
+    match = re.search(rf"<{tag_name}>\s*([\s\S]*?)\s*</{tag_name}>", raw_text, re.IGNORECASE)
+    return match.group(1).strip() if match else raw_text.strip()
 
 
 def split_turns(text: str) -> list[str]:

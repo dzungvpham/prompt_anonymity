@@ -36,7 +36,9 @@ from pathlib import Path
 from ._backends import (
     PerTurnBatchRewriteDefense,
     configure_cuda_toolkit,
+    extract_tagged_output,
     model_path,
+    render_template,
     resolve_model_path,
     shutdown_vllm,
 )
@@ -191,19 +193,9 @@ OPENANON_INPUT_TEMPLATE = """
 """.strip()
 
 
-def render_template(template: str, values: dict) -> str:
-    """Fill ``{{KEY}}`` placeholders in ``template`` from ``values`` (mirrors the JS helper)."""
-    return re.sub(r"\{\{([A-Z0-9_]+)\}\}", lambda m: str(values.get(m.group(1), "")), template)
-
-
-def extract_tagged_output(raw_text, tag_name: str) -> str:
-    """Pull the inner text of ``<tag_name>...</tag_name>``; fall back to the whole trimmed string if
-    the model omitted the wrapper (mirrors the JS helper)."""
-    if not isinstance(raw_text, str):
-        return ""
-    match = re.search(rf"<{tag_name}>\s*([\s\S]*?)\s*</{tag_name}>", raw_text, re.IGNORECASE)
-    return match.group(1).strip() if match else raw_text.strip()
-
+# ``render_template`` and ``extract_tagged_output`` moved to ._backends when frame_shift.py became
+# their second consumer; they are re-exported here (via the import above) so existing callers and
+# `from .openanonymity import extract_tagged_output` keep working.
 
 #: gpt-oss speaks the *harmony* format: one token stream carrying several labelled CHANNELS, of
 #: which ``analysis`` is the chain of thought and ``final`` is the answer. Generating with

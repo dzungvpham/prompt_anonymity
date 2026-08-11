@@ -266,7 +266,9 @@ class OpenRouterEmbeddingFeaturizer(Featurizer):
             from dotenv import load_dotenv
 
             self._requests = requests
-            load_dotenv()  # walks up from cwd, so the key can live in the repo root or a subdir
+            # Walks UP from the working directory: a .env at the repo root (or above it) is found,
+            # one in a SUBdirectory is not (`DS_env/.env` does not work from the repo root).
+            load_dotenv()
             self._api_key = os.environ.get(OPENROUTER_API_KEY_ENV)
             if not self._api_key:
                 raise RuntimeError(

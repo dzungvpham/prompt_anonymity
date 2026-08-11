@@ -262,6 +262,8 @@ DEFENSES = (
     "collision_seeding_k24",
     "collision_seeding_full",
     "collision_seeding_indep",
+    "frame_shift",
+    "frame_shift_single",
     "dp_mlm",
     "dp_mlm_pii",
     "dp_mlm_var_a10",
@@ -309,6 +311,11 @@ DEFENSE_LABELS = {
     "collision_seeding_k24": "Collision seeding (K=24)",
     "collision_seeding_full": "Collision seeding (always on)",
     "collision_seeding_indep": "Collision seeding (independent)",
+    # The codebook size is in the label for the same reason K is above: it is the knob. 50 scenes
+    # rotate per document; the single-frame arm collapses that to one, so a figure holding both is a
+    # figure about dilution versus convergence.
+    "frame_shift": "Frame shift (50 frames)",
+    "frame_shift_single": "Frame shift (single frame)",
     "dp_mlm": "DP-MLM",
     "dp_mlm_pii": "DP-MLM (PII only)",
     "dp_mlm_var_a10": "DP-MLM ± (A=0.1)",

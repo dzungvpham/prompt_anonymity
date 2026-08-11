@@ -7,10 +7,12 @@ thin wrapper over the chat-completions endpoint: a lazily read ``OPENROUTER_API_
 ``.env``), jittered exponential backoff on transient failures, fail-fast on non-retryable 4xx, and
 a thread pool to fan a batch of requests out.
 
-**This is the only part of the package that still calls a hosted API.** The OpenAnonymity defense
-was the other one and now runs a local model through vLLM
-(:mod:`prompt_anonymity.defenses.openanonymity`); the judges stay remote because a judge is meant
-to be a stronger, independent model than the one under test.
+The judges stay remote because a judge is meant to be a stronger, independent model than the one
+under test. They are no longer the only remote caller: the OpenAnonymity defense used to be one and
+now runs a local model through vLLM (:mod:`prompt_anonymity.defenses.openanonymity`), but the Frame
+Shift defense (:mod:`prompt_anonymity.defenses.frame_shift`) reuses this client to rewrite prompts
+through a hosted model. That second caller is why :meth:`OpenRouterChat.complete` takes a per-call
+``max_tokens``: a judge's reply is a fixed-size verdict, a rewrite's is as long as its input.
 
 One prompt is one request, with no token-budget chunking / context-length re-split (which the
 scrubber does do). That is safe for the per-turn callers, whose inputs are turn-sized and bounded;
@@ -73,7 +75,9 @@ class OpenRouterChat:
         self.timeout = timeout
         self.base_url = base_url
 
-        load_dotenv()  # walks up from cwd, so the key can live in the repo root or a subdir
+        # Walks UP from the working directory: a .env at the repo root (or above it) is found, one
+        # in a SUBdirectory is not -- `DS_env/.env` does not work when the job runs from the root.
+        load_dotenv()
         self.api_key = os.environ.get(api_key_env)
         if not self.api_key:
             raise RuntimeError(
@@ -86,13 +90,18 @@ class OpenRouterChat:
         delay = min(self.backoff_cap, 2 ** attempt)
         time.sleep(random.uniform(0, delay))  # full jitter de-synchronizes concurrent workers
 
-    def complete(self, text: str) -> str:
+    def complete(self, text: str, max_tokens: int | None = None) -> str:
         """Return the model's reply to ``text`` under the fixed system prompt.
 
         A blank input has nothing to answer and 400s some providers, so short-circuit it to ``""``.
         Transient failures (429, 5xx, network/JSON errors) are retried with jittered exponential
         backoff; a non-retryable 4xx (bad model id, malformed/over-limit prompt) fails fast with
         OpenRouter's error body attached (``raise_for_status`` alone carries only the status line).
+
+        ``max_tokens`` overrides the instance default for this one call. The judges leave it unset
+        (their replies are a verdict and a sentence, so one fixed cap fits every call); a *rewrite*
+        caller needs a budget proportional to its input, since a long turn's rewrite is long too and
+        the fixed default would silently truncate it.
         """
         if not text.strip():
             return ""
@@ -102,7 +111,8 @@ class OpenRouterChat:
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": text},
             ],
-            "temperature": self.temperature, "top_p": self.top_p, "max_tokens": self.max_tokens,
+            "temperature": self.temperature, "top_p": self.top_p,
+            "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
@@ -134,17 +144,28 @@ class OpenRouterChat:
                     self._backoff(attempt)
         raise RuntimeError(f"OpenRouter request failed after {self.max_retries} attempts: {last_err}")
 
-    def complete_batch(self, texts: list[str]) -> list[str]:
+    def complete_batch(self, texts: list[str], max_tokens=None) -> list[str]:
         """Answer a batch of prompts concurrently, preserving input order.
 
         Network I/O-bound, so a thread pool gives near-linear speedup despite the GIL; a prompt
         that still fails after retries raises, aborting the batch (same contract as the scrubber).
+
+        ``max_tokens`` is either ``None`` (use the instance default for every call), one int applied
+        to all of them, or a sequence carrying a per-prompt budget -- which is what a rewrite caller
+        wants, its budget scaling with each input's length.
         """
         from concurrent.futures import ThreadPoolExecutor
 
         texts = list(texts)
         if not texts:
             return []
+        if max_tokens is None or isinstance(max_tokens, int):
+            budgets = [max_tokens] * len(texts)
+        else:
+            budgets = [int(b) for b in max_tokens]
+            if len(budgets) != len(texts):
+                raise ValueError(f"max_tokens has {len(budgets)} entries but texts has {len(texts)}.")
         workers = max(1, min(self.max_workers, len(texts)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(self.complete, texts))  # preserves order, re-raises first failure
+            # map over both iterables -> preserves order, re-raises the first failure.
+            return list(pool.map(self.complete, texts, budgets))

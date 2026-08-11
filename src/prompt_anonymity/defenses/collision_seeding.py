@@ -65,7 +65,6 @@ Command line::
 
 from __future__ import annotations
 
-import hashlib
 import random
 import re
 import unicodedata
@@ -77,6 +76,7 @@ import numpy as np
 
 from ..caching import IndexedRowCache, params_hash
 from ..core import AttackData
+from ._keying import keyed_rng as _rng
 from .base import CachedDefense
 
 # Separator between a document id and a turn's position, forming a turn's cache id
@@ -99,17 +99,10 @@ DEFAULT_MIN_LATIN_RATIO = 0.6
 
 
 # --- deterministic randomness ------------------------------------------------
-
-def _rng(*parts) -> random.Random:
-    """A ``random.Random`` seeded by the keyed hash of ``parts``.
-
-    Every stochastic decision in this defense goes through here, which is what makes the whole
-    thing a pure function of ``(seed, author_id, marker_key, doc_id)``: shard layout cannot change
-    an outcome, a re-run is bit-identical, and the assignment can be reconstructed offline. BLAKE2b
-    rather than :func:`hash` because Python's string hashing is salted per process.
-    """
-    digest = hashlib.blake2b("\x00".join(str(p) for p in parts).encode("utf-8"), digest_size=8)
-    return random.Random(int.from_bytes(digest.digest(), "big"))
+#
+# ``_rng`` is :func:`prompt_anonymity.defenses._keying.keyed_rng`, imported above under the short
+# local name every draw in this module uses. Every stochastic decision here goes through it, which
+# is what makes the whole defense a pure function of ``(seed, author_id, marker_key, doc_id)``.
 
 
 # --- protected spans ---------------------------------------------------------
