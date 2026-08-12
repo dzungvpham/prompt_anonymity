@@ -326,6 +326,28 @@ def accept_passage(raw_text: str) -> tuple[str | None, str]:
     return text, "untagged"
 
 
+def _save_partial(bank: "PassageBank") -> Path | None:
+    """Write the passages generated so far to ``<bank>.partial.json``, best-effort.
+
+    Insurance against losing paid work to a kill, a preemption or a timeout: a build that dies
+    mid-way leaves this behind, and ``mv frame_pad_bank.partial.json frame_pad_bank.json`` makes it
+    the bank (the defense is happy with a partial one -- see
+    :meth:`FramePadDefense.active_framings`). Overwritten each chunk, unlike
+    :meth:`PassageBank.save`, which deliberately refuses to clobber a finished bank.
+    """
+    path = bank_path().with_suffix(".partial.json")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(bank.to_json(), handle, ensure_ascii=False, indent=1)
+        os.replace(temporary, path)
+        return path
+    except OSError as error:  # noqa: BLE001 - losing the safety net must not kill the build
+        print(f"[frame_pad] could not write the partial bank ({error})")
+        return None
+
+
 def _dump_rejected(rejected: list[dict], model: str, framings, passages_per_frame: int,
                    target_words: int) -> Path:
     """Write the rejected replies beside the bank, so a failed build can be read rather than guessed.
@@ -531,6 +553,11 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
             first = rejected[0]
             print(f"[frame_pad] first rejection ({first['reason']}, {first['framing']}): "
                   f"{first['reply'][:300]!r}", flush=True)
+        # Keep what has been paid for. Two builds have now lost several hundred generated passages
+        # -- one to an exception, one to a kill -- and every call here is money already spent, so the
+        # work in hand goes to disk after every chunk. Written beside the bank rather than to it, so
+        # a completed build's atomic write is still the thing that creates the real file.
+        _save_partial(PassageBank(passages, model=model, target_words=target_words))
 
     bank = PassageBank(passages, model=model, target_words=target_words)
     missing = bank.covers(framings)
@@ -544,15 +571,23 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
               + ", ".join(f"{reason}: {n}" for reason, n in why.most_common()))
     if untagged:
         print(f"[frame_pad] {untagged} reply/replies omitted the <passage> tags and were kept whole")
-    if missing:
-        dump = _dump_rejected(rejected, model, framings, passages_per_frame, target_words)
+    if not len(bank):
         raise SystemExit(
-            f"no usable passage for {len(missing)} of {len(framings)} scene(s): "
-            f"{', '.join(missing)}.\n"
-            f"The {len(rejected)} rejected replies are in {dump} -- READ THEM. 'empty' means the "
-            f"model returned nothing at all, 'too short' a stub, 'stray tag' a truncated reply. "
-            f"Then re-run --build-bank, or try another --model."
+            f"every one of the {len(jobs)} calls failed -- not one usable passage.\n"
+            f"The replies are in {dump} -- READ THEM. 'empty' means the model returned nothing at "
+            f"all, 'too short' a stub, 'stray tag' a reply truncated mid-passage (raise the token "
+            f"budget, or the model is spending it on reasoning). Then try another --model."
         )
+    if missing:
+        # NOT fatal, and this used to be: a build that lost some scenes raised before saving and
+        # threw away every passage it had paid for. A partial bank is usable -- the defense restricts
+        # its draw to the covered scenes (see FramePadDefense.active_framings), so every document is
+        # still padded and only pad diversity suffers -- so it is written and the gap is reported.
+        print(f"[frame_pad] {len(missing)} of {len(framings)} scene(s) got no usable passage: "
+              f"{', '.join(missing)}")
+        print(f"[frame_pad] keeping the bank anyway -- the draw restricts to the "
+              f"{len(framings) - len(missing)} covered scenes, so every document is still padded. "
+              f"The rejected replies are in {dump} if you want to know why they failed.")
     short = [f"{f.key} ({len(passages[f.key])})" for f in framings
              if len(passages[f.key]) < passages_per_frame]
     if short:
