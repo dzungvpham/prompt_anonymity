@@ -296,6 +296,10 @@ ATTACKS = (
     "rlsc",
     "svm",
     "xgboost",
+    # Appended rather than filed next to `logistic`, and it has to be: an attack's index in this
+    # tuple is its colour slot (see METHOD_STRIDE), so inserting one mid-list recolours every
+    # attack below it. New entries go on the end regardless of where they belong by meaning.
+    "logistic_sgd",
 )
 
 #: Keyed by the directory spelling, valued by how the corpus is written in prose and on a figure
@@ -348,14 +352,30 @@ ATTACK_LABELS = {
     "lda": "LDA centroid",
     "plda": "PLDA",
     "logistic": "Logistic",
+    # Same model as "Logistic", fitted by minibatch Adam so it runs at WildChat's author counts.
+    # Named for the fit rather than the model because the two are not interchangeable numbers.
+    "logistic_sgd": "Logistic (SGD)",
     "rlsc": "RLSC",
     "svm": "SVM",
     "xgboost": "XGBoost",
 }
 
+#: Stride between one feature's block of attack slots and the next. **Frozen, and deliberately
+#: not ``len(ATTACKS)``.** Since ``hue = slot % 8``, the stride's residue mod 8 is what decides
+#: the whole assignment: at 9 (the attack count when this was written) it is 1, so
+#: ``hue == (feature_index + attack_index) % 8``. Registering one more attack made it 10, residue
+#: 2 -- which silently recoloured **57 of the 63** feature-attack pairs and every figure already
+#: drawn, breaking the rule that a colour follows the entity rather than its position.
+#:
+#: 17 keeps residue 1, so every existing assignment is preserved exactly, and leaves room for 17
+#: attacks before a block overflows into the next feature's. **Add new attacks to the END of**
+#: :data:`ATTACKS`: inserting one mid-list shifts the index of everything after it, which moves
+#: those hues just as surely. Any replacement must stay ``= 1 (mod 8)`` and ``>= len(ATTACKS)``.
+METHOD_STRIDE = 17
+
 #: Reading order for methods, and the colour slot each one owns: feature-major, so a figure's
 #: legend runs feature by feature and two runs of the same feature sit next to each other.
-METHOD_SLOTS = {(feature, attack): feature_index * len(ATTACKS) + attack_index
+METHOD_SLOTS = {(feature, attack): feature_index * METHOD_STRIDE + attack_index
                 for feature_index, feature in enumerate(FEATURES)
                 for attack_index, attack in enumerate(ATTACKS)}
 

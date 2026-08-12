@@ -57,6 +57,7 @@ from .multiclass import (
     MULTICLASS_ATTACKS,
     GradientBoostedTrees,
     LogisticAttribution,
+    MinibatchLogisticAttribution,
     RegularizedLeastSquares,
     SupportVectorAttribution,
 )
@@ -104,6 +105,7 @@ __all__ = [
     # multiclass discriminant
     "MULTICLASS_ATTACKS",
     "LogisticAttribution",
+    "MinibatchLogisticAttribution",
     "SupportVectorAttribution",
     "GradientBoostedTrees",
     "RegularizedLeastSquares",

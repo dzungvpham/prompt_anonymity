@@ -162,18 +162,28 @@ DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
 FEATURES = ("stylometrix", "char_ngram_tfidf", "gemini_embedding_2")
 
 #: In increasing cost order, which is the order cells are executed in. ``nearest_neighbor`` is a
-#: matmul; ``logistic`` and ``xgboost`` fit one decision function per author, so their cost grows
-#: with the author count (xgboost measured ~0.097 s per author per 20 boosting rounds).
-ATTACKS = ("nearest_neighbor", "logistic", "xgboost")
+#: matmul; the rest fit one decision function per author, so their cost grows with the author
+#: count (xgboost measured ~0.097 s per author per 20 boosting rounds). ``logistic_sgd`` fits the
+#: same model as ``logistic`` but minibatched on a GPU, which is why it sits below it here despite
+#: being the only one of the three that runs at WildChat's 19,711 authors: the whole
+#: six-configuration StyloMetrix grid is 20 minutes on one A16.
+ATTACKS = ("nearest_neighbor", "logistic_sgd", "logistic", "xgboost")
 
 #: Per-source attack restrictions -- a source absent here gets all of :data:`ATTACKS`.
 #:
-#: WildChat is nearest-neighbour only. It has 19,711 known authors at the largest configuration
-#: and both discriminative attacks are linear in that: xgboost would be ~8 h for a *single* fit
-#: at the default 300 estimators, and one-vs-all logistic over ~20,000 classes is in the same
-#: territory. These are excluded by design, not pending -- do not add them back without a
-#: measurement showing the fit is affordable.
-SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor",)}
+#: WildChat gets ``nearest_neighbor`` and ``logistic_sgd``, and nothing else. It has 19,711 known
+#: authors at the largest configuration and the two excluded attacks are linear in that: xgboost
+#: would be ~8 h for a *single* fit at the default 300 estimators, and sklearn's multinomial
+#: ``logistic`` is worse than slow -- its per-iteration logit matrix is 129,382 x 19,711 in
+#: float64, 20.4 GB against a 16 GB cap, so it cannot run at all. Measured scaling, wildchat
+#: StyloMetrix with the pool subsampled: 26 s at 250 authors, 34 s at 500, 64 s at 1,000, 158 s at
+#: 2,000. Do not add either back without a measurement showing the fit is affordable.
+#:
+#: ``logistic_sgd`` is that same ``logistic`` model fitted so that it does run there, and it is
+#: not an optional extra: it roughly **doubles** WildChat's StyloMetrix top-1 over
+#: ``nearest_neighbor`` (0.0655 -> 0.1387 at ``known0075``, 1.7-2.1x on every configuration), so a
+#: grid without it reports a corpus limit where there was only a solver limit.
+SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "logistic_sgd")}
 
 #: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
 #: ``DEFAULT_KNOWN_WINDOWS``. Used only to decide whether a directory is complete; this script
@@ -190,10 +200,12 @@ KNOWN_CONFIGS = ("known0025", "known2550", "known5075", "known0050", "known2575"
 # lets another cluster be adopted by editing one TOML -- the rule is a property of the experiment
 # and travels with it, the flags are not.
 
-#: Attacks worth allocating a GPU for. Only xgboost has a device to use (measured 17x: 22.1 s CPU
-#: against 1.29 s on one A100 at 1,000 documents x 3,072 features over 81 authors). Every other
-#: attack here is BLAS on the CPU and would leave a card idle for the whole job.
-GPU_ATTACKS = ("xgboost",)
+#: Attacks worth allocating a GPU for. ``xgboost`` measured 17x (22.1 s CPU against 1.29 s on one
+#: A100 at 1,000 documents x 3,072 features over 81 authors); ``logistic_sgd`` is ~2 TFLOP per
+#: pass of pure matmul and is the one attack here that is *only* practical on a device -- its
+#: WildChat StyloMetrix grid is 20 minutes on one A16 against a projected ~9 h on eight CPU cores.
+#: Every other attack is BLAS on the CPU and would leave a card idle for the whole job.
+GPU_ATTACKS = ("xgboost", "logistic_sgd")
 
 #: Sources whose score matrix does not fit a default allocation. WildChat's is 86,255 x 13,694
 #: float32 = 4.72 GB at ``known0050`` alone; runs have been OOM-killed at 16 GB.
@@ -257,12 +269,20 @@ def build_grid() -> list[Cell]:
 def resource_profile(cell: Cell) -> str:
     """The ``scripts/slurm.toml`` profile this cell should be submitted under.
 
-    Deliberately coarse -- three classes, not a per-cell resource table. A cell that genuinely
-    needs something its class does not give it belongs in the TOML's ``[overrides.<tag>]``, which
-    keeps the exception next to the numbers it is an exception to.
+    Deliberately coarse -- four classes over two independent axes, not a per-cell resource table.
+    A cell that genuinely needs something its class does not give it belongs in the TOML's
+    ``[overrides.<tag>]``, which keeps the exception next to the numbers it is an exception to.
+
+    The two axes are orthogonal and both matter, which is why there are four and not three.
+    Needing a *device* is a property of the attack; needing *host memory and wall time* is a
+    property of the corpus, because what is large is the ``[n_unknown x n_authors]`` score matrix
+    and that lives on the host whatever fitted it. ``wildchat`` + ``logistic_sgd`` needs both at
+    once, and folding it into plain ``gpu`` -- sized for xgboost on swe-chat at 24 GB and a
+    four-hour ``short`` QOS -- would hand a 3.4 GB score matrix and a multi-hour Gemini fit an
+    allocation that fits neither.
     """
     if cell.attack in GPU_ATTACKS:
-        return "gpu"
+        return "gpu_large" if cell.source in LARGE_MEMORY_SOURCES else "gpu"
     if cell.source in LARGE_MEMORY_SOURCES:
         return "cpu_large"
     return "cpu"

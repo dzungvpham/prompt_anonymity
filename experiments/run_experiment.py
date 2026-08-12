@@ -114,6 +114,30 @@ metric undefined for them).
 oversight: the filter does not change what is fitted, so the model a language-aware run scores
 with is exactly the model the search was selecting.
 
+A trained out-of-set class (``--background``, off by default)
+-------------------------------------------------------------
+The reject option below reads "is this a stranger?" *off* a score matrix that was never asked the
+question: a closed-set softmax has to assign its probability mass to some enrolled author, so a
+stranger's document lands on whichever one it is least unlike, and how confident that looks is
+only loosely related to whether the author was enrolled. ``--background <split>`` instead trains
+the question in, adding one class fitted on documents sampled from another split
+(:func:`load_background`) -- ShareChat, which publishes no author at all and is therefore useless
+as a labelled side and exactly right as a pool nobody in the known side wrote.
+
+The extra class is split back off before anything reads the score matrix
+(:func:`split_background`), so every closed-set table is computed on a matrix of the same shape
+and meaning a base run produces. What is new is one column in ``predictions_*.csv``,
+``out_of_set_logit`` -- the model's own log-odds that a document belongs to none of the enrolled
+authors -- next to the ``accept_score`` every run already writes. ``rolling_results.csv`` carries
+``background_auroc`` and ``margin_auroc`` (plus ``*_dir_at_far*``) so the two are read against
+each other on the same documents; ``margin_*`` is recorded on **every** run, with or without a
+background pool, because a base run is what a background run has to be compared to.
+
+Only the multiclass attacks fit a class per label, so ``--background`` is rejected for the
+similarity family rather than silently ignored. On WildChat that means ``logistic_sgd``: see
+:class:`~prompt_anonymity.attacks.multiclass.MinibatchLogisticAttribution` for why the plain
+``logistic`` cannot be fitted at 19,711 authors at all.
+
 The reject option (``--ood reject``, off by default)
 ----------------------------------------------------
 Raw scores are not comparable across documents -- a short, generic document scores low against
@@ -248,12 +272,13 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 from scipy.spatial.distance import cdist
+from scipy.special import logsumexp
 from scipy.stats import loguniform
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401  (unlocks the import below)
 from sklearn.model_selection import HalvingRandomSearchCV
 
-from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, rejection_score
+from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, MULTICLASS_ATTACKS, rejection_score
 from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
 from prompt_anonymity.evaluation.metrics import (
@@ -306,6 +331,18 @@ SOURCES = ("wildchat", "swe_chat")
 # The extra class: "this document's author is not among the known authors". Not a valid
 # author_id (those are ``<source>-<16 hex>``), so it can never collide with a real one.
 OOD_LABEL = "<OOD>"
+
+#: The label ``--background`` documents are trained under. Like :data:`OOD_LABEL` this is not a
+#: valid ``author_id``, and for the same reason -- it becomes a class the attack fits, so it has
+#: to be impossible for a real author to collide with. The two are distinct because they live at
+#: different stages: this one is an input to the fit, ``OOD_LABEL`` is an output of the decision.
+BACKGROUND_LABEL = "<BACKGROUND>"
+
+#: Splits usable as a ``--background`` pool. ``sharechat`` is the one built for it: publicly
+#: shared conversation links with no author at all, which is what makes it useless as a labelled
+#: side and exactly right as a pool of documents nobody in the known side wrote. Note it is a
+#: *different corpus* from either attack target -- see :func:`load_background` for what that costs.
+BACKGROUND_SOURCES = ("sharechat",)
 
 # False-alarm rates at which the detection-and-identification rate is reported. DIR@FAR is the
 # standard open-set identification summary: of the in-set documents, the fraction both accepted
@@ -471,6 +508,55 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
                                        merged.pop(FEATURE_ROW).to_numpy())
 
 
+def load_background(data_dir, source: str, feature: str, size: int,
+                    seed: int) -> np.ndarray:
+    """Feature vectors for a ``--background`` pool: documents the attack learns to *reject*.
+
+    A closed-set softmax has to put its probability mass somewhere, so a document by a stranger is
+    assigned to whichever enrolled author happens to be least unlike it, and how confident that
+    assignment looks carries little information about whether the author was enrolled at all.
+    Training an extra class on documents nobody in the known side wrote gives the model somewhere
+    to put that mass, and turns "is this one of mine?" into a question the model answers directly
+    rather than one read off the shape of its scores afterwards.
+
+    **This is an attacker-side capability, not a leak.** The pool is a different corpus, drawn
+    without reference to the split under attack, and no unknown document or label is touched: an
+    attacker holding a public dump of chat logs has exactly this.
+
+    **The cost is that the pool is a different corpus, and it is measurable.** A logistic
+    classifier separates 10,000 ShareChat documents from 10,000 WildChat ones at held-out AUROC
+    **0.820** on StyloMetrix (against 0.532 for a WildChat-vs-WildChat control), driven mostly by
+    two verb-tense features -- ``VT_MUST_PROGRESSIVE`` and ``VT_FUTURE_PERFECT`` sit +1.79 and
+    +1.54 WildChat sigma apart. So some of this class's capacity goes on telling the corpora
+    apart rather than on telling strangers from enrolled users.
+
+    That confound can only *shrink* the measured effect, which is why the experiment is still
+    readable: the out-of-set documents at test time are WildChat users who happen not to be
+    enrolled, i.e. the same corpus as the in-set ones, so a class that had learned nothing but
+    "is this ShareChat" would score them all alike and change no detection number. A gain here is
+    therefore a real transfer; a null result is ambiguous between "no transfer" and "the corpus
+    gap ate it", and the way to tell those apart is an in-corpus background pool built by holding
+    known authors out of the enrolled set.
+
+    ``size`` documents are drawn without replacement under ``seed``, spread over the whole split
+    rather than taken from its head, and the row order is sorted so the parquet is read forwards.
+    """
+    path = Path(data_dir) / f"{source}_{feature}.parquet"
+    if not path.exists():
+        raise SystemExit(f"{path} not found -- build the background pool's vectors first with\n"
+                         f"  python -m prompt_anonymity.data.compute_features --source {source} "
+                         f"--feature {feature}")
+    handle = pq.ParquetFile(path)
+    available = handle.metadata.num_rows
+    if size > available:
+        raise SystemExit(f"--background-size {size:,} exceeds the {available:,} documents in "
+                         f"{path.name}.")
+    columns = [column for column in handle.schema_arrow.names
+               if column not in ("doc_id", "author_id")]
+    rows = np.sort(np.random.default_rng(seed).choice(available, size=size, replace=False))
+    return read_feature_matrix(handle, columns, rows)
+
+
 #: The default known configurations: every quartile-aligned interval that does not touch the
 #: held-out test quarter. Ordered by size then start, so a run's output reads smallest-attacker
 #: first. See the module docstring for why these six and not others -- they are the complete set,
@@ -597,8 +683,8 @@ def gap_weeks(frame: pd.DataFrame, config: KnownConfig, known: slice) -> float:
     return float((stamps.iloc[1] - stamps.iloc[0]).total_seconds() / (7 * 24 * 3600))
 
 
-def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Z-score both sides using **known-side** statistics only.
+def standardize(known: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Z-score the known side and every other block using **known-side** statistics only.
 
     StyloMetrix mixes ratios in [0, 1] with occasional raw counts, so without scaling a handful
     of wide-range columns dominate any distance. Fitting the mean/scale on the known side alone
@@ -609,11 +695,17 @@ def standardize(known: np.ndarray, unknown: np.ndarray) -> tuple[np.ndarray, np.
     exactly the arithmetic a float64 z-score followed by the attacks' float32 cast performed, so
     the numbers are unchanged, at half the memory. The z-score itself runs in row chunks so the
     float64 temporary is bounded rather than a second copy of the whole side.
+
+    ``others`` is normally just the unknown side. ``--background`` adds a second block -- the
+    out-of-set pool the attack trains against -- and it is deliberately scaled by the *known
+    side's* statistics rather than by its own or by the union's: the geometry the authors live in
+    then does not move when a background pool is switched on, so a background run and a base run
+    differ in what the attack was told and in nothing else.
     """
     center = known.mean(axis=0, dtype=np.float64)
     scale = known.std(axis=0, dtype=np.float64)
     scale = np.where(scale > 0, scale, 1.0)
-    return _zscore(known, center, scale), _zscore(unknown, center, scale)
+    return tuple(_zscore(block, center, scale) for block in (known, *others))
 
 
 #: Rows z-scored per pass. Sizes only the float64 temporary (8,192 x n_features), not the output.
@@ -793,7 +885,9 @@ def build_attack(name: str, args: argparse.Namespace, overrides: dict | None = N
     """
     attack = ATTRIBUTION_ATTACKS[name]
     settings = execution_settings(name, args)
-    if name == "logistic":
+    if name in ("logistic", "logistic_sgd"):
+        # Both spellings of the same model take the same two flags, so that switching between the
+        # exact and the minibatch fit changes how it is fitted and nothing about what is fitted.
         settings |= {"C": args.regularization,
                      "class_weight": "balanced" if args.balanced else None}
     elif name in ("wccn", "plda"):
@@ -822,6 +916,15 @@ HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
     # iterations to converge and a single fit dominates the whole search, while every window that
     # has been searched picked a C below 1. Widen it only alongside a higher max_iter.
     "logistic": {"C": loguniform(0.02, 5.0), "class_weight": [None, "balanced"]},
+    # Same two knobs as `logistic`, over a range that reaches two decades lower. The floor is not
+    # copied from there because the shape of the problem is not the same: at 19,711 authors over
+    # 196 features the model carries 3.9M parameters against 129,382 documents, where swe-chat's
+    # 124 authors carry 24k against 2,992 -- and even at that easier ratio the search picks
+    # C = 0.11 in four of six configurations and never picks the C = 1.0 default. `steps` and
+    # `learning_rate` are deliberately absent: the first is a compute budget rather than a
+    # hyper-parameter, and the second measured insensitive over 0.02-0.1 (same top-1, same final
+    # loss to four decimals), so sampling it would spend the budget learning nothing.
+    "logistic_sgd": {"C": loguniform(0.002, 5.0), "class_weight": [None, "balanced"]},
     "svm": [
         {"kernel": ["linear"], "C": loguniform(0.1, 30.0)},
         {"kernel": ["rbf"], "C": loguniform(1.0, 300.0), "gamma": ["scale"]},
@@ -1441,9 +1544,50 @@ def identity_level_scores(headline: pd.DataFrame) -> dict:
 
 # --- driver -----------------------------------------------------------------
 
+def split_background(scores: np.ndarray, authors: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Separate the ``--background`` class's column from the real authors' columns.
+
+    Returns ``(author_scores, authors, out_of_set_logit)``. Everything downstream then sees an
+    ``[n_documents x n_real_authors]`` matrix with the same meaning it has on a base run, so the
+    closed-set tables, the CMC curve and the language filter need no knowledge that a background
+    class existed. Only the third return value is new.
+
+    ``out_of_set_logit`` is ``background - logsumexp(authors)``: the model's own log-odds that
+    this document belongs to none of the enrolled authors, which is the point of training the
+    class at all. It is a **calibrated posterior quantity**, not a margin -- unlike
+    :func:`~prompt_anonymity.attacks.rejection_score`, which has to infer "out of set" from how
+    peaked the author scores happen to be, and which is kept alongside it so the two can be read
+    against each other on the same run.
+
+    Both reductions run in row blocks against the same budget as everything else here:
+    ``logsumexp`` over a 43,127 x 19,711 matrix is another float64 copy of it if taken in one go.
+
+    **The author block is a slice, not a fancy index**, which is why the background column's
+    position is asserted rather than assumed. Dropping one column of a 3.4 GB matrix with a
+    boolean mask copies all of it, and the copy would be live alongside the original -- 6.8 GB at
+    ``known0075``, on a run whose measured peak is already 14.6 GB against a 16 GB cap.
+    :data:`BACKGROUND_LABEL` begins with ``<``, and every real ``author_id`` with a source name,
+    so ``np.unique`` always sorts it to the front and the real authors are a contiguous tail.
+    """
+    column = int(np.flatnonzero(authors == BACKGROUND_LABEL)[0])
+    if column != 0:
+        raise AssertionError(
+            f"{BACKGROUND_LABEL} sorted to column {column} of {len(authors)}, not the front; "
+            "the author block is taken as a slice on the assumption that it is contiguous.")
+    background = scores[:, column].astype(np.float64)
+    author_scores = scores[:, 1:]
+    evidence = np.empty(len(scores))
+    block_rows = max(1, 2 ** 28 // max(author_scores.shape[1] * 8, 1))
+    for start in range(0, len(author_scores), block_rows):
+        rows = slice(start, start + block_rows)
+        evidence[rows] = logsumexp(author_scores[rows].astype(np.float64), axis=1)
+    return author_scores, authors[1:], background - evidence
+
+
 def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
-               tuning_cache: dict, languages: np.ndarray | None = None):
+               tuning_cache: dict, languages: np.ndarray | None = None,
+               background: np.ndarray | None = None):
     """Run one (known configuration, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
@@ -1455,6 +1599,15 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
 
     ``tuning_cache`` is passed through to :func:`tuned_settings`; see there for why sharing a
     search between attacks of the same known configuration is sound.
+
+    ``background`` (``--background``, off by default) is a block of feature vectors for documents
+    nobody wrote -- see :func:`load_background`. They are appended to the known side under
+    :data:`BACKGROUND_LABEL` so the attack fits one extra class, and that class's column is split
+    back off (:func:`split_background`) before anything reads the score matrix. Everything the
+    run reports about *identification* is therefore computed on a matrix of exactly the same shape
+    and meaning as a base run's; what is new is one extra per-document column,
+    ``out_of_set_logit``. Only attacks that fit a class per label can use this, which is why
+    :func:`parse_args` rejects it for the similarity family rather than silently ignoring it.
 
     ``languages`` (``--language-aware``, off by default) turns on the candidate filter: the
     attack is still fitted **once** on the whole known side, and the filter then marks the
@@ -1468,7 +1621,10 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
     known_embeddings, unknown_embeddings = embeddings[known], embeddings[unknown]
     if args.standardize:
-        known_embeddings, unknown_embeddings = standardize(known_embeddings, unknown_embeddings)
+        blocks = standardize(known_embeddings, unknown_embeddings,
+                             *([] if background is None else [background]))
+        known_embeddings, unknown_embeddings = blocks[0], blocks[1]
+        background = blocks[2] if background is not None else None
     known_labels = known_frame["author_id"].to_numpy()
     unknown_labels = unknown_frame["author_id"].to_numpy()
     known_authors = np.unique(known_labels)
@@ -1491,8 +1647,23 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # Fit the attack on the known side (documents + labels, all of which the attacker holds) and
     # score every unknown document against every known author.
     factory = build_attack(attack, args, settings)
-    fitted = factory().fit(known_embeddings, known_labels)
-    author_scores = fitted.score(unknown_embeddings)          # (n_unknown, n_known_authors)
+    if background is None:
+        fitted = factory().fit(known_embeddings, known_labels)
+        author_scores = fitted.score(unknown_embeddings)      # (n_unknown, n_known_authors)
+        authors, out_of_set_logit = fitted.authors, None
+    else:
+        # One extra class, fitted on documents no known author wrote. The concatenation is the
+        # only place the two blocks are held together; it is released as soon as the fit returns,
+        # because at WildChat's scale the known side is already 100 MB and the score matrix that
+        # follows is measured in gigabytes.
+        fitted = factory().fit(
+            np.vstack([known_embeddings, background]),
+            np.concatenate([known_labels, np.full(len(background), BACKGROUND_LABEL)]),
+        )
+        # From here on `authors` is the real authors alone, so every table below is the shape a
+        # base run produces. `fitted.authors` still carries the background class and is not read.
+        author_scores, authors, out_of_set_logit = split_background(
+            fitted.score(unknown_embeddings), fitted.authors)
 
     # Narrow each document's candidate pool to the authors who write its language(s), before
     # anything reads the matrix: the argmax, the ranking and the cohort-normalised rejection
@@ -1501,16 +1672,16 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     if languages is not None:
         known_languages, unknown_languages = languages[known], languages[unknown]
         candidate_counts, true_author_is_candidate, language_stats = apply_language_filter(
-            author_scores, fitted.authors, unknown_languages, known_languages, known_labels,
+            author_scores, authors, unknown_languages, known_languages, known_labels,
             true_labels=unknown_labels,
         )
     else:
-        candidate_counts = np.full(len(unknown_labels), len(fitted.authors), dtype=int)
+        candidate_counts = np.full(len(unknown_labels), len(authors), dtype=int)
         true_author_is_candidate = in_set.copy()
         language_stats = {"n_language_groups": 1, "n_language_fallback": 0}
 
     best = author_scores.argmax(axis=1)
-    predicted_author = fitted.authors[best]
+    predicted_author = authors[best]
     normalize = not args.ood_raw_distance
     accept_score = rejection_score(author_scores, normalize)  # higher = more out-of-set
 
@@ -1533,7 +1704,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
         pruned = ~true_author_is_candidate[in_set]      # unattributable: below every candidate
         document_ranks[in_set] = np.where(
             pruned, np.asarray(candidate_counts)[in_set] + 1,
-            true_author_ranks(in_set_scores, fitted.authors, in_set_labels))
+            true_author_ranks(in_set_scores, authors, in_set_labels))
 
     scores = {
         "known_config": config.tag,
@@ -1599,6 +1770,28 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
             languages=["|".join(sorted(document_languages)) for document_languages in unknown_languages],
             true_author_is_candidate=true_author_is_candidate,
         )
+    # How well each available statistic tells an out-of-set document from an in-set one, recorded
+    # on **every** run rather than only under `--ood reject`. The reject option chooses an
+    # operating point; these are threshold-free and are what a base run has to be compared against
+    # for `--background` to be readable at all. `margin_*` is the cohort-normalised margin every
+    # run already computes -- the same statistic `ood_auroc` reports, under a name that says which
+    # of the two it is.
+    correctly_ranked = predicted_author == unknown_labels
+    scores["margin_auroc"] = detection_auroc(accept_score, ~in_set)
+    for far in DIR_FAR_POINTS:
+        scores[f"margin_dir_at_far{int(far * 100)}"] = detection_identification_rate(
+            accept_score, correctly_ranked, ~in_set, far)
+    if out_of_set_logit is not None:
+        # The background class's own verdict, kept beside `accept_score` rather than replacing it:
+        # the two are different statistics over the same documents (a trained posterior against a
+        # cohort-normalised margin) and the point of the run is which one detects a stranger
+        # better. Both run the same way round -- higher means more out-of-set.
+        predictions = predictions.assign(out_of_set_logit=out_of_set_logit)
+        scores["background_size"] = len(background)
+        scores["background_auroc"] = detection_auroc(out_of_set_logit, ~in_set)
+        for far in DIR_FAR_POINTS:
+            scores[f"background_dir_at_far{int(far * 100)}"] = detection_identification_rate(
+                out_of_set_logit, correctly_ranked, ~in_set, far)
     ood_sweep = None
 
     if args.ood != "none":
@@ -1642,11 +1835,11 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     in_set_counts = candidate_counts[in_set]
     # `closed_set_table` wants distances, so the scores are negated -- in a temporary that is
     # dropped as soon as it returns, rather than by keeping a second signed copy alive.
-    headline = closed_set_table(-in_set_scores, fitted.authors, in_set_labels,
+    headline = closed_set_table(-in_set_scores, authors, in_set_labels,
                                 in_set_counts, args)
     scores.update(identity_level_scores(headline))
 
-    cmc, author_report = closed_set_detail(in_set_scores, fitted.authors, in_set_labels,
+    cmc, author_report = closed_set_detail(in_set_scores, authors, in_set_labels,
                                            in_set_counts, document_ranks[in_set],
                                            args, scores)
 
@@ -1810,6 +2003,26 @@ def parse_args() -> argparse.Namespace:
                              "each of them (default: logistic, the best measured on swe-chat -- "
                              "see that module for the comparison). 'cosine' is the unsupervised "
                              "centroid baseline and 'nearest_neighbor' the original attack.")
+    parser.add_argument("--background", default="none",
+                        choices=["none", *sorted(BACKGROUND_SOURCES)],
+                        help="Train an extra 'none of these authors' class on documents sampled "
+                             "from another split (default: none). The pool is drawn without "
+                             "reference to the split under attack and no unknown document or "
+                             "label is read, so this is an attacker-side capability rather than a "
+                             "leak -- see load_background. It gives the softmax somewhere to put "
+                             "the probability mass a stranger's document would otherwise be "
+                             "forced onto the least-unlike enrolled author, and adds an "
+                             "out_of_set_logit column to predictions_*.csv beside the existing "
+                             "cohort-normalised accept_score. Only the multiclass attacks fit a "
+                             "class per label, so this is rejected for the similarity family.")
+    parser.add_argument("--background-size", type=int, default=20000,
+                        help="Documents drawn from the --background pool (default: 20,000, ~13%% "
+                             "of WildChat's largest known side). This is the dial for how heavily "
+                             "the extra class counts, but only while --balanced is off (the "
+                             "default): the raw document count is then its prior. Under "
+                             "--balanced every class carries equal total weight, so the "
+                             "background pool counts for as much as one single-document author "
+                             "however large it is, and the size stops mattering.")
     parser.add_argument("--regularization", type=float, default=1.0,
                         help="Inverse regularisation strength C for the logistic attack (default: 1).")
     parser.add_argument("--balanced", action="store_true",
@@ -1909,6 +2122,16 @@ def parse_args() -> argparse.Namespace:
     if args.sweep_top_k not in args.top_ks:
         raise SystemExit(f"--sweep-top-k {args.sweep_top_k} is not among --top-ks {args.top_ks}; "
                          "it can only summarise a k that was measured.")
+    # A background class is a *class*, so only an attack that fits one per label can be handed it.
+    # The similarity family summarises each author instead -- a centroid over the background pool
+    # would be a meaningless average of unrelated documents, and nearest-neighbour would just
+    # return whichever background document happened to be closest. Rejected rather than ignored,
+    # so a run cannot report itself as using a background pool that did nothing.
+    unusable = sorted(set(args.attacks) - set(MULTICLASS_ATTACKS))
+    if args.background != "none" and unusable:
+        raise SystemExit(f"--background {args.background} needs an attack that fits a class per "
+                         f"label; {', '.join(unusable)} do not. Available: "
+                         f"{', '.join(sorted(MULTICLASS_ATTACKS))}.")
     return args
 
 
@@ -1941,6 +2164,11 @@ def output_tag(args: argparse.Namespace) -> str:
     owner = "" if args.model_owner.lower() == "all" else f"_{args.model_owner.lower()}"
     language = "" if args.language.lower() == "all" else f"_{args.language.lower()}"
     language_aware = "_langaware" if args.language_aware else ""
+    # A background class changes what the attack was trained on, so a background run is not a
+    # point on a base run's curve and must not overwrite one. The size rides in the name too: it
+    # is the one setting that changes how heavily the extra class is weighted.
+    background = ("" if args.background == "none"
+                  else f"_bg-{args.background}{args.background_size // 1000}k")
     openset = "" if args.ood == "none" else f"_openset_{args.ood_calibration}"
     fractions = ("" if tuple(args.known_windows) == DEFAULT_KNOWN_WINDOWS
                  else "_k" + "-".join(args.known_windows))
@@ -1951,7 +2179,8 @@ def output_tag(args: argparse.Namespace) -> str:
     defense = NO_DEFENSE_TAG if args.defense == "none" else args.defense
     attacks = "-".join(args.attacks)
     return (f"{args.source}_{defense}_{args.feature}_{attacks}"
-            f"{owner}{language}{language_aware}{fractions}{held_out}{openset}{metric}{scaled}")
+            f"{owner}{language}{language_aware}{background}{fractions}{held_out}{openset}"
+            f"{metric}{scaled}")
 
 
 def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFrame,
@@ -2058,6 +2287,16 @@ def main() -> None:
     # The language sets are a property of the corpus, not of a window, so they are built once and
     # sliced per window -- rebuilding a frozenset per document inside every window would repeat
     # the same work up to eight times over.
+    # Loaded once for the whole run, not per configuration: the pool is a fixed draw from another
+    # split, so re-sampling it per known side would make the configurations differ in their
+    # background as well as in their known interval.
+    background = None
+    if args.background != "none":
+        background = load_background(args.data_dir, args.background, args.feature,
+                                     args.background_size, args.seed)
+        print(f"background: {len(background):,} documents from {args.background} as a trained "
+              f"'none of these authors' class (seed {args.seed})")
+
     languages = None
     if args.language_aware:
         languages = document_language_sets(frame)
@@ -2091,7 +2330,7 @@ def main() -> None:
     for config, known, unknown in configurations:
         for attack in args.attacks:
             outcome = run_window(frame, embeddings, config, attack, known, unknown,
-                                 args, tuning_cache, languages)
+                                 args, tuning_cache, languages, background)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             cmcs.append(cmc)

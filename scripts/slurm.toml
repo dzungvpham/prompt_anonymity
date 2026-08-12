@@ -72,8 +72,15 @@ sbatch = [
     "--time=0-04:00:00",
 ]
 
-# xgboost only. Measured 17x on the shape these cells have -- 1,000 documents x 3,072 features
-# over 81 authors, 22.1 s CPU against 1.29 s on one A100.
+# swe-chat on a GPU attack: xgboost (measured 17x on the shape these cells have -- 1,000 documents
+# x 3,072 features over 81 authors, 22.1 s CPU against 1.29 s on one A100) and logistic_sgd.
+#
+# NO `--qos=short`, and that is load-bearing rather than tidying. On Unity `short` carries
+# `MaxSubmitJobsPerUser = 1`, so with it this profile could hold exactly ONE queued cell at a time
+# and a batch of six failed five submissions with `QOSMaxSubmitJobPerUserLimit`. A launcher whose
+# entire job is submitting a grid cannot use a QOS that permits one job. `normal` has no such cap;
+# the cost is losing short's scheduling priority, which is the right trade here. Keep the walltime
+# under four hours anyway -- these cells are minutes, and a small ask schedules sooner.
 [profiles.gpu]
 sbatch = [
     "--partition=gpu-preempt",
@@ -81,8 +88,30 @@ sbatch = [
     "--constraint=a100|l40s|h100|h200",
     "--cpus-per-task=8",
     "--mem=24g",
-    "--qos=short",
     "--time=0-03:59:59",
+]
+
+# WildChat on a GPU attack, i.e. `logistic_sgd` -- both axes at once, so neither `gpu` nor
+# `cpu_large` fits. What is large here is *host* memory, not device: the fit is comfortable in a
+# corner of any card (the weight matrix is 15 MB at 19,711 authors on StyloMetrix, 242 MB on
+# Gemini, and the minibatched logits 646 MB), while the score matrix it produces is 3.4 GB and
+# lives in RAM alongside its in-set slice. Measured 15.8 GB peak for the StyloMetrix grid; Gemini
+# adds ~2 GB of feature matrix on top, hence the headroom.
+#
+# NOT `gpu-preempt`, unlike every other profile here, and not on the `short` QOS. A Gemini cell is
+# 15.6x the FLOPs of a StyloMetrix one (3,072-d against 197-d) and runs for hours, where a
+# preemption costs the whole cell -- `run_experiment.py` has no resume, and it clears its own
+# predictions_*.csv on the way in. Queue latency is the price for that, and it is the right trade
+# at this length. The constraint is by compute capability rather than by card name so an A16 or
+# an L4 counts: TF32 needs sm_80+, and the StyloMetrix grid measured 20 minutes on an A16.
+[profiles.gpu_large]
+sbatch = [
+    "--partition=gpu",
+    "--gpus=1",
+    "--constraint=sm_80|sm_86|sm_89|sm_90",
+    "--cpus-per-task=8",
+    "--mem=96g",
+    "--time=0-16:00:00",
 ]
 
 # --- per-cell exceptions (optional) ------------------------------------------
