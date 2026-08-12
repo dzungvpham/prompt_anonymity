@@ -141,6 +141,8 @@ draw shared by every configuration and run of a dataset. Every figure is written
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import multiprocessing
 import os
 from collections import defaultdict
@@ -448,10 +450,15 @@ def resolve_slots(slots: list[int], dashes: list[tuple] | None = None) -> list[i
     return slots if len(set(styles)) == len(styles) else list(range(len(slots)))
 
 
-def style_axes(axes, xlabel: str, ylabel: str, title: str, subtitle: str = "") -> None:
+def style_axes(axes, xlabel: str, ylabel: str, title: str) -> None:
     """Apply the shared chart chrome: recessive solid grid, no box, text in text colours.
 
     Every figure in this file goes through here, which is what makes them look like one set.
+
+    **There is no subtitle any more** (removed 2026-08-12, on request): the explanatory sentence
+    that used to sit under a title is caption text, and it belongs in the document that publishes
+    the figure rather than burned into the image. The sentences themselves are kept -- see
+    :data:`CURVE_TYPES`' fifth field.
     """
     axes.set_facecolor(SURFACE)
     axes.grid(True, which="both", color=GRID, linewidth=0.7, linestyle="-")
@@ -464,15 +471,9 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str, subtitle: str = "") -
     axes.tick_params(colors=TEXT_SECONDARY, labelsize=9, length=3, width=0.8)
     axes.set_xlabel(xlabel, color=TEXT_SECONDARY, fontsize=10)
     axes.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=10)
-    # Title and subtitle are set as two left-aligned lines rather than one centred block: the
-    # subtitle carries the caveats (how many windows, how far the k axis is trusted) and should
-    # read as a sentence under the title, not compete with it.
+    # Left-aligned rather than centred, matching `figure_heading`.
     axes.set_title(title, color=TEXT_PRIMARY, fontsize=11.5, fontweight="bold",
-                   loc="left", pad=22 if subtitle else 10)
-    if subtitle:
-        axes.annotate(subtitle, xy=(0, 1), xytext=(0, 8), xycoords="axes fraction",
-                      textcoords="offset points", color=TEXT_SECONDARY, fontsize=9,
-                      va="bottom", ha="left")
+                   loc="left", pad=10)
 
 
 def add_legend(axes, **options):
@@ -2310,7 +2311,7 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str) -> None:
             style_axes(axes,
                        xlabel if row == rows[-1] else "",
                        f"known side = {size:.0%}\n{ylabel}" if column == 0 else "",
-                       header if row == rows[0] and row == 0 else "", "")
+                       header if row == rows[0] and row == 0 else "")
             if row == rows[-1]:
                 # `sharex` hides the tick labels on every row but the grid's last one, and the
                 # triangle's outer edge is not its last row. Without this the lowest panel of the
@@ -2333,20 +2334,23 @@ def panel_note(axes, text: str) -> None:
                   va="top", ha="left", zorder=5)
 
 
-def figure_heading(figure, title: str, subtitle: str) -> float:
-    """Place a figure-level title and its subtitle, and return the top of the drawing area.
+def figure_heading(figure, title: str) -> float:
+    """Place a figure-level title and return the top of the drawing area.
 
-    Two left-aligned lines rather than one centred block, matching :func:`style_axes`: the
-    subtitle carries the caveats and should read as a sentence under the title. The reserved band
-    scales with the figure's height in inches, so a short figure does not have its title written
-    across the axes and a tall one does not leave a stripe of empty surface.
+    Left-aligned rather than centred, matching :func:`style_axes`. The reserved band scales with
+    the figure's height in inches, so a short figure does not have its title written across the
+    axes and a tall one does not leave a stripe of empty surface.
+
+    **The subtitle under it was removed 2026-08-12, on request.** It was a sentence of caveats,
+    which is caption text: it belongs in whatever publishes the figure, not burned into the image
+    where it cannot be edited, translated or footnoted. The band it occupied is reclaimed by the
+    panels. The sentences are still written down -- :data:`CURVE_TYPES`' fifth field is now
+    documentation for exactly that purpose.
     """
     height = figure.get_size_inches()[1]
     figure.text(0.01, 1 - 0.30 / height, title, color=TEXT_PRIMARY, fontsize=12.5,
                 fontweight="bold", ha="left", va="top")
-    figure.text(0.01, 1 - 0.58 / height, subtitle, color=TEXT_SECONDARY, fontsize=9,
-                ha="left", va="top")
-    return 1 - 0.78 / height
+    return 1 - 0.56 / height
 
 
 def style_legend(legend) -> None:
@@ -2355,7 +2359,7 @@ def style_legend(legend) -> None:
     legend.get_title().set_fontsize(8.5)
 
 
-def finish_facets(figure, handles: dict, legend_title: str, title: str, subtitle: str,
+def finish_facets(figure, handles: dict, legend_title: str, title: str,
                   stem: Path, table: pd.DataFrame, legend_cell=None,
                   extra_legend: tuple[str, dict] | None = None) -> Path:
     """Shared chrome for every facet figure: its legend(s), one title, one companion CSV.
@@ -2391,7 +2395,7 @@ def finish_facets(figure, handles: dict, legend_title: str, title: str, subtitle
         bottom = (0.26 + 0.24 * rows) / figure.get_size_inches()[1]
     else:
         columns, bottom = 1, 0.0
-    figure.tight_layout(rect=(0, bottom, 1, figure_heading(figure, title, subtitle)))
+    figure.tight_layout(rect=(0, bottom, 1, figure_heading(figure, title)))
     shared = dict(ncol=columns, frameon=False, fontsize=8.5, labelcolor=TEXT_PRIMARY)
     if legend_cell is None:
         legend = figure.legend(list(handles.values()), list(handles), title=legend_title,
@@ -2433,8 +2437,8 @@ def draw_cmc_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
     supply the prior, and falls back to uniform ``1/N`` where it is not.
 
     Serves the identity-level panels too: the two levels differ in what was counted, not in how it
-    is drawn, and which one a panel shows is carried by the y label and subtitle its curve type
-    registers rather than by anything here.
+    is drawn, and which one a panel shows is carried by the y label its curve type registers
+    rather than by anything here.
     """
     shared_k = min(item.curve.max_k for item in series)
     rows = []
@@ -2691,7 +2695,7 @@ def draw_scaling_panel(axes, series: list[Series], handles: dict) -> pd.DataFram
 
     Serves both counting levels and both scopes. At the author level ``accuracy`` is the attained
     *lower* bound and the band spans the analytic bracket as well as the bootstrap, which the
-    curve type's subtitle says; on the cross-dataset figures the dash carries the corpus, so a
+    curve type's description says; on the cross-dataset figures the dash carries the corpus, so a
     hue deliberately shared by two lines is a channel rather than a collision -- which is why the
     dashes go to :func:`resolve_slots` too.
 
@@ -2821,12 +2825,17 @@ def draw_separation_panel(axes, series: list[Series], handles: dict) -> pd.DataF
     return curve.assign(auroc=separation.auroc)
 
 
-#: The curve types, each as (panel drawer, subdirectory, x label, y label, subtitle).
+#: The curve types, each as (panel drawer, subdirectory, x label, y label, description).
+#:
+#: **The description is no longer drawn.** It was the subtitle under each figure's title until
+#: 2026-08-12; that is caption text and belongs in whatever publishes the figure. It is kept here
+#: because it is the one place each family's caveats are written down in a sentence -- copy it
+#: into the caption rather than re-deriving it, and keep it current when a family changes.
 #:
 #: **The subdirectory carries the counting level**, so every family lands at
 #: ``<family>/<doc|author>/by_{defense,attack}/`` and a reader flips between two panels that
 #: differ in one thing only: whether the unit is a document or a person. That is the whole path
-#: scheme -- :func:`plot_defense_comparisons` appends ``by_defense/<feature>_<attack>`` to
+#: scheme -- :func:`plot_defense_comparison` appends ``by_defense/<feature>_<attack>`` to
 #: whatever is here and needs to know nothing about levels.
 #:
 #: All of these are drawn by both comparison families except ``separation``, which is per run (see
@@ -2858,9 +2867,9 @@ CURVE_TYPES = {
     "author_risk": (draw_author_risk_panel, "author_risk",
                     "Share of users, most exposed first (%)", "That user's own top-1 accuracy",
                     "A cliff means the risk sits with a few users, not with the average one"),
-    # The bars are explained in the subtitle rather than in the y label: the label is prefixed
-    # with the row's known-side size and stacked in a 3-inch column, so a parenthetical there
-    # runs over the panel above it.
+    # The bars are explained in the description rather than in the y label: the label is
+    # prefixed with the row's known-side size and stacked in a 3-inch column, so a parenthetical
+    # there runs over the panel above it.
     "ndocs_known": (draw_ndocs_panel, "accuracy_by_known_ndocs/doc",
                     "Documents the attacker holds for that author",
                     "Top-1 accuracy (per document)",
@@ -2928,7 +2937,7 @@ CURVE_TYPES = {
                           "document; grey dashes are a detector that knows nothing"),
     # The x label is kept short deliberately: a facet column is a third of the figure wide, and
     # the long form ran off the right-hand panel and past the left edge of the figure. What it
-    # used to say lives in the subtitle, which has the full width.
+    # used to say lives in the description, which is caption text and has no width limit.
     "separation": (draw_separation_panel, "openset/separation/doc",
                    "Rejection score (higher = more out-of-set)",
                    "Share of that cohort's documents",
@@ -2983,7 +2992,7 @@ def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: st
     ``extra_legend`` is a second legend block for figures whose lines carry two channels -- the
     cross-dataset scaling figures, where colour is the compared entity and dash is the corpus.
     """
-    draw, _, xlabel, ylabel, subtitle = CURVE_TYPES[kind]
+    draw, _, xlabel, ylabel, _description = CURVE_TYPES[kind]
     figure, grid, axes_for, legend_cell = config_axes_grid()
     handles: dict[str, object] = {}
     rows = []
@@ -2994,7 +3003,7 @@ def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: st
             continue
         rows.append(draw(axes, series, handles).assign(known_config=tag))
     label_facets(grid, axes_for, xlabel, ylabel)
-    return finish_facets(figure, handles, legend_title, title, subtitle, stem,
+    return finish_facets(figure, handles, legend_title, title, stem,
                          pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(),
                          legend_cell=legend_cell, extra_legend=extra_legend)
 
@@ -3004,60 +3013,76 @@ def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: st
 # Both families are "hold one axis fixed, draw a line per value of the other". They are written
 # once and parameterised by the curve type, so every curve type gets both views.
 
-def plot_defense_comparisons(dataset: str, runs: list[Run], curves: dict, kind: str,
-                             output_dir: Path) -> list[Path]:
-    """One figure per (feature, attack): every defense measured against that same attack.
+def method_groups(runs: list[Run]) -> list[tuple[tuple[str, str], list[Run]]]:
+    """Runs grouped by (feature, attack) -- one group per ``by_defense`` figure.
 
-    This is the figure that answers "does the defense work?" -- the attack is held fixed so the
-    only thing that moves between lines is what the defense did to the text.
+    Split out of the drawing so a figure can be *named*, and therefore checked against the cache,
+    before any curve is built. Groups come back in colour-slot order and each group's runs in
+    defense order, so the series order on a figure is a property of the vocabulary rather than of
+    which runs happened to be on disk.
     """
-    by_method: dict[tuple[str, str], list[Run]] = defaultdict(list)
+    groups: dict[tuple[str, str], list[Run]] = defaultdict(list)
     for run in runs:
-        if run in curves:
-            by_method[run.method].append(run)
-
-    written = []
-    for method, method_runs in sorted(by_method.items(), key=lambda item: METHOD_SLOTS[item[0]]):
-        method_runs.sort(key=lambda run: DEFENSE_SLOTS[run.defense])
-        panels: dict[str, list[Series]] = defaultdict(list)
-        for run in method_runs:
-            for tag, curve in curves[run].items():
-                panels[tag].append(Series(run.defense_label, DEFENSE_SLOTS[run.defense], curve))
-        feature, attack = method
-        written.append(plot_config_comparison(
-            kind, panels,
-            title=f"{DATASET_LABELS[dataset]}: defenses under "
-                  f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
-            legend_title="Defense",
-            stem=output_dir / CURVE_TYPES[kind][1] / "by_defense" / f"{feature}_{attack}"))
-    return written
+        groups[run.method].append(run)
+    return [(method, sorted(members, key=lambda run: DEFENSE_SLOTS[run.defense]))
+            for method, members in sorted(groups.items(), key=lambda item: METHOD_SLOTS[item[0]])]
 
 
-def plot_attack_comparisons(dataset: str, runs: list[Run], curves: dict, kind: str,
-                            output_dir: Path) -> list[Path]:
-    """One figure per defense: every (feature, attack) measured against that same defense.
+def defense_groups(runs: list[Run]) -> list[tuple[str, list[Run]]]:
+    """Runs grouped by defense -- one group per ``by_attack`` figure. :func:`method_groups`' twin."""
+    groups: dict[str, list[Run]] = defaultdict(list)
+    for run in runs:
+        groups[run.defense].append(run)
+    return [(defense, sorted(members, key=lambda run: METHOD_SLOTS[run.method]))
+            for defense, members in sorted(groups.items(),
+                                           key=lambda item: DEFENSE_SLOTS[item[0]])]
 
-    The transpose of :func:`plot_defense_comparisons` -- with the defense held fixed, it says
-    which representation and estimator the attacker should reach for.
+
+def plot_defense_comparison(dataset: str, method: tuple[str, str], runs: list[Run], curves: dict,
+                            kind: str, output_dir: Path) -> list[Path]:
+    """One figure: every defense measured against one (feature, attack).
+
+    The figure that answers "does the defense work?" -- the attack is held fixed, so the only
+    thing that moves between lines is what the defense did to the text.
+
+    Returns an empty list when no run in the group produced this curve family (an attack outside
+    :data:`POOL_INTERPOLABLE_ATTACKS` for ``scaling``, an English corpus for ``language``). That
+    is a real outcome rather than a failure, and the cache records it as one so the figure is not
+    re-planned every sweep.
     """
-    by_defense: dict[str, list[Run]] = defaultdict(list)
+    panels: dict[str, list[Series]] = defaultdict(list)
     for run in runs:
-        if run in curves:
-            by_defense[run.defense].append(run)
+        for tag, curve in curves.get(run, {}).items():
+            panels[tag].append(Series(run.defense_label, DEFENSE_SLOTS[run.defense], curve))
+    if not panels:
+        return []
+    feature, attack = method
+    return [plot_config_comparison(
+        kind, panels,
+        title=f"{DATASET_LABELS[dataset]}: defenses under "
+              f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
+        legend_title="Defense",
+        stem=output_dir / CURVE_TYPES[kind][1] / "by_defense" / f"{feature}_{attack}")]
 
-    written = []
-    for defense, defense_runs in sorted(by_defense.items(), key=lambda item: DEFENSE_SLOTS[item[0]]):
-        defense_runs.sort(key=lambda run: METHOD_SLOTS[run.method])
-        panels: dict[str, list[Series]] = defaultdict(list)
-        for run in defense_runs:
-            for tag, curve in curves[run].items():
-                panels[tag].append(Series(run.method_label, METHOD_SLOTS[run.method], curve))
-        written.append(plot_config_comparison(
-            kind, panels,
-            title=f"{DATASET_LABELS[dataset]}: attacks against {DEFENSE_LABELS[defense]}",
-            legend_title="Feature / attack",
-            stem=output_dir / CURVE_TYPES[kind][1] / "by_attack" / defense))
-    return written
+
+def plot_attack_comparison(dataset: str, defense: str, runs: list[Run], curves: dict, kind: str,
+                           output_dir: Path) -> list[Path]:
+    """One figure: every (feature, attack) measured against one defense.
+
+    The transpose of :func:`plot_defense_comparison` -- with the defense held fixed, it says which
+    representation and estimator the attacker should reach for.
+    """
+    panels: dict[str, list[Series]] = defaultdict(list)
+    for run in runs:
+        for tag, curve in curves.get(run, {}).items():
+            panels[tag].append(Series(run.method_label, METHOD_SLOTS[run.method], curve))
+    if not panels:
+        return []
+    return [plot_config_comparison(
+        kind, panels,
+        title=f"{DATASET_LABELS[dataset]}: attacks against {DEFENSE_LABELS[defense]}",
+        legend_title="Feature / attack",
+        stem=output_dir / CURVE_TYPES[kind][1] / "by_attack" / defense)]
 
 
 def plot_separation_figures(dataset: str, runs: list[Run], separation: dict, kind: str,
@@ -3172,9 +3197,7 @@ def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> l
                           for config in (parse_config_tag(tag) for tag in reach["known_config"])])
     axes.invert_yaxis()   # smallest, freshest known side at the top
     style_axes(axes, "Share of the shared test set the known side reaches", "",
-               f"{DATASET_LABELS[dataset]}: what a bigger known side buys is reach",
-               "Everything outside these bars was written by someone the attacker never saw, "
-               "and is excluded from every in-set figure")
+               f"{DATASET_LABELS[dataset]}: what a bigger known side buys is reach")
     axes.set_xlim(0, 1.15)   # headroom for the direct labels
     axes.set_xticks(np.linspace(0, 1, 6))
     axes.grid(False, axis="y")
@@ -3575,8 +3598,7 @@ def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_
     baseline = baseline[baseline["week"] <= limit]
     axes.plot(baseline["week"], baseline["random"], color=TEXT_MUTED, linewidth=1.2,
               linestyle=BASELINE_DASH, zorder=2)
-    style_axes(axes, "", "Share of users linked" if level == "author" else "Top-1 accuracy",
-               "", "")
+    style_axes(axes, "", "Share of users linked" if level == "author" else "Top-1 accuracy", "")
     axes.set_ylim(bottom=0)
 
     per_week = (series[0].curve.counts.set_index("week")["n_users"]
@@ -3588,65 +3610,47 @@ def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_
     # The bins are whole weeks; a tick at 1.5 weeks labels a point that cannot exist.
     bars.xaxis.set_major_locator(MaxNLocator(integer=True))
 
-    known = parse_config_tag(series[0].curve.known_config)
-    subtitle = (f"Attacker holds {known.start:.0%}-{known.end:.0%} of the timeline; whole unknown "
-                f"side, disjoint weekly buckets")
-    return finish_facets(figure, handles, legend_title, title, subtitle, stem,
+    return finish_facets(figure, handles, legend_title, title, stem,
                          pd.concat(rows, ignore_index=True))
 
 
-def plot_temporal_defense_comparisons(dataset: str, runs: list[Run],
-                                      decay: dict[Run, TemporalDecay],
-                                      output_dir: Path) -> list[Path]:
-    """One figure per (feature, attack): every defense's decay under that same attack.
-
-    The temporal twin of :func:`plot_defense_comparisons`, same question -- does the defense hold
-    up? -- asked against elapsed time instead of against k.
-    """
-    by_method: dict[tuple[str, str], list[Run]] = defaultdict(list)
-    for run in runs:
-        if run in decay:
-            by_method[run.method].append(run)
-
-    written = []
-    for method, method_runs in sorted(by_method.items(), key=lambda item: METHOD_SLOTS[item[0]]):
-        method_runs.sort(key=lambda run: DEFENSE_SLOTS[run.defense])
-        series = [Series(run.defense_label, DEFENSE_SLOTS[run.defense], decay[run])
-                  for run in method_runs]
-        level = LEVEL_DIRS[series[0].curve.level]
-        feature, attack = method
-        written.append(plot_temporal_figure(
-            dataset, series,
-            title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
-                  f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
-            legend_title="Defense",
-            stem=output_dir / "temporal" / level / "by_defense" / f"{feature}_{attack}"))
-    return written
-
-
-def plot_temporal_attack_comparisons(dataset: str, runs: list[Run],
+def plot_temporal_defense_comparison(dataset: str, method: tuple[str, str], runs: list[Run],
                                      decay: dict[Run, TemporalDecay],
                                      output_dir: Path) -> list[Path]:
-    """One figure per defense: every (feature, attack)'s decay against that same defense."""
-    by_defense: dict[str, list[Run]] = defaultdict(list)
-    for run in runs:
-        if run in decay:
-            by_defense[run.defense].append(run)
+    """One figure: every defense's decay under one (feature, attack).
 
-    written = []
-    for defense, defense_runs in sorted(by_defense.items(),
-                                        key=lambda item: DEFENSE_SLOTS[item[0]]):
-        defense_runs.sort(key=lambda run: METHOD_SLOTS[run.method])
-        series = [Series(run.method_label, METHOD_SLOTS[run.method], decay[run])
-                  for run in defense_runs]
-        level = LEVEL_DIRS[series[0].curve.level]
-        written.append(plot_temporal_figure(
-            dataset, series,
-            title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
-                  f"{DEFENSE_LABELS[defense]}",
-            legend_title="Feature / attack",
-            stem=output_dir / "temporal" / level / "by_attack" / defense))
-    return written
+    The temporal twin of :func:`plot_defense_comparison`, same question -- does the defense hold
+    up? -- asked against elapsed time instead of against k.
+    """
+    series = [Series(run.defense_label, DEFENSE_SLOTS[run.defense], decay[run])
+              for run in runs if run in decay]
+    if not series:
+        return []
+    feature, attack = method
+    return [plot_temporal_figure(
+        dataset, series,
+        title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
+              f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
+        legend_title="Defense",
+        stem=(output_dir / "temporal" / LEVEL_DIRS[series[0].curve.level] / "by_defense"
+              / f"{feature}_{attack}"))]
+
+
+def plot_temporal_attack_comparison(dataset: str, defense: str, runs: list[Run],
+                                    decay: dict[Run, TemporalDecay],
+                                    output_dir: Path) -> list[Path]:
+    """One figure: every (feature, attack)'s decay against one defense."""
+    series = [Series(run.method_label, METHOD_SLOTS[run.method], decay[run])
+              for run in runs if run in decay]
+    if not series:
+        return []
+    return [plot_temporal_figure(
+        dataset, series,
+        title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
+              f"{DEFENSE_LABELS[defense]}",
+        legend_title="Feature / attack",
+        stem=(output_dir / "temporal" / LEVEL_DIRS[series[0].curve.level] / "by_attack"
+              / defense))]
 
 # --- macro vs micro vs identity: three ways to count the same result ---------
 
@@ -3755,9 +3759,7 @@ def plot_macro_micro(dataset: str, runs: list[Run], modes: dict[Run, pd.DataFram
                           else f"{run.method_label}\n{run.defense_label}" for run in ordered])
     axes.invert_yaxis()  # first run at the top, reading order
     style_axes(axes, "Top-1 accuracy", "", f"{DATASET_LABELS[dataset]}: one result, three ways "
-               f"of counting it",
-               f"Micro weights documents, macro weights users, identity asks whether any one "
-               f"document hit  ·  {parse_config_tag(HEADLINE_CONFIG).label}, shared test set")
+               f"of counting it  ·  {parse_config_tag(HEADLINE_CONFIG).label}")
     axes.set_xlim(0, 1.02)
     axes.grid(False, axis="y")  # the bars already separate the groups; a y grid would fight them
     add_legend(axes, loc="best", title="Counting mode")
@@ -3985,7 +3987,7 @@ def config_scaling_authors(run: Run, table: pd.DataFrame, weights: PanelWeights
     determine the author-level answer (see :func:`author_subpool_bounds`), so the shaded region
     carries two things at once: the analytic bracket between the two bounds, *and* the clustered
     bootstrap on each edge. It is therefore wider than a confidence interval and is labelled as
-    such in the curve type's subtitle -- read it as "the curve is in here", not "the estimate is
+    such in the curve type's description -- read it as "the curve is in here", not "the estimate is
     this plus or minus".
 
     **The line is the lower bound**, because that is the one that is attained rather than merely
@@ -4108,11 +4110,11 @@ def dataset_legend(panels: dict[str, list[Series]]) -> tuple[str, dict]:
 
 
 def plot_scaling_across_datasets_by_defense(
-        runs: list[Run], scaling: dict[Run, dict[str, ScalingCurve]], kind: str,
-        output_dir: Path) -> list[Path]:
-    """One figure per (feature, attack): every defense's scaling curve, on both corpora at once.
+        method: tuple[str, str], runs: list[Run], scaling: dict[Run, dict[str, ScalingCurve]],
+        kind: str, output_dir: Path) -> list[Path]:
+    """One figure: every defense's scaling curve under one (feature, attack), both corpora at once.
 
-    The cross-dataset twin of :func:`plot_defense_comparisons`, and it asks the same question --
+    The cross-dataset twin of :func:`plot_defense_comparison`, and it asks the same question --
     *does the defense work?* -- of an axis only the two corpora together can span. Within a
     dataset the candidate pool covers a factor of a few; across SWE-chat and WildChat it covers
     more than two orders of magnitude, so "the defense helps" can be separated here from "the
@@ -4125,34 +4127,27 @@ def plot_scaling_across_datasets_by_defense(
     it is worth flipping between them here for the same reason as everywhere else: the two are
     weighted differently -- micro against macro -- so their curves cross.
     """
-    written = []
-    by_method: dict[tuple[str, str], list[Run]] = defaultdict(list)
-    for run in runs:
-        by_method[run.method].append(run)
-    for method, method_runs in sorted(by_method.items(), key=lambda item: METHOD_SLOTS[item[0]]):
-        panels = cross_dataset_scaling_panels(method_runs, scaling,
-                                              lambda run: DEFENSE_SLOTS[run.defense],
-                                              lambda run: run.defense_label)
-        if not panels:
-            continue
-        feature, attack = method
-        written.append(plot_config_comparison(
-            kind, panels,
-            title=f"Defenses under {FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}, "
-                  f"both corpora",
-            legend_title="Defense",
-            stem=cross_dataset_stem(kind, "defense", f"{feature}_{attack}", output_dir),
-            extra_legend=dataset_legend(panels)))
-    return written
+    panels = cross_dataset_scaling_panels(runs, scaling,
+                                          lambda run: DEFENSE_SLOTS[run.defense],
+                                          lambda run: run.defense_label)
+    if not panels:
+        return []
+    feature, attack = method
+    return [plot_config_comparison(
+        kind, panels,
+        title=f"Defenses under {FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}, both corpora",
+        legend_title="Defense",
+        stem=cross_dataset_stem(kind, "defense", f"{feature}_{attack}", output_dir),
+        extra_legend=dataset_legend(panels))]
 
 
 def plot_scaling_across_datasets_by_attack(
-        runs: list[Run], scaling: dict[Run, dict[str, ScalingCurve]], kind: str,
+        defense: str, runs: list[Run], scaling: dict[Run, dict[str, ScalingCurve]], kind: str,
         output_dir: Path) -> list[Path]:
-    """One figure per defense: every feature+attack's scaling curve, on both corpora at once.
+    """One figure: every feature+attack's scaling curve against one defense, both corpora at once.
 
     The transpose of :func:`plot_scaling_across_datasets_by_defense`, and the cross-dataset twin
-    of :func:`plot_attack_comparisons`: with the defense held fixed it says which representation
+    of :func:`plot_attack_comparison`: with the defense held fixed it says which representation
     and estimator the attacker should reach for, at a *matched* pool size rather than at whatever
     pool each corpus happens to have. ``by_attack/base.pdf`` is the undefended figure -- how far
     the threat reaches before any countermeasure.
@@ -4161,24 +4156,17 @@ def plot_scaling_across_datasets_by_attack(
     both -- which is the whole point, since the interesting comparison is the same attack at a
     matched pool size rather than either corpus on its own.
     """
-    written = []
-    by_defense: dict[str, list[Run]] = defaultdict(list)
-    for run in runs:
-        by_defense[run.defense].append(run)
-    for defense, defense_runs in sorted(by_defense.items(),
-                                        key=lambda item: DEFENSE_SLOTS[item[0]]):
-        panels = cross_dataset_scaling_panels(defense_runs, scaling,
-                                              lambda run: METHOD_SLOTS[run.method],
-                                              lambda run: run.method_label)
-        if not panels:
-            continue
-        written.append(plot_config_comparison(
-            kind, panels,
-            title=f"Attacks against {DEFENSE_LABELS[defense]}, both corpora",
-            legend_title="Feature / attack",
-            stem=cross_dataset_stem(kind, "attack", defense, output_dir),
-            extra_legend=dataset_legend(panels)))
-    return written
+    panels = cross_dataset_scaling_panels(runs, scaling,
+                                          lambda run: METHOD_SLOTS[run.method],
+                                          lambda run: run.method_label)
+    if not panels:
+        return []
+    return [plot_config_comparison(
+        kind, panels,
+        title=f"Attacks against {DEFENSE_LABELS[defense]}, both corpora",
+        legend_title="Feature / attack",
+        stem=cross_dataset_stem(kind, "attack", defense, output_dir),
+        extra_legend=dataset_legend(panels))]
 
 
 # --- per-run figures ---------------------------------------------------------
@@ -4211,9 +4199,7 @@ def plot_config_cmc(cmc: pd.DataFrame, title: str, stem: Path) -> Path:
                   label=config.label if config else str(tag))
         axes.plot(group["k"], group["random"], color=TEXT_MUTED, linewidth=1.0,
                   linestyle=BASELINE_DASH, alpha=0.6, zorder=2)
-    style_axes(axes, "k (candidate authors returned)", "Top-k accuracy", title,
-               "One line per known configuration, over its whole future; grey dashes are that "
-               "configuration's random baseline")
+    style_axes(axes, "k (candidate authors returned)", "Top-k accuracy", title)
     axes.set_xscale("log")
     axes.set_ylim(0, 1.02)
     add_legend(axes, loc="upper left", ncols=2)
@@ -4245,7 +4231,7 @@ def plot_pool_growth(sweep: pd.DataFrame, top_k: int, title: str, stem: Path) ->
                           textcoords="offset points", xytext=(0, 9), ha="center",
                           fontsize=7.5, color=TEXT_MUTED)
     style_axes(axes, "Target users on the unknown side", f"Top-{top_k} identification accuracy",
-               title, "Grey dashes are random guessing over the same pool")
+               title)
     axes.set_ylim(bottom=0)
     add_legend(axes, loc="best")  # the lines can sit anywhere in the frame; let it find the gap
     figure.tight_layout()
@@ -4369,7 +4355,164 @@ def parse_args() -> argparse.Namespace:
                              "top-k bar figures. Off by default: they are 160 of the 262 figures "
                              "a full sweep writes and none of them compares runs, so they are "
                              "diagnostics rather than results.")
+    parser.add_argument("--force", action="store_true",
+                        help="Redraw every figure, ignoring the cache. Not needed after editing "
+                             "this file (the cache keys on its contents) or after a re-run (they "
+                             "key on the predictions files' size and mtime) -- reach for it when "
+                             "something outside both changed, such as the corpus parquet the "
+                             "baselines and the language and temporal figures read.")
     return parser.parse_args()
+
+
+# --- what has already been drawn ---------------------------------------------
+#
+# A sweep is dominated by work that did not need doing: adding one attack leaves most of the tree
+# untouched, and re-running the script after editing a caption redraws 448 figures to change one.
+# The cache is a manifest of what the last sweep drew and of everything that decided it, so a
+# figure is skipped exactly when nothing it depends on has moved.
+#
+# WHAT A FIGURE DEPENDS ON, and every one of these is in its key:
+#
+#   * the runs it draws -- by name, so a *new* run in a group changes the key of the figures that
+#     group feeds and of no others. This is the asymmetry that makes the cache worth having:
+#     a new attack rewrites every `by_attack/` figure, because each gains a series, but only adds
+#     one `by_defense/` figure and leaves the rest of that view alone.
+#   * each of those runs' predictions files, by size and mtime. Contents are not hashed: the files
+#     are hundreds of MB and `make` has been right about this for fifty years. A touched file
+#     redraws, which is conservative in the harmless direction.
+#   * this file, by content digest. Any edit to any drawing routine invalidates everything, which
+#     is the property that makes a cached figure trustworthy -- the alternative is a tree of
+#     figures drawn by code that no longer exists, and no way to tell which.
+#   * the settings that change what is drawn: `--bootstrap`, `--png`.
+#
+# WHAT IT DOES NOT COVER, deliberately: the corpus parquet in `data/hf/`. The baselines, the
+# temporal figures and the language breakdown all read it, but it is a build artefact that changes
+# far less often than the results do, and stat-ing it on every sweep would tie the plots' cache to
+# a directory that is legitimately swapped between `data/dist/` and `data/hf/`. `--force` is the
+# answer when it moves.
+
+#: The manifest, kept **inside** the plots tree rather than in `experiments/.cache/`, so that
+#: deleting the figures deletes the memory of them. The two must not be able to disagree.
+CACHE_FILE = ".plot_cache.json"
+
+
+def source_digest() -> str:
+    """Content digest of this file: what makes an edit to any drawing routine invalidate the tree.
+
+    Coarse on purpose. Attributing figures to the functions that draw them would be finer and
+    would be wrong the first time a shared helper changed -- and the failure mode it would buy is
+    a figure that silently disagrees with the code that claims to have drawn it.
+    """
+    return hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
+def run_digest(run: Run) -> str:
+    """One run's inputs as a digest of its CSVs' names, sizes and mtimes.
+
+    Every file in the directory counts, not only ``predictions_*.csv``: ``rolling_results.csv``
+    and ``cmc_results.csv`` feed the per-run figures, and a run whose files disagree with each
+    other is one nobody should be reading a cached figure of.
+    """
+    parts = sorted(f"{path.name}:{path.stat().st_size}:{path.stat().st_mtime_ns}"
+                   for path in run.directory.glob("*.csv"))
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class PlannedFigure:
+    """One figure the sweep intends to draw, named and priced before any curve is built.
+
+    ``name`` is its stable identity and doubles as the manifest key -- it is the output path
+    without an extension, so a line of the manifest can be read against the tree by eye.
+    ``runs`` is everything whose predictions decide the figure's content, which is what the cache
+    compares. ``build`` turns the built curves into a ``run_jobs`` triple; it is deferred because
+    planning happens *before* building, which is the whole point -- a figure that is up to date
+    contributes nothing to what has to be built.
+
+    ``builds`` is the runs whose **curves** this figure needs, which is not always the runs whose
+    data decides it. The two counting-mode and reach figures are the reason: both are stale the
+    moment any run of their dataset changes, but neither reads a curve family -- one wants the
+    cheap per-run counting modes, the other reads the tables directly. Left at ``None`` it is
+    ``runs``, which is the safe reading and what every comparison figure wants.
+    """
+
+    name: str
+    runs: tuple
+    build: object
+    builds: tuple | None = None
+
+    @property
+    def needs_curves(self) -> tuple:
+        return self.runs if self.builds is None else self.builds
+
+    def key(self, settings: str) -> str:
+        payload = "|".join([settings, *(f"{run.directory.name}:{run_digest(run)}"
+                                        for run in self.runs)])
+        return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+class PlotCache:
+    """The manifest of what the last sweep drew, and the check against it.
+
+    A figure is current when its key matches *and* every file the last sweep recorded for it is
+    still on disk -- so deleting a PDF is enough to get it back, without `--force` and without
+    knowing anything about this file.
+
+    **A figure that produced no output is recorded, not forgotten.** Plenty of planned figures
+    legitimately draw nothing: `scaling` for an attack that refits against the gallery, `language`
+    for an English corpus, a cross-dataset figure with only one corpus. Recording the empty result
+    is what stops the sweep re-deciding that every time.
+    """
+
+    def __init__(self, path: Path, settings: str, force: bool = False) -> None:
+        self.path, self.settings, self.force = path, settings, force
+        self.entries: dict[str, dict] = {}
+        if not force and path.exists():
+            try:
+                self.entries = json.loads(path.read_text()).get("figures", {})
+            except (OSError, ValueError):
+                # A truncated manifest means a redraw, never a crash: it is a cache.
+                print(f"  {path.name} is unreadable -- redrawing everything")
+
+    def is_current(self, figure: PlannedFigure) -> bool:
+        entry = self.entries.get(figure.name)
+        if entry is None or entry.get("key") != figure.key(self.settings):
+            return False
+        return all((self.path.parent / output).exists() for output in entry.get("outputs", ()))
+
+    def record(self, figure: PlannedFigure, outputs: list[Path]) -> None:
+        self.entries[figure.name] = {
+            "key": figure.key(self.settings),
+            "outputs": sorted(str(path.relative_to(self.path.parent)) for path in outputs),
+        }
+
+    def save(self, planned: list[PlannedFigure]) -> None:
+        """Write the manifest, pruned to what this sweep planned.
+
+        Pruning is what keeps a figure that no longer exists -- a run deleted, a family retired --
+        from sitting in the file forever. The figures it drew are left on disk: this script has
+        never deleted a figure and guessing which orphans are wanted is not its job.
+        """
+        names = {figure.name for figure in planned}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(
+            {"settings": self.settings,
+             "figures": {name: entry for name, entry in sorted(self.entries.items())
+                         if name in names}},
+            indent=1))
+
+
+def run_counting_modes(run: Run, tables: dict[str, pd.DataFrame],
+                       bootstrap: AuthorBootstrap) -> pd.DataFrame | None:
+    """Just the counting-mode row for one run: the cheap tier of :func:`build_curves`.
+
+    The same call :func:`run_curves` makes, without the dozen curve families around it. It exists
+    because ``accuracy/macro_micro.pdf`` needs a row from *every* run of a dataset while costing
+    almost nothing, so a cached sweep should not have to rebuild a run's whole curve set to
+    redraw it.
+    """
+    weights = {tag: PanelWeights(bootstrap, table["true_author"]) for tag, table in tables.items()}
+    return counting_modes(tables, weights)
 
 
 def run_curves(run: Run, tables: dict[str, pd.DataFrame], bootstrap: AuthorBootstrap,
@@ -4462,7 +4605,8 @@ def warm_baselines(runs: list[Run], tables: dict[Run, dict[str, pd.DataFrame]]) 
               f"needs the known side's document counts, falling back to uniform 1/N")
 
 
-def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
+def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1,
+                 needed: list[Run] | None = None):
     """Every curve every figure needs, built once per (run, configuration).
 
     One pass over the predictions: the same table feeds the CMC, risk-coverage, per-user risk,
@@ -4484,10 +4628,18 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
     any curve can be computed, and because the tables are the one thing too big to want to send
     anywhere -- the workers inherit them through :func:`run_jobs`'s fork instead. What comes back
     is only the curves, which are a few MB per run.
+
+    ``needed`` restricts which runs are *built*, never which are *read*: both bootstraps resample
+    the union of every run's users, and narrowing that universe would move the band on every
+    figure of the dataset -- including the ones the cache is about to skip, which would then be
+    inconsistent with the ones it redraws. So a cached sweep still pays for reading (27 s on
+    WildChat) and skips the expensive half (67 s per run). The caller guarantees that every run
+    feeding a figure it intends to draw is in ``needed``; a figure whose runs are not all built
+    would silently lose the missing series.
     """
     tables = {run: config_predictions(run) for run in runs}
-    stale = [run for run in runs if not tables[run]]
-    for run in stale:
+    unusable = [run for run in runs if not tables[run]]
+    for run in unusable:
         print(f"  {run.directory.name}: no predictions_<attack>_known<XXYY>.csv -- this run "
               f"predates the known-configuration design, re-run it to appear in the figures")
 
@@ -4503,14 +4655,23 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
 
     live = [run for run in runs if tables[run]]
     warm_baselines(live, tables)
-    jobs = [(run_curves, (run, tables[run], bootstrap, open_tables[run], open_bootstrap), {})
-            for run in live]
+    # Two tiers of work. A run whose figures are all cached still owes the counting-mode figure a
+    # row -- `accuracy/macro_micro.pdf` draws one bar group per run, so *any* run changing makes
+    # it stale and drawing it needs every run's three numbers. That would drag the whole dataset
+    # into a full rebuild for one small figure, so the modes are computed on their own: measured
+    # 2.1 s against 67 s for the curves, which is cheap enough to pay unconditionally.
+    heavy = [run for run in live if needed is None or run in needed]
+    light = [run for run in live if run not in set(heavy)]
+    jobs = ([(run_curves, (run, tables[run], bootstrap, open_tables[run], open_bootstrap), {})
+             for run in heavy]
+            + [(run_counting_modes, (run, tables[run], bootstrap), {}) for run in light])
     results = run_jobs(jobs, workers)
+    modes = dict(zip(light, results[len(heavy):]))
+    live, results = heavy, results[:len(heavy)]
 
     # Keyed by family rather than unpacked into a tuple: there are twelve of them once both
     # counting levels exist, and a twelve-element tuple is a positional bug waiting to happen.
     built: dict[str, dict] = {family: {} for family in CURVE_FAMILIES}
-    modes = {}
     for run, curves in zip(live, results):
         for family in CURVE_FAMILIES:
             # A family is absent for a run when it had nothing to build -- an attack outside
@@ -4525,7 +4686,7 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
     # Reported once for the dataset rather than once per run: it is a property of the corpus's
     # language mix, so when it fires it fires for every run of that corpus at once.
     mute = [run for run in live if run not in built["language"]]
-    if mute:
+    if mute and live:
         print(f"  {len(mute)} of {len(live)} run(s): fewer than {MIN_LANGUAGES_PER_PANEL} "
               f"languages clear the {MIN_AUTHORS_PER_BIN}-user gate on any configuration -- "
               f"accuracy_by_language skipped, it would redraw accuracy/ with one line")
@@ -4533,41 +4694,129 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
     return tables, bootstrap, built, modes, reach
 
 
-def dataset_figure_jobs(dataset: str, runs: list[Run], built: dict, modes: dict,
-                        reach: pd.DataFrame, decay: dict, output_dir: Path,
-                        per_run: bool) -> list[tuple]:
-    """One dataset's figures as ``(callable, args, kwargs)`` jobs, not yet drawn.
+class DrawContext:
+    """What the build pass produces and the draw pass consumes, keyed by dataset.
 
-    Splitting the *deciding* from the *drawing* is what lets every figure in the project be drawn
-    by one pool: the jobs from both corpora are pooled together before any of them runs, so a
-    worker that finishes swe-chat's cheap panels picks up a WildChat one instead of idling.
-
-    The two comparison families are already one job per (curve type, view). The separation
-    families are sharded here to one job per run -- they draw one figure per run anyway, and as a
-    single job that was the longest pole in the pass at 11 s.
+    It exists so a :class:`PlannedFigure` can be described before its curves exist: the figure
+    holds a closure over this object, and the closure is not called until the build has filled it
+    in. A dataset the sweep never had to build is simply absent, which is correct rather than an
+    error -- no figure that reads it can be stale, or it would have been built.
     """
-    jobs = []
+
+    def __init__(self) -> None:
+        self.built: dict[str, dict] = {}
+        self.modes: dict[str, dict] = {}
+        self.reach: dict[str, pd.DataFrame] = {}
+        self.decay: dict[str, dict] = {}
+        #: Accumulated across datasets -- the cross-dataset figures are the one place a curve from
+        #: one corpus is drawn beside a curve from another.
+        self.scaling: dict[str, dict] = {kind: {} for kind in CROSS_DATASET_SCALING_KINDS}
+
+    def family(self, dataset: str, family: str) -> dict:
+        return self.built.get(dataset, {}).get(family, {})
+
+
+def dataset_figure_plan(dataset: str, runs: list[Run], output_dir: Path,
+                        per_run: bool) -> list[PlannedFigure]:
+    """One dataset's figures, named and attributed to runs, but not yet drawn or even built.
+
+    **One planned figure is one output figure**, which is what makes the cache worth having: the
+    comparison families used to be one job per (curve type, view) drawing every group in it, so a
+    single new attack marked all of `by_defense/` dirty. Sharding them also spreads the drawing
+    over the pool more evenly.
+
+    Each figure's run tuple is *conservative*: it is every run that could feed the figure, taken
+    from the run list alone, without knowing which of them will actually produce that curve
+    family. It has to be, because that is only known after building -- and erring this way costs
+    an occasional needless redraw, where erring the other way would serve a figure that is missing
+    a series.
+    """
+    plan: list[PlannedFigure] = []
+
+    def add(name: str, figure_runs, build, builds=None) -> None:
+        plan.append(PlannedFigure(name=name, runs=tuple(figure_runs), build=build,
+                                  builds=None if builds is None else tuple(builds)))
+
     for family, kind in CURVE_FAMILIES.items():
+        folder = CURVE_TYPES[kind][1]
         if family in PER_RUN_FAMILIES:
             plot = PER_RUN_FAMILIES[family]
-            jobs += [(plot, (dataset, [run], built[family], kind, output_dir), {})
-                     for run in runs if run in built[family]]
+            for run in runs:
+                add(f"{dataset}/{folder}/{run.directory.name}", [run],
+                    lambda ctx, run=run, family=family, kind=kind, plot=plot:
+                    (plot, (dataset, [run], ctx.family(dataset, family), kind, output_dir), {}))
             continue
-        jobs.append((plot_defense_comparisons, (dataset, runs, built[family], kind, output_dir), {}))
-        jobs.append((plot_attack_comparisons, (dataset, runs, built[family], kind, output_dir), {}))
-    jobs.append((plot_macro_micro, (dataset, runs, modes, output_dir), {}))
-    jobs.append((plot_openset_reach, (dataset, reach, output_dir), {}))
-    for level_decay in decay.values():
-        if not level_decay:
-            continue
-        temporal_runs = [run for run in runs if run in level_decay]
-        jobs.append((plot_temporal_defense_comparisons,
-                     (dataset, temporal_runs, level_decay, output_dir), {}))
-        jobs.append((plot_temporal_attack_comparisons,
-                     (dataset, temporal_runs, level_decay, output_dir), {}))
+        for method, members in method_groups(runs):
+            add(f"{dataset}/{folder}/by_defense/{method[0]}_{method[1]}", members,
+                lambda ctx, method=method, members=members, family=family, kind=kind:
+                (plot_defense_comparison,
+                 (dataset, method, members, ctx.family(dataset, family), kind, output_dir), {}))
+        for defense, members in defense_groups(runs):
+            add(f"{dataset}/{folder}/by_attack/{defense}", members,
+                lambda ctx, defense=defense, members=members, family=family, kind=kind:
+                (plot_attack_comparison,
+                 (dataset, defense, members, ctx.family(dataset, family), kind, output_dir), {}))
+
+    # Both are stale the moment any run of the dataset changes -- one draws a bar group per run,
+    # the other a row per configuration over all of them -- but neither needs a curve family, so
+    # neither drags the dataset into a full rebuild. See `PlannedFigure.builds`.
+    add(f"{dataset}/accuracy/macro_micro", runs,
+        lambda ctx: (plot_macro_micro,
+                     (dataset, runs, ctx.modes.get(dataset, {}), output_dir), {}),
+        builds=())
+    add(f"{dataset}/openset/reach", runs,
+        lambda ctx: (plot_openset_reach,
+                     (dataset, ctx.reach.get(dataset, pd.DataFrame()), output_dir), {}),
+        builds=())
+
+    # Temporal is not on the `CURVE_TYPES` grid -- one known side, no configuration axis -- so it
+    # names its own folders. Both levels, both views, one figure each.
+    for level in ("doc", "author"):
+        for method, members in method_groups(runs):
+            add(f"{dataset}/temporal/{level}/by_defense/{method[0]}_{method[1]}", members,
+                lambda ctx, level=level, method=method, members=members:
+                (plot_temporal_defense_comparison,
+                 (dataset, method, members, ctx.decay.get(dataset, {}).get(level, {}),
+                  output_dir), {}))
+        for defense, members in defense_groups(runs):
+            add(f"{dataset}/temporal/{level}/by_attack/{defense}", members,
+                lambda ctx, level=level, defense=defense, members=members:
+                (plot_temporal_attack_comparison,
+                 (dataset, defense, members, ctx.decay.get(dataset, {}).get(level, {}),
+                  output_dir), {}))
+
     if per_run:
-        jobs += [(plot_run_detail, (run, output_dir), {}) for run in runs]
-    return jobs
+        for run in runs:
+            add(f"{dataset}/per_run/{run.directory.name}", [run],
+                lambda ctx, run=run: (plot_run_detail, (run, output_dir), {}))
+    return plan
+
+
+def cross_dataset_plan(runs: list[Run], output_dir: Path) -> list[PlannedFigure]:
+    """The figures that span corpora, planned the same way as one dataset's.
+
+    Their run tuples reach across both corpora, which is the honest statement of what they draw --
+    and the reason a new run on one corpus can make the other's curves needed. There is no way
+    around that short of caching the curves themselves: the figure really does put SWE-chat's line
+    beside WildChat's.
+    """
+    plan = []
+    for kind in CROSS_DATASET_SCALING_KINDS:
+        for method, members in method_groups(runs):
+            plan.append(PlannedFigure(
+                f"cross_dataset/{CURVE_TYPES[kind][1]}/by_defense/{method[0]}_{method[1]}",
+                tuple(members),
+                lambda ctx, kind=kind, method=method, members=members:
+                (plot_scaling_across_datasets_by_defense,
+                 (method, members, ctx.scaling[kind], kind, output_dir), {})))
+        for defense, members in defense_groups(runs):
+            plan.append(PlannedFigure(
+                f"cross_dataset/{CURVE_TYPES[kind][1]}/by_attack/{defense}",
+                tuple(members),
+                lambda ctx, kind=kind, defense=defense, members=members:
+                (plot_scaling_across_datasets_by_attack,
+                 (defense, members, ctx.scaling[kind], kind, output_dir), {})))
+    return plan
 
 
 def main() -> None:
@@ -4586,25 +4835,59 @@ def main() -> None:
     for run in runs:
         by_dataset[run.dataset].append(run)
 
-    jobs: list[tuple] = []
-    # Both counting levels, accumulated across datasets -- the cross-dataset figures are the one
-    # place a curve from one corpus is drawn beside a curve from another.
-    all_scaling: dict[str, dict[Run, dict[str, ScalingCurve]]] = {
-        kind: {} for kind in CROSS_DATASET_SCALING_KINDS}
+    # --- plan every figure, before reading or building anything ---------------
+    #
+    # Figures that span datasets go to plots/cross_dataset/ rather than under either corpus: pool
+    # size is the one axis where the two are the same experiment at different scales, and filing
+    # that under one of them would imply it belongs to that one. Below that they follow the
+    # per-dataset tree exactly -- both counting levels, both comparison views, the same 3x3
+    # configuration grid -- so a figure and its single-corpus twin sit at matching paths.
+    context = DrawContext()
+    plan: list[PlannedFigure] = []
+    for dataset in DATASETS:
+        if by_dataset.get(dataset):
+            plan += dataset_figure_plan(dataset, by_dataset[dataset], PLOTS_DIR / dataset,
+                                        args.per_run)
+    plan += cross_dataset_plan(runs, PLOTS_DIR)
+
+    settings = f"{source_digest()}|bootstrap={args.bootstrap}|png={int(args.png)}"
+    cache = PlotCache(PLOTS_DIR / CACHE_FILE, settings, force=args.force)
+    stale = [figure for figure in plan if not cache.is_current(figure)]
+    print(f"{len(plan) - len(stale)} of {len(plan)} figure(s) already current"
+          f"{'  (--force ignored the cache)' if args.force else ''}")
+    if not stale:
+        cache.save(plan)
+        print("nothing to draw.")
+        return
+
+    # --- build only what those figures need -----------------------------------
+    #
+    # A figure is drawn only if it is stale, and a stale figure puts every run it draws into
+    # `needed`, so anything drawn below has all of its series. The converse is the saving: a run
+    # no stale figure touches is never built.
+    # `touched` decides which datasets are visited at all; `curved` which of their runs pay for
+    # a full curve build. They differ for the two figures that are stale on any change but read no
+    # curve family, and that difference is what keeps one changed run from rebuilding a corpus.
+    touched = {run for figure in stale for run in figure.runs}
+    curved = {run for figure in stale for run in figure.needs_curves}
     for dataset in DATASETS:
         dataset_runs = by_dataset.get(dataset, [])
-        if not dataset_runs:
+        if not any(run in touched for run in dataset_runs):
             continue
+        wanted = [run for run in dataset_runs if run in curved]
         output_dir = PLOTS_DIR / dataset
-        print(f"\n[{DATASET_LABELS[dataset]}] {len(dataset_runs)} run(s) -> {output_dir}/")
-
-        tables, bootstrap, built, modes, reach = build_curves(dataset_runs, args.bootstrap,
-                                                              args.jobs)
+        print(f"\n[{DATASET_LABELS[dataset]}] building {len(wanted)} of {len(dataset_runs)} "
+              f"run(s) -> {output_dir}/")
+        _, _, built, modes, reach = build_curves(dataset_runs, args.bootstrap, args.jobs,
+                                                 needed=wanted)
+        context.built[dataset] = built
+        context.modes[dataset] = modes
+        context.reach[dataset] = reach
         for kind in CROSS_DATASET_SCALING_KINDS:
-            all_scaling[kind].update(built[kind])
+            context.scaling[kind].update(built[kind])
 
         decay = {level: {} for level in ("doc", "author")}
-        for run in dataset_runs:
+        for run in wanted:
             for level, name in (("doc", "document"), ("author", "author")):
                 staleness = temporal_accuracy(run, level=name)
                 if staleness is None:
@@ -4614,26 +4897,19 @@ def main() -> None:
                               f"temporal decay skipped")
                 else:
                     decay[level][run] = staleness
+        context.decay[dataset] = decay
 
-        jobs += dataset_figure_jobs(dataset, dataset_runs, built, modes, reach, decay,
-                                    output_dir, args.per_run)
+    # --- draw ------------------------------------------------------------------
+    jobs = [figure.build(context) for figure in stale]
+    print(f"\nDrawing {len(jobs)} figure(s) across {min(args.jobs, len(jobs))} process(es)")
+    written = []
+    for figure, paths in zip(stale, run_jobs(jobs, args.jobs)):
+        cache.record(figure, paths)
+        written += paths
+    cache.save(plan)
 
-    # Figures that span datasets go to plots/cross_dataset/ rather than under either corpus:
-    # pool size is the one axis where the two are the same experiment at different scales, and
-    # filing that under one of them would imply it belongs to that one. Below that they follow the
-    # per-dataset tree exactly -- both counting levels, both comparison views, the same 3x3
-    # configuration grid -- so a figure and its single-corpus twin sit at matching paths.
-    for kind in CROSS_DATASET_SCALING_KINDS:
-        jobs.append((plot_scaling_across_datasets_by_defense,
-                     (runs, all_scaling[kind], kind, PLOTS_DIR), {}))
-        jobs.append((plot_scaling_across_datasets_by_attack,
-                     (runs, all_scaling[kind], kind, PLOTS_DIR), {}))
-
-    print(f"\nDrawing {len(jobs)} figure group(s) across {min(args.jobs, len(jobs))} process(es)")
-    written = [path for group in run_jobs(jobs, args.jobs) for path in group]
     for path in sorted(written):
         print(f"  {path.relative_to(PLOTS_DIR)}")
-
     formats = "PDF + PNG" if WRITE_PNG else "PDF"
     print(f"\nWrote {len(written)} figure(s) ({formats}) to {PLOTS_DIR}/")
     if not args.per_run:
