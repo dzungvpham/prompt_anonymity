@@ -227,6 +227,25 @@ N: {{COUNT}}
 
 # --- the passage bank --------------------------------------------------------
 
+def openrouter_chat_class():
+    """The shared OpenRouter client class, imported lazily and from exactly one place.
+
+    Lazy so that importing this module -- which the defense registry does at package import --
+    never pulls in ``requests``/``python-dotenv`` or asks for an API key; a fully-cached run and the
+    offline selftest both need neither.
+
+    In one place because the module has already moved once
+    (``prompt_anonymity.utility`` -> :mod:`prompt_anonymity.attacks.llm._openrouter`, when the
+    utility judge left OpenRouter), and a defense importing it across package boundaries is exactly
+    the kind of caller such a move forgets. The selftest resolves this function, so the next move
+    breaks a check that runs in seconds with no key rather than stage 0b of a cluster job that has
+    already queued.
+    """
+    from ..attacks.llm._openrouter import OpenRouterChat
+
+    return OpenRouterChat
+
+
 def parse_passages(raw_text: str) -> list[str]:
     """Pull the ``<passage>`` blocks out of one reply, in order.
 
@@ -351,12 +370,12 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
     nothing usable -- a bank missing a scene would leave every document assigned to it unpadded, a
     hole in the arm that would not show up until the numbers looked odd.
     """
-    from ..utility._openrouter import OpenRouterChat
-
     system_prompt = FRAME_PAD_SYSTEM_PROMPT.replace("{{TARGET_WORDS}}", str(target_words))
-    client = OpenRouterChat(model, system_prompt, temperature=FRAME_PAD_TEMPERATURE,
-                            top_p=FRAME_PAD_TOP_P, max_workers=FRAME_PAD_MAX_WORKERS,
-                            max_retries=FRAME_PAD_MAX_RETRIES, timeout=FRAME_PAD_TIMEOUT)
+    client = openrouter_chat_class()(
+        model, system_prompt, temperature=FRAME_PAD_TEMPERATURE, top_p=FRAME_PAD_TOP_P,
+        max_workers=FRAME_PAD_MAX_WORKERS, max_retries=FRAME_PAD_MAX_RETRIES,
+        timeout=FRAME_PAD_TIMEOUT,
+    )
     prompts = [FRAME_PAD_INPUT_TEMPLATE.replace("{{SCENE}}", f.scene)
                                        .replace("{{COUNT}}", str(passages_per_frame))
                for f in framings]
@@ -756,6 +775,18 @@ def _selftest() -> None:
     # 1. The turn-id separator still agrees with the pipeline that produces the ids.
     check("turn id separator matches apply_defenses", TURN_ID_SEPARATOR == PIPELINE_SEPARATOR,
           f"{TURN_ID_SEPARATOR!r} != {PIPELINE_SEPARATOR!r}")
+
+    # 1b. The OpenRouter client is still where this module thinks it is. Resolving it costs
+    #     milliseconds and needs no key, and it is the difference between finding out here and
+    #     finding out in stage 0b of a queued cluster job -- which is exactly how this broke once,
+    #     when the client moved out of prompt_anonymity.utility.
+    try:
+        client_class = openrouter_chat_class()
+    except Exception as error:  # noqa: BLE001 - reporting the failure IS the check
+        check("the OpenRouter client resolves", False, f"{type(error).__name__}: {error}")
+    else:
+        check("the OpenRouter client resolves", hasattr(client_class, "complete_batch"),
+              f"{client_class!r} has no complete_batch")
 
     # 2. The defense declares itself to the pipeline. Without this flag apply_defenses would send it
     #    down the per-turn path, where adding a turn raises -- so the flag IS the integration.
