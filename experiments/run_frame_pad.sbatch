@@ -49,9 +49,11 @@
 #              must be 0. The pad lands inside a real user message, so a passage that asks for
 #              something WILL be answered by the response model, and that shows up as a utility
 #              failure caused by the measurement rather than by the defense.
-#   technical  must be 0. Nothing in the pad may share vocabulary with software or assistant chat;
-#              passages carrying it are dropped at build time, so a non-zero count here means the
-#              bank predates that filter and should be rebuilt with --force.
+#   technical  passages carrying code markup (backticks, URLs, filenames). Should be 0, but it only
+#              catches MARKUP -- software vocabulary is not machine-checked, because a word list that
+#              tried lost 16 of 50 scenes to their own English (Morse code, birding data, an
+#              algebraic variable). Nothing in the pad should share words with software or assistant
+#              chat, and reading the passages is the only check for that. 400 passages, one sitting.
 #
 # Overrides (sbatch exports your submitting environment, so these are read at run time):
 #

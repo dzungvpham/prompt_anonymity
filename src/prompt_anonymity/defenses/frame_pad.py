@@ -38,11 +38,13 @@ sharding under a SLURM array and is reconstructible offline (``--manifest``), an
 draw namespace and seed as ``frame_shift``, so a document lands in the same scene under both defenses
 and the two arms are comparable document by document.
 
-**Nothing in the codebook is software-adjacent**, which is a property of
-:data:`~.frame_shift.FRAMINGS` and is enforced again here: passages carrying any of
-:data:`SOFTWARE_TERMS` are dropped at build time rather than merely counted. The corpora are software
-chat and assistant chat, so a pad that shared their vocabulary would blend into the text it is
-supposed to sit apart from.
+**Nothing in the codebook is software-adjacent** -- a property of :data:`~.frame_shift.FRAMINGS` --
+and the passage prompt's rule 3 forbids computing vocabulary outright, because the corpora are
+software chat and assistant chat and a pad sharing their words would blend into the text it is meant
+to sit apart from. That rule is *not* machine-enforced: a build that rejected passages on a software
+word list lost 16 of 50 scenes to their own ordinary English (Morse code, birding data, an algebraic
+variable). The bank is 400 passages, so the check is a person reading ``--show-bank`` once -- which
+is the only place in this experiment where the entire generated corpus fits under one pair of eyes.
 
 **This defense adds a turn, which no other defense here does.** ``apply_defenses`` normally requires
 exactly one output turn per input turn (see
@@ -365,10 +367,15 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
     it has already written and make the next one different (rule 4), and 50 requests at temperature 0
     is a reproducible, two-cent job rather than 400 of them.
 
-    Passages are filtered on the way in: too short, or carrying any software vocabulary
-    (:data:`SOFTWARE_TERMS`), and they do not enter the bank. Raises if any scene comes back with
-    nothing usable -- a bank missing a scene would leave every document assigned to it unpadded, a
-    hole in the arm that would not show up until the numbers looked odd.
+    The only thing rejected here is a passage under :data:`FRAME_PAD_MIN_PASSAGE_CHARS` -- a stub,
+    which pads nothing. Nothing is rejected on *content*: an earlier version dropped any passage
+    containing software vocabulary and lost 16 of 50 scenes to their own ordinary English (Morse
+    code, birding data, an algebraic variable, a railway terminal, a piano keyboard). Keeping the pad
+    clear of software is the system prompt's job, and the check is a human reading ``--show-bank``.
+
+    Raises if a scene comes back with nothing at all -- a bank missing a scene would leave every
+    document assigned to it unpadded, a hole in the arm that would not show up until the numbers
+    looked odd.
     """
     system_prompt = FRAME_PAD_SYSTEM_PROMPT.replace("{{TARGET_WORDS}}", str(target_words))
     client = openrouter_chat_class()(
@@ -389,31 +396,30 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
     replies = client.complete_batch(prompts, budget)
 
     passages: dict[str, list[str]] = {}
-    short: list[str] = []
-    rejected = 0
+    stubs: dict[str, int] = {}
     for framing, reply in zip(framings, replies):
-        parsed = [p for p in parse_passages(reply) if len(p) >= FRAME_PAD_MIN_PASSAGE_CHARS]
-        # Software vocabulary is filtered out at build time rather than merely counted afterwards:
-        # the pad's only job is to share nothing with the documents it is appended to, and a bank is
-        # cheap enough that dropping a contaminated passage costs nothing but a slightly smaller
-        # collision space. A scene that loses ALL of its passages this way raises below.
-        usable = [p for p in parsed if not SOFTWARE_PATTERN.search(p)]
-        rejected += len(parsed) - len(usable)
-        if len(usable) < passages_per_frame:
-            short.append(f"{framing.key} ({len(usable)})")
+        parsed = parse_passages(reply)
+        usable = [p for p in parsed if len(p) >= FRAME_PAD_MIN_PASSAGE_CHARS]
+        stubs[framing.key] = len(parsed) - len(usable)
         passages[framing.key] = usable[:passages_per_frame]
 
     bank = PassageBank(passages, model=model, target_words=target_words)
     missing = bank.covers(framings)
     if missing:
-        raise SystemExit(f"the model returned no usable passage for {len(missing)} scene(s): "
-                         f"{', '.join(missing)}. Re-run --build-bank, or try another --model.")
-    if rejected:
-        print(f"[frame_pad] dropped {rejected} passage(s) containing software vocabulary "
-              f"(see SOFTWARE_TERMS); the pad must share no words with the corpus it pads")
+        detail = ", ".join(f"{key} ({stubs.get(key, 0)} too short)" for key in missing)
+        raise SystemExit(
+            f"no usable passage for {len(missing)} scene(s): {detail}.\n"
+            f"Either the reply carried no <passage> blocks (a model ignoring the output contract) "
+            f"or every one was a stub. Re-run --build-bank, or try another --model."
+        )
+    if sum(stubs.values()):
+        print(f"[frame_pad] dropped {sum(stubs.values())} passage(s) under "
+              f"{FRAME_PAD_MIN_PASSAGE_CHARS} characters")
+    short = [f"{f.key} ({len(passages[f.key])})" for f in framings
+             if len(passages[f.key]) < passages_per_frame]
     if short:
-        print(f"[frame_pad] note: {len(short)} scene(s) returned fewer than {passages_per_frame} "
-              f"usable passages: {', '.join(short)}")
+        print(f"[frame_pad] note: {len(short)} scene(s) hold fewer than {passages_per_frame} "
+              f"passages: {', '.join(short)}")
     scores = bank_quality(bank)
     print(f"[frame_pad] bank built: {len(bank):,} passages, digest {bank.digest}; "
           f"density {scores['density']:.1f} content markers/100 words "
@@ -455,26 +461,17 @@ def resolve_bank(path: Path, *, framings: tuple[Framing, ...] = FRAMINGS,
 IMPERATIVE_OPENERS = ("please ", "consider ", "note that", "imagine ", "write ", "explain ",
                       "describe ", "list ", "tell ", "give ", "make ", "create ", "help ")
 
-#: Software vocabulary that must never appear in a passage. The scenes are chosen to share no
-#: vocabulary with the corpora being defended (software chat and assistant chat), so a technical word
-#: in the pad is not a stylistic blemish -- it is the pad overlapping the very text it exists to sit
-#: apart from, and it is exactly the kind of thing a cheap model slips in when a scene involves any
-#: kind of machinery. Matched whole-word and case-insensitively; kept short and high-precision so it
-#: flags real leakage rather than ordinary English. Words with a common non-technical sense are
-#: deliberately absent -- "record" and "file" (a zoning board keeps records, a detective has a file),
-#: "application" (a patent application), "program" (a concert programme), "function" (a social
-#: function), "cloud" (weather), "monitor" and "screen". Since a hit DROPS the passage at build time,
-#: a loose term here costs usable passages rather than catching leaks.
-SOFTWARE_TERMS = (
-    "software", "hardware", "computer", "laptop", "smartphone", "internet", "website", "online",
-    "email", "app", "programming", "programmer", "code", "coding", "script", "algorithm",
-    "database", "server", "api", "repository", "terminal", "compiler", "debug", "debugging",
-    "python", "javascript", "sql", "linux", "windows", "github", "git", "docker", "variable",
-    "boolean", "json", "html", "css", "url", "download", "upload", "digital", "data", "dataset",
-    "spreadsheet", "keyboard", "pixel", "byte", "megabyte", "wifi", "bluetooth", "backend",
-    "frontend", "framework", "runtime", "deploy",
-)
-SOFTWARE_PATTERN = re.compile(r"\b(?:" + "|".join(SOFTWARE_TERMS) + r")\b", re.IGNORECASE)
+#: Markup that has no business in a passage: fenced or inline code, URLs, function calls, source
+#: filenames. This is a *markup* pattern, not a word list, which is why it survived and a software
+#: VOCABULARY filter did not: the first real build rejected 16 of 50 scenes outright, because a
+#: frontier telegraph office says "code" (Morse), a birding listserv says "data", a linear-algebra
+#: textbook says "variable", a model railway club says "terminal" and a music workbook says
+#: "keyboard". No word list can tell those from the software senses, and a false positive there does
+#: not catch a leak -- it deletes a whole scene's passages. Keeping software vocabulary out of the
+#: pad is therefore the system prompt's job (rule 3), checked by a human reading ``--show-bank``:
+#: 400 passages is exactly the size of thing worth eyeballing once, and this is the only text in the
+#: experiment that a person can read in full.
+CODEISH_PATTERN = re.compile(r"`|https?://|\w+\(\)|\w+\.(?:py|js|sh|json)\b")
 
 #: Content markers per 100 words below which a passage counts as *thin*: mood and scene-setting
 #: rather than substance. Calibrated on the worked example in the system prompt, which runs about
@@ -515,10 +512,11 @@ def bank_quality(bank: PassageBank) -> dict:
     * ``questions`` -- passages containing a question mark. A padded document that asks a question is
       a document whose *utility* judgement changes, because the assistant will answer the padding.
     * ``imperatives`` -- passages opening in the imperative, same failure by a different route.
-    * ``technical`` -- passages carrying backticks, URLs, code-ish tokens or any of
-      :data:`SOFTWARE_TERMS`. The scenes are deliberately non-software (see
-      :data:`~.frame_shift.FRAMINGS`) and the pad's whole job is to share no vocabulary with the
-      documents it is appended to, so this must be 0, not merely small.
+    * ``technical`` -- passages carrying code markup: backticks, URLs, function calls, source
+      filenames (:data:`CODEISH_PATTERN`). Nothing acts on this; it is a pointer to the passages
+      worth reading first. Software *vocabulary* is not machine-checked at all -- see
+      :data:`CODEISH_PATTERN` for why a word list cannot do that job -- so ``--show-bank`` is the
+      real check, and it is the reason the bank is deliberately small enough to read.
     * ``thin`` / ``density`` -- passages under :data:`DENSITY_FLOOR` content markers per 100 words
       (:func:`passage_density`). A thin bank turns this defense into "documents got longer", which is
       the one result it must not be confounded with.
@@ -533,8 +531,7 @@ def bank_quality(bank: PassageBank) -> dict:
         "passages": len(texts),
         "questions": sum("?" in t for t in texts),
         "imperatives": sum(t.lstrip().lower().startswith(IMPERATIVE_OPENERS) for t in texts),
-        "technical": sum(bool(re.search(r"`|https?://|\w+\(\)|\w+\.(py|js|sh|json)\b", t))
-                         or bool(SOFTWARE_PATTERN.search(t)) for t in texts),
+        "technical": sum(bool(CODEISH_PATTERN.search(t)) for t in texts),
         "thin": sum(density < DENSITY_FLOOR for density in densities),
         "density": sum(densities) / len(densities),
         "min_chars": lengths[0],
@@ -901,21 +898,25 @@ def _selftest() -> None:
     check("quality: an imperative opening is caught", scores["imperatives"] == 1)
     check("quality: technical content is caught", scores["technical"] == 1)
 
-    # 14b. Software vocabulary, the thing the pad must never share with the corpus it pads. Checked
-    #      both ways: a leaked term is caught, and ordinary scene vocabulary is NOT (a filter that
-    #      fired on "record" or "file" would empty the zoning and detective scenes at build time).
-    leaked = "The Assessor mentioned the parcel database and asked for a python script."
-    innocent = ("Chair Ndiaye filed the record, the caliper seized, and the protein skimmer "
-                "overflowed across the record book and the estate's ledger files.")
-    check("software vocabulary is caught", bool(SOFTWARE_PATTERN.search(leaked)))
-    check("scene vocabulary is not flagged as software",
-          SOFTWARE_PATTERN.search(innocent) is None,
-          str(SOFTWARE_PATTERN.findall(innocent)))
-    check("a leaked passage counts as technical",
-          bank_quality(PassageBank({"a": [leaked * 4]}))["technical"] == 1)
-    check("no framing in the codebook is software-adjacent",
-          not any(SOFTWARE_PATTERN.search(f.scene) for f in FRAMINGS),
-          str([f.key for f in FRAMINGS if SOFTWARE_PATTERN.search(f.scene)]))
+    # 14b. The code-markup check flags markup and NOTHING ELSE. This is the check that keeps the
+    #      lesson from the first real build: a passage filter that fired on ordinary English emptied
+    #      16 of 50 scenes, because these sentences are what the scenes actually say. Every one of
+    #      them must pass, or the measure has drifted back into being a vocabulary filter.
+    scene_english = ("The operator tapped out the message in Morse code.",
+                     "The data from the 2011 record is still disputed at the reservoir hide.",
+                     "Solve for the variable x in the third exercise.",
+                     "The branch line ends at the terminal beside the goods shed.",
+                     "She sat at the keyboard and played the third inversion.",
+                     "The host went off script for a full minute.",
+                     "The server brought the second course.",
+                     "The framework of the altarpiece is original.",
+                     "The regiment was ordered to deploy at first light.",
+                     "The patent application was filed in 1911, and the concert program lists four.")
+    flagged = [s for s in scene_english if CODEISH_PATTERN.search(s)]
+    check("ordinary scene English is never flagged", not flagged, str(flagged))
+    check("code markup is flagged",
+          all(CODEISH_PATTERN.search(s) for s in
+              ("see `df.head()`", "at https://x.example", "in config.py", "call render()")))
     clean = bank_quality(bank)
     check("quality: a clean bank scores clean",
           clean["questions"] == 0 and clean["imperatives"] == 0 and clean["technical"] == 0,
@@ -1085,8 +1086,10 @@ def main() -> None:
               f"defense to 'the documents got longer')")
         print(f"  rule violations: {scores['questions']} with a question mark, "
               f"{scores['imperatives']} opening in the imperative, {scores['technical']} carrying "
-              f"technical tokens  (all three should be 0 -- a pad that asks for something gets "
-              f"answered, and answering it is a utility failure)")
+              f"code markup  (all three should be 0 -- a pad that asks for something gets answered, "
+              f"and answering it is a utility failure)")
+        print("  NOT machine-checked: software vocabulary. Read the passages below -- a word list "
+              "cannot tell Morse code from source code, and one that tried emptied 16 scenes.")
         for framing in defense.framings[:max(0, args.show_frames)]:
             print(f"\n{'=' * 100}\n{framing.label}  [{framing.key}]\n{'=' * 100}")
             for i, passage in enumerate(bank.passages_for(framing.key) or []):
