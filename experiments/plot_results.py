@@ -1705,6 +1705,191 @@ def config_ndocs(table: pd.DataFrame, weights: PanelWeights, dataset: str, known
                        side=side, level=level)
 
 
+# --- the same accuracy curve, split by the language the document is written in ----------------
+#
+# This family is the `accuracy/` family restricted to one language at a time: identical axes,
+# identical estimator, one line per language instead of one per run. It is therefore drawn **per
+# (defense, attack) combination** rather than in the two comparison views -- those vary the thing
+# this figure holds fixed, and crossing five defended runs with eight languages would put forty
+# lines in a panel.
+
+#: How many languages get a line of their own; everything else is pooled into
+#: :data:`OTHER_LANGUAGE`, so the lines still account for every document the panel scored. Eight
+#: series is also exactly the width of :data:`CATEGORICAL`, so each language holds a hue of its
+#: own and none has to fall back to a numbered slot.
+TOP_LANGUAGES = 7
+
+#: Where every language outside a corpus's top :data:`TOP_LANGUAGES` is counted. Drawn rather than
+#: dropped: on WildChat it is 12.4% of the traffic, and a figure that silently discarded it would
+#: not account for the documents ``accuracy/`` reports on.
+OTHER_LANGUAGE = "Other"
+
+#: Band opacity on this family alone. Eight bands overlap in every panel here, against the two to
+#: five a comparison figure draws, and at the shared :data:`BAND_ALPHA` they stack into a wash
+#: that the lines have to compete with -- worst exactly where the curves converge on 1.0. Lowered
+#: rather than dropped: the thin languages' bands are wide, and that width is the caveat their
+#: level needs carrying with it.
+LANGUAGE_BAND_ALPHA = 0.07
+
+#: Languages a panel needs before it is drawn at all. One line is not a breakdown -- it is
+#: ``accuracy/`` redrawn under a folder claiming otherwise, with a legend of one entry -- so the
+#: guard is the same one, and for the same reason, as
+#: :func:`cross_dataset_scaling_panels`'s "at least two corpora have the run".
+#:
+#: **This is what excludes swe-chat**, whose experiments are English: measured 2026-08-12, exactly
+#: one of its eight languages clears :data:`MIN_AUTHORS_PER_BIN` on **every** configuration (the
+#: ~40 non-English documents in a panel are spread over seven languages and a handful of users).
+#: A dataset literal would have said the same thing less honestly and would have silently excluded
+#: the next multilingual corpus; this reads the corpus instead of naming it.
+MIN_LANGUAGES_PER_PANEL = 2
+
+
+@dataclass
+class ConfigLanguageCmc:
+    """One (run, configuration, language) CMC curve: one line of an ``accuracy_by_language/`` panel.
+
+    ``curve`` carries the same columns :class:`ConfigCmc` does -- ``k``, ``accuracy``, the two
+    baselines, ``ci_low``/``ci_high`` -- computed over this language's documents alone, plus three
+    that only mean something here:
+
+    * ``random_panel`` / ``random_panel_uniform`` -- the *whole* panel's baselines, identical
+      across the panel's series and the one the figure draws. A per-language proportional baseline
+      is in ``random_proportional`` and stays in the CSV: it is a real quantity but a poor
+      reference line, since the proportional guesser ranks over every known author and knows
+      nothing about language, so it barely moves between languages.
+    * ``random_within_language`` -- ``min(k, n) / n`` over the ``n`` known authors who write this
+      language. **This is the denominator a level should be read against**, and it is deliberately
+      not drawn: eight more dashed lines per panel would be unreadable, and a dash on these
+      figures means "not a measurement" exactly once.
+
+    ``n_documents``/``n_users`` are this language's share of the panel; ``panel_documents`` /
+    ``panel_users`` are the panel's totals, which is what the note prints.
+    """
+
+    curve: pd.DataFrame
+    n_documents: int
+    n_users: int
+    n_known_authors: int
+    n_candidates: int
+    max_k: int
+    level: str
+    panel_documents: int
+    panel_users: int
+
+    @property
+    def top1(self) -> float:
+        return float(self.curve["accuracy"].iloc[0])
+
+
+def config_language_cmc(table: pd.DataFrame, weights: PanelWeights, dataset: str,
+                        known_config: str, panel_baseline: ProportionalBaseline | None,
+                        level: str = "document") -> dict[str, ConfigLanguageCmc] | None:
+    """One CMC curve per language, for one configuration: the panel's lines, in draw order.
+
+    **A level is not a ranking of how identifiable a language's writers are.** The known side
+    holds far fewer authors writing a rare language than it does English writers, so a rare
+    language's candidate field is narrower before any authorship signal is used, and its accuracy
+    is inflated by that narrowing alone. StyloMetrix makes this worse rather than better -- it
+    runs an English spaCy pipeline over every document whatever it is written in, and separates
+    English from Russian at AUROC 0.984 *within* one corpus. The comparison that survives is
+    accuracy against ``random_within_language``; the raw curve is what that ratio is built from.
+
+    Evaluated on :func:`baseline_k_grid` rather than at every k. Eight languages by six
+    configurations by two levels is 96 curves per run where ``accuracy/`` has 6, and at WildChat's
+    19,711 candidates an exhaustive grid would make this family alone about 2 GB of the sweep. The
+    grid is exhaustive to k=32 and geometric after, the curve is monotone, and the x axis is
+    logarithmic -- the same argument that already justifies it for the proportional baseline.
+
+    At the author level a user is assigned their **modal** language over this panel's documents,
+    and their whole cluster -- documents included, for the baseline -- goes into that one series.
+    Counting them under each language they used would make the series sum past the population.
+
+    A language is dropped from a panel below :data:`MIN_AUTHORS_PER_BIN` users, because the user
+    is the bootstrap's resampling unit and a two-user curve is a band, not a measurement. A panel
+    left with fewer than :data:`MIN_LANGUAGES_PER_PANEL` drawable languages is not drawn at all --
+    that is what keeps this family off the English-only corpora.
+
+    ``None`` when the corpus parquet is not on disk (the languages live there rather than in any
+    predictions file), and when the panel has too few languages to compare.
+    """
+    languages, order = document_languages(dataset), dataset_languages(dataset)
+    if languages is None or order is None:
+        return None
+
+    named = table["doc_id"].map(languages)
+    # A document with no language row means the predictions and the parquet disagree about the
+    # corpus -- dropped rather than carried as NaN, the stance `config_ndocs` takes for its own
+    # version of this. Neither corpus has any: `language_primary` is non-null throughout.
+    keep = named.notna().to_numpy()
+    if not keep.any():
+        return None
+    table, named = table[keep], named[keep]
+    document_weights = weights.documents[:, keep] if len(weights.documents) else weights.documents
+
+    label = named.where(named.isin(order[:-1]), OTHER_LANGUAGE).to_numpy()
+    authors = table["true_author"].to_numpy()
+    if level == "author":
+        label = modal_label(authors, label, order).reindex(authors).to_numpy()
+
+    n_candidates = int(table["n_candidate_authors"].max())
+    ks = baseline_k_grid(n_candidates)
+    known_authors = known_language_counts(dataset, known_config)
+    panel_documents, panel_users = int(len(table)), int(pd.unique(authors).size)
+
+    # Drawn once per panel and therefore identical on every series: a baseline is a property of
+    # the configuration, not of the language whose line happens to carry the column.
+    if panel_baseline is not None:
+        pooled = (panel_baseline.for_identities(ks) if level == "author"
+                  else panel_baseline.for_documents(ks))
+    else:
+        pooled = np.nan
+    if level == "author":
+        per_user = table.groupby("true_author")["true_author_rank"].size().to_numpy()
+        pooled_uniform = chance_identity(per_user, n_candidates, ks)
+    else:
+        pooled_uniform = chance_cmc(table["n_candidate_authors"].to_numpy(dtype=float), ks)
+
+    curves: dict[str, ConfigLanguageCmc] = {}
+    for name in order:
+        mask = label == name
+        rows = table[mask]
+        if not len(rows) or rows["true_author"].nunique() < MIN_AUTHORS_PER_BIN:
+            continue
+        baseline = config_baseline(dataset, known_config, rows["true_author"])
+        if level == "author":
+            grouped = rows.groupby("true_author")["true_author_rank"]
+            best, counts = grouped.min(), grouped.size()
+            ranks = best.to_numpy(dtype=float)
+            pools = np.full(len(best), float(n_candidates))
+            unit_weights = weights.for_authors(best.index)
+            uniform = chance_identity(counts.to_numpy(), n_candidates, ks)
+            proportional = baseline.for_identities(ks) if baseline else np.nan
+        else:
+            ranks = rows["true_author_rank"].to_numpy(dtype=float)
+            pools = rows["n_candidate_authors"].to_numpy(dtype=float)
+            unit_weights = (document_weights[:, mask] if len(document_weights)
+                            else document_weights)
+            uniform = chance_cmc(pools, ks)
+            proportional = baseline.for_documents(ks) if baseline else np.nan
+        accuracy = weighted_cmc(ranks, pools, ks)
+        low, high = (band_from_replicates(cmc_replicates(ranks, ks, unit_weights))
+                     if len(unit_weights) else (accuracy, accuracy))
+        enrolled = int(known_authors.get(name, 0)) if known_authors is not None else 0
+        curves[name] = ConfigLanguageCmc(
+            curve=pd.DataFrame({
+                "k": ks, "accuracy": accuracy, "random": uniform,
+                "random_proportional": proportional,
+                "random_panel": pooled, "random_panel_uniform": pooled_uniform,
+                "random_within_language": (np.minimum(ks, enrolled) / enrolled if enrolled
+                                           else np.nan),
+                "ci_low": low, "ci_high": high, "n_known_authors": enrolled,
+            }),
+            n_documents=int(len(rows)), n_users=int(rows["true_author"].nunique()),
+            n_known_authors=enrolled, n_candidates=n_candidates, max_k=int(ks[-1]), level=level,
+            panel_documents=panel_documents, panel_users=panel_users)
+    return curves if len(curves) >= MIN_LANGUAGES_PER_PANEL else None
+
+
 # --- the open world: the documents nobody the attacker knows wrote -----------
 #
 # Every figure above answers "which known author wrote this?" on the documents where that
@@ -2276,6 +2461,45 @@ def draw_cmc_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True)
 
 
+def draw_language_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
+    """One cell's CMC curves, one line per language: :func:`draw_cmc_panel` over sub-populations.
+
+    Deliberately not that function itself, for one reason: there the panel's baseline can be read
+    off any series, because every line covers the same documents. Here each line covers a
+    different slice, so its own ``random_proportional`` is not the panel's -- the panel's is
+    carried separately in ``random_panel``, and drawing a series' own would put a dashed line
+    under one language that means nothing for the seven beside it.
+
+    The note prints the panel's totals rather than any one language's; the per-language counts are
+    in the companion CSV, along with ``random_within_language``, the guessing rate among just the
+    known authors who write it.
+
+    Bands are drawn at :data:`LANGUAGE_BAND_ALPHA` rather than the usual weight -- see there.
+    """
+    shared_k = min(item.curve.max_k for item in series)
+    rows = []
+    for item, slot in zip(series, resolve_slots([item.slot for item in series])):
+        curve = item.curve.curve
+        curve = curve[curve["k"] <= shared_k]
+        color = series_style(slot)
+        axes.fill_between(curve["k"], curve["ci_low"], curve["ci_high"], color=color,
+                          alpha=LANGUAGE_BAND_ALPHA, linewidth=0, zorder=2)
+        axes.plot(curve["k"], curve["accuracy"], color=color, linewidth=LINE_WIDTH,
+                  solid_capstyle="round", zorder=3)
+        handles.setdefault(item.label, Line2D([], [], color=color, linewidth=LINE_WIDTH))
+        rows.append(curve.assign(series=item.label))
+    panel = series[0].curve
+    baseline = panel.curve[panel.curve["k"] <= shared_k]
+    drawn = "random_panel" if baseline["random_panel"].notna().all() else "random_panel_uniform"
+    axes.plot(baseline["k"], baseline[drawn], color=TEXT_MUTED, linewidth=1.2,
+              linestyle=BASELINE_DASH, zorder=2)
+    axes.set_xscale("log")
+    axes.set_ylim(0, 1.02)
+    panel_note(axes, f"{panel.panel_documents:,} docs · {panel.panel_users:,} users\n"
+                     f"{panel.n_candidates:,} candidates")
+    return pd.concat(rows, ignore_index=True)
+
+
 def draw_risk_coverage_panel(axes, series: list[Series], handles: dict) -> pd.DataFrame:
     """One cell's risk-coverage curves: precision against the share of documents answered.
 
@@ -2661,6 +2885,22 @@ CURVE_TYPES = {
                            "Being linked at least once gets more chances the more a user writes, "
                            "and the dashed baseline rises for that reason too -- the gap between "
                            "them is what the attack contributed. Bars: share of the panel's users"),
+    # The `accuracy/` axes exactly -- this family is that curve split by language, so the two are
+    # meant to be read side by side and a different axis would stop that.
+    "language": (draw_language_panel, "accuracy_by_language/doc",
+                 "k (candidate authors returned)",
+                 "Top-k accuracy (per document)",
+                 "The accuracy/ curve restricted to one language at a time. Levels are NOT a "
+                 "ranking of how identifiable each language's writers are: the known side holds "
+                 "far fewer authors writing a rare language, so its candidate field is narrower "
+                 "before any authorship signal is used. Grey dashes: the whole panel's baseline"),
+    "language_authors": (draw_language_panel, "accuracy_by_language/author",
+                         "k (candidate authors returned)",
+                         "Share of users linked at least once",
+                         "A user counts once their most identifiable document reaches the top k, "
+                         "under the language they wrote most of this panel in. Levels are NOT a "
+                         "ranking of identifiability -- see the doc-level panel's note on the "
+                         "pool. Grey dashes: the whole panel's baseline"),
     "scaling": (draw_scaling_panel, "scaling/doc", "Candidate users the attack ranks over",
                 "Top-1 accuracy (per document)",
                 "Line interpolates down to smaller galleries; rings are the pools actually run"),
@@ -2718,6 +2958,8 @@ CURVE_FAMILIES = {
     "ndocs_known_authors": "ndocs_known_authors",
     "ndocs_test": "ndocs_test",
     "ndocs_test_authors": "ndocs_test_authors",
+    "language": "language",
+    "language_authors": "language_authors",
     "scaling": "scaling",
     "scaling_authors": "scaling_authors",
     "coverage": "openset_coverage",
@@ -2727,11 +2969,6 @@ CURVE_FAMILIES = {
     "separation": "separation",
     "separation_authors": "separation_authors",
 }
-
-#: The families drawn per run rather than by the two comparison families -- their series are the
-#: two cohorts, not the runs. See :func:`plot_separation_figures`.
-PER_RUN_FAMILIES = ("separation", "separation_authors")
-
 
 def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: str,
                            legend_title: str, stem: Path,
@@ -2851,6 +3088,48 @@ def plot_separation_figures(dataset: str, runs: list[Run], separation: dict, kin
             legend_title=legend_title,
             stem=output_dir / CURVE_TYPES[kind][1] / run.directory.name))
     return written
+
+
+def plot_language_figures(dataset: str, runs: list[Run], curves: dict, kind: str,
+                          output_dir: Path) -> list[Path]:
+    """One accuracy figure per run, with a line per language instead of a line per run.
+
+    Per run, and with **no ``by_defense``/``by_attack`` split**, because those two views vary the
+    thing this figure holds fixed: the question here is which of the corpus's languages one
+    attacker links, and crossing five defended runs with eight languages would put forty lines in
+    a panel. A defense or attack comparison of the same numbers is what ``accuracy/`` already is.
+
+    Colour follows the language, taken from :func:`dataset_languages` rather than from the
+    series' position, so a language that a panel drops for thinness does not shift the colour of
+    the ones below it.
+    """
+    order = dataset_languages(dataset) or ()
+    slots = {name: index for index, name in enumerate(order)}
+    written = []
+    for run in sorted(runs, key=lambda run: (DEFENSE_SLOTS[run.defense], METHOD_SLOTS[run.method])):
+        by_config = curves.get(run)
+        if not by_config:
+            continue
+        panels = {tag: [Series(name, slots[name], curve) for name, curve in languages.items()]
+                  for tag, languages in by_config.items()}
+        written.append(plot_config_comparison(
+            kind, panels,
+            title=f"{DATASET_LABELS[dataset]}: accuracy by language. "
+                  f"{run.defense_label}, {run.method_label}",
+            legend_title="Primary language",
+            stem=output_dir / CURVE_TYPES[kind][1] / run.directory.name))
+    return written
+
+
+#: The families drawn once per run rather than through the two comparison views, and what draws
+#: them. Their series are something other than the runs -- the two cohorts for ``separation``,
+#: the corpus's languages for ``language`` -- so there is no axis left for a view to vary.
+PER_RUN_FAMILIES = {
+    "separation": plot_separation_figures,
+    "separation_authors": plot_separation_figures,
+    "language": plot_language_figures,
+    "language_authors": plot_language_figures,
+}
 
 
 def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> list[Path]:
@@ -2973,7 +3252,8 @@ def corpus_documents(dataset: str) -> pd.DataFrame | None:
     path = DATA_DIR / f"{dataset}.parquet"
     frame = None
     if path.exists():
-        frame = pd.read_parquet(path, columns=["doc_id", "author_id", "ended_at"])
+        frame = pd.read_parquet(path, columns=["doc_id", "author_id", "ended_at",
+                                               "language_primary"])
         frame["ended_at"] = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True,
                                            format="mixed")
     _CORPUS[dataset] = frame
@@ -2984,6 +3264,88 @@ def corpus_documents(dataset: str) -> pd.DataFrame | None:
 _CORPUS: dict[str, pd.DataFrame | None] = {}
 
 
+def document_languages(dataset: str) -> pd.Series | None:
+    """``doc_id -> language_primary``, the projection ``accuracy_by_language/`` reads.
+
+    Like :func:`document_end_times`, this is corpus metadata rather than anything a run recorded,
+    so joining it back here makes the breakdown available for **every run already on disk**
+    without re-running an attack for one column.
+    """
+    frame = corpus_documents(dataset)
+    if frame is None:
+        return None
+    return pd.Series(frame["language_primary"].to_numpy(), index=frame["doc_id"].to_numpy())
+
+
+def dataset_languages(dataset: str) -> tuple[str, ...] | None:
+    """The corpus's :data:`TOP_LANGUAGES` most-written languages, then :data:`OTHER_LANGUAGE`.
+
+    A property of the **corpus**, not of a panel, and that is the point: every figure of a dataset
+    draws the same eight series in the same order, so a language keeps its colour across
+    configurations, counting levels, defenses and attacks. Per-panel top-N would let two cells of
+    one grid put different languages in the same slot, which is the failure the fixed colour-slot
+    rule exists to prevent.
+
+    Measured: WildChat is English, Russian, Spanish, Persian, French, Chinese, Korean and then
+    12.4% ``Other``; swe-chat is English, Chinese, Japanese, Korean, Portuguese, Russian, German
+    and a single ``Other`` document, which every panel drops as too thin to draw.
+    """
+    if dataset not in _DATASET_LANGUAGES:
+        frame = corpus_documents(dataset)
+        _DATASET_LANGUAGES[dataset] = None if frame is None else (
+            *frame["language_primary"].value_counts().index[:TOP_LANGUAGES], OTHER_LANGUAGE)
+    return _DATASET_LANGUAGES[dataset]
+
+
+#: Memo for :func:`dataset_languages`, one entry per dataset.
+_DATASET_LANGUAGES: dict[str, tuple[str, ...] | None] = {}
+
+
+def modal_label(keys, labels, order: tuple[str, ...]) -> pd.Series:
+    """Each key's most frequent label, ties broken toward the earlier label in ``order``.
+
+    Vectorised rather than ``groupby(...).agg(lambda values: values.value_counts().idxmax())``,
+    which is a Python call per group -- and the known side of WildChat has 19,711 of them. The
+    tie-break is explicit because a user who split a panel evenly between two languages must not
+    land in a different series depending on row order.
+    """
+    counts = pd.DataFrame({"key": keys, "label": labels}).groupby(
+        ["key", "label"], sort=False).size().reset_index(name="n")
+    rank = {name: index for index, name in enumerate(order)}
+    counts["priority"] = -counts["label"].map(rank).fillna(len(order))
+    counts = counts.sort_values(["key", "n", "priority"])
+    return counts.drop_duplicates("key", keep="last").set_index("key")["label"]
+
+
+def known_language_counts(dataset: str, known_config: str) -> pd.Series | None:
+    """How many of the known side's authors write each language: the pool behind a language's line.
+
+    The denominator of ``random_within_language``, and the number that stops a level on
+    ``accuracy_by_language/`` being read as identifiability -- an attacker choosing between the 7
+    known authors who write Japanese is not doing the same task as one choosing between 706
+    English writers. An author is counted **once**, under the language most of their known-side
+    documents are in, so the counts partition the gallery.
+
+    Memoised per (dataset, configuration) and warmed by :func:`warm_baselines`, like the two
+    other known-side reconstructions.
+    """
+    key = (dataset, known_config)
+    if key not in _KNOWN_LANGUAGES:
+        known, order = known_documents(dataset, known_config), dataset_languages(dataset)
+        if known is None or order is None:
+            _KNOWN_LANGUAGES[key] = None
+        else:
+            named = known["language_primary"]
+            named = named.where(named.isin(order[:-1]), OTHER_LANGUAGE)
+            _KNOWN_LANGUAGES[key] = modal_label(known["author_id"].to_numpy(), named.to_numpy(),
+                                                order).value_counts()
+    return _KNOWN_LANGUAGES[key]
+
+
+#: Memo for :func:`known_language_counts`, one entry per (dataset, known configuration).
+_KNOWN_LANGUAGES: dict[tuple[str, str], pd.Series | None] = {}
+
+
 def document_end_times(dataset: str) -> pd.Series | None:
     """``doc_id -> ended_at``, the projection of :func:`corpus_documents` the temporal figure uses."""
     frame = corpus_documents(dataset)
@@ -2992,39 +3354,57 @@ def document_end_times(dataset: str) -> pd.Series | None:
     return pd.Series(frame["ended_at"].to_numpy(), index=frame["doc_id"].to_numpy())
 
 
-def known_author_counts(dataset: str, known_config: str) -> pd.Series | None:
-    """How many documents each author wrote on ``known_config``'s known side.
+def known_documents(dataset: str, known_config: str) -> pd.DataFrame | None:
+    """The corpus rows on ``known_config``'s known side -- the gallery the attack searched.
 
     The known side is the interval ``known_config`` names, taken over the dated corpus in
-    chronological order -- ``round(fraction * n_documents)`` at each end, the same arithmetic
-    ``known_configurations`` uses, so this is the gallery the attack really searched rather than
-    an approximation of it.
+    chronological order: ``round(fraction * n_documents)`` at each end, the same arithmetic
+    ``known_configurations`` uses, so this is the real gallery rather than an approximation of it.
 
-    Two figures read it and they want different things from the same slice: the proportional
-    baseline needs it as a *distribution* (:func:`known_author_shares`), and
-    ``accuracy_by_known_ndocs/`` needs the raw per-author count as its x axis. Memoised, because
-    every run of a dataset asks for the same six known sides and the slice costs a sort of the
-    whole corpus -- 172,509 rows on WildChat. :func:`warm_baselines` fills this memo in the
-    parent process as a side effect of warming the baselines, so the curve workers inherit it.
+    Three things reconstruct it and each wants something different from the same slice -- the
+    proportional baseline wants a *distribution* over authors (:func:`known_author_shares`),
+    ``accuracy_by_known_ndocs/`` wants the raw per-author count as its x axis, and
+    ``accuracy_by_language/`` wants how many authors write each language -- so the boundary
+    arithmetic lives here once. Memoised, because every run of a dataset asks for the same six
+    known sides and the slice costs a sort of the whole corpus (172,509 rows on WildChat).
+
+    What is memoised is the *ordering* (:func:`dated_corpus`), one frame per dataset, rather than
+    the six slices: a slice keeps its parent frame alive, so caching them would hold six copies of
+    the corpus for what the callers reduce to a few thousand counts. The slice itself is an
+    ``iloc`` on an already-sorted frame and costs nothing to repeat.
     """
-    key = (dataset, known_config)
-    if key not in _KNOWN_COUNTS:
+    dated = dated_corpus(dataset)
+    if dated is None:
+        return None
+    config = parse_config_tag(known_config)
+    known = dated.iloc[int(round(config.start * len(dated))):
+                       int(round(config.end * len(dated)))]
+    return known if len(known) else None
+
+
+def dated_corpus(dataset: str) -> pd.DataFrame | None:
+    """:func:`corpus_documents` in ``load_documents_and_features``'s order, memoised per dataset.
+
+    Undated documents dropped -- swe-chat's are ~8% of the corpus, so keeping them would shift
+    every window boundary -- then sorted by ``ended_at`` with ``doc_id`` breaking ties. Every
+    known-side reconstruction slices this, so the sort is paid once per dataset instead of once
+    per (dataset, configuration).
+    """
+    if dataset not in _DATED_CORPUS:
         frame = corpus_documents(dataset)
-        if frame is None:
-            _KNOWN_COUNTS[key] = None
-        else:
-            dated = frame[frame["ended_at"].notna()].sort_values(["ended_at", "doc_id"],
-                                                                 kind="mergesort")
-            config = parse_config_tag(known_config)
-            start = int(round(config.start * len(dated)))
-            end = int(round(config.end * len(dated)))
-            known = dated["author_id"].iloc[start:end]
-            _KNOWN_COUNTS[key] = known.value_counts() if len(known) else None
-    return _KNOWN_COUNTS[key]
+        _DATED_CORPUS[dataset] = None if frame is None else frame[
+            frame["ended_at"].notna()].sort_values(["ended_at", "doc_id"], kind="mergesort")
+    return _DATED_CORPUS[dataset]
 
 
-#: Memo for :func:`known_author_counts`, one entry per (dataset, known configuration).
-_KNOWN_COUNTS: dict[tuple[str, str], pd.Series | None] = {}
+#: Memo for :func:`dated_corpus`, one entry per dataset.
+_DATED_CORPUS: dict[str, pd.DataFrame | None] = {}
+
+
+def known_author_counts(dataset: str, known_config: str) -> pd.Series | None:
+    """How many documents each author wrote on ``known_config``'s known side."""
+    known = known_documents(dataset, known_config)
+    return None if known is None else known["author_id"].value_counts()
 
 
 def known_author_shares(dataset: str, known_config: str) -> pd.Series | None:
@@ -4023,6 +4403,15 @@ def run_curves(run: Run, tables: dict[str, pd.DataFrame], bootstrap: AuthorBoots
                 ndocs = config_ndocs(table, panel, run.dataset, tag, side=side, level=level)
                 if ndocs is not None:
                     curves[f"ndocs_{side}{suffix}"][tag] = ndocs
+        # The same CMC curve as `cmc`/`identity` above, split by the document's language. Joined
+        # from the corpus parquet, so like the `known` pair it is absent without one; it takes the
+        # panel's baseline rather than rebuilding it, since a baseline is a property of the
+        # configuration and every language's line is drawn against the same one.
+        for level, suffix in (("document", ""), ("author", "_authors")):
+            by_language = config_language_cmc(table, panel, run.dataset, tag, baseline,
+                                              level=level)
+            if by_language:
+                curves[f"language{suffix}"][tag] = by_language
         pool_curve = config_scaling(run, table, panel)
         if pool_curve is not None:
             curves["scaling"][tag] = pool_curve
@@ -4057,8 +4446,12 @@ def warm_baselines(runs: list[Run], tables: dict[Run, dict[str, pd.DataFrame]]) 
     for six times rather than once per worker -- and the workers, which would each have filled
     their own copy, get it for free.
     """
-    wanted = {(run.dataset, tag) for run in runs for tag in tables[run]}
-    missing = sorted(key for key in wanted if key not in _INCLUSION)
+    wanted = sorted({(run.dataset, tag) for run in runs for tag in tables[run]})
+    # Its own memo, so it is asked for every configuration rather than only the ones whose
+    # inclusion probabilities are still missing. Free after the first pass.
+    for key in wanted:
+        known_language_counts(*key)
+    missing = [key for key in wanted if key not in _INCLUSION]
     if not missing:
         return
     for key in missing:
@@ -4129,6 +4522,13 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1):
                   f"gallery, so sub-pool interpolation is not exact -- scaling skipped")
         if curves["modes"] is not None:
             modes[run] = curves["modes"]
+    # Reported once for the dataset rather than once per run: it is a property of the corpus's
+    # language mix, so when it fires it fires for every run of that corpus at once.
+    mute = [run for run in live if run not in built["language"]]
+    if mute:
+        print(f"  {len(mute)} of {len(live)} run(s): fewer than {MIN_LANGUAGES_PER_PANEL} "
+              f"languages clear the {MIN_AUTHORS_PER_BIN}-user gate on any configuration -- "
+              f"accuracy_by_language skipped, it would redraw accuracy/ with one line")
     reach = openset_reach({run: open_tables[run] for run in runs if open_tables[run]})
     return tables, bootstrap, built, modes, reach
 
@@ -4149,7 +4549,8 @@ def dataset_figure_jobs(dataset: str, runs: list[Run], built: dict, modes: dict,
     jobs = []
     for family, kind in CURVE_FAMILIES.items():
         if family in PER_RUN_FAMILIES:
-            jobs += [(plot_separation_figures, (dataset, [run], built[family], kind, output_dir), {})
+            plot = PER_RUN_FAMILIES[family]
+            jobs += [(plot, (dataset, [run], built[family], kind, output_dir), {})
                      for run in runs if run in built[family]]
             continue
         jobs.append((plot_defense_comparisons, (dataset, runs, built[family], kind, output_dir), {}))
