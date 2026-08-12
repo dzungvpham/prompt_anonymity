@@ -587,9 +587,10 @@ def resolve_bank(path: Path, *, framings: tuple[Framing, ...] = FRAMINGS,
     bank = PassageBank.load(path)
     missing = bank.covers(framings)
     if missing:
-        print(f"[frame_pad] warning: {path} has no passages for {len(missing)} scene(s) "
-              f"({', '.join(missing[:3])}...); documents in those scenes will NOT be padded. "
-              f"Rebuild with --build-bank --force.")
+        print(f"[frame_pad] note: {path} has no passages for {len(missing)} of {len(framings)} "
+              f"scene(s) ({', '.join(missing[:3])}{'...' if len(missing) > 3 else ''}). The draw is "
+              f"restricted to the covered scenes, so every document is still padded -- the cost is "
+              f"pad diversity, not coverage. `--build-bank --force` rebuilds the whole bank.")
     return bank
 
 
@@ -740,6 +741,7 @@ class FramePadDefense:
         self._by_key = {f.key: f for f in framings}
         self._bank = bank
         self._bank_path = bank_path
+        self._active: tuple[Framing, ...] | None = None   # see active_framings()
         self.padded = 0
         self.unpadded = 0
 
@@ -769,15 +771,45 @@ class FramePadDefense:
 
     # --- assignment ---
 
+    def active_framings(self) -> tuple[Framing, ...]:
+        """The scenes documents are actually assigned to: the codebook, minus any the bank misses.
+
+        A partial bank is the normal case, not an error -- a build where some calls fail writes what
+        it got -- and the alternative to restricting here is worse than it looks: documents drawn to
+        an unbanked scene would get **no pad at all**, so the defended arm would silently contain a
+        slice of undefended documents and under-report the defense's effect.
+
+        Restricting changes the draw's modulus, so the scene assignment no longer matches
+        ``frame_shift``'s at the same seed. That is a real loss (it is what made the two arms
+        comparable document by document) and it is why this says so out loud, once.
+        """
+        if self._active is None:
+            bank = self.bank()
+            covered = tuple(f for f in self.framings if bank.passages_for(f.key))
+            if not covered:
+                raise SystemExit(
+                    f"the passage bank has no passages for any of this defense's "
+                    f"{len(self.framings)} scenes; build one with "
+                    f"`python -m prompt_anonymity.defenses.frame_pad --build-bank`."
+                )
+            if len(covered) != len(self.framings):
+                print(f"[frame_pad] the bank covers {len(covered)} of {len(self.framings)} scenes; "
+                      f"assignment is restricted to those, so every document still gets a pad. "
+                      f"Note the scene draw no longer lines up with frame_shift's at this seed.")
+            self._active = covered
+        return self._active
+
     def framing_for(self, doc_id) -> Framing:
         """The scene this document's pad comes from: a keyed hash of ``(seed, "framing", doc_id)``.
 
-        Deliberately the same key as :meth:`~.frame_shift.FrameShiftDefense.framing_for`, so the two
-        defenses agree document by document and a comparison between them holds the scene fixed.
+        The same key as :meth:`~.frame_shift.FrameShiftDefense.framing_for`, so with a **complete**
+        bank the two defenses agree document by document and a comparison between them holds the
+        scene fixed. See :meth:`active_framings` for what a partial bank costs.
         """
         if self.single_framing is not None:
             return self._by_key[self.single_framing]
-        return self.framings[keyed_rng(self.seed, "framing", doc_id).randrange(len(self.framings))]
+        active = self.active_framings()
+        return active[keyed_rng(self.seed, "framing", doc_id).randrange(len(active))]
 
     def passage_for(self, doc_id) -> str | None:
         """The padding text for this document, or ``None`` when its scene is missing from the bank.
@@ -991,13 +1023,24 @@ def _selftest() -> None:
     else:
         check("unknown framing key is rejected", False, "no ValueError raised")
 
-    # 10. A scene missing from the bank means "not padded", not a crash: a bank built under an older
-    #     codebook must not kill a corpus run partway through.
-    partial = FramePadDefense(seed=7, bank=PassageBank({FRAMINGS[0].key: ["x" * 300]}))
+    # 10. A PARTIAL bank still pads every document. This is the normal case -- a build where some
+    #     calls fail writes what it got -- and the failure it guards against is the quiet one: if
+    #     documents drawn to an unbanked scene went unpadded, the defended arm would carry a slice of
+    #     undefended documents and under-report the defense.
+    covered = {FRAMINGS[0].key: ["x" * 300], FRAMINGS[3].key: ["y" * 300]}
+    partial = FramePadDefense(seed=7, bank=PassageBank(covered))
     outputs = [partial.extra_turns(f"doc-{i}") for i in range(2_000)]
-    check("unbanked scenes pass through unpadded",
-          any(o == [] for o in outputs) and any(len(o) == 1 for o in outputs),
-          f"{sum(len(o) for o in outputs)} pads over 2,000 documents")
+    check("a partial bank still pads every document",
+          all(len(o) == 1 for o in outputs), f"{sum(1 for o in outputs if not o)} unpadded")
+    check("a partial bank draws only from covered scenes",
+          {partial.framing_for(f"doc-{i}").key for i in range(2_000)} == set(covered))
+    empty = FramePadDefense(seed=7, bank=PassageBank({}))
+    try:
+        empty.extra_turns("doc-1")
+    except SystemExit:
+        check("an empty bank fails loudly", True)
+    else:
+        check("an empty bank fails loudly", False, "no SystemExit raised")
 
     # 11. The conversation-cell path appends a turn in the cell encoding, leaving the original text
     #     an exact prefix -- "the user's words are untouched" is the whole claim of this defense.
