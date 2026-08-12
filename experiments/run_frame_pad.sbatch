@@ -95,6 +95,13 @@ SHOW_FRAMES="${SHOW_FRAMES:-4}"
 
 # Same env bootstrap the experiment launcher uses, so how a batch shell finds conda stays defined
 # in exactly one file. It ends in `exec "$@"`, so calling it as a command runs the stage.
+# Every defense CLI here is run with `python -m`, and the defense registry has already imported the
+# module by then -- so runpy executes it a second time under the name __main__ and warns about it on
+# every invocation. Two copies of the module do exist, but nothing crosses between them (the CLI
+# builds its own defense instance and the registry's is never touched), so the warning is noise.
+# Filtered by message rather than by category, so a real RuntimeWarning still reaches the log.
+export PYTHONWARNINGS="ignore:.*found in sys.modules:RuntimeWarning"
+
 RUN=(bash scripts/slurm_job.sh)
 
 echo "=================================================================="

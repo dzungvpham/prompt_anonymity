@@ -83,6 +83,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -514,16 +515,30 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
         done = offset + len(chunk)
         elapsed = time.time() - started
         remaining = (len(jobs) - done) * elapsed / done  # seconds, at the rate so far
+        # The reason breakdown is on every line, not just at the end: "25 rejected" tells you
+        # something is wrong and nothing about what, and waiting out a 20-minute build to find out
+        # is exactly the loop this reporting exists to break. 'empty'/'stray tag' both mean the
+        # model spent its budget without producing a closed passage -- raise the budget or drop to
+        # a non-reasoning model; 'too short' means it wrote a stub.
+        why = Counter(entry["reason"] for entry in rejected)
         print(f"[frame_pad] {done}/{len(jobs)} calls | "
-              f"{sum(len(v) for v in passages.values())} passages, {len(rejected)} rejected | "
-              f"{elapsed / 60:.1f} min elapsed"
+              f"{sum(len(v) for v in passages.values())} passages, {len(rejected)} rejected"
+              + (" (" + ", ".join(f"{r}: {n}" for r, n in why.most_common()) + ")" if why else "")
+              + f" | {elapsed / 60:.1f} min elapsed"
               + (f", ~{remaining / 60:.1f} min left" if done < len(jobs) else ""), flush=True)
+        if rejected and offset == 0:
+            # One real example, once, so the first chunk already shows what a bad reply looks like.
+            first = rejected[0]
+            print(f"[frame_pad] first rejection ({first['reason']}, {first['framing']}): "
+                  f"{first['reply'][:300]!r}", flush=True)
 
     bank = PassageBank(passages, model=model, target_words=target_words)
     missing = bank.covers(framings)
+    # Always keep the rejected replies, not only when a scene ends up empty: a build that "worked"
+    # while throwing away half its calls is a build whose replies someone needs to read.
+    dump = _dump_rejected(rejected, model, framings, passages_per_frame, target_words) if rejected \
+        else None
     if rejected:
-        from collections import Counter
-
         why = Counter(entry["reason"] for entry in rejected)
         print(f"[frame_pad] {len(rejected)} of {len(jobs)} calls produced nothing usable "
               + ", ".join(f"{reason}: {n}" for reason, n in why.most_common()))
@@ -877,8 +892,6 @@ def _selftest() -> None:
     introducing one (the same choice ``collision_seeding`` and ``frame_shift`` made). Every check is
     a property this defense's correctness rests on.
     """
-    from collections import Counter
-
     from ..data.apply_defenses import TURN_ID_SEPARATOR as PIPELINE_SEPARATOR
     from ._backends import TURN_ID_SEPARATOR
     from .frame_shift import FrameShiftDefense
