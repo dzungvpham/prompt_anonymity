@@ -82,6 +82,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -122,7 +123,16 @@ FRAME_PAD_MIN_PASSAGE_CHARS = 200
 FRAME_PAD_TEMPERATURE = 0.0   # greedy -> the bank is reproducible from the prompt and the codebook
 FRAME_PAD_TOP_P = 1.0
 FRAME_PAD_OUTPUT_TAG = "passage"
-FRAME_PAD_MAX_WORKERS = int(os.environ.get("FRAME_PAD_MAX_WORKERS", "8"))
+#: Concurrent requests during a bank build. Higher than the 8 the other defenses use because this
+#: job's shape is different: 400 *short* calls, entirely network-bound, and temperature 0 -- so
+#: concurrency cannot change a single passage, only how long the wait is. The client already backs
+#: off with full jitter on a 429, so the failure mode of going too wide is a slower build, not a
+#: broken one. Drop it if a provider starts rate-limiting in earnest.
+FRAME_PAD_MAX_WORKERS = int(os.environ.get("FRAME_PAD_MAX_WORKERS", "24"))
+#: Calls per progress line. The build used to print nothing between "building a bank" and the final
+#: summary, which made a slow run and a hung one look identical for twenty minutes; the batch is cut
+#: into chunks this size so there is something on stdout roughly every half-minute.
+FRAME_PAD_PROGRESS_EVERY = int(os.environ.get("FRAME_PAD_PROGRESS_EVERY", "48"))
 FRAME_PAD_MAX_RETRIES = int(os.environ.get("FRAME_PAD_MAX_RETRIES", "8"))
 FRAME_PAD_TIMEOUT = float(os.environ.get("FRAME_PAD_TIMEOUT", "180"))
 
@@ -480,20 +490,34 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
     budget = int(target_words * 3) + 512
 
     print(f"[frame_pad] building a bank: {len(framings)} scenes x {passages_per_frame} passages "
-          f"~{target_words} words = {len(jobs)} calls, model '{model}'")
-    replies = client.complete_batch(prompts, budget)
+          f"~{target_words} words = {len(jobs)} calls at {FRAME_PAD_MAX_WORKERS} concurrent, "
+          f"model '{model}'", flush=True)
 
     passages: dict[str, list[str]] = {f.key: [] for f in framings}
     rejected: list[dict] = []
     untagged = 0
-    for (framing, index), reply in zip(jobs, replies):
-        passage, reason = accept_passage(reply)
-        if passage is None:
-            rejected.append({"framing": framing.key, "aspect_index": index, "reason": reason,
-                             "reply": (reply or "")[:2000]})
-            continue
-        untagged += reason == "untagged"
-        passages[framing.key].append(passage)
+    # In chunks, purely so there is progress on stdout: one all-or-nothing batch of 400 prints
+    # nothing for as long as it takes, and a slow build then looks exactly like a hung one.
+    chunk_size = max(1, FRAME_PAD_PROGRESS_EVERY)
+    started = time.time()
+    for offset in range(0, len(jobs), chunk_size):
+        chunk = jobs[offset:offset + chunk_size]
+        replies = client.complete_batch(prompts[offset:offset + chunk_size], budget)
+        for (framing, index), reply in zip(chunk, replies):
+            passage, reason = accept_passage(reply)
+            if passage is None:
+                rejected.append({"framing": framing.key, "aspect_index": index, "reason": reason,
+                                 "reply": (reply or "")[:2000]})
+                continue
+            untagged += reason == "untagged"
+            passages[framing.key].append(passage)
+        done = offset + len(chunk)
+        elapsed = time.time() - started
+        remaining = (len(jobs) - done) * elapsed / done  # seconds, at the rate so far
+        print(f"[frame_pad] {done}/{len(jobs)} calls | "
+              f"{sum(len(v) for v in passages.values())} passages, {len(rejected)} rejected | "
+              f"{elapsed / 60:.1f} min elapsed"
+              + (f", ~{remaining / 60:.1f} min left" if done < len(jobs) else ""), flush=True)
 
     bank = PassageBank(passages, model=model, target_words=target_words)
     missing = bank.covers(framings)
