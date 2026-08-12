@@ -20,9 +20,12 @@
 # much needed the rewrite?
 #
 # WHY IT IS ALMOST FREE, unlike frame_shift's ~$95-180 per corpus. The padding text is generated
-# ONCE: 50 scenes x 8 passages = 400 passages, one call per scene on the same model frame_shift
-# rewrites with, about two cents in total (stage 0b) -- 50 calls buy the padding for an entire
-# corpus. It is written to data/dist/frame_pad_bank.json and every later run just reads
+# ONCE: 50 scenes x 8 passages = 400 short calls on the same model frame_shift rewrites with, about
+# two cents in total (stage 0b) -- that buys the padding for an entire corpus. One call per PASSAGE,
+# not per scene, so a reply the parser cannot read costs one passage instead of a whole scene; any
+# that fail are written to data/dist/frame_pad_bank.rejected.json to be read, and a scene ending
+# with none of its eight is a hard failure. The bank lands in data/dist/frame_pad_bank.json and
+# every later run just reads
 # that file -- each document draws its pad by a keyed hash of its doc_id, with no API call at corpus
 # time. Nothing about the defense stage scales with the corpus.
 #

@@ -20,9 +20,9 @@ into dilution versus rewriting; read next to ``collision_seeding`` it is the sam
 from the character-n-gram channel (spelling, punctuation) to whole paragraphs of shared topical text.
 
 **The padding text is generated once, not per document.** A bank of
-:data:`FRAME_PAD_PASSAGES_PER_FRAME` passages is written for each of the 50 scenes -- 50 calls, about
-two cents, on the same model ``frame_shift`` rewrites with -- and every document draws one passage
-from its scene's bank. Corpus scale is therefore free, which is the whole point of this arm existing beside
+:data:`FRAME_PAD_PASSAGES_PER_FRAME` passages is written for each of the 50 scenes -- 400 short
+calls, about two cents, on the same model ``frame_shift`` rewrites with -- and every document draws
+one passage from its scene's bank. Corpus scale is therefore free, which is the whole point of this arm existing beside
 frame_shift. It also means the pad **repeats**: K scenes x P passages = 400 distinct pads, so on
 WildChat ~430 documents carry byte-identical padding. That is deliberate. Shared text is collision
 material; unique-per-document padding would only add length.
@@ -95,7 +95,7 @@ from .frame_shift import FRAMING_KEYS, FRAMINGS, SINGLE_FRAMING_KEY, Framing
 #: the frames and the pads removes "one arm had a better writer" as an explanation of any gap.
 #:
 #: Cost is not a reason to pick anything else here, however tempting the cheaper tiers look on
-#: frame_shift's bill. This job is **50 calls, once** -- at $0.08/M in and $0.18/M out that is about
+#: frame_shift's bill. This job is **400 short calls, once** -- at $0.08/M in and $0.18/M out about
 #: two cents for the whole bank, against frame_shift's ~$95-180 for a corpus of rewrites -- and what
 #: it buys is prose density, which is the one property this defense lives on (see
 #: :func:`passage_density`). A cheaper model writes thinner, more generic passages, and a thin bank
@@ -146,10 +146,10 @@ FRAME_PAD_SYSTEM_PROMPT = """
 You are FramePad, a generator of dense, inert scene prose.
 
 # Task
-You are given a SCENE and a number N. Write N separate passages of heavily detailed prose from inside
-that scene. These passages will be appended to unrelated documents, so each one must stand completely
-on its own, must be packed with concrete subject matter, and must never address, instruct or question
-a reader.
+You are given a SCENE and an ASPECT of it. Write ONE passage of heavily detailed prose from inside
+that scene, about that aspect. The passage will be appended to an unrelated document, so it must
+stand completely on its own, must be packed with concrete subject matter, and must never address,
+instruct or question a reader.
 
 # Rules
 
@@ -179,31 +179,28 @@ a reader.
    that for the passage it appears in. Period-appropriate machinery, tools and the scene's own
    domain jargon are fine and encouraged -- a caliper, a protein skimmer, a ley-line, a quorum.
 
-4. EACH PASSAGE IS ITS OWN MOMENT. Passage 2 must not continue passage 1. Different props, different
-   people, a different hour of the day. They will never be read together, so continuity between them
-   is wasted and repetition between them is harmful.
+4. WRITE TO THE GIVEN ASPECT. You are told which aspect of the scene to write about. Stay on it: it
+   is what keeps this passage from repeating another one drawn from the same scene.
 
-5. LENGTH. About {{TARGET_WORDS}} words per passage. A passage much shorter than that will be
-   rejected. Use the length for more substance, never for more atmosphere.
+5. LENGTH. About {{TARGET_WORDS}} words. A passage much shorter than that will be rejected. Use the
+   length for more substance, never for more atmosphere.
 
 6. ENGLISH, and plain prose. No headings, no lists, no markdown, no stage directions, no titles.
 
 # Output contract
-Return exactly N passages, each wrapped in <passage> tags, and nothing else:
+Return ONE passage wrapped in <passage> tags, and nothing else:
 
 <passage>
-...the first passage...
-</passage>
-<passage>
-...the second passage...
+...the passage...
 </passage>
 
-No preamble, no numbering, no commentary between or after them.
+No preamble, no numbering, no commentary before or after it.
 
 # Example
 SCENE: The minutes of a municipal planning and zoning board: attendance, quorum established, a
 variance requested for parcel 14-227-03, a neighbour's objection about setbacks, and an item where
 the board asks staff to explain a matter fully for the record.
+ASPECT: a dispute or disagreement, and how it was settled
 
 <passage>
 The November meeting ran forty minutes past its scheduled close, largely on account of item 4(b).
@@ -223,8 +220,31 @@ reason.
 
 FRAME_PAD_INPUT_TEMPLATE = """
 SCENE: {{SCENE}}
-N: {{COUNT}}
+ASPECT: {{ASPECT}}
 """.strip()
+
+#: One aspect per passage, cycled over a scene's :data:`FRAME_PAD_PASSAGES_PER_FRAME` requests.
+#:
+#: Diversity within a scene has to come from the *prompt*, because temperature is 0: asking the same
+#: model the same question eight times returns the same passage eight times. Asking for all eight in
+#: one reply was the first design and it failed on the cluster -- half the scenes came back with no
+#: parseable passage at all, and one long multi-passage completion gives no way to tell a
+#: contract-ignoring model from a truncated one. One passage per call is the robust shape: each
+#: request is short, independently retried by the client, and independently diagnosable.
+FRAME_PAD_ASPECTS = (
+    "an inventory, a set of measurements, or a record of quantities taken on one particular day",
+    "a dispute or disagreement, and how it was settled",
+    "an accident, a breakage, or a near miss, and what it cost",
+    "a visitor or newcomer, who they were and what they brought with them",
+    "a repair, a restoration, or a piece of routine maintenance done properly",
+    "a record of who was present, what was decided, and by what margin",
+    "a departure, an ending, or a handover from one person to another",
+    "an unusual find, purchase or acquisition, and what was paid for it",
+    "a delay, a postponement, or a deadline that was missed",
+    "a procedure carried out step by step, exactly as it should be done",
+    "a correction to an earlier record, and who noticed the error",
+    "a season's or a year's worth of the work, summarised with figures",
+)
 
 
 # --- the passage bank --------------------------------------------------------
@@ -261,6 +281,57 @@ def parse_passages(raw_text: str) -> list[str]:
     blocks = re.findall(rf"<{FRAME_PAD_OUTPUT_TAG}>\s*([\s\S]*?)\s*</{FRAME_PAD_OUTPUT_TAG}>",
                         text, re.IGNORECASE)
     return [block.strip() for block in blocks if block.strip()]
+
+
+def accept_passage(raw_text: str) -> tuple[str | None, str]:
+    """One reply -> ``(passage, reason)``; ``passage`` is ``None`` when nothing is usable.
+
+    Three ways in, in order of preference:
+
+    * the text inside ``<passage>`` tags, as the contract asks;
+    * failing that, the **whole reply**, when it is long enough to be a passage and carries no stray
+      tag. Models drop the wrapper often enough that throwing away good prose over it is silly, and
+      here the wrapper carries no information -- one call returns one passage, so there is nothing to
+      delimit;
+    * a reply with an *opening* tag and no closing one was truncated mid-passage, and half a passage
+      is not one. Rejected as ``"stray tag"``.
+
+    The reason string is the diagnosis, and it exists because the first two cluster runs failed with
+    no way to tell "the model returned nothing" from "the model ignored the tags".
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return None, "empty"
+    tagged = parse_passages(text)
+    if tagged:
+        best = max(tagged, key=len)
+        if len(best) < FRAME_PAD_MIN_PASSAGE_CHARS:
+            return None, "too short"
+        return best, "tagged"
+    if f"<{FRAME_PAD_OUTPUT_TAG}" in text.lower():
+        return None, "stray tag"      # opened and never closed -> truncated
+    if len(text) < FRAME_PAD_MIN_PASSAGE_CHARS:
+        return None, "too short"
+    return text, "untagged"
+
+
+def _dump_rejected(rejected: list[dict], model: str, framings, passages_per_frame: int,
+                   target_words: int) -> Path:
+    """Write the rejected replies beside the bank, so a failed build can be read rather than guessed.
+
+    Best-effort: a build that cannot write its diagnosis still raises with the message, since losing
+    the real error to a permissions problem would be the worst of both.
+    """
+    path = bank_path().with_suffix(".rejected.json")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"model": model, "scenes": len(framings),
+                       "passages_per_frame": passages_per_frame, "target_words": target_words,
+                       "rejected": rejected}, handle, ensure_ascii=False, indent=1)
+    except OSError as error:  # noqa: BLE001 - the raise that follows carries the real failure
+        print(f"[frame_pad] could not write the rejected replies ({error})")
+    return path
 
 
 class PassageBank:
@@ -363,17 +434,28 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
                target_words: int = FRAME_PAD_TARGET_WORDS) -> PassageBank:
     """Generate the padding passages: one request per scene, all of them concurrently.
 
-    One call per scene rather than one per passage, for two reasons: the model can see the passages
-    it has already written and make the next one different (rule 4), and 50 requests at temperature 0
-    is a reproducible, two-cent job rather than 400 of them.
+    **One call per passage**, not per scene. The first design asked for all eight of a scene's
+    passages in one reply and it failed on the cluster: 25 of 50 scenes came back with nothing this
+    module could parse, and a single long multi-passage completion gives no way to tell a
+    contract-ignoring model from a truncated one -- the whole scene is simply lost. One short request
+    per passage means a failure costs one passage instead of eight, each request is retried
+    independently by the client, and 400 x ~250 tokens is the same two cents as before.
 
-    The only thing rejected here is a passage under :data:`FRAME_PAD_MIN_PASSAGE_CHARS` -- a stub,
-    which pads nothing. Nothing is rejected on *content*: an earlier version dropped any passage
-    containing software vocabulary and lost 16 of 50 scenes to their own ordinary English (Morse
-    code, birding data, an algebraic variable, a railway terminal, a piano keyboard). Keeping the pad
-    clear of software is the system prompt's job, and the check is a human reading ``--show-bank``.
+    Diversity within a scene comes from :data:`FRAME_PAD_ASPECTS`, one aspect per request, because at
+    temperature 0 the same prompt returns the same passage every time.
 
-    Raises if a scene comes back with nothing at all -- a bank missing a scene would leave every
+    A reply is accepted three ways, in order: the text inside ``<passage>`` tags; failing that, the
+    whole reply, if it is long enough to be a passage and carries no stray tag (models drop the
+    wrapper often enough that discarding a good passage over it would be silly); failing that,
+    nothing. Whatever is rejected is written to ``<bank>.rejected.json`` so the next failure can be
+    read rather than guessed at -- not having that is why the first two cluster runs were a mystery.
+
+    Passages under :data:`FRAME_PAD_MIN_PASSAGE_CHARS` are dropped as stubs. Nothing is rejected on
+    *content*: an earlier version dropped any passage containing software vocabulary and lost scenes
+    to their own ordinary English (Morse code, birding data, an algebraic variable). Keeping the pad
+    clear of software is the system prompt's job, checked by a human reading ``--show-bank``.
+
+    Raises if a scene ends with no passage at all -- a bank missing a scene would leave every
     document assigned to it unpadded, a hole in the arm that would not show up until the numbers
     looked odd.
     """
@@ -383,38 +465,55 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
         max_workers=FRAME_PAD_MAX_WORKERS, max_retries=FRAME_PAD_MAX_RETRIES,
         timeout=FRAME_PAD_TIMEOUT,
     )
-    prompts = [FRAME_PAD_INPUT_TEMPLATE.replace("{{SCENE}}", f.scene)
-                                       .replace("{{COUNT}}", str(passages_per_frame))
-               for f in framings]
-    # ~1.4 tokens per word, doubled for tag overhead and the model's own verbosity: over-budgeting a
-    # completion is free (only generated tokens are billed), under-budgeting truncates the last
-    # passage of every scene.
-    budget = int(passages_per_frame * target_words * 3) + 512
+    # One job per (scene, passage). The aspect list is cycled; past its length the repeat is numbered
+    # so the prompt still differs, since an identical prompt at temperature 0 gives identical text.
+    jobs = [(framing, index) for framing in framings for index in range(passages_per_frame)]
+    prompts = []
+    for framing, index in jobs:
+        aspect = FRAME_PAD_ASPECTS[index % len(FRAME_PAD_ASPECTS)]
+        if index >= len(FRAME_PAD_ASPECTS):
+            aspect += f" (a second, different occasion of this -- number {index + 1})"
+        prompts.append(FRAME_PAD_INPUT_TEMPLATE.replace("{{SCENE}}", framing.scene)
+                                               .replace("{{ASPECT}}", aspect))
+    # ~1.4 tokens per word, tripled for tag overhead and the model's own verbosity. Over-budgeting a
+    # completion is free (only generated tokens are billed); under-budgeting truncates the passage.
+    budget = int(target_words * 3) + 512
 
     print(f"[frame_pad] building a bank: {len(framings)} scenes x {passages_per_frame} passages "
-          f"~{target_words} words, model '{model}'")
+          f"~{target_words} words = {len(jobs)} calls, model '{model}'")
     replies = client.complete_batch(prompts, budget)
 
-    passages: dict[str, list[str]] = {}
-    stubs: dict[str, int] = {}
-    for framing, reply in zip(framings, replies):
-        parsed = parse_passages(reply)
-        usable = [p for p in parsed if len(p) >= FRAME_PAD_MIN_PASSAGE_CHARS]
-        stubs[framing.key] = len(parsed) - len(usable)
-        passages[framing.key] = usable[:passages_per_frame]
+    passages: dict[str, list[str]] = {f.key: [] for f in framings}
+    rejected: list[dict] = []
+    untagged = 0
+    for (framing, index), reply in zip(jobs, replies):
+        passage, reason = accept_passage(reply)
+        if passage is None:
+            rejected.append({"framing": framing.key, "aspect_index": index, "reason": reason,
+                             "reply": (reply or "")[:2000]})
+            continue
+        untagged += reason == "untagged"
+        passages[framing.key].append(passage)
 
     bank = PassageBank(passages, model=model, target_words=target_words)
     missing = bank.covers(framings)
+    if rejected:
+        from collections import Counter
+
+        why = Counter(entry["reason"] for entry in rejected)
+        print(f"[frame_pad] {len(rejected)} of {len(jobs)} calls produced nothing usable "
+              + ", ".join(f"{reason}: {n}" for reason, n in why.most_common()))
+    if untagged:
+        print(f"[frame_pad] {untagged} reply/replies omitted the <passage> tags and were kept whole")
     if missing:
-        detail = ", ".join(f"{key} ({stubs.get(key, 0)} too short)" for key in missing)
+        dump = _dump_rejected(rejected, model, framings, passages_per_frame, target_words)
         raise SystemExit(
-            f"no usable passage for {len(missing)} scene(s): {detail}.\n"
-            f"Either the reply carried no <passage> blocks (a model ignoring the output contract) "
-            f"or every one was a stub. Re-run --build-bank, or try another --model."
+            f"no usable passage for {len(missing)} of {len(framings)} scene(s): "
+            f"{', '.join(missing)}.\n"
+            f"The {len(rejected)} rejected replies are in {dump} -- READ THEM. 'empty' means the "
+            f"model returned nothing at all, 'too short' a stub, 'stray tag' a truncated reply. "
+            f"Then re-run --build-bank, or try another --model."
         )
-    if sum(stubs.values()):
-        print(f"[frame_pad] dropped {sum(stubs.values())} passage(s) under "
-              f"{FRAME_PAD_MIN_PASSAGE_CHARS} characters")
     short = [f"{f.key} ({len(passages[f.key])})" for f in framings
              if len(passages[f.key]) < passages_per_frame]
     if short:
@@ -882,6 +981,34 @@ def _selftest() -> None:
     check("a truncated final passage is dropped",
           parse_passages(reply + "<passage>\nhalf a pas") == ["one", "two"])
     check("an empty reply parses to nothing", parse_passages("") == [])
+
+    # 12b. accept_passage is where a build succeeds or silently loses a scene, and every branch of it
+    #      corresponds to a way the cluster actually failed. The untagged branch is the important
+    #      one: requiring the wrapper is what turned "the model dropped the tags" into "25 scenes
+    #      produced nothing", and the reason strings are what make the next failure readable.
+    body = "The Assessor recorded nine entries on 14 November, of which three were later struck. " * 4
+    cases = {
+        "tagged": f"<passage>\n{body}\n</passage>",
+        "untagged": body,
+        "stray tag": f"<passage>\n{body[:80]}",
+        "empty": "   ",
+        "too short": "<passage>\nstub\n</passage>",
+    }
+    for expected, reply in cases.items():
+        passage, reason = accept_passage(reply)
+        check(f"accept_passage: {expected}",
+              reason == expected and (passage is None) == (expected in ("stray tag", "empty",
+                                                                        "too short")),
+              f"got ({'None' if passage is None else f'{len(passage)} chars'}, {reason!r})")
+    check("accept_passage keeps the untagged text verbatim",
+          accept_passage(body)[0] == body.strip())
+
+    # 12c. One aspect per passage is the only thing making a scene's passages differ at temperature 0,
+    #      so there must be enough of them to cover a bank's worth, and they must be distinct.
+    check("there are at least as many aspects as passages per scene",
+          len(FRAME_PAD_ASPECTS) >= FRAME_PAD_PASSAGES_PER_FRAME,
+          f"{len(FRAME_PAD_ASPECTS)} aspects, {FRAME_PAD_PASSAGES_PER_FRAME} passages")
+    check("aspects are distinct", len(set(FRAME_PAD_ASPECTS)) == len(FRAME_PAD_ASPECTS))
 
     # 13. The bank round-trips through JSON with a stable digest -- the digest is what identifies
     #     which text a defended corpus was padded with.
