@@ -139,6 +139,16 @@ FRAME_PAD_TIMEOUT = float(os.environ.get("FRAME_PAD_TIMEOUT", "180"))
 
 #: Filename of the passage bank inside the dist directory.
 FRAME_PAD_BANK_FILENAME = "frame_pad_bank.json"
+#: The bank committed alongside this module -- the default, and the reason a normal run needs no API
+#: key and no generation step. See :func:`bank_path` for the precedence, and ``--build-bank`` for
+#: making a new one (which lands in ``data/dist`` and takes precedence over this).
+#:
+#: **CSV, not JSON**, because this file is meant to be read and edited by people: it is the padding
+#: that goes onto every document in the corpus, and one row per passage with its length and density
+#: beside it opens in a spreadsheet. :meth:`PassageBank.load` dispatches on the extension, and
+#: :meth:`PassageBank.to_csv` round-trips, so editing a row -- or deleting one -- changes the bank
+#: with no rebuild step.
+PACKAGED_BANK = Path(__file__).with_name("frame_pad_bank.csv")
 #: Environment variable pointing at a bank file directly (wins over the dist-directory default).
 #: Point it at a copy to freeze a bank against a rebuild, the way ``$PROMPT_ANONYMITY_MODELS_CONFIG``
 #: pins a models config.
@@ -380,7 +390,13 @@ class PassageBank:
 
     def __init__(self, passages: dict[str, list[str]], *, model: str = FRAME_PAD_MODEL,
                  target_words: int = FRAME_PAD_TARGET_WORDS):
-        self.passages = {key: tuple(texts) for key, texts in passages.items() if texts}
+        # Stripped at construction so a passage has ONE canonical form. Without this the JSON and the
+        # CSV disagree on trailing whitespace (the CSV reader strips, the writer does not), the
+        # digest changes depending on which file a bank was loaded from, and a bank that round-trips
+        # through the readable form is silently not the bank that was written.
+        self.passages = {key: tuple(t.strip() for t in texts if t and t.strip())
+                         for key, texts in passages.items()
+                         if any(t and t.strip() for t in texts)}
         self.model = model
         self.target_words = target_words
 
@@ -421,8 +437,53 @@ class PassageBank:
                    model=payload.get("model", FRAME_PAD_MODEL),
                    target_words=int(payload.get("target_words", FRAME_PAD_TARGET_WORDS)))
 
+    def to_csv(self, path: Path) -> Path:
+        """Write the bank as a CSV: one row per passage, with what it measures beside it.
+
+        The JSON is what the code loads; this is what a person reads. Four hundred passages is
+        exactly the size that wants a spreadsheet -- sort by density to find the thin ones, by scene
+        to see whether a scene's four passages are really four different moments -- and eyeballing
+        the bank is now the only check on its content that is not mechanical.
+
+        Passages contain newlines, which is what CSV quoting is for; ``csv`` handles it, and
+        ``newline=""`` on the file is required for that to round-trip on every platform.
+        """
+        import csv
+
+        labels = {f.key: f.label for f in FRAMINGS}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["framing", "label", "index", "chars", "words", "density", "passage"])
+            for key, texts in sorted(self.passages.items()):
+                for index, text in enumerate(texts):
+                    writer.writerow([key, labels.get(key, ""), index, len(text),
+                                     len(re.findall(r"[\w'’-]+", text)),
+                                     f"{passage_density(text):.1f}", text])
+        return path
+
+    @classmethod
+    def from_csv(cls, path: Path, **kwargs) -> "PassageBank":
+        """Read a bank back from the CSV form, so a hand-edited one can be used as-is.
+
+        Rows are grouped by ``framing`` in the order they appear -- the ``index`` column is
+        informational, so deleting a row does not leave a hole.
+        """
+        import csv
+
+        passages: dict[str, list[str]] = {}
+        with open(path, encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                text = (row.get("passage") or "").strip()
+                if text:
+                    passages.setdefault(row["framing"], []).append(text)
+        return cls(passages, **kwargs)
+
     @classmethod
     def load(cls, path: Path) -> "PassageBank":
+        """Load a bank from ``.json`` or ``.csv``, by extension."""
+        if Path(path).suffix.lower() == ".csv":
+            return cls.from_csv(Path(path))
         with open(path, encoding="utf-8") as handle:
             return cls.from_json(json.load(handle))
 
@@ -443,11 +504,25 @@ class PassageBank:
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(self.to_json(), handle, ensure_ascii=False, indent=1)
         os.replace(temporary, path)
+        # The readable copy, always written beside the canonical one, so "what is in the bank?" is
+        # answered by opening a spreadsheet rather than by running a command.
+        self.to_csv(path.with_suffix(".csv"))
 
 
 def bank_path(explicit: str | os.PathLike | None = None) -> Path:
-    """Where the bank lives: an explicit path, else ``$FRAME_PAD_BANK``, else ``<dist>/`` + the
-    default filename.
+    """Where the bank lives, in precedence order.
+
+    1. an explicit path (``--bank``);
+    2. ``$FRAME_PAD_BANK``;
+    3. ``<dist>/frame_pad_bank.json`` -- a bank built on this machine, which wins over the shipped
+       one so ``--build-bank --force`` still means something;
+    4. :data:`PACKAGED_BANK`, the bank committed to the repo.
+
+    Point 4 is the one that matters. The padding text is **identical for every user, every corpus
+    and every run** -- it is a codebook, exactly like :data:`~.frame_shift.FRAMINGS`, and there was
+    never a good reason for it to be a runtime artifact. Shipping it means no API key, no generation
+    step, no partial bank, and bit-identical padding for anyone who checks out the repo. Generating
+    it was the only fragile part of this defense and this removes it from the path entirely.
 
     ``data.config`` is imported lazily because ``data`` imports the defense registry, which imports
     this module -- the same circular-import dance :func:`~.frame_shift._load_documents` does.
@@ -459,7 +534,10 @@ def bank_path(explicit: str | os.PathLike | None = None) -> Path:
         return Path(override).expanduser()
     from ..data.config import dist_dir
 
-    return dist_dir() / FRAME_PAD_BANK_FILENAME
+    local = dist_dir() / FRAME_PAD_BANK_FILENAME
+    if local.exists() or not PACKAGED_BANK.exists():
+        return local          # a locally built bank, or nowhere to build one but here
+    return PACKAGED_BANK
 
 
 def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = FRAMINGS,
@@ -498,9 +576,15 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
         max_workers=FRAME_PAD_MAX_WORKERS, max_retries=FRAME_PAD_MAX_RETRIES,
         timeout=FRAME_PAD_TIMEOUT,
     )
-    # One job per (scene, passage). The aspect list is cycled; past its length the repeat is numbered
-    # so the prompt still differs, since an identical prompt at temperature 0 gives identical text.
-    jobs = [(framing, index) for framing in framings for index in range(passages_per_frame)]
+    # One job per (scene, passage), ordered ROUND-ROBIN: every scene's first passage, then every
+    # scene's second, and so on. Scene-major order would mean a build killed at 40% had covered the
+    # first 20 scenes completely and the other 30 not at all -- a bank that is a prefix of the
+    # codebook, which is worse than a thin one because the surviving scenes are correlated (the
+    # codebook opens with twelve fiction genres). Round-robin makes any prefix of the work a
+    # *uniform* bank: stop anywhere and every scene has roughly the same number of passages.
+    # The aspect list is cycled; past its length the repeat is numbered so the prompt still differs,
+    # since an identical prompt at temperature 0 returns identical text.
+    jobs = [(framing, index) for index in range(passages_per_frame) for framing in framings]
     prompts = []
     for framing, index in jobs:
         aspect = FRAME_PAD_ASPECTS[index % len(FRAME_PAD_ASPECTS)]
@@ -654,8 +738,22 @@ CODEISH_PATTERN = re.compile(r"`|https?://|\w+\(\)|\w+\.(?:py|js|sh|json)\b")
 DENSITY_FLOOR = 5.0
 
 
+#: Numbers written as words. Without these the measure is a register test rather than a content
+#: test: a zoning board writes "41 pounds" and a Socratic dialogue writes "some fourteen feet", and
+#: only the first has a digit in it. Scoring the second at zero rejected genuinely dense prose --
+#: a passage counting out four minutes, six passes and twenty-five minutes measured 0.0 -- and the
+#: scenes it rejected were exactly the narrative ones the codebook needs most.
+NUMBER_WORDS = (
+    "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
+    "sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    "hundred|thousand|million|dozen|score|half|quarter|third|fourth|fifth|sixth|seventh|eighth|"
+    "ninth|tenth|first|second|twelfth|twentieth|thirtieth"
+)
+NUMBER_WORD_PATTERN = re.compile(rf"\b(?:{NUMBER_WORDS})(?:s|th|ths)?\b", re.IGNORECASE)
+
+
 def passage_density(text: str) -> float:
-    """Content markers per 100 words: proper nouns plus numbers.
+    """Content markers per 100 words: proper nouns plus numbers, written either way.
 
     A stand-in for "how much substance is in here", and a deliberately crude one -- what it has to
     separate is a passage full of named people, parcel numbers, dosages and dates from a passage of
@@ -675,6 +773,7 @@ def passage_density(text: str) -> float:
         tokens = re.findall(r"[\w'’-]+", sentence)
         proper += sum(1 for token in tokens[1:] if token[:1].isupper())
     numeric = sum(1 for word in words if any(character.isdigit() for character in word))
+    numeric += len(NUMBER_WORD_PATTERN.findall(text))
     return 100.0 * (proper + numeric) / len(words)
 
 
@@ -1191,6 +1290,34 @@ def _selftest() -> None:
     check("the shipped example breaks none of the bank rules",
           not any(shipped[rule] for rule in ("questions", "imperatives", "technical", "thin")),
           f"{ {rule: shipped[rule] for rule in ('questions', 'imperatives', 'technical', 'thin')} }")
+
+    # 15b. The SHIPPED bank, if there is one. This is the text that actually gets appended to a
+    #      corpus, so it is checked here rather than trusted: full scene coverage (a gap silently
+    #      shrinks the codebook), enough passages to be a collision space rather than a fingerprint,
+    #      and the four contract properties -- a pad that asks a question gets answered, and a thin
+    #      one reduces this defense to "the documents got longer".
+    if PACKAGED_BANK.exists():
+        shipped = PassageBank.load(PACKAGED_BANK)
+        gaps = shipped.covers(FRAMINGS)
+        quality = bank_quality(shipped)
+        check("shipped bank covers every scene", not gaps,
+              f"missing: {', '.join(gaps[:5])}")
+        check("shipped bank has at least 3 passages per scene",
+              all(len(v) >= 3 for v in shipped.passages.values()),
+              f"min {min((len(v) for v in shipped.passages.values()), default=0)}")
+        check("shipped bank asks nothing", quality["questions"] == 0, f"{quality['questions']}")
+        check("shipped bank instructs nothing", quality["imperatives"] == 0,
+              f"{quality['imperatives']}")
+        check("shipped bank carries no code markup", quality["technical"] == 0,
+              f"{quality['technical']}")
+        check("shipped bank is content, not atmosphere",
+              quality["thin"] == 0 and quality["density"] >= DENSITY_FLOOR,
+              f"{quality['thin']} thin, mean density {quality['density']:.1f}")
+        check("shipped bank has no duplicate passages",
+              len({p for v in shipped.passages.values() for p in v}) == len(shipped),
+              f"{len(shipped)} passages")
+    else:
+        print("  --    no shipped bank yet (build one with --build-bank)")
 
     # 16. params() records the bank, so a defended corpus can be traced back to its padding.
     check("params carry the bank digest", defense.params()["bank_digest"] == bank.digest)

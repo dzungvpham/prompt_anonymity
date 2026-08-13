@@ -230,6 +230,13 @@ experiments/plots/
 # Data Protection
 *.csv
 *.npz
+
+# ...with exactly one exception. The frame_pad passage bank is SOURCE, not data: 200 hand-written
+# passages that are identical for every user, every corpus and every run, and are appended verbatim
+# to documents by prompt_anonymity.defenses.frame_pad. It is a codebook like FRAMINGS is, and it
+# ships with the package so nobody needs an API key or a generation step to run the defense. It is a
+# csv rather than json because it is meant to be read and edited in a spreadsheet.
+!src/prompt_anonymity/defenses/frame_pad_bank.csv
 .claude/
 /data
 
