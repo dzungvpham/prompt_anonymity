@@ -704,6 +704,11 @@ def resolve_bank(path: Path, *, framings: tuple[Framing, ...] = FRAMINGS,
         build_bank(model, framings=framings, passages_per_frame=passages_per_frame,
                    target_words=target_words).save(path)
     bank = PassageBank.load(path)
+    # Say which file, always. "The bank covers 2 of 50 scenes" is not a diagnosis on its own -- the
+    # question it raises is *which bank*, and the answer has been a stale build left in data/dist or
+    # a $FRAME_PAD_BANK pointing somewhere forgotten. One line here ends that guessing.
+    print(f"[frame_pad] bank: {len(bank):,} passages over {len(bank.passages)} scene(s), "
+          f"digest {bank.digest} <- {path}")
     missing = bank.covers(framings)
     if missing:
         print(f"[frame_pad] note: {path} has no passages for {len(missing)} of {len(framings)} "

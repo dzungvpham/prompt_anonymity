@@ -70,8 +70,13 @@ SOURCE="${SOURCE:-swe_chat}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"
 DEFENSES="${DEFENSES:-frame_pad frame_pad_single}"
 FEATURES="${FEATURES:-gemini_embedding_2}"
-BANK="${BANK:-$DIST_DIR/frame_pad_bank.json}"
-export FRAME_PAD_BANK="$BANK"
+# Only pin the bank when the caller names one. Exporting a default here would OVERRIDE the bank that
+# ships with the package (src/prompt_anonymity/defenses/frame_pad_bank.csv) and silently pick up
+# whatever half-built json a previous run left in data/dist -- which is exactly what happened once,
+# and it presents as "the bank covers 2 of 50 scenes" rather than as an error.
+if [ -n "${BANK:-}" ]; then
+    export FRAME_PAD_BANK="$BANK"
+fi
 
 # Every defense CLI here runs with `python -m` after the registry has already imported the module,
 # so runpy re-executes it as __main__ and warns. Two copies exist but nothing crosses between them
@@ -85,19 +90,18 @@ RUN=(bash scripts/slurm_job.sh)
 
 echo "=================================================================="
 echo "Frame pad on an existing bank: source=$SOURCE"
-echo "  bank:     $BANK"
+echo "  bank:     ${BANK:-the one shipped in the package (stage 1 prints the file and its digest)}"
 echo "  defenses: $DEFENSES"
 echo "  features: $FEATURES"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname), started $(date)"
 echo "=================================================================="
 
-# 0a. Fail before anything else if there is no bank. This script does not build one on purpose (see
-#     the header), and finding out here costs a second while finding out in stage 1 costs the queue.
-if [ ! -f "$BANK" ]; then
-    echo "ERROR: no passage bank at $BANK"
-    echo "Build one first, on a login node so you can watch it:"
+# 0a. Fail before anything else if a bank the caller NAMED is missing. With no BANK= the package's
+#     own bank is used and there is nothing to check -- it ships in the repo.
+if [ -n "${BANK:-}" ] && [ ! -f "$BANK" ]; then
+    echo "ERROR: BANK=$BANK does not exist."
+    echo "Leave BANK unset to use the bank that ships with the package, or build one with:"
     echo "  python -m prompt_anonymity.defenses.frame_pad --build-bank"
-    echo "Or point BANK= at a bank you already have."
     exit 1
 fi
 
