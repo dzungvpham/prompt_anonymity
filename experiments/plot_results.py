@@ -17,6 +17,13 @@ part must be a name this file knows (:data:`DATASETS`, :data:`DEFENSES`, :data:`
 skipped with a note, which is how exploratory output (``tuned_comparison/`` and friends) stays out
 of the figures.
 
+A **second** input is ``experiments/clustering/<dataset>_<defense>_<feature>/`` -- the author
+*clustering* experiment, whose three-part names have no attack because a clustering attack has no
+such axis. It is a different question about the same corpora (does an anonymised log fall apart
+into its authors on its own, with nobody named?) rather than a different view of the one above,
+so it shares this file's palette, chrome and cache but none of its machinery. See the
+``clustering/`` family below.
+
 Output is ``experiments/plots/<dataset>/``, and the path is three nested choices:
 
     ``<family>/<doc|author>/by_{defense,attack}/``
@@ -81,6 +88,17 @@ fixed, a line per feature+attack -- *which attack is strongest?*).
     **Per-user risk** -- each user's own accuracy, sorted from most to least exposed. Who carries
     the risk, rather than what it averages to. **Keeps the flat path**: it is a per-user curve by
     construction, so there is no document-level twin to file it against.
+``clustering/``
+    The **other experiment** (merged in from ``plot_clustering.py`` on 2026-08-13), and the one
+    family that reads :data:`CLUSTERING_DIR` instead of :data:`RESULTS_DIR`. It reports a
+    *partition* rather than a ranking, so it has no known-side grid and none of the three levels
+    above: ``clustering/bcubed/by_defense/<feature>.pdf`` is BCubed F per algorithm with every
+    reference partition drawn as a grey bar beside them -- the comparison the figure exists for,
+    since an all-singleton partition scores F = 0.285 on WildChat *while linking nothing*;
+    ``clustering/precision_recall/by_algorithm/<feature>.pdf`` puts each algorithm at one point in
+    BCubed precision x recall, where a method that buys precision by refusing to cluster is visibly
+    doing so; and ``clustering/exposure/<run>.pdf`` is the privacy reading -- per author, the share
+    of their traffic that ended up in one cluster, the same cliff curve as ``author_risk/``.
 
 The whole ``openset/`` family reads the documents every other figure drops -- on WildChat that is
 63-87% of the test quarter, some 6,200 unenrolled authors against ~970 enrolled. It rests on two
@@ -161,6 +179,11 @@ from matplotlib.ticker import MaxNLocator  # noqa: E402  (whole-week ticks on th
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
+
+#: The clustering experiment's results, deliberately *not* under :data:`RESULTS_DIR`: its
+#: directories are three-part names and its ``clustering_results.csv`` schema is a partition rather
+#: than a ranking, so a run of one kind must never parse as a run of the other.
+CLUSTERING_DIR = REPO_ROOT / "experiments" / "clustering"
 PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
 
 
@@ -4169,6 +4192,435 @@ def plot_scaling_across_datasets_by_attack(
         extra_legend=dataset_legend(panels))]
 
 
+# --- author clustering: the other experiment ---------------------------------
+#
+# These three families were `experiments/plot_clustering.py` until they were merged in here. That
+# file already imported this one's palette, chrome and baseline convention, so keeping it separate
+# bought nothing and cost two things: its figures sat outside the plot cache (every sweep redrew
+# them), and they were filed under `plots/clustering/<dataset>/` rather than beside the corpus
+# they describe. They now write `plots/<dataset>/clustering/`, which is the same rule every other
+# family follows -- a dataset's figures live under that dataset.
+#
+# What they draw is a different *experiment*, not a different view of this one. Everything above
+# reads `experiments/results/<4-part-name>/` and reports a **ranking** over named authors: the
+# attacker holds a labelled known side and asks which enrolled person wrote an unknown document.
+# These read `experiments/clustering/<3-part-name>/` and report a **partition**: nobody is named,
+# and the question is whether an anonymised log falls apart into its authors on its own. There is
+# no known side, so there is no configuration grid and none of the machinery above -- no
+# bootstrap, no `PanelWeights`, no `CURVE_TYPES` entry. The drawing routines read their own CSVs
+# at draw time, the way `plot_run_detail` does.
+
+#: Clustering algorithms, in the order that fixes each one's colour everywhere. **Append only** --
+#: inserting a name shifts the hue of every algorithm below it, exactly the hazard
+#: :data:`DEFENSE_SLOTS` and :data:`METHOD_STRIDE` document at length.
+CLUSTERING_ALGORITHMS = ("hdbscan", "leiden", "average_linkage", "connected")
+
+CLUSTERING_ALGORITHM_SLOTS = {name: index for index, name in enumerate(CLUSTERING_ALGORITHMS)}
+
+#: Reference partitions, drawn beside the algorithms as **grey bars**. They are properties of the
+#: collection rather than measurements of an attack, and grey is the channel that says so -- the
+#: same reservation the dashed baseline relies on elsewhere, and grey is a hue no series occupies.
+#:
+#: They were dashed horizontal lines until 2026-08-13, on request. The dash was the file's own
+#: "not a measurement" convention, but it made the one comparison the figure exists for -- did the
+#: attack beat doing nothing? -- a matter of reading a bar against a line, with four lines within
+#: ~0.1 of each other and their names pushed apart by a de-cluttering pass to stop them stacking.
+#: As bars they are on the axis the algorithms are on, named on the same ticks, and the grey still
+#: carries what the dash did.
+#:
+#: ``baseline_model_owner`` is deliberately absent (omitted 2026-08-13, on request). It partitions
+#: by which provider served the conversation, and on a corpus whose documents nearly all come from
+#: one provider that is the one-cluster partition under another name -- measured on WildChat it
+#: scores F = 0.002565, identical to ``baseline_single_cluster`` to six decimals. `run_clustering.py`
+#: still computes it; nothing draws it.
+CLUSTERING_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseline_random",
+                        "baseline_language_primary")
+
+#: The three baselines the precision/recall figure marks, which is a subset: the metadata
+#: partitions land in the same corner as ``single_cluster`` and would only crowd it.
+CLUSTERING_PR_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseline_random")
+
+CLUSTERING_LABELS = {
+    "hdbscan": "HDBSCAN",
+    "leiden": "Leiden",
+    "average_linkage": "Average linkage",
+    "connected": "Connected components",
+    "baseline_singleton": "All singletons",
+    "baseline_single_cluster": "One cluster",
+    "baseline_random": "Random (matched)",
+    "baseline_language_primary": "By language",
+}
+
+#: Opacity of a reference-partition bar. Solid grey would compete with the measured bars for
+#: attention; this keeps them legible and clearly recessive, the same call
+#: :func:`draw_ndocs_panel` makes for its population histogram.
+CLUSTERING_BASELINE_ALPHA = 0.55
+
+#: Blank slots between the algorithm bars and the reference bars, in bar widths. Enough that the
+#: two groups read as two groups without a rule between them.
+CLUSTERING_GROUP_GAP = 0.9
+
+
+@dataclass(frozen=True)
+class ClusteringRun:
+    """One clustering directory, with its name parsed into the three axes it encodes.
+
+    :class:`Run`'s counterpart, and three parts rather than four for a real reason: a clustering
+    attack has no ``--attacks`` axis. It takes the neighbour graph and partitions it, so what
+    varies is the corpus, what was done to the text, and how the text was represented.
+    """
+
+    dataset: str
+    defense: str
+    feature: str
+    directory: Path
+
+    @property
+    def defense_label(self) -> str:
+        return DEFENSE_LABELS[self.defense]
+
+    @property
+    def feature_label(self) -> str:
+        return FEATURE_LABELS[self.feature]
+
+
+def parse_clustering_run_name(name: str) -> tuple[str, str, str] | None:
+    """Split ``<dataset>_<defense>_<feature>`` into its three parts, or return ``None``.
+
+    :func:`parse_run_name` without the attack, and it cannot be split on ``_`` for the same
+    reason: every part may contain one. Each candidate defense is checked against the requirement
+    that what follows it is a whole feature name, which is what tells ``dp_mlm`` from
+    ``dp_mlm_pii``.
+    """
+    for dataset in DATASETS:
+        if not name.startswith(f"{dataset}_"):
+            continue
+        remainder = name[len(dataset) + 1:]
+        for defense in DEFENSES:
+            if remainder.startswith(f"{defense}_") and remainder[len(defense) + 1:] in FEATURES:
+                return dataset, defense, remainder[len(defense) + 1:]
+    return None
+
+
+def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
+    """Every parseable clustering directory, sorted so figures are built in a stable order.
+
+    Absent directory is not an error: clustering is one experiment among several, and a checkout
+    that has only run the attribution side should still draw its figures.
+    """
+    if not clustering_dir.exists():
+        return []
+    runs, skipped = [], []
+    for directory in sorted(path for path in clustering_dir.iterdir() if path.is_dir()):
+        parsed = parse_clustering_run_name(directory.name)
+        if parsed is None:
+            skipped.append(directory.name)
+            continue
+        runs.append(ClusteringRun(*parsed, directory=directory))
+    if skipped:
+        print(f"skipped {len(skipped)} clustering director{'y' if len(skipped) == 1 else 'ies'} "
+              f"whose name is not <dataset>_<defense>_<feature>: {', '.join(skipped)}")
+    return runs
+
+
+def clustering_results(run: ClusteringRun) -> pd.DataFrame:
+    """One run's ``clustering_results.csv``, or an empty frame when it has not been written.
+
+    A directory that exists without the file is a run that was interrupted or is still going;
+    every drawing routine below treats that as "no series", not as a failure.
+    """
+    path = run.directory / "clustering_results.csv"
+    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+
+
+def clustering_style(name: str) -> str:
+    """Colour for one clustering algorithm, fixed by its position in :data:`CLUSTERING_ALGORITHMS`."""
+    return series_style(CLUSTERING_ALGORITHM_SLOTS[name])
+
+
+def clustering_scores(table: pd.DataFrame, names, column: str) -> list[tuple[str, float]]:
+    """``(name, value)`` for each of ``names`` present in ``table``, in the order given.
+
+    The order is the vocabulary's, never the CSV's, so a run that happened to write its rows in a
+    different order does not reorder the bars -- the same reason every group above is sorted by
+    colour slot rather than by what was found on disk.
+    """
+    return [(name, float(table.loc[table["algorithm"] == name, column].iloc[0]))
+            for name in names if not table[table["algorithm"] == name].empty]
+
+
+def clustering_feature_groups(runs: list[ClusteringRun]) -> list[tuple[str, list[ClusteringRun]]]:
+    """Clustering runs grouped by feature -- one group per ``by_defense`` figure.
+
+    :func:`method_groups`' counterpart, and the feature alone is the whole method here because a
+    clustering attack has no attack axis. Grouping is what keeps the two comparison figures
+    correct rather than merely tidy: both key their panels by *defense*, so two features of one
+    corpus in one figure would collide on that key and draw one of them twice.
+    """
+    groups: dict[str, list[ClusteringRun]] = defaultdict(list)
+    for run in runs:
+        groups[run.feature].append(run)
+    return [(feature, sorted(members, key=lambda run: DEFENSE_SLOTS[run.defense]))
+            for feature, members in sorted(groups.items(),
+                                           key=lambda item: FEATURES.index(item[0]))]
+
+
+def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun],
+                           output_dir: Path) -> list[Path]:
+    """BCubed F per algorithm, one panel per defense, with the reference partitions beside them.
+
+    **The reference bars are the point of the figure.** An all-singleton partition -- one cluster
+    per document, linking nothing at all -- scores F = 0.285 on WildChat and 0.112 on swe-chat,
+    because BCubed precision is 1.0 when no two documents are ever put together. A bar chart of
+    algorithms alone would therefore read as "0.49, quite good" where the honest statement is
+    "0.49 against 0.285 for doing nothing". Drawing the references as bars on the same axis makes
+    that a comparison of two bars rather than of a bar against a rule.
+
+    One panel per defense, sharing a y axis, so the columns are directly comparable: the question
+    a defended run answers is how far its bars fall from the undefended panel's. ``runs`` is one
+    feature's, which is what makes "one panel per defense" a well-defined statement.
+    """
+    defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])]
+    tables = {run.defense: clustering_results(run) for run in runs}
+    panels = [defense for defense in defenses if not tables[defense].empty]
+    if not panels:
+        return []
+
+    figure, axes_list = plt.subplots(1, len(panels), figsize=(3.9 * len(panels), 4.4),
+                                     sharey=True, squeeze=False)
+    figure.patch.set_facecolor(SURFACE)
+    rows = []
+    # Over the bars that are actually drawn, not over the CSV: `clustering_results.csv` carries
+    # rows nothing here draws (`baseline_model_owner`), and sizing the axis to a bar that is not
+    # on it would leave dead space no reader could account for.
+    tallest = max(value for defense in panels
+                  for _, value in clustering_scores(
+                      tables[defense], CLUSTERING_ALGORITHMS + CLUSTERING_BASELINES, "bcubed_f"))
+    for axes, defense in zip(axes_list[0], panels):
+        table = tables[defense]
+        measured = clustering_scores(table, CLUSTERING_ALGORITHMS, "bcubed_f")
+        reference = clustering_scores(table, CLUSTERING_BASELINES, "bcubed_f")
+        # The two groups share one categorical axis with a gap between them, rather than two axes
+        # or two figures: they are the same measure on the same collection, and comparing them is
+        # the whole job.
+        positions = np.concatenate([
+            np.arange(len(measured), dtype=float),
+            np.arange(len(reference), dtype=float) + len(measured) + CLUSTERING_GROUP_GAP])
+        colors = ([clustering_style(name) for name, _ in measured]
+                  + [TEXT_MUTED] * len(reference))
+        alphas = [1.0] * len(measured) + [CLUSTERING_BASELINE_ALPHA] * len(reference)
+        values = [value for _, value in measured] + [value for _, value in reference]
+        for position, value, color, alpha in zip(positions, values, colors, alphas):
+            axes.bar(position, value, width=0.68, color=color, alpha=alpha, zorder=3)
+            # On the cap, in text ink rather than the bar's colour: the bar carries identity, the
+            # number is text. Eight bars is few enough to label every one.
+            axes.text(position, value + 0.012, f"{value:.3f}", ha="center", va="bottom",
+                      fontsize=7.5, color=TEXT_SECONDARY)
+
+        style_axes(axes, "", "BCubed F" if defense == panels[0] else "",
+                   DEFENSE_LABELS[defense])
+        axes.set_xticks(positions)
+        axes.set_xticklabels([CLUSTERING_LABELS[name] for name, _ in measured + reference],
+                             rotation=30, ha="right", fontsize=8)
+        axes.set_xlim(-0.7, positions[-1] + 0.7)
+        # Headroom for the value labels on the caps, the panel note and the legend, which all
+        # live in the band above the tallest bar. Taken from the tallest bar in the *figure* and
+        # not the panel, because `sharey` means the last `set_ylim` wins for all of them anyway --
+        # computing it once says so rather than leaving it to call order.
+        axes.set_ylim(0, tallest * 1.30)
+        axes.grid(False, axis="x")
+        # The collection under attack, printed for the same reason the facet grids print their
+        # in-set counts: BCubed's reference levels are functions of the collection's shape -- the
+        # singleton baseline *is* the mean of 1/(documents by that author) -- so two panels are
+        # only comparable at face value when they cover the same one.
+        panel_note(axes, f"{int(table['n_documents'].iloc[0]):,} docs · "
+                         f"{int(table['n_authors'].iloc[0]):,} authors")
+        rows.append(pd.DataFrame({
+            "defense": defense,
+            "algorithm": [name for name, _ in measured + reference],
+            "bcubed_f": values,
+            "is_reference": [False] * len(measured) + [True] * len(reference)}))
+
+    # One legend entry, on the last panel: the algorithms are named on the ticks, so all the
+    # legend has to say is what the grey means -- that those bars are not an attack.
+    add_legend(axes_list[0][-1],
+               handles=[plt.Rectangle((0, 0), 1, 1, color=TEXT_MUTED,
+                                      alpha=CLUSTERING_BASELINE_ALPHA)],
+               labels=["Reference partition"], loc="upper right")
+    figure.tight_layout(rect=(0, 0, 1, figure_heading(
+        figure, f"{DATASET_LABELS[dataset]}: author clustering under "
+                f"{FEATURE_LABELS[feature]}, BCubed F by algorithm")))
+
+    stem = output_dir / "bcubed" / "by_defense" / feature
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat(rows, ignore_index=True).to_csv(stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
+
+
+def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[ClusteringRun],
+                                     output_dir: Path) -> list[Path]:
+    """Each algorithm as one point in BCubed precision x recall, marker shape per defense.
+
+    The figure that makes the trade legible, and that F alone hides: a method can buy precision by
+    declining to cluster, which is exactly where the all-singleton corner sits (precision 1.0, and
+    a recall equal to the mean of 1/|documents by that author|). HDBSCAN sits near it -- very high
+    precision, low recall, because it leaves documents as noise -- and connected components at the
+    opposite corner. Colour carries the algorithm, so it still follows the entity; shape carries
+    the defense.
+    """
+    tables = {run.defense: clustering_results(run) for run in runs}
+    defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])
+                if not tables[run.defense].empty]
+    if not defenses:
+        return []
+    markers = dict(zip(defenses, ("o", "s", "^", "D", "v", "P")))
+
+    figure, axes = plt.subplots(figsize=(5.8, 5.2))
+    figure.patch.set_facecolor(SURFACE)
+
+    # Markers are drawn OPEN (no fill), and that is load-bearing rather than a style choice. The
+    # defenses land almost on top of each other -- WildChat's base and openanonymity differ by
+    # 0.005 in precision and 0.003 in recall -- so a filled marker with the usual opaque surface
+    # ring completely erased whichever arm was drawn first. The undefended `base` series vanished
+    # from the figure *because* OpenAnonymity barely moves the result, which is the finding the
+    # figure exists to show. Open outlines overlap legibly instead of occluding.
+    #
+    # Sizes step down in defense order so a coincident pair reads as nested outlines rather than
+    # one thick one. That double-encodes the defense (shape already carries it), which is
+    # deliberate: redundant encoding costs nothing here and is what makes near-ties readable.
+    rows = []
+    for index, defense in enumerate(defenses):
+        table = tables[defense]
+        for name, _ in clustering_scores(table, CLUSTERING_ALGORITHMS, "bcubed_f"):
+            row = table[table["algorithm"] == name]
+            recall, precision = float(row["bcubed_recall"].iloc[0]), \
+                float(row["bcubed_precision"].iloc[0])
+            axes.plot(recall, precision, marker=markers[defense],
+                      markersize=MARKER_SIZE + 4 - 1.5 * index, markerfacecolor="none",
+                      markeredgecolor=clustering_style(name), markeredgewidth=1.8,
+                      linestyle="none", zorder=4)
+            rows.append({"defense": defense, "algorithm": name, "bcubed_recall": recall,
+                         "bcubed_precision": precision,
+                         "bcubed_f": float(row["bcubed_f"].iloc[0]), "is_reference": False})
+
+    # Offsets chosen per baseline rather than shared: all three sit against an edge of the unit
+    # square, and a single offset direction pushes at least one of them into the data. Singletons
+    # are at precision 1.0 (top edge, beside the high-precision methods), one cluster at recall
+    # 1.0 (right edge), random near the origin corner.
+    offsets = {"baseline_singleton": (-8, 6), "baseline_single_cluster": (-8, 8),
+               "baseline_random": (8, 6)}
+    alignment = {"baseline_singleton": "right", "baseline_single_cluster": "right",
+                 "baseline_random": "left"}
+    base = tables[defenses[0]]
+    for name, _ in clustering_scores(base, CLUSTERING_PR_BASELINES, "bcubed_f"):
+        row = base[base["algorithm"] == name]
+        recall, precision = float(row["bcubed_recall"].iloc[0]), \
+            float(row["bcubed_precision"].iloc[0])
+        axes.plot(recall, precision, marker="x", markersize=MARKER_SIZE, color=TEXT_MUTED,
+                  linestyle="none", zorder=3)
+        axes.annotate(CLUSTERING_LABELS[name], (recall, precision), textcoords="offset points",
+                      xytext=offsets[name], ha=alignment[name], fontsize=7, color=TEXT_MUTED)
+        rows.append({"defense": defenses[0], "algorithm": name, "bcubed_recall": recall,
+                     "bcubed_precision": precision, "bcubed_f": float(row["bcubed_f"].iloc[0]),
+                     "is_reference": True})
+
+    # Iso-F contours, so a reader can see which points are equivalent trades rather than guessing.
+    grid = np.linspace(0.01, 1.0, 200)
+    for level in (0.2, 0.4, 0.6, 0.8):
+        precision = level * grid / (2 * grid - level)
+        usable = (precision > 0) & (precision <= 1.0)
+        axes.plot(grid[usable], precision[usable], color=GRID, linewidth=0.9, zorder=1)
+
+    style_axes(axes, "BCubed recall", "BCubed precision",
+               f"{DATASET_LABELS[dataset]}: the precision/recall trade under "
+               f"{FEATURE_LABELS[feature]}")
+    # A hair past the unit square on both axes: the one-cluster reference sits at recall exactly
+    # 1.0 and the singleton one at precision exactly 1.0, so a hard limit halves both markers.
+    axes.set_xlim(0, 1.02)
+    axes.set_ylim(0, 1.05)
+
+    # **Two legends, one per channel**, the same construction and for the same reason as the
+    # cross-dataset scaling figures: a reader needs both to decode one marker, and a single list
+    # mixing them reads as one vocabulary -- with the defenses' neutral-ink circles filed under the
+    # algorithms' colours, "No defense" looks like a fifth algorithm.
+    #
+    # The keys must match the marks exactly -- open outlines, and the same size ladder -- or a
+    # reader matching a nested pair back to the legend gets the wrong defense.
+    drawn = {name for name in CLUSTERING_ALGORITHMS
+             if any(not tables[defense][tables[defense]["algorithm"] == name].empty
+                    for defense in defenses)}
+    by_algorithm = [plt.Line2D([], [], marker="o", linestyle="none", markersize=MARKER_SIZE + 4,
+                               markerfacecolor="none", markeredgecolor=clustering_style(name),
+                               markeredgewidth=1.8, label=CLUSTERING_LABELS[name])
+                    for name in CLUSTERING_ALGORITHMS if name in drawn]
+    by_defense = [plt.Line2D([], [], marker=markers[defense], linestyle="none",
+                             markersize=MARKER_SIZE + 4 - 1.5 * index, markerfacecolor="none",
+                             markeredgecolor=TEXT_SECONDARY, markeredgewidth=1.8,
+                             label=DEFENSE_LABELS[defense])
+                  for index, defense in enumerate(defenses)]
+    # Below the axes rather than inside it: the points and the three baseline markers between them
+    # occupy every corner of the unit square, so any in-axes placement sits on top of data.
+    first = add_legend(axes, handles=by_algorithm, ncol=2, title="Algorithm",
+                       loc="upper center", bbox_to_anchor=(0.5, -0.11))
+    # A second `.legend()` call on an axes *replaces* the first, so the first has to be adopted
+    # explicitly; the anchor is measured off it because its height grows a row per algorithm.
+    axes.add_artist(first)
+    add_legend(axes, handles=by_defense, ncol=2, title="Defense", loc="upper center",
+               bbox_to_anchor=tuple(stack_below(figure, axes, first)),
+               borderaxespad=0.0)  # honour the measured anchor instead of re-padding off it
+
+    stem = output_dir / "precision_recall" / "by_algorithm" / feature
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
+
+
+def plot_clustering_exposure(run: ClusteringRun, output_dir: Path) -> list[Path]:
+    """Per-author reassembly: what share of each person's traffic landed in one cluster.
+
+    The privacy reading rather than the clustering-quality one, and the reason the other two
+    figures are not the whole story: BCubed F is an average over documents, and an average can be
+    carried by a few people who were reassembled completely. Authors are sorted by their own
+    ``max_cluster_share`` and read off a percentile grid, so the curve is the distribution whose
+    mean is the macro reassembly rate -- the same construction, and the same question, as
+    ``author_risk/``.
+
+    One figure per run rather than a defense comparison, for the reason :data:`PER_RUN_FAMILIES`
+    gives: the series here are the algorithms, so there is no axis left for a view to vary.
+    """
+    figure, axes = plt.subplots(figsize=(6.2, 4.4))
+    figure.patch.set_facecolor(SURFACE)
+    percentiles = EXPOSURE_GRID
+    rows = []
+
+    for name in CLUSTERING_ALGORITHMS:
+        path = run.directory / f"author_report_{name}.csv"
+        if not path.exists():
+            continue
+        shares = pd.read_csv(path)["max_cluster_share"].to_numpy()
+        curve = np.percentile(shares, percentiles)
+        axes.plot(percentiles, curve, color=clustering_style(name), linewidth=LINE_WIDTH,
+                  label=CLUSTERING_LABELS[name], zorder=3)
+        rows.append(pd.DataFrame({"algorithm": name, "percentile": percentiles,
+                                  "max_cluster_share": curve, "n_authors": len(shares)}))
+    if not rows:
+        plt.close(figure)
+        return []
+
+    style_axes(axes, "Author percentile, ordered by how much was reassembled",
+               "Share of the author's documents in one cluster",
+               f"{DATASET_LABELS[run.dataset]}: per-author reassembly. "
+               f"{run.defense_label}, {run.feature_label}")
+    axes.set_ylim(0, 1.02)
+    add_legend(axes, loc="upper left", title="Algorithm")
+    figure.tight_layout()
+
+    stem = output_dir / "exposure" / run.directory.name
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.concat(rows, ignore_index=True).to_csv(stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
+
+
 # --- per-run figures ---------------------------------------------------------
 #
 # These are the figures `run_experiment.py` and `run_experiment.py` used to draw at the end of
@@ -4792,6 +5244,44 @@ def dataset_figure_plan(dataset: str, runs: list[Run], output_dir: Path,
     return plan
 
 
+def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
+                           output_dir: Path) -> list[PlannedFigure]:
+    """One dataset's clustering figures, planned exactly like every other family's.
+
+    They join the cache on the same terms as the attribution figures -- a figure's key is the runs
+    it draws plus their CSVs' size and mtime plus this file's digest -- which is most of what
+    merging ``plot_clustering.py`` in here bought: those figures used to be redrawn on every
+    invocation because nothing recorded that they were current.
+
+    Every one of them passes ``builds=()``: they read their own CSVs when they are drawn, so no
+    curve family and no bootstrap is involved, and a stale clustering figure must not drag its
+    corpus's attribution runs into a full curve rebuild.
+    """
+    plan = []
+    # One figure per feature, because both of these key their panels or their marker shapes by
+    # *defense* -- so a feature is the thing they hold fixed, exactly as `by_defense/` does in the
+    # attribution tree, where the file is named for the held-fixed method.
+    for feature, members in clustering_feature_groups(runs):
+        plan.append(PlannedFigure(
+            f"{dataset}/clustering/bcubed/by_defense/{feature}", tuple(members),
+            lambda ctx, feature=feature, members=members:
+            (plot_clustering_bcubed, (dataset, feature, members, output_dir), {}),
+            builds=()))
+        plan.append(PlannedFigure(
+            f"{dataset}/clustering/precision_recall/by_algorithm/{feature}", tuple(members),
+            lambda ctx, feature=feature, members=members:
+            (plot_clustering_precision_recall, (dataset, feature, members, output_dir), {}),
+            builds=()))
+    # Per run, not per view: the series are the algorithms, so there is nothing left for a
+    # `by_defense`/`by_attack` split to vary -- the same argument `PER_RUN_FAMILIES` makes.
+    for run in runs:
+        plan.append(PlannedFigure(
+            f"{dataset}/clustering/exposure/{run.directory.name}", (run,),
+            lambda ctx, run=run: (plot_clustering_exposure, (run, output_dir), {}),
+            builds=()))
+    return plan
+
+
 def cross_dataset_plan(runs: list[Run], output_dir: Path) -> list[PlannedFigure]:
     """The figures that span corpora, planned the same way as one dataset's.
 
@@ -4824,16 +5314,22 @@ def main() -> None:
     global WRITE_PNG
     WRITE_PNG = args.png
 
-    if not RESULTS_DIR.exists():
-        raise SystemExit(f"{RESULTS_DIR} does not exist -- run an experiment first.")
-
-    runs = discover_runs(RESULTS_DIR)
-    if not runs:
-        raise SystemExit(f"no runs named <dataset>_<defense>_<feature>_<attack> under {RESULTS_DIR}")
+    # Two experiments, two result roots, and either one alone is enough to draw figures from --
+    # a checkout that has only clustered is not an error.
+    runs = discover_runs(RESULTS_DIR) if RESULTS_DIR.exists() else []
+    clustering = discover_clustering_runs(CLUSTERING_DIR)
+    if not runs and not clustering:
+        raise SystemExit(
+            f"no runs named <dataset>_<defense>_<feature>_<attack> under {RESULTS_DIR}, and none "
+            f"named <dataset>_<defense>_<feature> under {CLUSTERING_DIR} -- run an experiment "
+            f"first.")
 
     by_dataset: dict[str, list[Run]] = defaultdict(list)
     for run in runs:
         by_dataset[run.dataset].append(run)
+    clustering_by_dataset: dict[str, list[ClusteringRun]] = defaultdict(list)
+    for run in clustering:
+        clustering_by_dataset[run.dataset].append(run)
 
     # --- plan every figure, before reading or building anything ---------------
     #
@@ -4848,6 +5344,12 @@ def main() -> None:
         if by_dataset.get(dataset):
             plan += dataset_figure_plan(dataset, by_dataset[dataset], PLOTS_DIR / dataset,
                                         args.per_run)
+        # Under the corpus it describes, not a tree of its own: the clustering experiment is a
+        # different question about the *same* corpus, so `plots/<dataset>/clustering/` files it
+        # the way every other family of that dataset's figures is filed.
+        if clustering_by_dataset.get(dataset):
+            plan += clustering_figure_plan(dataset, clustering_by_dataset[dataset],
+                                           PLOTS_DIR / dataset / "clustering")
     plan += cross_dataset_plan(runs, PLOTS_DIR)
 
     settings = f"{source_digest()}|bootstrap={args.bootstrap}|png={int(args.png)}"

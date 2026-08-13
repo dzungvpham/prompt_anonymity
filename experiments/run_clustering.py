@@ -1,0 +1,757 @@
+#!/usr/bin/env python
+"""Author-clustering attacks: group an anonymised log by author, naming nobody.
+
+The linkability counterpart to ``run_experiment.py``. That script asks *which enrolled author
+wrote this document?* and needs the attacker to hold labelled documents by the target; this one
+asks *which of these documents share an author?* and needs nothing but the log. The measures are
+BCubed and its companions (:mod:`prompt_anonymity.evaluation.metrics.clustering`), following PAN
+2016's author-clustering task.
+
+The split, and what the known side is for
+-----------------------------------------
+Documents are ordered by ``ended_at``. The **last 25% is the collection under attack**; the first
+75% is the attacker's own labelled history. Same cut ``run_experiment.py`` makes under
+``known0075``, reached through the same loader, so the two families cover the same documents.
+
+The known side is used for **hyper-parameter selection only** -- never to enrol an author, and
+never read at attack time. Specifically, tuning runs on the *last quarter of the known side*
+(positions 50-75%), not on all of it, and that is the load-bearing choice in this script:
+
+    Every parameter here is an **absolute** quantity whose optimum is set by the *shape* of the
+    problem instance. ``min_cluster_size`` is a document count. ``distance_threshold`` is a
+    radius, and how many strangers fall inside it depends on how crowded the space is. Leiden's
+    ``resolution`` trades against a null model carrying the graph's total edge weight. The whole
+    known side is 3x the size of the test quarter and a different shape (measured: 129,382
+    documents at r = 0.152 against 43,127 at r = 0.166, singleton-baseline F 0.264 against 0.285),
+    so a threshold tuned there is tuned for a denser space and transfers as an under-linking one.
+    The final quarter of the known side is the same size, adjacent in time, and the closest
+    available match -- which turns "match the simulation to the target" into a slice rather than a
+    resampling procedure.
+
+Did tuning help? Two references, neither of them the tuned number itself
+-----------------------------------------------------------------------
+``untuned_bcubed_f`` is the class defaults -- what somebody gets by not thinking about it -- and is
+weak evidence alone, since the defaults are a choice made in this repo and bad ones would flatter
+tuning for free. ``--oracle-sweep`` re-runs the whole grid on the **test** collection, giving the
+median (what an arbitrary reasonable configuration scores) and the best (what a perfect chooser
+would have reached). Both are **oracles**: nothing may select a configuration on them. Measured on
+swe-chat, the median is the honest reference and tuning is worth +0.05 to +0.34 against it, while
+against the defaults it looks worth +0.42 -- the difference is entirely how bad a default is.
+
+``--diagnostics``: measuring the problem rather than the attack
+---------------------------------------------------------------
+Everything above scores a *partition*, so it confounds two things: whether the features know who
+wrote what, and whether the algorithm assembled that knowledge correctly. ``--diagnostics`` adds
+the algorithm-free half, which needs no clustering run at all and is the cheap first look at a new
+corpus or feature:
+
+* **Same-author verification AUC** over every pair, streamed into a fixed histogram (9.3e8 pairs on
+  WildChat, 3 MB of counters). Prevalence-free, hence the only figure here comparable *across*
+  corpora -- and prevalence-blind, hence optimistic, so it is reported next to average precision
+  and the prevalence itself. StyloMetrix on WildChat is the case that makes the point: AUC 0.712
+  with AP 0.0047 describe the same scores.
+* **Neighbour-graph quality per k** -- edge precision, hit rate and neighbour recall against their
+  own chance references, plus the connected-component structure. This is what explains a tuned
+  ``neighbors=2``: at k=100 the graph is a single component on both corpora, so a loose method
+  chains the whole corpus into one cluster.
+* **A within-language control** on edge precision. StyloMetrix separates English from Russian at
+  0.984 AUROC *within* one corpus, so on a corpus that is 44.9% English and 22.1% Russian a result
+  that a language partition matches is not evidence about writing style.
+* **Authorship-link ranking** (PAN's second subtask) -- AP, R-precision and P@10 over the graph's
+  edges, which separates the quality of the similarity from the quality of the algorithm.
+
+This was a separate script (``clustering_diagnostics.py``) until it was folded in here, because it
+duplicated the reference partitions -- two implementations of a number that appears as a line on
+every figure, which had already drifted by 1.9e-4 on the seeded random baseline. The baselines now
+have one implementation (:func:`run_baselines`) and this file has one definition of the split.
+
+Run (from the repo root)::
+
+    python experiments/run_clustering.py --source swe_chat --feature gemini_embedding_2
+    python experiments/run_clustering.py --source wildchat --defense styleremix \
+        --algorithms leiden hdbscan
+    python experiments/run_clustering.py --source wildchat --diagnostics --algorithms  # no attack
+    sbatch scripts/run_clustering_slurm.sh --source wildchat --defense base --oracle-sweep
+
+Outputs, under ``experiments/clustering/<dataset>_<defense>_<feature>/``:
+
+* ``clustering_results.csv`` -- one row per algorithm (plus one per baseline): every BCubed,
+  link-level, exposure and shape measure, the chosen hyper-parameters, and how the tuning
+  transferred (``tuning_optimism``, ``untuned_bcubed_f``, ``tuning_gain_over_default``).
+* ``clusters_<algorithm>.csv`` -- ``doc_id`` -> cluster label for the collection under attack, so
+  any downstream slice can be re-scored without re-running the attack.
+* ``author_report_<algorithm>.csv`` -- per author: how much of their traffic was reassembled.
+* ``tuning_trials.csv`` -- every configuration tried on the simulation slice, with its score.
+* ``oracle_sweep.csv`` (``--oracle-sweep``) -- the same grid scored on the test collection.
+* ``diagnostics.csv`` / ``graph_diagnostics.csv`` (``--diagnostics``) -- one row per slice, and one
+  row per (slice, k), for the algorithm-free measures above.
+
+The directory is **not** under ``experiments/results/``, whose four-part names are a contract
+``plot_results.py`` parses and whose ``rolling_results.csv`` schema is built for ranking attacks.
+That file does read *this* directory, though: since 2026-08-13 it draws the clustering figures
+too, into ``experiments/plots/<dataset>/clustering/``, so there is still exactly one script that
+draws every figure in the project. This one writes CSVs and stops, like every other runner.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.sparse.csgraph import connected_components
+from scipy.special import gammaln
+
+# Expected, not a problem: the neighbour graph is deliberately sparse, so it has several connected
+# components and scikit-learn joins them to finish the tree. Left unfiltered it prints once per
+# configuration and buries the actual results.
+warnings.filterwarnings("ignore", message=".*number of connected components.*")
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "experiments"))
+
+from prompt_anonymity.attacks.clustering import (  # noqa: E402
+    CLUSTERING_ATTACKS,
+    CLUSTERING_SPACES,
+    BaselineClustering,
+    MAX_DENSE_DOCUMENTS,
+    build_neighbor_graph,
+    get_clustering_attack,
+    parameter_grid,
+)
+from prompt_anonymity.attacks.similarity.kernel import blocked_distances  # noqa: E402
+from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
+    auc_from_histogram,
+    average_precision_from_histogram,
+    bcubed_scores,
+    clustering_summary,
+    link_ranking_metrics,
+    per_author_clustering,
+    ClusterContingency,
+    single_cluster_baseline,
+    singleton_baseline,
+)
+
+from run_experiment import load_documents_and_features  # noqa: E402
+
+OUTPUT_ROOT = REPO_ROOT / "experiments" / "clustering"
+DATA_DIR = REPO_ROOT / "data" / "hf"
+
+#: Share of the timeline the attacker holds as labelled history; the rest -- the final quarter --
+#: is the anonymous collection to be clustered. Matches ``run_experiment.py``'s ``known0075``, so
+#: the two attack families cover exactly the same documents.
+KNOWN_FRACTION = 0.75
+
+#: Neighbour counts the graph diagnostics report at. The graph is built once at the largest and
+#: truncated for the rest, since neighbours are stored in distance order.
+NEIGHBOR_COUNTS = (1, 2, 3, 5, 10, 20, 50, 100)
+
+#: Bins the pairwise-score histogram is accumulated into. Cosine distance is bounded on [0, 2], so
+#: this is a resolution of 1e-5, and it is why a 9.3e8-pair AUC costs 3 MB rather than 7.4 GB.
+#: Measured against ``sklearn.metrics`` on samples of the size the bins see, binning costs
+#: |AUC error| < 2.6e-6 and |AP error| < 2.0e-5. 20,000 bins was the first choice and was raised:
+#: it held AUC to 1.2e-5 but let AP drift to 2.3e-4, and the extra 3 MB is free.
+SCORE_BINS = 200_000
+
+#: Cosine distance's exact upper bound. Any other metric has its range estimated from a sample.
+COSINE_MAX_DISTANCE = 2.0
+
+#: Seed for the sampled range estimate on non-cosine metrics, and for anything else drawn here.
+DIAGNOSTIC_SEED = 20260812
+
+#: Largest ``k`` any configuration may ask for. The graph is built once at this width and every
+#: configuration truncates it, so a sweep over ``neighbors`` costs one build rather than one per
+#: value -- and the build is by far the expensive part (measured: 19 s at 196 dimensions, minutes
+#: at 3,072).
+MAX_NEIGHBORS = 50
+
+#: Metadata partitions scored alongside the real attacks. Whatever these reach is available to an
+#: attacker who reads no text at all.
+METADATA_BASELINES = ("language_primary", "model_owner")
+
+
+def slice_bounds(n_documents: int) -> tuple[slice, slice]:
+    """``(tuning, test)`` -- the simulation slice and the collection under attack.
+
+    Both are a quarter of the corpus. The tuning slice is the quarter immediately before the test
+    set, i.e. the tail of the attacker's own labelled history; see the module docstring for why it
+    is that rather than the whole known side.
+    """
+    cut = int(round(KNOWN_FRACTION * n_documents))
+    return slice(int(round(0.50 * n_documents)), cut), slice(cut, n_documents)
+
+
+def score_partition(labels: np.ndarray, authors: np.ndarray) -> dict:
+    """Every measure for one partition."""
+    return clustering_summary(labels, authors)
+
+
+# --- diagnostics (--diagnostics): measure the problem, not the attack --------
+
+def collection_shape(authors: np.ndarray) -> dict:
+    """Properties of the clustering problem itself, before any attack.
+
+    ``authors_per_document`` is the one that governs the rest: it decides how strong the singleton
+    baseline is, and it is why PAN's collections (0.5-0.9) and these corpora (0.166 and 0.059) sit
+    in different regimes -- PAN's BASELINE-Singleton scores 0.821 and is "very hard to beat", ours
+    scores 0.285 and 0.112.
+    """
+    values, sizes = np.unique(authors, return_counts=True)
+    per_document = sizes[np.unique(authors, return_inverse=True)[1].ravel()]
+    n = len(authors)
+    n_true_links = float(np.sum(sizes.astype(np.float64) * (sizes - 1) / 2))
+    return {
+        "n_documents": n,
+        "n_authors": len(values),
+        "authors_per_document": len(values) / n,
+        "mean_docs_per_author": float(sizes.mean()),
+        "median_docs_per_author": float(np.median(sizes)),
+        "max_docs_per_author": int(sizes.max()),
+        "share_authors_linkable": float((sizes >= 2).mean()),
+        "share_docs_linkable": float((per_document >= 2).mean()),
+        "n_true_links": n_true_links,
+        # Probability that two documents drawn at random share an author. Every edge-precision and
+        # link-ranking figure is read against this, and it moves by a factor of 67 between the two
+        # corpora (0.087 on swe-chat, 0.0013 on WildChat), so an unreferenced "edge precision 0.15"
+        # says nothing at all.
+        "random_link_precision": n_true_links / (n * (n - 1) / 2),
+    }
+
+
+def random_neighbor_references(authors: np.ndarray, k: int) -> dict:
+    """What ``k`` neighbours drawn at random would score. Closed form, no sampling.
+
+    Without these, ``hit_at_k`` cannot be compared across corpora: k=100 is a tenth of swe-chat's
+    collection and a four-hundredth of WildChat's, so the same value means very different things.
+    """
+    n = len(authors)
+    _, codes = np.unique(np.asarray(authors), return_inverse=True)
+    others = np.bincount(codes.ravel())[codes.ravel()] - 1
+    pool = n - 1
+    # P(no same-author document among k draws) = C(pool - others, k) / C(pool, k), through
+    # log-gammas because the binomials overflow long before they cancel at these sizes.
+    log_miss = np.where(
+        pool - others >= k,
+        gammaln(pool - others + 1) - gammaln(np.maximum(pool - others - k, 0) + 1)
+        - gammaln(pool + 1) + gammaln(pool - k + 1),
+        -np.inf)
+    return {"random_hit_at_k": float(np.mean(1.0 - np.exp(log_miss))),
+            "random_neighbor_recall": k / pool}
+
+
+def within_language_chance(authors: np.ndarray, languages: np.ndarray) -> float:
+    """P(same author | same language) for a random pair -- the language-controlled reference.
+
+    The plain chance reference asks how often two documents from the whole collection share an
+    author, which flatters any similarity that is partly a language detector. StyloMetrix is
+    exactly that: it runs an *English* spaCy pipeline over every document whatever language it is
+    in, and separates English from Russian at 0.984 AUROC within a single corpus. So the honest
+    question is not "is an edge better than a random pair?" but "is a within-language edge better
+    than a random *within-language* pair?".
+    """
+    frame = pd.DataFrame({"author": np.asarray(authors), "language": np.asarray(languages)})
+    same_author = total = 0.0
+    for _, group in frame.groupby("language", dropna=False, observed=True):
+        sizes = group["author"].value_counts().to_numpy(dtype=np.float64)
+        same_author += float(np.sum(sizes * (sizes - 1) / 2))
+        total += len(group) * (len(group) - 1) / 2
+    return same_author / total if total > 0 else float("nan")
+
+
+def graph_diagnostics(graph, authors: np.ndarray,
+                      languages: np.ndarray | None = None) -> pd.DataFrame:
+    """Per-``k`` measures of how much authorship the neighbour graph carries.
+
+    Three easily-confused quantities. ``nn_precision`` is the share of edges joining two documents
+    by one person -- what a community-detection method sees, and if it is low the dense regions of
+    the graph are topics rather than people. ``hit_at_k`` is the share of documents with at least
+    one same-author neighbour, an upper bound on what any edge-joining method can link at all.
+    ``neighbor_recall`` is the share of an author's *other* documents reachable in one hop.
+
+    Also the connected-component structure, which decides whether a threshold-and-connect method
+    is viable: once a giant component forms, transitive closure merges most of the corpus.
+    """
+    rows = []
+    labels = np.asarray(authors)
+    _, author_codes = np.unique(labels, return_inverse=True)
+    author_codes = author_codes.ravel()
+    author_sizes = np.bincount(author_codes)
+    others = author_sizes[author_codes] - 1
+    has_partner = others > 0
+    n = len(labels)
+    chance_edge = float(np.sum(author_sizes.astype(np.float64) * (author_sizes - 1) / 2)
+                        / (n * (n - 1) / 2))
+
+    language_codes = language_chance = None
+    if languages is not None:
+        _, language_codes = np.unique(np.asarray(languages).astype(str), return_inverse=True)
+        language_codes = language_codes.ravel()
+        language_chance = within_language_chance(labels, np.asarray(languages).astype(str))
+
+    for k in NEIGHBOR_COUNTS:
+        if k > graph.k:
+            continue
+        view = graph.truncate(k)
+        valid = np.isfinite(view.distances)
+        same = (author_codes[view.indices] == author_codes[:, None]) & valid
+
+        language_columns = {}
+        if language_codes is not None:
+            same_language = (language_codes[view.indices] == language_codes[:, None]) & valid
+            within = same_language.sum()
+            language_columns = {
+                "nn_same_language": float(within / valid.sum()),
+                "nn_precision_within_language": float((same & same_language).sum() / within)
+                                                if within else float("nan"),
+                "random_nn_precision_within_language": language_chance,
+            }
+
+        matched = same.sum(axis=1)
+        component_count, assignment = connected_components(view.to_sparse(), directed=False,
+                                                           return_labels=True)
+        component_sizes = np.bincount(assignment)
+        rows.append({
+            "k": k,
+            "nn_precision": float(same.sum() / valid.sum()),
+            "random_nn_precision": chance_edge,
+            **language_columns,
+            "hit_at_k": float((matched > 0).mean()),
+            "neighbor_recall": float(np.mean(matched[has_partner] / others[has_partner])),
+            **random_neighbor_references(labels, k),
+            "mean_distance": float(view.distances[valid].mean()),
+            "n_components": int(component_count),
+            "largest_component_share": float(component_sizes.max() / view.n_documents),
+            "n_singleton_components": int(np.sum(component_sizes == 1)),
+        })
+    return pd.DataFrame(rows)
+
+
+def link_ranking(graph, authors: np.ndarray, n_true_links: float, k: int) -> dict:
+    """PAN's authorship-link ranking over the graph's edges, ranked by similarity.
+
+    ``link_ap`` divides by *every* true link in the collection, including ones the candidate set
+    never contained, so a narrow candidate set is penalised for what it missed;
+    ``candidate_link_recall`` reports that loss separately.
+    """
+    source, target, distance = graph.edges(k)
+    _, author_codes = np.unique(np.asarray(authors), return_inverse=True)
+    author_codes = author_codes.ravel()
+    order = np.argsort(distance, kind="stable")            # most similar first
+    relevant = author_codes[source[order]] == author_codes[target[order]]
+    return {**link_ranking_metrics(relevant, n_true_links), "link_ranking_k": k}
+
+
+def verification_diagnostics(embeddings: np.ndarray, authors: np.ndarray, metric: str,
+                             bins: int = SCORE_BINS, working_memory_mb: int = 256) -> dict:
+    """Same-author verification AUC over **every** pair, plus its per-document and imbalance twins.
+
+    The algorithm-free reading: no partition built on these scores can recover a link the scores
+    themselves rank below the strangers.
+
+    ``verification_auc_macro`` is a correction rather than a refinement. Same-author pairs grow
+    quadratically in an author's document count, so WildChat's most prolific test-quarter user
+    (509 documents) contributes 129,286 pairs -- **11% of every true link in the collection** --
+    and the pair-weighted AUC is substantially a statement about a handful of people. Measured, the
+    two differ by 0.06 on WildChat/Gemini (0.867 against 0.926).
+
+    One streamed pass over the full pairwise matrix, never materialised. The macro half sorts each
+    row, which is the more expensive part. **This is a second pass, after the neighbour graph's**;
+    fusing them would halve the distance cost and is the obvious optimisation if this ever runs on
+    something larger. Only ``metric="cosine"`` has an exact bound to bin against; any other metric
+    has its range sampled, and over-range distances fall in the last bin.
+    """
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    n = len(embeddings)
+    _, codes = np.unique(np.asarray(authors), return_inverse=True)
+    codes = codes.ravel()
+
+    if metric == "cosine":
+        upper = COSINE_MAX_DISTANCE
+    else:
+        sample = np.random.default_rng(DIAGNOSTIC_SEED).choice(n, size=min(n, 512), replace=False)
+        upper = float(max(block.max() for _, block in blocked_distances(
+            embeddings[sample], embeddings, metric=metric))) * 1.05
+    scale = (bins - 1) / upper
+
+    positive_counts = np.zeros(bins, dtype=np.int64)
+    negative_counts = np.zeros(bins, dtype=np.int64)
+    macro_auc_total, macro_documents = 0.0, 0
+
+    for start, block in blocked_distances(embeddings, embeddings, metric=metric,
+                                          working_memory_mb=working_memory_mb):
+        rows = np.arange(len(block))
+        block[rows, start + rows] = np.inf                 # a document is not its own pair
+        same = codes[start:start + len(block), None] == codes[None, :]
+        same[rows, start + rows] = False
+
+        # Each row of a block spans the whole collection, so a document's ranking is complete
+        # within one block and needs no cross-block accumulation.
+        ordered = np.sort(block, axis=1)
+        for row in rows:
+            positives = block[row][same[row]]
+            n_positive = len(positives)
+            n_negative = n - 1 - n_positive
+            if n_positive == 0 or n_negative == 0:
+                continue
+            positives = np.sort(positives)
+            closer = (np.searchsorted(ordered[row], positives, "left")
+                      - np.searchsorted(positives, positives, "left"))
+            up_to = (np.searchsorted(ordered[row], positives, "right")
+                     - np.searchsorted(positives, positives, "right"))
+            macro_auc_total += float(np.sum((n_negative - up_to) + 0.5 * (up_to - closer))
+                                     / (n_positive * n_negative))
+            macro_documents += 1
+        del ordered
+
+        # Clip before the cast: the diagonal is +inf and casting that to an integer is undefined --
+        # it lands in the *nearest* bin on this platform, counting every document as its own
+        # most-similar pair.
+        np.multiply(block, scale, out=block)
+        np.clip(block, 0, bins - 1, out=block)
+        binned = block.astype(np.int32)
+        # Negatives as "everything minus the positives" rather than a ``~same`` mask, which would
+        # copy out ~67 million non-pairs per block where ``ravel`` is a view.
+        totals = np.bincount(binned.ravel(), minlength=bins)
+        positives = np.bincount(binned[same], minlength=bins)
+        positive_counts += positives
+        negative_counts += totals - positives
+        negative_counts[bins - 1] -= len(block)            # take the diagonal back out exactly
+        del binned, totals, positives, same
+
+    # The stream visits both (i, j) and (j, i), so every bin holds twice its unordered count. AUC,
+    # AP and prevalence are ratios in which the factor cancels exactly -- verified against sklearn
+    # on the whole pairwise matrix -- so only the reported pair *count* is halved, to mean the same
+    # thing as ``n_true_links``.
+    n_positive, n_negative = positive_counts.sum(), negative_counts.sum()
+    return {
+        "verification_auc": auc_from_histogram(positive_counts, negative_counts),
+        "verification_auc_macro": (macro_auc_total / macro_documents
+                                   if macro_documents else float("nan")),
+        "verification_ap": average_precision_from_histogram(positive_counts, negative_counts),
+        "verification_prevalence": float(n_positive / (n_positive + n_negative)),
+        "verification_pairs": int((n_positive + n_negative) // 2),
+        "verification_documents_scored": macro_documents,
+        "verification_bins": bins,
+    }
+
+
+def slice_diagnostics(name: str, frame: pd.DataFrame, embeddings: np.ndarray, graph,
+                      metric: str) -> tuple[dict, pd.DataFrame]:
+    """Every algorithm-free measure for one slice: its shape, its graph, its pairwise separability."""
+    authors = frame["author_id"].to_numpy()
+    shape = collection_shape(authors)
+    per_k = graph_diagnostics(graph, authors, frame.get("language_primary"))
+    row = {"slice": name, "metric": metric, **shape,
+           **verification_diagnostics(embeddings, authors, metric),
+           **link_ranking(graph, authors, shape["n_true_links"], graph.k)}
+    per_k.insert(0, "slice", name)
+    return row, per_k
+
+
+def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None
+         ) -> tuple[dict, pd.DataFrame]:
+    """Choose hyper-parameters by maximising BCubed F on a labelled slice.
+
+    Exhaustive over :data:`CLUSTERING_SPACES`, because these grids are small (24-48 points) and the
+    graph they share is already built -- so the search costs one clustering per point and nothing
+    else. Returns the best settings and the full trials table, which is written out: a search that
+    only reports its winner cannot be checked for a flat optimum, and a flat optimum is exactly
+    what would make the transfer to the test set safe.
+    """
+    grid = parameter_grid(CLUSTERING_SPACES[algorithm])
+    if limit is not None:
+        grid = grid[:limit]
+    factory = get_clustering_attack(algorithm)
+    trials = []
+    for settings in grid:
+        started = time.perf_counter()
+        try:
+            labels = factory(**settings).cluster(graph)
+            scores = bcubed_scores(labels, authors)
+            row = {**settings, "bcubed_f": scores.f_score, "bcubed_precision": scores.precision,
+                   "bcubed_recall": scores.recall,
+                   "n_clusters": int(len(np.unique(labels)))}
+        except Exception as error:                      # a configuration that cannot run is data
+            row = {**settings, "bcubed_f": float("nan"), "error": str(error)[:200]}
+        trials.append({**row, "seconds": time.perf_counter() - started})
+    table = pd.DataFrame(trials).sort_values("bcubed_f", ascending=False, kind="mergesort")
+    if table["bcubed_f"].isna().all():
+        raise SystemExit(f"every {algorithm} configuration failed; see the trials table.")
+    # Restore each value's original Python type from the *space*, not from the retrieved dtype.
+    # A single failed trial puts a NaN in the frame, which promotes that whole column to float64 --
+    # so an integer parameter like `neighbors` comes back as 25.0 and fails as a slice index. The
+    # grid is the authority on what type each parameter is; the frame is only how it travelled.
+    winner = table.iloc[0]
+    best = {}
+    for key, values in CLUSTERING_SPACES[algorithm].items():
+        template = values[0]
+        if isinstance(template, bool):
+            best[key] = bool(winner[key])
+        elif isinstance(template, (int, np.integer)):
+            best[key] = int(winner[key])
+        elif isinstance(template, (float, np.floating)):
+            best[key] = float(winner[key])
+        else:
+            best[key] = str(winner[key])
+    return best, table
+
+
+def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
+                  tuning_graph, tuning_authors: np.ndarray, args) -> tuple[dict, np.ndarray, pd.DataFrame]:
+    """Tune on the simulation slice, then attack the test collection once with the winner."""
+    started = time.perf_counter()
+    settings, trials = tune(algorithm, tuning_graph, tuning_authors, args.tune_limit)
+    tuning_seconds = time.perf_counter() - started
+    tuned_score = float(trials.iloc[0]["bcubed_f"])
+
+    # The winner is re-fitted on a *different* graph, so a configuration that ran on the
+    # simulation slice can still fail on the collection under attack. That is worth one algorithm,
+    # not the whole cell: the others' results stand, and the trials table records what happened.
+    started = time.perf_counter()
+    try:
+        labels = get_clustering_attack(algorithm)(**settings).cluster(test_graph)
+    except Exception as error:
+        print(f"  {algorithm:<28s} FAILED on the test collection with "
+              f"[{settings}]: {type(error).__name__}: {error}")
+        return None, None, trials
+    attack_seconds = time.perf_counter() - started
+
+    row = {
+        "algorithm": algorithm,
+        "hyperparameters": ", ".join(
+            f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}"
+            for key, value in sorted(settings.items())),
+        **score_partition(labels, test_authors),
+        "tuning_bcubed_f": tuned_score,
+        # Named for its sign, because the old name (`tuning_transfer_gap`) did not carry one and
+        # was misread: POSITIVE means the tuning slice scored HIGHER than the test collection, i.e.
+        # tuning where the labels are visible was optimistic. Measured +0.005 to +0.025 on all nine
+        # WildChat (defense x algorithm) combinations, and negative on swe-chat, where the final
+        # quarter is simply an easier instance than the one before it.
+        "tuning_optimism": float("nan"),                     # filled below, needs the test score
+        "seconds_tuning": tuning_seconds,
+        "seconds_attack": attack_seconds,
+    }
+    row["tuning_optimism"] = row["tuning_bcubed_f"] - row["bcubed_f"]
+
+    # Did tuning actually buy anything? Two references, because "untuned" has no canonical meaning
+    # for these methods and the obvious one is gameable:
+    #
+    #   `untuned_bcubed_f`  - the class defaults, i.e. what someone gets by not thinking about it.
+    #                         Weak as evidence on its own: the defaults are a choice made in this
+    #                         repo, and picking bad ones would flatter tuning for free.
+    #   `--oracle-sweep`    - the whole grid re-run on the test collection, which gives the median
+    #                         (what a configuration drawn at random from a sane range scores) and
+    #                         the best (what a perfect chooser would have got). Neither depends on
+    #                         a default anyone picked, and the median is the honest reference.
+    try:
+        default_labels = get_clustering_attack(algorithm)().cluster(test_graph)
+        row["untuned_bcubed_f"] = bcubed_scores(default_labels, test_authors).f_score
+    except Exception:
+        row["untuned_bcubed_f"] = float("nan")       # defaults may not run on this graph
+    row["tuning_gain_over_default"] = row["bcubed_f"] - row["untuned_bcubed_f"]
+
+    trials.insert(0, "algorithm", algorithm)
+    return row, labels, trials
+
+
+def oracle_sweep(algorithm: str, graph, authors: np.ndarray, limit: int | None) -> pd.DataFrame:
+    """Every configuration in the grid, scored on the **test** collection.
+
+    An oracle and labelled as one: nothing may select a configuration on these numbers. It exists
+    to bound the tuning question from both sides -- ``median`` is what an arbitrary reasonable
+    configuration scores, ``max`` is what a perfect chooser would have reached, and the tuned
+    configuration's own score sits somewhere between. Without it, "tuning helped" is a claim about
+    one point with nothing to compare it to.
+    """
+    grid = parameter_grid(CLUSTERING_SPACES[algorithm])
+    if limit is not None:
+        grid = grid[:limit]
+    factory = get_clustering_attack(algorithm)
+    rows = []
+    for settings in grid:
+        try:
+            scores = bcubed_scores(factory(**settings).cluster(graph), authors)
+            rows.append({**settings, "bcubed_f": scores.f_score})
+        except Exception as error:
+            rows.append({**settings, "bcubed_f": float("nan"), "error": str(error)[:200]})
+    table = pd.DataFrame(rows)
+    table.insert(0, "algorithm", algorithm)
+    return table
+
+
+def run_baselines(frame: pd.DataFrame, authors: np.ndarray, graph) -> list[dict]:
+    """The reference partitions, scored through the same path as the attacks."""
+    rows = []
+    for kind in ("singleton", "single_cluster"):
+        labels = BaselineClustering(kind=kind).cluster(graph)
+        rows.append({"algorithm": f"baseline_{kind}", "hyperparameters": "",
+                     **score_partition(labels, authors)})
+    # Matched-random: the true cluster-size distribution with the association destroyed. Averaged
+    # over repetitions the way PAN does, seeded so a redraw cannot move the number.
+    replicates = [score_partition(
+        BaselineClustering(kind="random", metadata=authors, seed=seed).cluster(graph), authors)
+        for seed in range(50)]
+    rows.append({"algorithm": "baseline_random", "hyperparameters": "50 seeded replicates",
+                 **{key: float(np.mean([r[key] for r in replicates]))
+                    for key in replicates[0] if isinstance(replicates[0][key], (int, float))}})
+    for column in METADATA_BASELINES:
+        if column in frame.columns:
+            labels = BaselineClustering(kind="metadata",
+                                        metadata=frame[column].to_numpy()).cluster(graph)
+            rows.append({"algorithm": f"baseline_{column}", "hyperparameters": "",
+                         **score_partition(labels, authors)})
+    return rows
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Cluster an anonymised log by author.")
+    parser.add_argument("--source", default="wildchat")
+    parser.add_argument("--feature", default="gemini_embedding_2")
+    parser.add_argument("--defense", default="base")
+    parser.add_argument("--algorithms", nargs="*", default=sorted(CLUSTERING_ATTACKS),
+                        help="Methods to run. Pass none (`--algorithms`) with --diagnostics to "
+                             "measure the corpus without attacking it.")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--metric", default="cosine")
+    parser.add_argument("--max-neighbors", type=int, default=MAX_NEIGHBORS)
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Also measure the problem itself -- verification AUC, neighbour-graph "
+                             "quality per k, the within-language control and the link ranking -- "
+                             "for both slices. Needs no clustering algorithm.")
+    parser.add_argument("--oracle-sweep", action="store_true",
+                        help="Also score the whole grid on the TEST collection, to bound what "
+                             "tuning could have achieved. An oracle: never select on it.")
+    parser.add_argument("--tune-limit", type=int, default=None,
+                        help="Cap the grid, for smoke tests. Omit for the full search.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    tag = f"{args.source}_{args.defense}_{args.feature}"
+    output_dir = args.output_dir or (OUTPUT_ROOT / tag)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frame, embeddings = load_documents_and_features(
+        args.data_dir, args.source, args.feature,
+        defense="none" if args.defense == "base" else args.defense)
+    tuning_window, test_window = slice_bounds(len(frame))
+
+    test_frame = frame.iloc[test_window].reset_index(drop=True)
+    test_authors = test_frame["author_id"].to_numpy()
+    tuning_authors = frame["author_id"].to_numpy()[tuning_window]
+
+    shape = collection_shape(test_authors)
+    print(f"{tag}\n  test: {shape['n_documents']:,} documents, {shape['n_authors']:,} authors "
+          f"(r={shape['authors_per_document']:.3f})")
+    print(f"  tuning slice: {len(tuning_authors):,} documents, "
+          f"{len(np.unique(tuning_authors)):,} authors")
+    print(f"  baselines: singleton F={singleton_baseline(test_authors).f_score:.3f}, "
+          f"one-cluster F={single_cluster_baseline(test_authors).f_score:.3f}")
+
+    k = min(args.max_neighbors, len(test_authors) - 1, len(tuning_authors) - 1)
+    started = time.perf_counter()
+    test_graph = build_neighbor_graph(np.nan_to_num(embeddings[test_window]), k, metric=args.metric)
+    tuning_graph = build_neighbor_graph(np.nan_to_num(embeddings[tuning_window]), k,
+                                        metric=args.metric)
+    print(f"  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
+
+    # Before `embeddings` is released: the verification pass needs the vectors, not the graph.
+    if args.diagnostics:
+        started = time.perf_counter()
+        diagnostic_rows, graph_tables = [], []
+        for name, window, subframe, subgraph in (
+                ("test", test_window, test_frame, test_graph),
+                ("tuning", tuning_window, frame.iloc[tuning_window].reset_index(drop=True),
+                 tuning_graph)):
+            row, per_k = slice_diagnostics(name, subframe, np.nan_to_num(embeddings[window]),
+                                           subgraph, args.metric)
+            diagnostic_rows.append(row)
+            graph_tables.append(per_k)
+            print(f"  diagnostics [{name}]: verification AUC={row['verification_auc']:.4f} "
+                  f"(macro {row['verification_auc_macro']:.4f}), AP={row['verification_ap']:.4f} "
+                  f"({row['verification_ap'] / row['verification_prevalence']:.0f}x prevalence), "
+                  f"1-NN edge precision={per_k.iloc[0]['nn_precision']:.3f} "
+                  f"({per_k.iloc[0]['nn_precision'] / per_k.iloc[0]['random_nn_precision']:.0f}x chance)")
+        pd.DataFrame(diagnostic_rows).to_csv(output_dir / "diagnostics.csv", index=False)
+        pd.concat(graph_tables, ignore_index=True).to_csv(
+            output_dir / "graph_diagnostics.csv", index=False)
+        print(f"  diagnostics took {time.perf_counter() - started:.0f}s")
+    del embeddings
+    print()
+
+    rows = run_baselines(test_frame, test_authors, test_graph)
+    for row in rows:
+        print(f"  {row['algorithm']:<28s} BCubed F={row['bcubed_f']:.4f}")
+    print()
+
+    all_trials, oracle_tables = [], []
+    for algorithm in args.algorithms:
+        if algorithm not in CLUSTERING_ATTACKS:
+            raise SystemExit(f"unknown algorithm {algorithm!r}; "
+                             f"available: {sorted(CLUSTERING_ATTACKS)}")
+        # A method that cannot run at this scale is skipped with a note rather than killing the
+        # cell: the other algorithms' results are still worth having, and the reason is a property
+        # of the method (see MAX_DENSE_DOCUMENTS) that a reader of the table needs to know.
+        if (algorithm == "average_linkage"
+                and len(test_authors) > MAX_DENSE_DOCUMENTS):
+            print(f"  {algorithm:<28s} SKIPPED: needs a dense "
+                  f"{len(test_authors):,}^2 matrix "
+                  f"({len(test_authors) ** 2 * 8 / 1e9:.1f} GB), over the "
+                  f"{MAX_DENSE_DOCUMENTS:,}-document limit.")
+            continue
+        row, labels, trials = run_algorithm(algorithm, test_graph, test_authors,
+                                            tuning_graph, tuning_authors, args)
+        all_trials.append(trials)
+        if row is None:
+            continue
+        rows.append(row)
+        pd.DataFrame({"doc_id": test_frame["doc_id"].to_numpy(), "cluster": labels}).to_csv(
+            output_dir / f"clusters_{algorithm}.csv", index=False)
+        table = ClusterContingency.from_labels(labels, test_authors)
+        per_author_clustering(table, np.unique(test_authors)).to_csv(
+            output_dir / f"author_report_{algorithm}.csv", index=False)
+        print(f"  {algorithm:<28s} BCubed F={row['bcubed_f']:.4f} "
+              f"(P={row['bcubed_precision']:.3f} R={row['bcubed_recall']:.3f}), "
+              f"clusters={row['n_clusters']:,}, any-link={row['any_link_rate']:.3f}, "
+              f"amplification={row['amplification']:.2f}")
+        if args.oracle_sweep:
+            sweep = oracle_sweep(algorithm, test_graph, test_authors, args.tune_limit)
+            oracle_tables.append(sweep)
+            usable = sweep["bcubed_f"].dropna()
+            row["oracle_best_bcubed_f"] = float(usable.max())
+            row["oracle_median_bcubed_f"] = float(usable.median())
+            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
+                  f"(tuning gain {row['tuning_gain_over_default']:+.4f}) | "
+                  f"grid on test: median={row['oracle_median_bcubed_f']:.4f} "
+                  f"best={row['oracle_best_bcubed_f']:.4f}")
+        else:
+            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
+                  f"(tuning gain {row['tuning_gain_over_default']:+.4f})")
+        print(f"  {'':<28s} tuned on slice F={row['tuning_bcubed_f']:.4f} "
+              f"(tuning optimism {row['tuning_optimism']:+.4f}), "
+              f"{row['seconds_tuning']:.0f}s tune + {row['seconds_attack']:.0f}s attack "
+              f"[{row['hyperparameters']}]")
+
+    results = pd.DataFrame(rows)
+    for column, value in (("feature", args.feature), ("defense", args.defense),
+                          ("dataset", args.source)):
+        results.insert(0, column, value)
+    results.to_csv(output_dir / "clustering_results.csv", index=False)
+    if all_trials:
+        pd.concat(all_trials, ignore_index=True).to_csv(output_dir / "tuning_trials.csv",
+                                                        index=False)
+    if oracle_tables:
+        pd.concat(oracle_tables, ignore_index=True).to_csv(output_dir / "oracle_sweep.csv",
+                                                           index=False)
+    print(f"\nWrote {output_dir}/clustering_results.csv, clusters_*.csv, author_report_*.csv")
+
+
+if __name__ == "__main__":
+    main()

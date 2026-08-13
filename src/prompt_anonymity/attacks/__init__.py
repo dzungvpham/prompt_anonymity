@@ -1,14 +1,21 @@
 """Linkage attacks, organised by what an attack actually does.
 
-Every attack answers the same question -- *which known author wrote this unknown document?* --
-and every attack answers it in the same shape: an ``[n_documents x n_authors]`` **score** matrix
-where **higher means more likely this author**, with the author order in ``self.authors``.
+Almost every attack answers the same question -- *which known author wrote this unknown document?*
+-- and answers it in the same shape: an ``[n_documents x n_authors]`` **score** matrix where
+**higher means more likely this author**, with the author order in ``self.authors``.
 Identification is ``argmax``; :mod:`prompt_anonymity.attacks.ood` turns the same matrix into an
 accept/reject decision, and :mod:`prompt_anonymity.evaluation.metrics` scores it.
 
 The author is the unit throughout. There is deliberately no conversation-level attack any more:
 a matrix over known *conversations* answers a different question from the one the metrics report,
 and mixing the two invites reading a distance as a score with the sign inverted.
+
+:mod:`~prompt_anonymity.attacks.clustering` is the one exception, and it is a deliberate one: it
+asks *which of these documents share an author?* without naming anybody, so it returns a partition
+rather than a score matrix and needs no known side at all. That is a different threat model --
+linkability rather than identifiability -- with its own measures in
+:mod:`prompt_anonymity.evaluation.metrics.clustering`. See its docstring for why the two are kept
+apart rather than reconciled into one interface.
 
 Packages
 --------
@@ -18,6 +25,7 @@ Packages
 :mod:`~prompt_anonymity.attacks.llm`           shortlist cheaply, then let a judge reorder
 :mod:`~prompt_anonymity.attacks.verification`  learned same-author scoring over pairs
 :mod:`~prompt_anonymity.attacks.ood`           score matrix -> accept or reject
+:mod:`~prompt_anonymity.attacks.clustering`    group documents by author, naming nobody
 =============================================  ===========================================
 
 :mod:`~prompt_anonymity.attacks.common` holds the helpers the families share -- the linear
@@ -36,6 +44,14 @@ labels for the shortlist. They return the same author-score frame.
 
 from __future__ import annotations
 
+from .clustering import (
+    NeighborGraph,
+    build_neighbor_graph,
+    metadata_labels,
+    random_labels,
+    single_cluster_labels,
+    singleton_labels,
+)
 from .common import (
     AuthorGroups,
     class_means,
@@ -120,6 +136,13 @@ __all__ = [
     # pairwise verification
     "VERIFICATION_ATTACKS",
     "run_cross_encoder",
+    # clustering (linkability: a partition, not a score matrix)
+    "NeighborGraph",
+    "build_neighbor_graph",
+    "singleton_labels",
+    "single_cluster_labels",
+    "random_labels",
+    "metadata_labels",
     # open-set
     "cohort_normalize",
     "rejection_score",

@@ -1,9 +1,9 @@
 """Metrics for scoring linkage and authorship-attribution attacks.
 
-Four families, each answering a different question about the same attack. All but the first
-consume a **score matrix** (documents x candidate authors, higher = more likely) rather than a
-distance matrix, which is the orientation an attribution model produces; negate a distance
-matrix to move between them.
+Five families, each answering a different question about the same attack. The first four consume a
+**score matrix** (documents x candidate authors, higher = more likely) rather than a distance
+matrix, which is the orientation an attribution model produces; negate a distance matrix to move
+between them. The fifth consumes a partition instead, because it scores a different threat model.
 
 :mod:`~prompt_anonymity.evaluation.metrics.accuracy` -- *how often is the attack right?*
     ``top_k_accuracy`` at the conversation and identity levels, and ``random_guessing_accuracy``
@@ -23,9 +23,30 @@ matrix to move between them.
 :mod:`~prompt_anonymity.evaluation.metrics.detection` -- *is this document's author known at all?*
     Open-set / verification metrics for the reject option: AUROC, equal error rate, DIR@FAR,
     PAN's c@1, and calibration of the reported confidence.
+
+:mod:`~prompt_anonymity.evaluation.metrics.clustering` -- *which of these share an author?*
+    The odd one out, and deliberately so: it scores a **partition** of anonymous documents rather
+    than a ranking of named candidates, because it measures *linkability* rather than
+    identifiability. BCubed precision/recall/F as defined by PAN 2016, the link-ranking view, the
+    degenerate baselines that make those numbers readable, and the exposure measures that say what
+    a partition is worth to an attacker.
 """
 
 from .accuracy import random_guessing_accuracy, top_k_accuracy
+from .clustering import (
+    BCubedScores,
+    ClusterContingency,
+    NOISE_LABEL,
+    bcubed_from_contingency,
+    bcubed_scores,
+    clustering_summary,
+    expand_noise,
+    link_ranking_metrics,
+    pairwise_scores,
+    per_author_clustering,
+    single_cluster_baseline,
+    singleton_baseline,
+)
 from .detection import (
     c_at_1,
     calibration_metrics,
@@ -67,4 +88,17 @@ __all__ = [
     "detection_identification_rate",
     "equal_error_rate",
     "max_softmax_confidence",
+    # clustering (linkability)
+    "NOISE_LABEL",
+    "BCubedScores",
+    "ClusterContingency",
+    "bcubed_scores",
+    "bcubed_from_contingency",
+    "clustering_summary",
+    "expand_noise",
+    "link_ranking_metrics",
+    "pairwise_scores",
+    "per_author_clustering",
+    "singleton_baseline",
+    "single_cluster_baseline",
 ]
