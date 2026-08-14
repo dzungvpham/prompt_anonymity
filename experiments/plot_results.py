@@ -4598,11 +4598,18 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
 BASELINE_VARIANT_LABEL = "Baseline (absolute search)"
 
 CLUSTERING_VARIANTS = (
+    # Order is the figure's row order, and it is the order the ideas were built in: the controls
+    # first, then what was added, then the combination. Timing-only leads because it is the
+    # reference every timing-fused row has to be read against -- it reads no text at all.
+    ("time1_quantile", "Timing only (no text)"),
     ("quantile", "Baseline (quantile search)"),
     ("lda", "LDA projection"),
     ("wccn_csls", "WCCN + CSLS"),
     ("wccn_local_scaling", "WCCN + local scaling"),
+    ("time0.45_quantile", "Baseline + timing"),
+    ("time0.5_quantile", "Baseline + timing"),
     ("contrastive", "Contrastive projection"),
+    ("contrastive_time0.45", "Contrastive + timing"),
 )
 
 

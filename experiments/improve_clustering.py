@@ -103,6 +103,12 @@ from prompt_anonymity.attacks.clustering.projection import (  # noqa: E402
     identity_projection,
 )
 from prompt_anonymity.attacks.clustering.edge_scoring import fit_edge_scorer  # noqa: E402
+from prompt_anonymity.attacks.clustering.linkage import capped_linkage  # noqa: E402
+from prompt_anonymity.attacks.clustering.rescoring import (  # noqa: E402
+    global_distance_moments,
+    temporal_fusion,
+    zscore_distances,
+)
 from prompt_anonymity.attacks.clustering.rescoring import rescore_graph  # noqa: E402
 from prompt_anonymity.attacks.common import unit_rows  # noqa: E402
 from prompt_anonymity.evaluation.metrics.clustering import bcubed_scores  # noqa: E402
@@ -266,6 +272,30 @@ def sweep_graph(graph, author_codes: np.ndarray, n_authors: int, projection_name
             print(f"    {rescoring:<14s} locality={locality:<3d} best F={best:.4f}  "
                   f"[{time.perf_counter() - started:.0f}s]", flush=True)
     return rows
+
+
+class EnsembleProjection:
+    """Several linear projections applied together, so cosine averages over them.
+
+    Diversity from *hyper-parameters* rather than seeds: the saved projections differ in width,
+    temperature and training length, which spreads the errors further apart than re-seeding one
+    configuration would. Duck-types :class:`LinearProjection` -- same ``name``, ``transform`` and
+    ``n_components`` -- so nothing downstream branches on which it was handed.
+    """
+
+    def __init__(self, matrices: list[np.ndarray], name: str):
+        self.matrices, self.name = matrices, name
+
+    @property
+    def n_components(self) -> int:
+        return sum(matrix.shape[1] for matrix in self.matrices)
+
+    def transform(self, embeddings: np.ndarray) -> np.ndarray:
+        scale = np.float32(1.0 / np.sqrt(len(self.matrices)))
+        blocks = [unit_rows(np.asarray(embeddings, dtype=np.float32)
+                            @ matrix.astype(np.float32)) * scale
+                  for matrix in self.matrices]
+        return np.hstack(blocks).astype(np.float32)
 
 
 def fuse_features(blocks: list[np.ndarray], weights: list[float]) -> np.ndarray:
@@ -448,6 +478,387 @@ def seen_unseen_report(labels: np.ndarray, author_codes: np.ndarray, n_authors: 
     return rows
 
 
+
+def sorted_edges(graph, k_cap: int):
+    """``(source, target, order)`` for one k-truncation, edges ordered closest-first."""
+    source, target, distance = graph_edges(graph, k_cap)
+    finite = np.isfinite(distance)
+    source, target, distance = source[finite], target[finite], distance[finite]
+    return source, target, np.argsort(distance, kind="stable"), distance
+
+
+def linkage_rows(graph, author_codes, n_authors, projection_name, k_caps, caps, rules):
+    """Size-constrained single linkage, swept over (k, cap, rule, budget).
+
+    One pass per (k, cap, rule) covers every budget, because the linkage is incremental -- the
+    same trick that makes the unconstrained frontier affordable.
+    """
+    rows = []
+    for k_cap in k_caps:
+        source, target, order, distance = sorted_edges(graph, k_cap)
+        budgets = np.unique(np.geomspace(1, len(order), BUDGET_STEPS).astype(np.int64))
+        for cap in caps:
+            for rule in (rules if cap > 0 else rules[:1]):   # cap=0 ignores the rule
+                started = time.perf_counter()
+                for used, labels in capped_linkage(source, target, order, graph.n_documents,
+                                                   cap, rule, budgets):
+                    precision, recall, f_score, n_clusters = fast_bcubed(
+                        labels, author_codes, n_authors)
+                    sizes = np.bincount(labels)
+                    rows.append({"projection": projection_name, "rescoring": "none",
+                                 "algorithm": f"capped_linkage[{rule}]", "cap": cap,
+                                 "k": k_cap, "edge_budget": int(used),
+                                 "distance_threshold": float(
+                                     distance[order[min(used, len(order)) - 1]]) if used else 0.0,
+                                 "bcubed_precision": precision, "bcubed_recall": recall,
+                                 "bcubed_f": f_score, "n_clusters": n_clusters,
+                                 "largest_cluster": int(sizes.max()),
+                                 "largest_cluster_share": float(sizes.max() / len(labels)),
+                                 "singleton_share": float((sizes == 1).sum() / len(labels))})
+                best = max(row["bcubed_f"] for row in rows
+                           if row["cap"] == cap and row["k"] == k_cap
+                           and row["algorithm"].endswith(f"[{rule}]"))
+                print(f"    k={k_cap:<3d} cap={cap:<5d} rule={rule:<5s} best F={best:.4f}  "
+                      f"[{time.perf_counter() - started:.0f}s]", flush=True)
+    return rows
+
+
+def temporal_rows(graph, frame, author_codes, n_authors, projection_name, k_caps, weights,
+                  per_language: bool = False):
+    """Fuse the time gap between two documents into the edge score, and sweep the weight.
+
+    **Both ends of the sweep are controls.** ``weight=0`` is the pure-cosine attack this is
+    measured against; ``weight=1`` is timing alone, reading no text at all -- the same kind of
+    metadata reference as ``baseline_language_primary`` in ``run_clustering.py``, and the number
+    that says how much of any gain is style rather than session structure.
+
+    Both terms are standardised over the candidate-edge population before mixing, because a cosine
+    distance and a log-hour gap have no common scale and a raw sum would be whichever happens to
+    have the larger variance.
+    """
+    times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds[times.isna().to_numpy()] = np.nan
+
+    def standardise(values):
+        usable = np.isfinite(values)
+        centre, spread = values[usable].mean(), values[usable].std()
+        out = (values - centre) / (spread if spread > 0 else 1.0)
+        out[~usable] = np.nanmax(out[usable])          # unknown time = maximally far apart
+        return out
+
+    rows = []
+    for k_cap in k_caps:
+        source, target, distance = graph_edges(graph, k_cap)
+        finite = np.isfinite(distance)
+        source, target, distance = source[finite], target[finite], distance[finite]
+        gap = np.abs(seconds[source] - seconds[target]) / 3600.0
+        cosine_z = standardise(distance.astype(np.float64))
+        time_z = standardise(np.log1p(gap))
+        languages = frame["language_primary"].astype(str).to_numpy()
+        # Group an edge by the unordered pair of its endpoints' languages.
+        pair_key = pd.factorize(pd.Series(
+            [f"{a}|{b}" for a, b in zip(np.minimum(languages[source], languages[target]),
+                                        np.maximum(languages[source], languages[target]))]))[0]
+        for weight in weights:
+            fused = (1 - weight) * cosine_z + weight * time_z
+            if per_language:
+                # Standardise within each language pair, so the same budget cuts each group at its
+                # own quantile rather than at a shared absolute score.
+                frame_scores = pd.DataFrame({"g": pair_key, "s": fused})
+                stats = frame_scores.groupby("g")["s"].agg(["mean", "std", "size"])
+                # A group too small to estimate a spread keeps the global scale rather than being
+                # rescaled by noise.
+                usable = (stats["size"] >= 200) & (stats["std"] > 0)
+                centre = np.where(usable, stats["mean"], 0.0)[pair_key]
+                spread = np.where(usable, stats["std"], 1.0)[pair_key]
+                fused = (fused - centre) / spread
+            for row in budget_frontier(source, target, fused, author_codes, n_authors,
+                                       graph.n_documents):
+                rows.append({"projection": projection_name,
+                             "rescoring": f"time{weight:g}" + ("+lang" if per_language else ""),
+                             "algorithm": "connected", "locality": 0, "k": k_cap, **row})
+            tag = f"time{weight:g}" + ("+lang" if per_language else "")
+            best = max(row["bcubed_f"] for row in rows
+                       if row["rescoring"] == tag and row["k"] == k_cap)
+            print(f"    k={k_cap:<3d} time weight={weight:<4g} best F={best:.4f}", flush=True)
+    return rows
+
+
+
+def fused_edges(graph, frame, k_cap: int, weight: float):
+    """Candidate edges with the cosine/time fusion applied, ordered closest-first."""
+    source, target, distance = graph_edges(graph, k_cap)
+    finite = np.isfinite(distance)
+    source, target, distance = source[finite], target[finite], distance[finite]
+    if weight <= 0:
+        return source, target, distance.astype(np.float64)
+    times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds[times.isna().to_numpy()] = np.nan
+
+    def standardise(values):
+        usable = np.isfinite(values)
+        centre, spread = values[usable].mean(), values[usable].std()
+        out = (values - centre) / (spread if spread > 0 else 1.0)
+        out[~usable] = np.nanmax(out[usable])
+        return out
+
+    gap = np.abs(seconds[source] - seconds[target]) / 3600.0
+    return source, target, ((1 - weight) * standardise(distance.astype(np.float64))
+                            + weight * standardise(np.log1p(gap)))
+
+
+def constrained_rows(graph, frame, author_codes, n_authors, projection_name, k_caps,
+                     cohesion_quantiles, caps, rules, time_weight, tag):
+    """Cohesion- and size-constrained linkage over (optionally time-fused) edges.
+
+    The two constraint families and the fusion are orthogonal -- one changes which edges are
+    offered, the others change which offered edges are accepted -- so this sweeps them together
+    and lets the tuning slice say whether their gains add or overlap.
+    """
+    rows = []
+    for k_cap in k_caps:
+        source, target, distance = fused_edges(graph, frame, k_cap, time_weight)
+        order = np.argsort(distance, kind="stable")
+        budgets = np.unique(np.geomspace(1, len(order), BUDGET_STEPS).astype(np.int64))
+        ordered = distance[order]
+        for quantile in cohesion_quantiles:
+            ceiling = (float("inf") if quantile >= 1.0
+                       else float(ordered[min(int(quantile * len(ordered)), len(ordered) - 1)]))
+            for cap in caps:
+                for rule in (rules if cap > 0 else rules[:1]):
+                    started = time.perf_counter()
+                    for used, labels in capped_linkage(
+                            source, target, order, graph.n_documents, cap, rule, budgets,
+                            distance=distance, max_mean_distance=ceiling):
+                        precision, recall, f_score, n_clusters = fast_bcubed(
+                            labels, author_codes, n_authors)
+                        sizes = np.bincount(labels)
+                        rows.append({
+                            "projection": projection_name, "rescoring": f"time{time_weight:g}",
+                            "algorithm": f"constrained[{rule}]", "cap": cap,
+                            "cohesion_quantile": quantile, "k": k_cap, "edge_budget": int(used),
+                            "distance_threshold": float(ordered[max(used - 1, 0)]),
+                            "bcubed_precision": precision, "bcubed_recall": recall,
+                            "bcubed_f": f_score, "n_clusters": n_clusters,
+                            "largest_cluster": int(sizes.max()),
+                            "largest_cluster_share": float(sizes.max() / len(labels)),
+                            "singleton_share": float((sizes == 1).sum() / len(labels))})
+                    best = max(row["bcubed_f"] for row in rows
+                               if row["k"] == k_cap and row["cohesion_quantile"] == quantile
+                               and row["cap"] == cap and row["algorithm"].endswith(f"[{rule}]"))
+                    print(f"    k={k_cap:<3d} cohesion_q={quantile:<6g} cap={cap:<5d} "
+                          f"rule={rule:<5s} best F={best:.4f} "
+                          f"[{time.perf_counter() - started:.0f}s]", flush=True)
+    return rows
+
+
+
+def time_candidate_rows(graph, frame, features, author_codes, n_authors, projection_name,
+                        k_caps, time_neighbors, weight):
+    """Add temporally adjacent documents to the candidate set, not just the cosine neighbours.
+
+    **This is the one idea here that can raise recall rather than trade it.** Every other method
+    re-ranks or filters a candidate set fixed by cosine k-NN, so a pair the embedding never
+    proposed can never be linked however good the scoring gets -- and the loss decomposition says
+    the reachable precision headroom runs out at F = 0.677 while recall sits at 0.511. Two
+    conversations by one person four minutes apart but about different subjects are exactly the
+    pair cosine will not propose and timing will.
+
+    The cost is that the candidate set grows with strangers: this corpus averages a document every
+    three minutes, so a document's temporal neighbours are mostly other people. That is what the
+    fused score and the budget sweep are for -- a bad candidate is only a bad *offer*, and the
+    frontier decides how many offers to accept.
+    """
+    times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds[times.isna().to_numpy()] = np.nan
+    dated = np.flatnonzero(np.isfinite(seconds))
+    chronological = dated[np.argsort(seconds[dated], kind="stable")]
+
+    rows = []
+    for k_cap in k_caps:
+        base_source, base_target, base_distance = graph_edges(graph, k_cap)
+        finite = np.isfinite(base_distance)
+        base_source, base_target = base_source[finite], base_target[finite]
+        base_distance = base_distance[finite].astype(np.float64)
+        for width in time_neighbors:
+            if width == 0:
+                source, target, distance = base_source, base_target, base_distance
+            else:
+                # Each document paired with the `width` documents that follow it in time; the
+                # symmetric partner comes from the earlier document's own window, so the union is
+                # every pair within `width` positions of each other.
+                offsets = np.arange(1, width + 1)
+                left = np.repeat(chronological[:-1], len(offsets))
+                positions = (np.repeat(np.arange(len(chronological) - 1), len(offsets))
+                             + np.tile(offsets, len(chronological) - 1))
+                keep = positions < len(chronological)
+                left, right = left[keep], chronological[positions[keep]]
+                # Cosine for exactly these pairs -- one row-wise dot product, not a matrix.
+                extra = 1.0 - np.einsum("ij,ij->i", features[left], features[right]).astype(np.float64)
+                source = np.concatenate([base_source, np.minimum(left, right)])
+                target = np.concatenate([base_target, np.maximum(left, right)])
+                distance = np.concatenate([base_distance, extra])
+                # One pair can be proposed by both routes; keep it once, at its true distance.
+                _, unique = np.unique(source.astype(np.int64) * graph.n_documents + target,
+                                      return_index=True)
+                source, target, distance = source[unique], target[unique], distance[unique]
+
+            if weight > 0:
+                def standardise(values):
+                    centre, spread = values.mean(), values.std()
+                    return (values - centre) / (spread if spread > 0 else 1.0)
+                gap = np.abs(seconds[source] - seconds[target]) / 3600.0
+                gap[~np.isfinite(gap)] = np.nanmax(gap[np.isfinite(gap)])
+                scored = ((1 - weight) * standardise(distance)
+                          + weight * standardise(np.log1p(gap)))
+            else:
+                scored = distance
+
+            for row in budget_frontier(source, target, scored, author_codes, n_authors,
+                                       graph.n_documents):
+                rows.append({"projection": projection_name,
+                             "rescoring": f"time{weight:g}+cand{width}", "algorithm": "connected",
+                             "locality": 0, "k": k_cap, "time_neighbors": width,
+                             "n_candidates": len(source), **row})
+            best = max(row["bcubed_f"] for row in rows
+                       if row["k"] == k_cap and row["time_neighbors"] == width)
+            print(f"    k={k_cap:<3d} time_neighbors={width:<3d} candidates={len(source):>9,} "
+                  f"best F={best:.4f}", flush=True)
+    return rows
+
+
+
+#: Pair features the learned edge model reads. Every one is symmetric in the two endpoints and
+#: *relative* rather than absolute -- a rank, an overlap count, a gap, a distance against the
+#: endpoints' own neighbourhood radii -- which is what lets a model fitted on the history slice
+#: transfer to a different collection of a different size. An absolute feature (a raw timestamp,
+#: a document index) would fit the history window and mean nothing outside it.
+PAIR_FEATURE_NAMES = ("cosine", "log_time_gap_hours", "shared_neighbors", "rank_min", "rank_max",
+                      "same_language", "radius_min", "radius_max", "margin_min", "margin_max")
+
+
+def pair_features(graph, frame, k_cap: int):
+    """``(source, target, X)`` -- candidate edges of one collection with their pair features.
+
+    Built once per collection and shared by the fit and the application, so the history side and
+    the collection under attack are described in exactly the same terms.
+    """
+    from scipy.sparse import csr_matrix
+
+    view = graph.truncate(k_cap)
+    source, target, distance = view.edges()
+    finite = np.isfinite(distance)
+    source, target = source[finite].astype(np.int64), target[finite].astype(np.int64)
+    distance = distance[finite].astype(np.float64)
+    n = view.n_documents
+    valid = np.isfinite(view.distances)
+
+    rows = np.repeat(np.arange(n, dtype=np.int64), view.k)[valid.ravel()]
+    columns = view.indices.ravel().astype(np.int64)[valid.ravel()]
+    positions = np.tile(np.arange(1, view.k + 1), n)[valid.ravel()]
+
+    # Shared neighbours for every candidate edge at once: one sparse product, where a per-edge set
+    # intersection would be a Python loop over ~900,000 pairs.
+    adjacency = csr_matrix((np.ones(len(rows), dtype=np.float32), (rows, columns)), shape=(n, n))
+    overlap = (adjacency @ adjacency.T).tocsr()
+    shared = np.asarray(overlap[source, target]).ravel()
+
+    rank = csr_matrix((positions.astype(np.float32), (rows, columns)), shape=(n, n)).tocsr()
+    forward = np.asarray(rank[source, target]).ravel()
+    backward = np.asarray(rank[target, source]).ravel()
+    forward[forward == 0] = view.k + 1
+    backward[backward == 0] = view.k + 1
+
+    radius = np.where(valid, view.distances, np.nan)
+    radius = np.nanmean(radius, axis=1)
+    radius = np.nan_to_num(radius, nan=float(np.nanmax(radius)))
+
+    times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds[times.isna().to_numpy()] = np.nan
+    gap = np.abs(seconds[source] - seconds[target]) / 3600.0
+    gap[~np.isfinite(gap)] = np.nanmax(gap[np.isfinite(gap)]) if np.isfinite(gap).any() else 0.0
+
+    languages = frame["language_primary"].astype(str).to_numpy()
+    margin_a, margin_b = distance - radius[source], distance - radius[target]
+
+    features = np.column_stack([
+        distance,
+        np.log1p(gap),
+        shared / max(view.k, 1),
+        np.minimum(forward, backward),
+        np.maximum(forward, backward),
+        (languages[source] == languages[target]).astype(np.float64),
+        np.minimum(radius[source], radius[target]),
+        np.maximum(radius[source], radius[target]),
+        np.minimum(margin_a, margin_b),
+        np.maximum(margin_a, margin_b),
+    ])
+    return source, target, features
+
+
+def to_quantiles(values: np.ndarray) -> np.ndarray:
+    """Each column replaced by its within-collection empirical quantile, in [0, 1]."""
+    out = np.empty_like(values, dtype=np.float64)
+    for column in range(values.shape[1]):
+        out[:, column] = pd.Series(values[:, column]).rank(method="average", pct=True).to_numpy()
+    return out
+
+
+def pair_model_rows(graph, eval_frame, history_graph, history_frame, author_codes, n_authors,
+                    projection_name, k_caps, normalize: bool = False):
+    """Fit a same-author model on history candidate edges, apply it to the eval graph's.
+
+    The diagnostic measured five signals on the candidate edges and every one of them carries
+    something: cosine 0.77 AUROC, time gap 0.76, shared neighbours 0.72, reciprocal rank 0.65,
+    same-language 0.53. Only two have ever been mixed here, by a hand-tuned scalar weight. This
+    asks whether a model that sees all of them, with their interactions, does better -- and it is
+    the honest way to combine them, because the mixing is fitted on labelled history rather than
+    chosen against the slice the result is reported on.
+
+    Distinct from the failed :mod:`~prompt_anonymity.attacks.clustering.edge_scoring`
+    cross-encoder, which read the two 1,024-dimensional vectors and had 2M parameters to overfit
+    with. This reads ten scalars.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    _, history_codes = np.unique(history_frame["author_id"].to_numpy(), return_inverse=True)
+    history_codes = history_codes.ravel()
+
+    rows = []
+    for k_cap in k_caps:
+        source, target, train_x = pair_features(history_graph, history_frame, k_cap)
+        train_y = (history_codes[source] == history_codes[target]).astype(np.int64)
+        if normalize:
+            train_x = to_quantiles(train_x)
+        started = time.perf_counter()
+        model = HistGradientBoostingClassifier(
+            max_iter=300, learning_rate=0.1, max_leaf_nodes=31, l2_regularization=1.0,
+            early_stopping=True, validation_fraction=0.15, random_state=20260814).fit(
+                train_x, train_y)
+        print(f"    k={k_cap:<3d} fitted on {len(train_y):,} history edges "
+              f"({train_y.mean():.3f} positive) in {time.perf_counter() - started:.0f}s; "
+              f"importances via permutation skipped", flush=True)
+
+        eval_source, eval_target, eval_x = pair_features(graph, eval_frame, k_cap)
+        if normalize:
+            eval_x = to_quantiles(eval_x)
+        # Score in log-odds, not probability: the ordering is the same but float32 sigmoid
+        # saturates and ties the confident edges, which is the trap the cross-encoder fell into.
+        scored = -model.decision_function(eval_x)
+        for row in budget_frontier(eval_source, eval_target, scored, author_codes, n_authors,
+                                   graph.n_documents):
+            rows.append({"projection": projection_name,
+                         "rescoring": "pair_model_q" if normalize else "pair_model",
+                         "algorithm": "connected", "locality": 0, "k": k_cap, **row})
+        print(f"    k={k_cap:<3d} best F="
+              f"{max(r['bcubed_f'] for r in rows if r['k'] == k_cap):.4f}", flush=True)
+    return rows
+
+
 def summarize(output_dir: Path) -> pd.DataFrame:
     """Leaderboard over every ``frontier_*.csv`` this directory holds.
 
@@ -498,7 +909,45 @@ def parse_args() -> argparse.Namespace:
                              "made on the eval slice is spent the moment this is passed.")
     parser.add_argument("--stage", default="graph",
                         choices=["graph", "projection", "contrastive", "algorithms",
-                                 "edge_scorer", "seen_unseen", "all"])
+                                 "edge_scorer", "seen_unseen", "linkage", "temporal",
+                                 "zscore", "cohesion", "combined", "time_candidates",
+                                 "pair_model", "temporal_graph", "all"])
+    parser.add_argument("--time-neighbors", nargs="*", type=int, default=[0, 2, 5, 10, 20],
+                        help="Temporally-adjacent documents added as candidate edges per document "
+                             "in --stage time_candidates; 0 is the cosine-only control.")
+    parser.add_argument("--cohesion-quantiles", nargs="*", type=float,
+                        default=[0.005, 0.01, 0.02, 0.04, 0.08, 0.15, 0.3, 1.0],
+                        help="Cohesion ceilings for --stage cohesion, as quantiles of the edge "
+                             "distance distribution; 1.0 is unconstrained (the control).")
+    parser.add_argument("--per-language-threshold", action="store_true",
+                        help="Standardise edge scores within each language pair before the budget "
+                             "cut, so one global budget becomes a language-adaptive threshold. "
+                             "Motivated by the error analysis: at one shared operating point "
+                             "Korean is over-merged (P 0.37, R 0.90) and Russian under-merged "
+                             "(P 0.76, R 0.37), so no single cut is right for both.")
+    parser.add_argument("--pair-model-normalize", action="store_true",
+                        help="Replace each pair feature by its within-collection quantile before "
+                             "fitting and applying. The history side is twice the size of the "
+                             "collection under attack and its k-NN graph is correspondingly "
+                             "denser (edge precision 0.299 against 0.35), so absolute features "
+                             "like the raw cosine and the neighbourhood radius do not mean the "
+                             "same thing on both; a quantile does.")
+    parser.add_argument("--ensemble-projections", nargs="*", type=Path, default=[],
+                        help="Extra projection matrices to concatenate with --projection-file. "
+                             "Each block is unit-normalised and scaled by 1/sqrt(n), so cosine in "
+                             "the stacked space is the mean of the per-projection cosines.")
+    parser.add_argument("--best-time-weight", type=float, default=0.4,
+                        help="Time weight --stage combined fuses in, chosen on the tuning slice "
+                             "by --stage temporal.")
+    parser.add_argument("--caps", nargs="*", type=int,
+                        default=[0, 2, 3, 5, 8, 16, 32, 64, 128, 256],
+                        help="Maximum cluster sizes for --stage linkage; 0 is unconstrained "
+                             "single linkage, i.e. the control.")
+    parser.add_argument("--linkage-rules", nargs="*", default=["both", "cap"])
+    parser.add_argument("--time-weights", nargs="*", type=float,
+                        default=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0],
+                        help="Weight on the time-gap term for --stage temporal; 0.0 is pure "
+                             "cosine (the control) and 1.0 is timing alone (the other control).")
     parser.add_argument("--edge-scorer-hidden", nargs="*", type=int, default=[512])
     parser.add_argument("--edge-scorer-steps", nargs="*", type=int, default=[4000])
     parser.add_argument("--edge-scorer-dropout", nargs="*", type=float, default=[0.1])
@@ -630,8 +1079,16 @@ def main() -> None:
             projections.append(fitted)
             print(f"  fitted {fitted.name} in {time.perf_counter() - started:.0f}s", flush=True)
     if args.projection_file is not None:
-        projections.append(LinearProjection(np.load(args.projection_file),
-                                            args.projection_file.stem))
+        matrices = [np.load(args.projection_file)] + [np.load(path)
+                                                      for path in args.ensemble_projections]
+        if len(matrices) == 1:
+            projections.append(LinearProjection(matrices[0], args.projection_file.stem))
+        else:
+            # Column-stacking L2-normalised blocks scaled by 1/sqrt(n) makes cosine in the stacked
+            # space exactly the mean of the per-projection cosines -- the same identity
+            # `fuse_features` uses for two featurizers, applied to two views of one.
+            projections.append(EnsembleProjection(matrices,
+                                                  f"ensemble{len(matrices)}({args.projection_file.stem[:28]})"))
     if not projections:
         # `--stage algorithms` fits nothing of its own, so with no `--projection-file` it would
         # otherwise sweep an empty list and fail at the summary. The base space is the right
@@ -643,7 +1100,9 @@ def main() -> None:
     rows = []
     for projection in projections:
         print(f"\n  == {projection.name} ({projection.n_components} components)", flush=True)
-        if projection.name != "identity":
+        # An EnsembleProjection holds several matrices and has no single one to save; it is
+        # reproduced from its component files instead, which is why the flag takes paths.
+        if projection.name != "identity" and hasattr(projection, "matrix"):
             np.save(matrix_dir / f"{projection.name}.npy", projection.matrix)
         projected = (eval_features if projection.name == "identity"
                      else projection.transform(eval_features))
@@ -670,6 +1129,73 @@ def main() -> None:
             rows.extend(seen_unseen_report(labels, author_codes, n_authors, eval_authors,
                                            history_frame["author_id"].to_numpy(),
                                            projection.name))
+            continue
+        if args.stage == "temporal_graph":
+            # The SAME code path run_clustering.py uses, so this checks that the graph-level
+            # transform reproduces the edge-level sweep that selected the weight. The two
+            # standardise over slightly different populations -- the (n, k) array counts a mutual
+            # pair twice where the deduplicated edge list counts it once -- so they are expected
+            # to agree closely rather than exactly.
+            seconds = (pd.to_datetime(eval_frame["ended_at"], errors="coerce", utc=True)
+                       .astype("int64").to_numpy() / 1e9)
+            seconds[pd.to_datetime(eval_frame["ended_at"], errors="coerce",
+                                   utc=True).isna().to_numpy()] = np.nan
+            for weight in args.time_weights:
+                view = temporal_fusion(graph, seconds, weight) if weight > 0 else graph
+                for k_cap in args.k_caps:
+                    source, target, distance = graph_edges(view, k_cap)
+                    finite = np.isfinite(distance)
+                    for row in budget_frontier(source[finite], target[finite], distance[finite],
+                                               author_codes, n_authors, graph.n_documents):
+                        rows.append({"projection": projection.name,
+                                     "rescoring": f"graphtime{weight:g}", "algorithm": "connected",
+                                     "locality": 0, "k": k_cap, **row})
+                    print(f"    w={weight:<5g} k={k_cap:<3d} best F="
+                          f"{max(r['bcubed_f'] for r in rows if r['k'] == k_cap and r['rescoring'] == f'graphtime{weight:g}'):.4f}",
+                          flush=True)
+            continue
+        if args.stage == "pair_model":
+            history_projected = (history_features if projection.name == "identity"
+                                 else projection.transform(history_features))
+            history_graph = cached_graph(history_projected, args.graph_width, "history", cache_dir)
+            rows.extend(pair_model_rows(graph, eval_frame, history_graph, history_frame,
+                                        author_codes, n_authors, projection.name, args.k_caps,
+                                        args.pair_model_normalize))
+            continue
+        if args.stage == "time_candidates":
+            rows.extend(time_candidate_rows(
+                graph, eval_frame, projected, author_codes, n_authors, projection.name,
+                args.k_caps, args.time_neighbors, args.best_time_weight))
+            continue
+        if args.stage in ("cohesion", "combined"):
+            rows.extend(constrained_rows(
+                graph, eval_frame, author_codes, n_authors, projection.name, args.k_caps,
+                args.cohesion_quantiles, args.caps, args.linkage_rules,
+                args.best_time_weight if args.stage == "combined" else 0.0, args.stage))
+            continue
+        if args.stage == "linkage":
+            rows.extend(linkage_rows(graph, author_codes, n_authors, projection.name,
+                                     args.k_caps, args.caps, args.linkage_rules))
+            continue
+        if args.stage == "temporal":
+            rows.extend(temporal_rows(graph, eval_frame, author_codes, n_authors,
+                                      projection.name, args.k_caps, args.time_weights,
+                                      args.per_language_threshold))
+            continue
+        if args.stage == "zscore":
+            mean, spread = global_distance_moments(projected)
+            print(f"    global distance moments: mean {mean.mean():.4f}, "
+                  f"std {spread.mean():.4f}", flush=True)
+            view = zscore_distances(graph, mean, spread)
+            for k_cap in args.k_caps:
+                source, target, distance = graph_edges(view, k_cap)
+                finite = np.isfinite(distance)
+                for row in budget_frontier(source[finite], target[finite], distance[finite],
+                                           author_codes, n_authors, graph.n_documents):
+                    rows.append({"projection": projection.name, "rescoring": "zscore",
+                                 "algorithm": "connected", "locality": 0, "k": k_cap, **row})
+                print(f"    k={k_cap:<3d} best F="
+                      f"{max(r['bcubed_f'] for r in rows if r['k'] == k_cap):.4f}", flush=True)
             continue
         if args.stage == "edge_scorer":
             # The scorer reads the projected space, so it is fitted on the projected HISTORY --

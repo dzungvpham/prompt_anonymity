@@ -131,6 +131,7 @@ from prompt_anonymity.attacks.clustering.projection import (  # noqa: E402
 from prompt_anonymity.attacks.clustering.rescoring import (  # noqa: E402
     GRAPH_RESCORINGS,
     rescore_graph,
+    temporal_fusion,
 )
 from prompt_anonymity.attacks.similarity.kernel import blocked_distances  # noqa: E402
 from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
@@ -664,6 +665,11 @@ def parse_args() -> argparse.Namespace:
                         help="Hubness correction applied to both neighbour graphs before "
                              "clustering. Like --projection, a non-default value is appended to "
                              "the output directory name.")
+    parser.add_argument("--time-weight", type=float, default=0.0,
+                        help="Weight on the elapsed-time term fused into every edge score (see "
+                             "rescoring.temporal_fusion). 0 is the pure-text attack. A non-zero "
+                             "value is appended to the output directory name, because it changes "
+                             "what the result claims: style AND session structure, not style.")
     parser.add_argument("--rescoring-locality", type=int, default=10,
                         help="Neighbours each rescoring summarises a point's neighbourhood over.")
     parser.add_argument("--threshold-mode", default=None, choices=["absolute", "quantile"],
@@ -729,6 +735,8 @@ def main() -> None:
         tag = f"{tag}_{args.projection}"
     if args.rescoring != "none":
         tag = f"{tag}_{args.rescoring}"
+    if args.time_weight > 0:
+        tag = f"{tag}_time{args.time_weight:g}"
     # --threshold-mode belongs in the tag for exactly the reason --projection and --rescoring do:
     # it changes WHAT WAS SEARCHED, so two runs that differ only in it are not the same experiment
     # and must not share a directory. Leaving it out overwrote this project's existing base
@@ -776,6 +784,14 @@ def main() -> None:
     test_graph = build_neighbor_graph(embeddings[test_window], k, metric=args.metric)
     tuning_graph = build_neighbor_graph(embeddings[tuning_window], k, metric=args.metric)
     print(f"  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
+
+    if args.time_weight > 0:
+        seconds = (pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+                   .astype("int64").to_numpy() / 1e9)
+        seconds[pd.to_datetime(frame["ended_at"], errors="coerce", utc=True).isna().to_numpy()] = np.nan
+        test_graph = temporal_fusion(test_graph, seconds[test_window], args.time_weight)
+        tuning_graph = temporal_fusion(tuning_graph, seconds[tuning_window], args.time_weight)
+        print(f"  fused elapsed time at weight {args.time_weight:g} into both graphs")
 
     if args.rescoring != "none":
         # Applied to BOTH graphs, so the tuning slice simulates exactly what the test collection
@@ -866,7 +882,8 @@ def main() -> None:
               f"[{row['hyperparameters']}]")
 
     results = pd.DataFrame(rows)
-    for column, value in (("rescoring", args.rescoring), ("projection", args.projection),
+    for column, value in (("time_weight", args.time_weight), ("rescoring", args.rescoring),
+                          ("projection", args.projection),
                           ("feature", args.feature),
                           ("defense", args.defense), ("dataset", args.source)):
         results.insert(0, column, value)
