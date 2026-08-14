@@ -117,11 +117,20 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 from prompt_anonymity.attacks.clustering import (  # noqa: E402
     CLUSTERING_ATTACKS,
     CLUSTERING_SPACES,
+    CLUSTERING_SPACES_QUANTILE,
     BaselineClustering,
     MAX_DENSE_DOCUMENTS,
     build_neighbor_graph,
     get_clustering_attack,
     parameter_grid,
+)
+from prompt_anonymity.attacks.clustering.projection import (  # noqa: E402
+    PROJECTION_FITTERS,
+    fit_projection,
+)
+from prompt_anonymity.attacks.clustering.rescoring import (  # noqa: E402
+    GRAPH_RESCORINGS,
+    rescore_graph,
 )
 from prompt_anonymity.attacks.similarity.kernel import blocked_distances  # noqa: E402
 from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
@@ -145,6 +154,18 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 #: is the anonymous collection to be clustered. Matches ``run_experiment.py``'s ``known0075``, so
 #: the two attack families cover exactly the same documents.
 KNOWN_FRACTION = 0.75
+
+#: Share of the timeline ``--projection`` is fitted on. **Deliberately 0.50 and not
+#: ``KNOWN_FRACTION``**, even though the attacker holds labels out to 0.75. The slice from 0.50 to
+#: 0.75 is what :func:`tune` selects hyper-parameters on, and a projection fitted through it would
+#: have seen those documents' authors -- so the tuning slice would stop being a simulation of the
+#: attack and start being a fit on the training set, silently inflating every
+#: ``tuning_bcubed_f`` and every ``tuning_optimism``. Holding the fit to the first half keeps the
+#: two stages disjoint and matches exactly what ``experiments/improve_clustering.py`` measured. It
+#: costs the projection a quarter of the available labels, which is the right trade: a projection
+#: is a low-dimensional object fitted on tens of thousands of documents, where the hyper-parameter
+#: selection has one labelled slice and nothing to spare.
+PROJECTION_FIT_FRACTION = 0.50
 
 #: Neighbour counts the graph diagnostics report at. The graph is built once at the largest and
 #: truncated for the rest, since neighbours are stored in distance order.
@@ -452,8 +473,8 @@ def slice_diagnostics(name: str, frame: pd.DataFrame, embeddings: np.ndarray, gr
     return row, per_k
 
 
-def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None
-         ) -> tuple[dict, pd.DataFrame]:
+def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None,
+         spaces: dict | None = None) -> tuple[dict, pd.DataFrame]:
     """Choose hyper-parameters by maximising BCubed F on a labelled slice.
 
     Exhaustive over :data:`CLUSTERING_SPACES`, because these grids are small (24-48 points) and the
@@ -462,7 +483,8 @@ def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None
     only reports its winner cannot be checked for a flat optimum, and a flat optimum is exactly
     what would make the transfer to the test set safe.
     """
-    grid = parameter_grid(CLUSTERING_SPACES[algorithm])
+    spaces = spaces or CLUSTERING_SPACES
+    grid = parameter_grid(spaces[algorithm])
     if limit is not None:
         grid = grid[:limit]
     factory = get_clustering_attack(algorithm)
@@ -487,7 +509,7 @@ def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None
     # grid is the authority on what type each parameter is; the frame is only how it travelled.
     winner = table.iloc[0]
     best = {}
-    for key, values in CLUSTERING_SPACES[algorithm].items():
+    for key, values in spaces[algorithm].items():
         template = values[0]
         if isinstance(template, bool):
             best[key] = bool(winner[key])
@@ -504,7 +526,8 @@ def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
                   tuning_graph, tuning_authors: np.ndarray, args) -> tuple[dict, np.ndarray, pd.DataFrame]:
     """Tune on the simulation slice, then attack the test collection once with the winner."""
     started = time.perf_counter()
-    settings, trials = tune(algorithm, tuning_graph, tuning_authors, args.tune_limit)
+    settings, trials = tune(algorithm, tuning_graph, tuning_authors, args.tune_limit,
+                            search_spaces(args, algorithm))
     tuning_seconds = time.perf_counter() - started
     tuned_score = float(trials.iloc[0]["bcubed_f"])
 
@@ -559,7 +582,8 @@ def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
     return row, labels, trials
 
 
-def oracle_sweep(algorithm: str, graph, authors: np.ndarray, limit: int | None) -> pd.DataFrame:
+def oracle_sweep(algorithm: str, graph, authors: np.ndarray, limit: int | None,
+                 spaces: dict | None = None) -> pd.DataFrame:
     """Every configuration in the grid, scored on the **test** collection.
 
     An oracle and labelled as one: nothing may select a configuration on these numbers. It exists
@@ -568,7 +592,7 @@ def oracle_sweep(algorithm: str, graph, authors: np.ndarray, limit: int | None) 
     configuration's own score sits somewhere between. Without it, "tuning helped" is a claim about
     one point with nothing to compare it to.
     """
-    grid = parameter_grid(CLUSTERING_SPACES[algorithm])
+    grid = parameter_grid((spaces or CLUSTERING_SPACES)[algorithm])
     if limit is not None:
         grid = grid[:limit]
     factory = get_clustering_attack(algorithm)
@@ -619,6 +643,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--metric", default="cosine")
+    parser.add_argument("--projection", default="none", choices=sorted(PROJECTION_FITTERS) + ["none"],
+                        help="Fit a metric-learning projection on the FIRST HALF of the timeline "
+                             "and cluster in that space instead of the raw feature space. See "
+                             "PROJECTION_FIT_FRACTION for why it is the first half and not the "
+                             "whole known side. A non-default value is appended to the output "
+                             "directory name, which takes the run out of the three-part set "
+                             "plot_results.py draws.")
+    parser.add_argument("--projection-components", type=int, default=1024,
+                        help="Output dimension for 'lda' and 'contrastive'.")
+    parser.add_argument("--projection-shrinkage", type=float, default=0.1,
+                        help="Covariance shrinkage for 'wccn' and 'lda'.")
+    parser.add_argument("--projection-steps", type=int, default=30_000,
+                        help="Gradient steps for 'contrastive'.")
+    parser.add_argument("--projection-temperature", type=float, default=0.05,
+                        help="Softmax temperature for 'contrastive'.")
+    parser.add_argument("--projection-batch", type=int, default=1024,
+                        help="Authors per batch for 'contrastive'; each contributes two documents.")
+    parser.add_argument("--rescoring", default="none", choices=sorted(GRAPH_RESCORINGS),
+                        help="Hubness correction applied to both neighbour graphs before "
+                             "clustering. Like --projection, a non-default value is appended to "
+                             "the output directory name.")
+    parser.add_argument("--rescoring-locality", type=int, default=10,
+                        help="Neighbours each rescoring summarises a point's neighbourhood over.")
+    parser.add_argument("--threshold-mode", default=None, choices=["absolute", "quantile"],
+                        help="Whether distance thresholds are searched as absolute radii or as "
+                             "quantiles of the graph's own edges. Defaults to 'quantile' whenever "
+                             "--projection or --rescoring is set, because an absolute radius does "
+                             "not survive a change of space (see edge_quantile), and to "
+                             "'absolute' otherwise so base runs keep the grid their results on "
+                             "disk were produced with.")
+    parser.add_argument("--projection-hard-negatives", type=int, default=0,
+                        help="Refresh interval in steps for hard-negative batches in "
+                             "'contrastive'; 0 keeps random batches.")
     parser.add_argument("--max-neighbors", type=int, default=MAX_NEIGHBORS)
     parser.add_argument("--diagnostics", action="store_true",
                         help="Also measure the problem itself -- verification AUC, neighbour-graph "
@@ -632,15 +689,74 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def search_spaces(args, algorithm: str) -> dict:
+    """The hyper-parameter grid for one algorithm, absolute or quantile as the run requires.
+
+    Quantile grids exist only for the two threshold-based methods; everything else falls back to
+    :data:`CLUSTERING_SPACES`, whose parameters (Leiden's ``resolution``, HDBSCAN's
+    ``min_cluster_size``) are not distances and so carry across spaces unchanged.
+    """
+    mode = args.threshold_mode or (
+        "quantile" if (args.projection != "none" or args.rescoring != "none") else "absolute")
+    if mode == "quantile" and algorithm in CLUSTERING_SPACES_QUANTILE:
+        return CLUSTERING_SPACES_QUANTILE
+    return CLUSTERING_SPACES
+
+
+def projection_kwargs(args) -> dict:
+    """Only the hyper-parameters the chosen projection actually takes.
+
+    The three fitters share one flag namespace but not one signature, so passing all of them would
+    be a ``TypeError`` on every fitter but ``contrastive``.
+    """
+    if args.projection == "wccn":
+        return {"shrinkage": args.projection_shrinkage}
+    if args.projection == "lda":
+        return {"n_components": args.projection_components,
+                "shrinkage": args.projection_shrinkage}
+    if args.projection == "contrastive":
+        return {"n_components": args.projection_components, "steps": args.projection_steps,
+                "temperature": args.projection_temperature,
+                "authors_per_batch": args.projection_batch,
+                "hard_negatives": args.projection_hard_negatives}
+    return {}
+
+
 def main() -> None:
     args = parse_args()
     tag = f"{args.source}_{args.defense}_{args.feature}"
+    if args.projection != "none":
+        tag = f"{tag}_{args.projection}"
+    if args.rescoring != "none":
+        tag = f"{tag}_{args.rescoring}"
+    # --threshold-mode belongs in the tag for exactly the reason --projection and --rescoring do:
+    # it changes WHAT WAS SEARCHED, so two runs that differ only in it are not the same experiment
+    # and must not share a directory. Leaving it out overwrote this project's existing base
+    # results once; the default is None (absolute unless a projection/rescoring implies quantile),
+    # so an explicit choice is what gets tagged.
+    if args.threshold_mode is not None:
+        tag = f"{tag}_{args.threshold_mode}"
     output_dir = args.output_dir or (OUTPUT_ROOT / tag)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame, embeddings = load_documents_and_features(
         args.data_dir, args.source, args.feature,
         defense="none" if args.defense == "base" else args.defense)
+    embeddings = np.nan_to_num(embeddings)
+
+    if args.projection != "none":
+        fit_window = slice(0, int(round(PROJECTION_FIT_FRACTION * len(frame))))
+        started = time.perf_counter()
+        projection = fit_projection(args.projection, embeddings[fit_window],
+                                    frame["author_id"].to_numpy()[fit_window],
+                                    **projection_kwargs(args))
+        # Whole-corpus transform, not per-window: the projection is fitted blind to which slice a
+        # document falls in, and applying it once keeps the two graphs in the same space.
+        embeddings = projection.transform(embeddings)
+        print(f"  projection {projection.name}: fitted on {fit_window.stop:,} documents "
+              f"({frame['author_id'].iloc[fit_window].nunique():,} authors), "
+              f"{embeddings.shape[1]} dimensions, {time.perf_counter() - started:.0f}s")
+
     tuning_window, test_window = slice_bounds(len(frame))
 
     test_frame = frame.iloc[test_window].reset_index(drop=True)
@@ -657,10 +773,19 @@ def main() -> None:
 
     k = min(args.max_neighbors, len(test_authors) - 1, len(tuning_authors) - 1)
     started = time.perf_counter()
-    test_graph = build_neighbor_graph(np.nan_to_num(embeddings[test_window]), k, metric=args.metric)
-    tuning_graph = build_neighbor_graph(np.nan_to_num(embeddings[tuning_window]), k,
-                                        metric=args.metric)
+    test_graph = build_neighbor_graph(embeddings[test_window], k, metric=args.metric)
+    tuning_graph = build_neighbor_graph(embeddings[tuning_window], k, metric=args.metric)
     print(f"  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
+
+    if args.rescoring != "none":
+        # Applied to BOTH graphs, so the tuning slice simulates exactly what the test collection
+        # will be attacked with. Rescoring after the build is free: it re-ranks the candidates the
+        # build already found (see the rescoring module on why that is an approximation and a
+        # one-sided one).
+        test_graph = rescore_graph(test_graph, args.rescoring, args.rescoring_locality)
+        tuning_graph = rescore_graph(tuning_graph, args.rescoring, args.rescoring_locality)
+        print(f"  rescored both graphs with {args.rescoring}"
+              f"(locality={args.rescoring_locality}) -> metric {test_graph.metric!r}")
 
     # Before `embeddings` is released: the verification pass needs the vectors, not the graph.
     if args.diagnostics:
@@ -670,7 +795,7 @@ def main() -> None:
                 ("test", test_window, test_frame, test_graph),
                 ("tuning", tuning_window, frame.iloc[tuning_window].reset_index(drop=True),
                  tuning_graph)):
-            row, per_k = slice_diagnostics(name, subframe, np.nan_to_num(embeddings[window]),
+            row, per_k = slice_diagnostics(name, subframe, embeddings[window],
                                            subgraph, args.metric)
             diagnostic_rows.append(row)
             graph_tables.append(per_k)
@@ -722,7 +847,8 @@ def main() -> None:
               f"clusters={row['n_clusters']:,}, any-link={row['any_link_rate']:.3f}, "
               f"amplification={row['amplification']:.2f}")
         if args.oracle_sweep:
-            sweep = oracle_sweep(algorithm, test_graph, test_authors, args.tune_limit)
+            sweep = oracle_sweep(algorithm, test_graph, test_authors, args.tune_limit,
+                                 search_spaces(args, algorithm))
             oracle_tables.append(sweep)
             usable = sweep["bcubed_f"].dropna()
             row["oracle_best_bcubed_f"] = float(usable.max())
@@ -740,8 +866,9 @@ def main() -> None:
               f"[{row['hyperparameters']}]")
 
     results = pd.DataFrame(rows)
-    for column, value in (("feature", args.feature), ("defense", args.defense),
-                          ("dataset", args.source)):
+    for column, value in (("rescoring", args.rescoring), ("projection", args.projection),
+                          ("feature", args.feature),
+                          ("defense", args.defense), ("dataset", args.source)):
         results.insert(0, column, value)
     results.to_csv(output_dir / "clustering_results.csv", index=False)
     if all_trials:

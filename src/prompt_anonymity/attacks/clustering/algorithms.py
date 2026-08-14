@@ -1,19 +1,27 @@
 """The clustering algorithms themselves: a neighbour graph in, one label per document out.
 
-Four methods, chosen to span the two families PAN 2016 found among its submissions plus the two
+Five methods, chosen to span the two families PAN 2016 found among its submissions plus the two
 reference points that make their numbers readable:
 
-======================  ====================================================================
-``hdbscan``             density-based; finds clusters of varying density and refuses to place
-                        documents in sparse regions (they come back as
-                        :data:`~prompt_anonymity.evaluation.metrics.clustering.NOISE_LABEL`)
-``leiden``              community detection on the similarity graph; guarantees well-connected
-                        communities, which is the defect Leiden was introduced to fix in Louvain
-``average_linkage``     bottom-up agglomerative merging under a distance cut -- the classic
-                        authorship-clustering method and the one to beat
-``connected``           threshold plus transitive closure; the naive attacker, present to
-                        exhibit the chaining failure the other three are built to avoid
-======================  ====================================================================
+==============================  ============================================================
+``hdbscan``                     density-based; finds clusters of varying density and refuses
+                                to place documents in sparse regions (they come back as
+                                :data:`~prompt_anonymity.evaluation.metrics.clustering.NOISE_LABEL`)
+``leiden``                      community detection on the similarity graph; guarantees
+                                well-connected communities, which is the defect Leiden was
+                                introduced to fix in Louvain
+``average_linkage``             bottom-up agglomerative merging under a distance cut -- the
+                                classic authorship-clustering method and the one to beat.
+                                Needs the dense matrix, so it stops at
+                                :data:`MAX_DENSE_DOCUMENTS`
+``componentwise_agglomerative``  the same merging run inside one connected component at a
+                                time, which is *exactly equivalent* under a connectivity
+                                constraint and is what makes average linkage runnable on
+                                WildChat
+``connected``                   threshold plus transitive closure; the naive attacker,
+                                present to exhibit the chaining failure the others are built
+                                to avoid -- and, measured, the one to beat on both corpora
+==============================  ============================================================
 
 Everything here consumes a :class:`~prompt_anonymity.attacks.clustering.graph.NeighborGraph`
 rather than the raw vectors. That is not a convenience: the pairwise matrix is 1.9 billion entries
@@ -58,6 +66,27 @@ NOISE_LABEL = -1
 #: 24 GB jobs this project runs; WildChat's 43,127-document test quarter would be 14.9 GB on top
 #: of a 2 GB feature matrix, and dies. The other three methods read only the neighbour graph.
 MAX_DENSE_DOCUMENTS = 20_000
+
+
+def edge_quantile(distances: np.ndarray, quantile: float) -> float:
+    """The distance at a given quantile of a graph's own finite edge weights.
+
+    **A threshold expressed as a quantile is the only kind that transfers between feature spaces.**
+    ``distance_threshold`` is an absolute radius, so a grid tuned under raw cosine is meaningless
+    after a learned projection rescales the space -- measured on WildChat, single linkage peaks at
+    0.131 under cosine and 0.428 after the contrastive fit, and the shipped grid
+    (``[0.05 ... 0.3]``) does not contain the second at all. A quantile asks the same question of
+    both ("keep the closest 28% of candidate edges") and lands in the right place in each.
+
+    Taken over the **k-truncated** edge list the attack will actually use, so the quantile equals
+    the ``edge_share`` that ``experiments/improve_clustering.py`` sweeps and the two are directly
+    comparable.
+    """
+    finite = distances[np.isfinite(distances)]
+    if len(finite) == 0:
+        return float("inf")
+    index = min(int(quantile * len(finite)), len(finite) - 1)
+    return float(np.partition(finite, index)[index])
 
 
 @dataclass
@@ -246,6 +275,139 @@ class AverageLinkageClustering(ClusteringAttack):
 
 
 @dataclass
+class ComponentwiseAgglomerative(ClusteringAttack):
+    """Average linkage at WildChat's scale, by merging inside one connected component at a time.
+
+    :class:`AverageLinkageClustering` refuses anything over
+    :data:`MAX_DENSE_DOCUMENTS` because scikit-learn's precomputed path has no sparse form, which
+    put the classic authorship-clustering method out of reach on the corpus that needs it most.
+    This gets it back, and **not by approximating**: a connectivity-constrained agglomeration can
+    only ever merge along graph edges, so two documents in different connected components of the
+    graph are never candidates for the same cluster. Their linkage trees are therefore independent
+    and running the method per component gives *exactly* the partition one dense fit would, at a
+    peak cost of the largest component squared rather than the collection squared. On WildChat's
+    tuning slice that is 9,400^2 (0.7 GB) instead of 43,128^2 (14.9 GB).
+
+    **That equivalence holds only because each component's own connectivity submatrix is passed to
+    scikit-learn along with its distances** -- see the comment in :meth:`cluster`. It was verified
+    rather than assumed: on a synthetic 300-document graph the per-component partition is identical
+    to one global constrained fit at four different threshold pairs, and the first version of this
+    class, which omitted the submatrix, disagreed completely (94 clusters against 6) and scored
+    0.107 lower on WildChat's tuning slice.
+
+    The graph is first cut at :attr:`link_threshold` to form those components -- which is
+    :class:`ThresholdComponents` -- and average linkage then splits each one under
+    :attr:`distance_threshold`. So this is strictly a *refinement* of the connected-components
+    partition and can only raise its precision, never its recall. That is the intended shape: the
+    chaining single linkage produces is exactly what average linkage is supposed to undo, and
+    doing it this way makes the two directly comparable at a matched first stage.
+
+    ``linkage`` is exposed because ``complete`` is a free variation on the same machinery, but
+    ``average`` is the default for the reason the sibling class documents: the closest pair in this
+    corpus is frequently two different people writing ``"yes"``.
+    """
+
+    #: Cut used to form the components average linkage then works inside. Looser than
+    #: :attr:`distance_threshold` by construction -- it decides what is *considered*, where the
+    #: other decides what is merged.
+    link_threshold: float = 0.2
+    distance_threshold: float = 0.15
+    linkage: str = "average"
+
+    #: Quantile overrides, as on :class:`ThresholdComponents` and for the same reason.
+    link_quantile: float | None = None
+    distance_quantile: float | None = None
+
+    #: Components above this are left as they are rather than split, with a warning. A component
+    #: this large is a chaining failure that average linkage cannot repair anyway, and the dense
+    #: matrix it would need is what this class exists to avoid.
+    max_component: int = 20_000
+
+    def cluster(self, graph: NeighborGraph) -> np.ndarray:
+        from scipy.sparse import csr_matrix
+        from sklearn.cluster import AgglomerativeClustering
+
+        view = self.prepared(graph)
+        source, target, distance = view.edges()
+        link = (self.link_threshold if self.link_quantile is None
+                else edge_quantile(distance, self.link_quantile))
+        cut = (self.distance_threshold if self.distance_quantile is None
+               else edge_quantile(distance, self.distance_quantile))
+        keep = distance <= link
+        source, target, distance = source[keep], target[keep], distance[keep]
+        n = view.n_documents
+        adjacency = csr_matrix((np.ones(len(distance), dtype=np.int8), (source, target)),
+                               shape=(n, n))
+        n_components, component = connected_components(adjacency, directed=False,
+                                                       return_labels=True)
+
+        # Edges bucketed by component once, rather than re-scanned per component: the giant holds
+        # most of them and a per-component pass over the whole list is quadratic in components.
+        edge_component = component[source]
+        edge_order = np.argsort(edge_component, kind="stable")
+        edge_starts = np.searchsorted(edge_component[edge_order], np.arange(n_components + 1))
+
+        members_order = np.argsort(component, kind="stable")
+        member_starts = np.searchsorted(component[members_order], np.arange(n_components + 1))
+
+        far = 2.0 if view.metric == "cosine" else float(distance.max() if len(distance) else 1.0)
+        labels = np.empty(n, dtype=np.int64)
+        next_label = 0
+        for index in range(n_components):
+            members = members_order[member_starts[index]:member_starts[index + 1]]
+            size = len(members)
+            if size == 1:
+                labels[members] = next_label
+                next_label += 1
+                continue
+            if size > self.max_component:
+                # Left whole, and said out loud. Silently passing it through produces a row that
+                # looks like an average-linkage result and is really `connected` with its giant
+                # cluster untouched -- measured on WildChat's tuning slice at
+                # ``link_threshold=0.16``, that is a 60.9% cluster and a BCubed F that says
+                # nothing about average linkage at all.
+                import warnings
+
+                warnings.warn(
+                    f"component of {size:,} documents exceeds max_component="
+                    f"{self.max_component:,} and was NOT split; this partition is "
+                    f"connected-components on that component, not average linkage. Raise "
+                    f"max_component (it costs size^2 x 8 bytes = "
+                    f"{size ** 2 * 8 / 1e9:.1f} GB) or lower link_threshold.")
+                labels[members] = next_label
+                next_label += 1
+                continue
+
+            position = np.full(n, -1, dtype=np.int64)
+            position[members] = np.arange(size)
+            block = edge_order[edge_starts[index]:edge_starts[index + 1]]
+            rows, columns = position[source[block]], position[target[block]]
+            dense = np.full((size, size), far, dtype=np.float64)
+            dense[rows, columns] = distance[block]
+            dense[columns, rows] = distance[block]
+            np.fill_diagonal(dense, 0.0)
+
+            # The connectivity submatrix is what makes the equivalence in the class docstring
+            # true, and leaving it out is not a small difference: without it scikit-learn averages
+            # the `far` fill for every non-adjacent pair inside the component, which is a distance
+            # this graph never measured. Verified on a synthetic 300-document graph -- with it, the
+            # per-component partition is *identical* to one global constrained fit at three
+            # different (link_threshold, distance_threshold) pairs; without it the two disagree
+            # completely (94 clusters against 6).
+            connectivity = csr_matrix(
+                (np.ones(len(block), dtype=np.int8), (rows, columns)), shape=(size, size))
+            connectivity = connectivity.maximum(connectivity.T)
+
+            found = AgglomerativeClustering(
+                n_clusters=None, distance_threshold=float(cut),
+                metric="precomputed", linkage=self.linkage,
+                connectivity=connectivity).fit_predict(dense)
+            labels[members] = found + next_label
+            next_label += int(found.max()) + 1
+        return labels
+
+
+@dataclass
 class ThresholdComponents(ClusteringAttack):
     """Keep every edge closer than a threshold, then take connected components.
 
@@ -271,12 +433,19 @@ class ThresholdComponents(ClusteringAttack):
 
     distance_threshold: float = 0.3
 
+    #: When set, overrides :attr:`distance_threshold` with the corresponding quantile of this
+    #: graph's own edge weights (:func:`edge_quantile`). Required for any run in a learned space,
+    #: where an absolute radius means nothing.
+    distance_quantile: float | None = None
+
     def cluster(self, graph: NeighborGraph) -> np.ndarray:
         from scipy.sparse import csr_matrix
 
         view = self.prepared(graph)
         source, target, distance = view.edges()
-        keep = distance <= self.distance_threshold
+        threshold = (self.distance_threshold if self.distance_quantile is None
+                     else edge_quantile(distance, self.distance_quantile))
+        keep = distance <= threshold
         adjacency = csr_matrix(
             (np.ones(int(keep.sum())), (source[keep], target[keep])),
             shape=(view.n_documents, view.n_documents))
@@ -292,6 +461,7 @@ CLUSTERING_ATTACKS = {
     "leiden": LeidenClustering,
     "average_linkage": AverageLinkageClustering,
     "connected": ThresholdComponents,
+    "componentwise_agglomerative": ComponentwiseAgglomerative,
 }
 
 
@@ -325,7 +495,35 @@ CLUSTERING_SPACES: dict[str, dict[str, list]] = {
     },
     "connected": {
         "neighbors": [1, 2, 5, 10],
-        "distance_threshold": [0.05, 0.1, 0.15, 0.2, 0.3],
+        # Refined 2026-08-13 after a fine sweep on WildChat's tuning slice: the F optimum sits at
+        # 0.131 with k=10, which the old five-point grid ([0.05, 0.1, 0.15, 0.2, 0.3]) could not
+        # express -- it selected 0.15/k=2 for F=0.4991 where 0.131/k=10 scores 0.5164. A grid
+        # coarse enough to miss the optimum by 0.017 is not measuring the method.
+        "distance_threshold": [0.05, 0.1, 0.12, 0.13, 0.14, 0.15, 0.2, 0.3],
+    },
+    "componentwise_agglomerative": {
+        "neighbors": [5, 10, 25],
+        "link_threshold": [0.15, 0.2],
+        "distance_threshold": [0.08, 0.10, 0.12, 0.14],
+    },
+}
+
+
+#: The same search, expressed in quantiles instead of absolute distances. Used for any run in a
+#: learned space (``run_clustering.py --projection``), where :data:`CLUSTERING_SPACES`' radii are
+#: meaningless -- see :func:`edge_quantile`. The range brackets every optimum measured on
+#: WildChat's tuning slice across four feature spaces (edge shares 0.17 to 0.36).
+#: Only the two threshold-based methods appear: Leiden's ``resolution`` and HDBSCAN's
+#: ``min_cluster_size`` are not distances, so their grids carry over unchanged.
+CLUSTERING_SPACES_QUANTILE: dict[str, dict[str, list]] = {
+    "connected": {
+        "neighbors": [2, 3, 5, 10, 25],
+        "distance_quantile": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50],
+    },
+    "componentwise_agglomerative": {
+        "neighbors": [5, 10, 25],
+        "link_quantile": [0.20, 0.30, 0.40],
+        "distance_quantile": [0.05, 0.10, 0.15, 0.20],
     },
 }
 

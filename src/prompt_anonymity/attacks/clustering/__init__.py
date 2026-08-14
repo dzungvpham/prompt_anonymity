@@ -43,10 +43,13 @@ from __future__ import annotations
 from .algorithms import (
     CLUSTERING_ATTACKS,
     CLUSTERING_SPACES,
+    CLUSTERING_SPACES_QUANTILE,
     MAX_DENSE_DOCUMENTS,
+    edge_quantile,
     NOISE_LABEL,
     AverageLinkageClustering,
     BaselineClustering,
+    ComponentwiseAgglomerative,
     ClusteringAttack,
     HDBSCANClustering,
     LeidenClustering,
@@ -61,8 +64,24 @@ from .baselines import (
     singleton_labels,
 )
 from .graph import NeighborGraph, build_neighbor_graph
+from .projection import (
+    LinearProjection,
+    PROJECTION_FITTERS,
+    fit_projection,
+    identity_projection,
+)
+from .rescoring import GRAPH_RESCORINGS, rescore_graph
 
 __all__ = [
+    "CLUSTERING_SPACES_QUANTILE",
+    "ComponentwiseAgglomerative",
+    "edge_quantile",
+    "GRAPH_RESCORINGS",
+    "LinearProjection",
+    "PROJECTION_FITTERS",
+    "fit_projection",
+    "identity_projection",
+    "rescore_graph",
     "NeighborGraph",
     "build_neighbor_graph",
     "CLUSTERING_ATTACKS",

@@ -4213,7 +4213,8 @@ def plot_scaling_across_datasets_by_attack(
 #: Clustering algorithms, in the order that fixes each one's colour everywhere. **Append only** --
 #: inserting a name shifts the hue of every algorithm below it, exactly the hazard
 #: :data:`DEFENSE_SLOTS` and :data:`METHOD_STRIDE` document at length.
-CLUSTERING_ALGORITHMS = ("hdbscan", "leiden", "average_linkage", "connected")
+CLUSTERING_ALGORITHMS = ("hdbscan", "leiden", "average_linkage", "connected",
+                         "componentwise_agglomerative")
 
 CLUSTERING_ALGORITHM_SLOTS = {name: index for index, name in enumerate(CLUSTERING_ALGORITHMS)}
 
@@ -4244,6 +4245,10 @@ CLUSTERING_LABELS = {
     "hdbscan": "HDBSCAN",
     "leiden": "Leiden",
     "average_linkage": "Average linkage",
+    # Same method as `average_linkage`, run one connected component at a time so it fits in memory
+    # at WildChat's scale -- the label says "average linkage" because that is what it computes,
+    # with the qualifier only to distinguish the two rows on a figure that carries both.
+    "componentwise_agglomerative": "Average linkage (per component)",
     "connected": "Connected components",
     "baseline_singleton": "All singletons",
     "baseline_single_cluster": "One cluster",
@@ -4310,13 +4315,21 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
     """
     if not clustering_dir.exists():
         return []
-    runs, skipped = [], []
+    runs, skipped, drawn_elsewhere = [], [], []
     for directory in sorted(path for path in clustering_dir.iterdir() if path.is_dir()):
         parsed = parse_clustering_run_name(directory.name)
         if parsed is None:
-            skipped.append(directory.name)
+            # A variant directory is not unrecognised -- it is drawn by `plot_clustering_variants`
+            # instead, because a learned projection cannot share the by_defense figures' panels.
+            # Reporting it as "skipped" alongside a genuine typo sent a reader looking for a
+            # missing figure that was in fact drawn.
+            (drawn_elsewhere if parse_clustering_variant_name(directory.name)
+             else skipped).append(directory.name)
             continue
         runs.append(ClusteringRun(*parsed, directory=directory))
+    if drawn_elsewhere:
+        print(f"{len(drawn_elsewhere)} clustering director{'y' if len(drawn_elsewhere) == 1 else 'ies'} "
+              f"drawn by the variants family rather than by_defense: {', '.join(drawn_elsewhere)}")
     if skipped:
         print(f"skipped {len(skipped)} clustering director{'y' if len(skipped) == 1 else 'ies'} "
               f"whose name is not <dataset>_<defense>_<feature>: {', '.join(skipped)}")
@@ -4570,6 +4583,172 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
                borderaxespad=0.0)  # honour the measured anchor instead of re-padding off it
 
     stem = output_dir / "precision_recall" / "by_algorithm" / feature
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
+    return [save_figure(figure, stem)]
+
+
+#: Directory suffixes a variant run carries after ``<dataset>_<defense>_<feature>``, mapped to the
+#: label the figure prints. ``run_clustering.py`` appends one part per non-default scope choice
+#: (``--projection``, ``--rescoring``, ``--threshold-mode``), so the suffix *is* the strategy.
+#: Order fixes the row order on the figure, and it is the order the strategies were developed in:
+#: the baseline first, then what was added to it.
+#: Row label for the plain three-part run drawn beside the variants -- the method as it stood
+#: before any of them, searched over absolute distance thresholds.
+BASELINE_VARIANT_LABEL = "Baseline (absolute search)"
+
+CLUSTERING_VARIANTS = (
+    ("quantile", "Baseline (quantile search)"),
+    ("lda", "LDA projection"),
+    ("wccn_csls", "WCCN + CSLS"),
+    ("wccn_local_scaling", "WCCN + local scaling"),
+    ("contrastive", "Contrastive projection"),
+)
+
+
+@dataclass(frozen=True)
+class ClusteringVariant:
+    """One clustering run that varies the *representation* rather than the defense or feature.
+
+    :class:`ClusteringRun`'s sibling for the directories ``parse_clustering_run_name``
+    deliberately refuses. Those four- and five-part names are not a defect: a run with a learned
+    projection is not comparable to a base run on the ``by_defense`` figures, whose panels key on
+    defense and would collide (every one of these is ``base``). They get their own family instead,
+    where the strategy is the axis rather than a contaminant.
+    """
+
+    dataset: str
+    variant: str
+    directory: Path
+
+    @property
+    def label(self) -> str:
+        return dict(CLUSTERING_VARIANTS)[self.variant]
+
+
+def parse_clustering_variant_name(name: str) -> tuple[str, str] | None:
+    """``(dataset, variant)`` for a variant directory, or ``None``.
+
+    Same defense/feature disambiguation as :func:`parse_clustering_run_name` -- every part may
+    contain an underscore, so the split is by matching known vocabulary rather than by ``_`` --
+    and then the remainder has to be a registered variant suffix. An unrecognised suffix returns
+    ``None`` rather than being guessed at, so a typo in a directory name is a skipped figure and
+    not a mislabelled series.
+    """
+    variants = dict(CLUSTERING_VARIANTS)
+    for dataset in DATASETS:
+        if not name.startswith(f"{dataset}_"):
+            continue
+        remainder = name[len(dataset) + 1:]
+        for defense in DEFENSES:
+            if not remainder.startswith(f"{defense}_"):
+                continue
+            tail = remainder[len(defense) + 1:]
+            for feature in FEATURES:
+                if tail == feature:
+                    return None                      # a plain three-part run, not a variant
+                if tail.startswith(f"{feature}_") and tail[len(feature) + 1:] in variants:
+                    return dataset, tail[len(feature) + 1:]
+    return None
+
+
+def discover_clustering_variants(clustering_dir: Path) -> list[ClusteringVariant]:
+    """Every variant directory under the clustering root, in :data:`CLUSTERING_VARIANTS` order."""
+    if not clustering_dir.exists():
+        return []
+    found = []
+    for directory in sorted(path for path in clustering_dir.iterdir() if path.is_dir()):
+        parsed = parse_clustering_variant_name(directory.name)
+        if parsed is not None:
+            found.append(ClusteringVariant(*parsed, directory=directory))
+    order = [name for name, _ in CLUSTERING_VARIANTS]
+    return sorted(found, key=lambda run: (run.dataset, order.index(run.variant)))
+
+
+def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
+                             base: ClusteringRun | None, output_dir: Path) -> list[Path]:
+    """Tuning-slice against test-slice BCubed F, one row per representation strategy.
+
+    **The gap between the two dots is the finding, not the level of either.** Each strategy was
+    selected by searching a labelled tuning slice, so its tuning score is the number that decided
+    it was worth running -- and the honest measure of what it is worth is the test score beside it.
+    Measured here, that gap is +0.007 to +0.017, and it is *larger for the strategies that looked
+    best*, which is exactly what a search over one labelled slice produces.
+
+    Both numbers come from one row of one ``clustering_results.csv`` (``tuning_bcubed_f`` and
+    ``bcubed_f``), so they are the same configuration on two slices rather than a best-of-many
+    compared against a single run -- the comparison a development sweep cannot make about itself.
+
+    A dumbbell rather than paired bars: the quantity a reader needs is the *change*, and two bars
+    per row make that a subtraction done by eye. Rows are ordered by the strategy vocabulary, not
+    by score, so a strategy sits in the same place on both corpora's figures.
+    """
+    # The plain three-part base run belongs on this figure as a row, not as an absent reference:
+    # it writes the same two columns from the same file, and on swe-chat it BEATS two of the three
+    # strategies -- a fact that is invisible if the figure only draws what was added to it.
+    candidates = ([(BASELINE_VARIANT_LABEL, base)] if base is not None else []) + \
+                 [(run.label, run) for run in runs]
+    rows, drawn = [], []
+    for label, run in candidates:
+        table = clustering_results(run)
+        if table.empty or "connected" not in set(table["algorithm"]):
+            continue
+        record = table.loc[table["algorithm"] == "connected"].iloc[0]
+        if not np.isfinite(record.get("tuning_bcubed_f", float("nan"))):
+            continue
+        drawn.append((label, float(record["tuning_bcubed_f"]), float(record["bcubed_f"])))
+        rows.append({"dataset": dataset,
+                     "variant": getattr(run, "variant", "absolute"), "label": label,
+                     "algorithm": "connected",
+                     "tuning_bcubed_f": float(record["tuning_bcubed_f"]),
+                     "test_bcubed_f": float(record["bcubed_f"]),
+                     "bcubed_precision": float(record["bcubed_precision"]),
+                     "bcubed_recall": float(record["bcubed_recall"]),
+                     "shrinkage": float(record["tuning_bcubed_f"]) - float(record["bcubed_f"]),
+                     "hyperparameters": record.get("hyperparameters", "")})
+    if len(drawn) < 2:
+        return []                                    # one row is a table, not a figure
+
+    figure, axes = plt.subplots(figsize=(8.2, 0.52 * len(drawn) + 1.9))
+    figure.patch.set_facecolor(SURFACE)
+    positions = np.arange(len(drawn))[::-1]          # first strategy at the top
+    tuning_colour, test_colour = series_style(0), series_style(1)
+
+    for position, (_, tuning, test) in zip(positions, drawn):
+        axes.plot([test, tuning], [position, position], color=TEXT_MUTED, linewidth=2.0,
+                  zorder=1, solid_capstyle="round")
+        # Surface ring on both marks: they overlap the connector and, on a small gap, each other.
+        for value, colour in ((tuning, tuning_colour), (test, test_colour)):
+            axes.plot([value], [position], marker="o", markersize=MARKER_SIZE + 2,
+                      color=colour, markeredgecolor=SURFACE, markeredgewidth=2.0, zorder=3)
+        # Direct-label the TEST value only. Labelling both would put a number on every mark, and
+        # the test number is the one a reader takes away.
+        axes.annotate(f"{test:.3f}", (test, position), textcoords="offset points",
+                      xytext=(0, -15), ha="center", color=TEXT_PRIMARY, fontsize=8.5)
+
+    axes.set_yticks(positions, [label for label, _, _ in drawn])
+    axes.tick_params(axis="y", length=0)
+    span = [value for _, tuning, test in drawn for value in (tuning, test)]
+    margin = 0.06 * (max(span) - min(span) + 1e-9)
+    axes.set_xlim(min(span) - margin - 0.01, max(span) + margin)
+    axes.set_ylim(-0.55, len(drawn) - 0.45)
+    style_axes(axes, "BCubed F (connected components)", "", "")
+    axes.grid(axis="y", visible=False)
+
+    # Above the axes, horizontally: the data occupy a different corner on each corpus, so any
+    # in-axes corner collides on one of them -- it did, with the bottom row's value label.
+    add_legend(axes, handles=[
+        plt.Line2D([], [], marker="o", linestyle="none", markersize=MARKER_SIZE + 2,
+                   color=tuning_colour, markeredgecolor=SURFACE, markeredgewidth=2.0),
+        plt.Line2D([], [], marker="o", linestyle="none", markersize=MARKER_SIZE + 2,
+                   color=test_colour, markeredgecolor=SURFACE, markeredgewidth=2.0)],
+        labels=["Tuning slice (selected on)", "Test slice (held out)"],
+        loc="lower left", bbox_to_anchor=(0.0, 1.005), ncol=2, borderaxespad=0.0,
+        handletextpad=0.4, columnspacing=1.6)
+    figure.tight_layout(rect=(0, 0, 1, figure_heading(
+        figure, f"{DATASET_LABELS[dataset]}: tuning-slice score against held-out test score")))
+
+    stem = output_dir / "variants" / "tuning_vs_test"
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
@@ -5318,6 +5497,9 @@ def main() -> None:
     # a checkout that has only clustered is not an error.
     runs = discover_runs(RESULTS_DIR) if RESULTS_DIR.exists() else []
     clustering = discover_clustering_runs(CLUSTERING_DIR)
+    # The variant directories the three-part parser refuses -- a learned projection or a rescoring
+    # is not comparable to a base run on the by_defense figures, so it gets its own family.
+    variants = discover_clustering_variants(CLUSTERING_DIR)
     if not runs and not clustering:
         raise SystemExit(
             f"no runs named <dataset>_<defense>_<feature>_<attack> under {RESULTS_DIR}, and none "
@@ -5330,6 +5512,9 @@ def main() -> None:
     clustering_by_dataset: dict[str, list[ClusteringRun]] = defaultdict(list)
     for run in clustering:
         clustering_by_dataset[run.dataset].append(run)
+    variants_by_dataset: dict[str, list[ClusteringVariant]] = defaultdict(list)
+    for run in variants:
+        variants_by_dataset[run.dataset].append(run)
 
     # --- plan every figure, before reading or building anything ---------------
     #
@@ -5350,6 +5535,17 @@ def main() -> None:
         if clustering_by_dataset.get(dataset):
             plan += clustering_figure_plan(dataset, clustering_by_dataset[dataset],
                                            PLOTS_DIR / dataset / "clustering")
+        if variants_by_dataset.get(dataset):
+            members = variants_by_dataset[dataset]
+            base = next((run for run in clustering_by_dataset.get(dataset, [])
+                         if run.defense == NO_DEFENSE), None)
+            plan.append(PlannedFigure(
+                f"{dataset}/clustering/variants/tuning_vs_test",
+                tuple(members) + ((base,) if base is not None else ()),
+                lambda ctx, dataset=dataset, members=members, base=base:
+                (plot_clustering_variants,
+                 (dataset, members, base, PLOTS_DIR / dataset / "clustering"), {}),
+                builds=()))
     plan += cross_dataset_plan(runs, PLOTS_DIR)
 
     settings = f"{source_digest()}|bootstrap={args.bootstrap}|png={int(args.png)}"
