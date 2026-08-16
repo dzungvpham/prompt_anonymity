@@ -4336,14 +4336,58 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
     return runs
 
 
-def clustering_results(run: ClusteringRun) -> pd.DataFrame:
-    """One run's ``clustering_results.csv``, or an empty frame when it has not been written.
+#: The author scopes ``run_clustering.py --scopes`` writes into one ``clustering_results.csv``, and
+#: how each is drawn: ``(subdirectory, heading clause)``. Every clustering family is drawn once per
+#: scope, into its own subtree.
+#:
+#: **``all`` is spelled by absence in both**, mirroring ``run_clustering.scope_suffix``: it is the
+#: threat model and the headline, so it keeps the paths and the titles it has always had and no
+#: existing figure moves when a scope is added.
+#:
+#: **The two are never put on one axis, and the heading clause is what stops a reader doing it by
+#: eye across two files.** Each scope is a differently-shaped problem with its own reference
+#: partitions -- the ``unseen`` collection has no single-document authors *at all*, because the
+#: corpus keeps no author with fewer than two documents, so an author absent from the known side
+#: must have at least two inside the test quarter. Its singleton baseline is 0.343 against 0.285 on
+#: WildChat. Raw F is therefore higher on ``unseen`` while the attack is slightly *weaker*; the
+#: comparable quantity is each bar's distance from the grey reference bar beside it, which is why
+#: those bars are on every panel.
+CLUSTERING_SCOPES = {
+    "all": ("", ""),
+    "unseen": ("unseen", ", authors with no known-side history"),
+}
+
+
+def clustering_scope_suffix(scope: str) -> str:
+    """Filename suffix for one scope's per-run CSVs; empty for ``all``.
+
+    **Must match ``run_clustering.scope_suffix``**, which is what named the files -- there is no
+    import to keep the two honest, for the reason the vocabulary at the top of this file is
+    literal: this script deliberately does not pull in the package's heavy imports.
+    """
+    return "" if scope == "all" else f"_{scope}"
+
+
+def clustering_results(run: ClusteringRun, scope: str = "all") -> pd.DataFrame:
+    """One run's ``clustering_results.csv``, restricted to one author scope.
 
     A directory that exists without the file is a run that was interrupted or is still going;
     every drawing routine below treats that as "no series", not as a failure.
+
+    Since 2026-08-16 a clustering run attacks its collection under two author scopes (see
+    :data:`CLUSTERING_SCOPES`) and writes both into this one file. A file written *before* that
+    change has no ``scope`` column and is entirely the ``all`` scope -- so it answers for ``all``
+    and, correctly, holds nothing for any other scope. Returning the whole legacy table for a
+    scope it predates would relabel one population as another, which is the one mistake this
+    split exists to prevent.
     """
     path = run.directory / "clustering_results.csv"
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    if not path.exists():
+        return pd.DataFrame()
+    table = pd.read_csv(path)
+    if "scope" not in table.columns:
+        return table if scope == "all" else pd.DataFrame()
+    return table[table["scope"] == scope]
 
 
 def clustering_style(name: str) -> str:
@@ -4379,7 +4423,7 @@ def clustering_feature_groups(runs: list[ClusteringRun]) -> list[tuple[str, list
 
 
 def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun],
-                           output_dir: Path) -> list[Path]:
+                           output_dir: Path, scope: str = "all") -> list[Path]:
     """BCubed F per algorithm, one panel per defense, with the reference partitions beside them.
 
     **The reference bars are the point of the figure.** An all-singleton partition -- one cluster
@@ -4393,8 +4437,9 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     a defended run answers is how far its bars fall from the undefended panel's. ``runs`` is one
     feature's, which is what makes "one panel per defense" a well-defined statement.
     """
+    subdirectory, clause = CLUSTERING_SCOPES[scope]
     defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])]
-    tables = {run.defense: clustering_results(run) for run in runs}
+    tables = {run.defense: clustering_results(run, scope) for run in runs}
     panels = [defense for defense in defenses if not tables[defense].empty]
     if not panels:
         return []
@@ -4462,16 +4507,16 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
                labels=["Reference partition"], loc="upper right")
     figure.tight_layout(rect=(0, 0, 1, figure_heading(
         figure, f"{DATASET_LABELS[dataset]}: author clustering under "
-                f"{FEATURE_LABELS[feature]}, BCubed F by algorithm")))
+                f"{FEATURE_LABELS[feature]}, BCubed F by algorithm{clause}")))
 
-    stem = output_dir / "bcubed" / "by_defense" / feature
+    stem = output_dir / subdirectory / "bcubed" / "by_defense" / feature
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.concat(rows, ignore_index=True).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
 
 
 def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[ClusteringRun],
-                                     output_dir: Path) -> list[Path]:
+                                     output_dir: Path, scope: str = "all") -> list[Path]:
     """Each algorithm as one point in BCubed precision x recall, marker shape per defense.
 
     The figure that makes the trade legible, and that F alone hides: a method can buy precision by
@@ -4481,7 +4526,8 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     opposite corner. Colour carries the algorithm, so it still follows the entity; shape carries
     the defense.
     """
-    tables = {run.defense: clustering_results(run) for run in runs}
+    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    tables = {run.defense: clustering_results(run, scope) for run in runs}
     defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])
                 if not tables[run.defense].empty]
     if not defenses:
@@ -4546,7 +4592,7 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
 
     style_axes(axes, "BCubed recall", "BCubed precision",
                f"{DATASET_LABELS[dataset]}: the precision/recall trade under "
-               f"{FEATURE_LABELS[feature]}")
+               f"{FEATURE_LABELS[feature]}{clause}")
     # A hair past the unit square on both axes: the one-cluster reference sits at recall exactly
     # 1.0 and the singleton one at precision exactly 1.0, so a hard limit halves both markers.
     axes.set_xlim(0, 1.02)
@@ -4582,7 +4628,7 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
                bbox_to_anchor=tuple(stack_below(figure, axes, first)),
                borderaxespad=0.0)  # honour the measured anchor instead of re-padding off it
 
-    stem = output_dir / "precision_recall" / "by_algorithm" / feature
+    stem = output_dir / subdirectory / "precision_recall" / "by_algorithm" / feature
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
@@ -4673,7 +4719,8 @@ def discover_clustering_variants(clustering_dir: Path) -> list[ClusteringVariant
 
 
 def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
-                             base: ClusteringRun | None, output_dir: Path) -> list[Path]:
+                             base: ClusteringRun | None, output_dir: Path,
+                             scope: str = "all") -> list[Path]:
     """Tuning-slice against test-slice BCubed F, one row per representation strategy.
 
     **The gap between the two dots is the finding, not the level of either.** Each strategy was
@@ -4693,11 +4740,12 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
     # The plain three-part base run belongs on this figure as a row, not as an absent reference:
     # it writes the same two columns from the same file, and on swe-chat it BEATS two of the three
     # strategies -- a fact that is invisible if the figure only draws what was added to it.
+    subdirectory, clause = CLUSTERING_SCOPES[scope]
     candidates = ([(BASELINE_VARIANT_LABEL, base)] if base is not None else []) + \
                  [(run.label, run) for run in runs]
     rows, drawn = [], []
     for label, run in candidates:
-        table = clustering_results(run)
+        table = clustering_results(run, scope)
         if table.empty or "connected" not in set(table["algorithm"]):
             continue
         record = table.loc[table["algorithm"] == "connected"].iloc[0]
@@ -4753,15 +4801,17 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
         loc="lower left", bbox_to_anchor=(0.0, 1.005), ncol=2, borderaxespad=0.0,
         handletextpad=0.4, columnspacing=1.6)
     figure.tight_layout(rect=(0, 0, 1, figure_heading(
-        figure, f"{DATASET_LABELS[dataset]}: tuning-slice score against held-out test score")))
+        figure, f"{DATASET_LABELS[dataset]}: tuning-slice score against held-out "
+                f"test score{clause}")))
 
-    stem = output_dir / "variants" / "tuning_vs_test"
+    stem = output_dir / subdirectory / "variants" / "tuning_vs_test"
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
 
 
-def plot_clustering_exposure(run: ClusteringRun, output_dir: Path) -> list[Path]:
+def plot_clustering_exposure(run: ClusteringRun, output_dir: Path,
+                             scope: str = "all") -> list[Path]:
     """Per-author reassembly: what share of each person's traffic landed in one cluster.
 
     The privacy reading rather than the clustering-quality one, and the reason the other two
@@ -4774,13 +4824,15 @@ def plot_clustering_exposure(run: ClusteringRun, output_dir: Path) -> list[Path]
     One figure per run rather than a defense comparison, for the reason :data:`PER_RUN_FAMILIES`
     gives: the series here are the algorithms, so there is no axis left for a view to vary.
     """
+    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    suffix = clustering_scope_suffix(scope)
     figure, axes = plt.subplots(figsize=(6.2, 4.4))
     figure.patch.set_facecolor(SURFACE)
     percentiles = EXPOSURE_GRID
     rows = []
 
     for name in CLUSTERING_ALGORITHMS:
-        path = run.directory / f"author_report_{name}.csv"
+        path = run.directory / f"author_report_{name}{suffix}.csv"
         if not path.exists():
             continue
         shares = pd.read_csv(path)["max_cluster_share"].to_numpy()
@@ -4796,12 +4848,12 @@ def plot_clustering_exposure(run: ClusteringRun, output_dir: Path) -> list[Path]
     style_axes(axes, "Author percentile, ordered by how much was reassembled",
                "Share of the author's documents in one cluster",
                f"{DATASET_LABELS[run.dataset]}: per-author reassembly. "
-               f"{run.defense_label}, {run.feature_label}")
+               f"{run.defense_label}, {run.feature_label}{clause}")
     axes.set_ylim(0, 1.02)
     add_legend(axes, loc="upper left", title="Algorithm")
     figure.tight_layout()
 
-    stem = output_dir / "exposure" / run.directory.name
+    stem = output_dir / subdirectory / "exposure" / run.directory.name
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.concat(rows, ignore_index=True).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
@@ -5442,29 +5494,39 @@ def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
     Every one of them passes ``builds=()``: they read their own CSVs when they are drawn, so no
     curve family and no bootstrap is involved, and a stale clustering figure must not drag its
     corpus's attribution runs into a full curve rebuild.
+
+    **Every family is planned once per author scope** (:data:`CLUSTERING_SCOPES`), into its own
+    subtree, so the two populations are never crossed inside one figure. A scope a run has no rows
+    for draws nothing and is *recorded* as having drawn nothing, on the same terms as a `scaling`
+    figure for a refitting attack -- which is what stops the sweep re-deciding it every time.
     """
     plan = []
-    # One figure per feature, because both of these key their panels or their marker shapes by
-    # *defense* -- so a feature is the thing they hold fixed, exactly as `by_defense/` does in the
-    # attribution tree, where the file is named for the held-fixed method.
-    for feature, members in clustering_feature_groups(runs):
-        plan.append(PlannedFigure(
-            f"{dataset}/clustering/bcubed/by_defense/{feature}", tuple(members),
-            lambda ctx, feature=feature, members=members:
-            (plot_clustering_bcubed, (dataset, feature, members, output_dir), {}),
-            builds=()))
-        plan.append(PlannedFigure(
-            f"{dataset}/clustering/precision_recall/by_algorithm/{feature}", tuple(members),
-            lambda ctx, feature=feature, members=members:
-            (plot_clustering_precision_recall, (dataset, feature, members, output_dir), {}),
-            builds=()))
-    # Per run, not per view: the series are the algorithms, so there is nothing left for a
-    # `by_defense`/`by_attack` split to vary -- the same argument `PER_RUN_FAMILIES` makes.
-    for run in runs:
-        plan.append(PlannedFigure(
-            f"{dataset}/clustering/exposure/{run.directory.name}", (run,),
-            lambda ctx, run=run: (plot_clustering_exposure, (run, output_dir), {}),
-            builds=()))
+    for scope in CLUSTERING_SCOPES:
+        prefix = "/".join(part for part in (f"{dataset}/clustering",
+                                            CLUSTERING_SCOPES[scope][0]) if part)
+        # One figure per feature, because both of these key their panels or their marker shapes by
+        # *defense* -- so a feature is the thing they hold fixed, exactly as `by_defense/` does in
+        # the attribution tree, where the file is named for the held-fixed method.
+        for feature, members in clustering_feature_groups(runs):
+            plan.append(PlannedFigure(
+                f"{prefix}/bcubed/by_defense/{feature}", tuple(members),
+                lambda ctx, feature=feature, members=members, scope=scope:
+                (plot_clustering_bcubed, (dataset, feature, members, output_dir, scope), {}),
+                builds=()))
+            plan.append(PlannedFigure(
+                f"{prefix}/precision_recall/by_algorithm/{feature}", tuple(members),
+                lambda ctx, feature=feature, members=members, scope=scope:
+                (plot_clustering_precision_recall,
+                 (dataset, feature, members, output_dir, scope), {}),
+                builds=()))
+        # Per run, not per view: the series are the algorithms, so there is nothing left for a
+        # `by_defense`/`by_attack` split to vary -- the same argument `PER_RUN_FAMILIES` makes.
+        for run in runs:
+            plan.append(PlannedFigure(
+                f"{prefix}/exposure/{run.directory.name}", (run,),
+                lambda ctx, run=run, scope=scope:
+                (plot_clustering_exposure, (run, output_dir, scope), {}),
+                builds=()))
     return plan
 
 
@@ -5546,13 +5608,16 @@ def main() -> None:
             members = variants_by_dataset[dataset]
             base = next((run for run in clustering_by_dataset.get(dataset, [])
                          if run.defense == NO_DEFENSE), None)
-            plan.append(PlannedFigure(
-                f"{dataset}/clustering/variants/tuning_vs_test",
-                tuple(members) + ((base,) if base is not None else ()),
-                lambda ctx, dataset=dataset, members=members, base=base:
-                (plot_clustering_variants,
-                 (dataset, members, base, PLOTS_DIR / dataset / "clustering"), {}),
-                builds=()))
+            for scope in CLUSTERING_SCOPES:
+                prefix = "/".join(part for part in (f"{dataset}/clustering",
+                                                    CLUSTERING_SCOPES[scope][0]) if part)
+                plan.append(PlannedFigure(
+                    f"{prefix}/variants/tuning_vs_test",
+                    tuple(members) + ((base,) if base is not None else ()),
+                    lambda ctx, dataset=dataset, members=members, base=base, scope=scope:
+                    (plot_clustering_variants,
+                     (dataset, members, base, PLOTS_DIR / dataset / "clustering", scope), {}),
+                    builds=()))
     plan += cross_dataset_plan(runs, PLOTS_DIR)
 
     settings = f"{source_digest()}|bootstrap={args.bootstrap}|png={int(args.png)}"

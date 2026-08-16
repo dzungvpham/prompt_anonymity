@@ -28,6 +28,39 @@ never read at attack time. Specifically, tuning runs on the *last quarter of the
     available match -- which turns "match the simulation to the target" into a slice rather than a
     resampling procedure.
 
+Two author scopes (``--scopes``), and why their scores must not be differenced
+------------------------------------------------------------------------------
+The two slices hold disjoint *documents*, but not disjoint *authors*: 21.3% of WildChat's
+test-quarter authors and 62.7% of swe-chat's also wrote on the known side (36.7% and 82.1% of the
+documents). Nothing enrols them -- no author is ever a label here -- but the hyper-parameters were
+chosen with their documents visible, and ``--projection`` is *fitted* on them, so a run that scores
+only the whole collection cannot say whether its result depends on people the attacker held labels
+for. So the collection is attacked twice, and both scopes land in ``clustering_results.csv`` under
+a ``scope`` column:
+
+``all``      the test quarter whole. The threat model, and the number every figure draws.
+``unseen``   only the documents whose author never appears in the known side ``[0, 0.75)``. The
+             tuning slice is restricted the same way against the history that precedes *it*
+             (``[0, 0.50)``), so it stays a simulation of the instance being attacked: measured,
+             26,936 documents against the test collection's 27,308 on WildChat, 184 against 178 on
+             swe-chat.
+
+Each scope is a complete run -- its own neighbour graphs, its own search, its own baselines -- and
+that is the point: **one scope's BCubed F may not be compared with the other's**. Restricting to
+unseen authors changes the *shape* of the problem, which the section above says is exactly what
+sets every parameter's optimum (``authors_per_document`` moves 0.166 -> 0.207 on WildChat, 0.059 ->
+0.124 on swe-chat). Sharper still, the restriction is not independent of the answer: the corpus
+keeps only authors with at least two documents in total, so an author absent from the known side
+must have **at least two in the test quarter**. The ``unseen`` collection therefore contains no
+single-document authors at all *by construction* -- 0.0% against 7.5% of the full quarter's
+authors on WildChat -- and singletons are the documents no method can link. That alone lifts the
+singleton baseline from F = 0.285 to 0.343 on WildChat and 0.112 to 0.220 on swe-chat. Read each
+scope against **its own** baseline rows, which is why they are recomputed per scope rather than
+shared.
+
+``unseen`` is small on swe-chat -- 178 documents from 22 authors -- and should be read as an
+indication rather than a measurement there.
+
 Did tuning help? Two references, neither of them the tuned number itself
 -----------------------------------------------------------------------
 ``untuned_bcubed_f`` is the class defaults -- what somebody gets by not thinking about it -- and is
@@ -71,20 +104,26 @@ Run (from the repo root)::
     python experiments/run_clustering.py --source wildchat --defense styleremix \
         --algorithms leiden hdbscan
     python experiments/run_clustering.py --source wildchat --diagnostics --algorithms  # no attack
+    python experiments/run_clustering.py --source wildchat --scopes unseen   # only the strangers
     sbatch scripts/run_clustering_slurm.sh --source wildchat --defense base --oracle-sweep
 
-Outputs, under ``experiments/clustering/<dataset>_<defense>_<feature>/``:
+Outputs, under ``experiments/clustering/<dataset>_<defense>_<feature>/``. The ``all`` scope keeps
+the file names it has always had and every other scope appends its own, so a directory written
+before ``--scopes`` existed is still read the same way:
 
-* ``clustering_results.csv`` -- one row per algorithm (plus one per baseline): every BCubed,
-  link-level, exposure and shape measure, the chosen hyper-parameters, and how the tuning
-  transferred (``tuning_optimism``, ``untuned_bcubed_f``, ``tuning_gain_over_default``).
-* ``clusters_<algorithm>.csv`` -- ``doc_id`` -> cluster label for the collection under attack, so
-  any downstream slice can be re-scored without re-running the attack.
-* ``author_report_<algorithm>.csv`` -- per author: how much of their traffic was reassembled.
+* ``clustering_results.csv`` -- one row per (scope, algorithm), plus one per (scope, baseline):
+  every BCubed, link-level, exposure and shape measure, the chosen hyper-parameters, and how the
+  tuning transferred (``tuning_optimism``, ``untuned_bcubed_f``, ``tuning_gain_over_default``).
+* ``clusters_<algorithm>[_<scope>].csv`` -- ``doc_id`` -> cluster label for the collection under
+  attack, with ``author_in_known`` beside it, so any downstream slice can be re-scored without
+  re-running the attack.
+* ``author_report_<algorithm>[_<scope>].csv`` -- per author: how much of their traffic was
+  reassembled.
 * ``tuning_trials.csv`` -- every configuration tried on the simulation slice, with its score.
 * ``oracle_sweep.csv`` (``--oracle-sweep``) -- the same grid scored on the test collection.
 * ``diagnostics.csv`` / ``graph_diagnostics.csv`` (``--diagnostics``) -- one row per slice, and one
-  row per (slice, k), for the algorithm-free measures above.
+  row per (slice, k), for the algorithm-free measures above. A scope's slices are named
+  ``test_<scope>`` / ``tuning_<scope>``.
 
 The directory is **not** under ``experiments/results/``, whose four-part names are a contract
 ``plot_results.py`` parses and whose ``rolling_results.csv`` schema is built for ranking attacks.
@@ -99,6 +138,7 @@ import argparse
 import sys
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -195,6 +235,17 @@ MAX_NEIGHBORS = 50
 #: attacker who reads no text at all.
 METADATA_BASELINES = ("language_primary", "model_owner")
 
+#: Author populations the collection is attacked over, in the order they are run and written. See
+#: the module docstring: ``all`` is the threat model and ``unseen`` is the validity check, they are
+#: separate runs of everything, and their scores are not comparable with each other.
+TEST_AUTHOR_SCOPES = ("all", "unseen")
+
+#: Below this many documents a scope is skipped with a note rather than attacked. A collection of a
+#: handful of documents is not a clustering problem, and on a small corpus an author restriction is
+#: exactly the thing that produces one -- swe-chat's ``unseen`` collection is already only 178
+#: documents from 22 authors.
+MIN_SCOPE_DOCUMENTS = 10
+
 
 def slice_bounds(n_documents: int) -> tuple[slice, slice]:
     """``(tuning, test)`` -- the simulation slice and the collection under attack.
@@ -205,6 +256,62 @@ def slice_bounds(n_documents: int) -> tuple[slice, slice]:
     """
     cut = int(round(KNOWN_FRACTION * n_documents))
     return slice(int(round(0.50 * n_documents)), cut), slice(cut, n_documents)
+
+
+def scope_suffix(scope: str) -> str:
+    """Filename and slice-name suffix for one scope; empty for ``all``.
+
+    So the default scope's files keep the names they have always had, and every result directory
+    written before ``--scopes`` existed stays readable by exactly the code that read it before.
+    """
+    return "" if scope == "all" else f"_{scope}"
+
+
+def scope_positions(authors: np.ndarray, scope: str) -> tuple[np.ndarray, np.ndarray]:
+    """``(tuning, test)`` document positions for one author scope.
+
+    ``all`` is the two slices whole. ``unseen`` keeps only the documents whose author the attacker
+    holds no labelled history for **at that point on the timeline**: the test collection drops
+    every author who appears anywhere in the known side ``[0, 0.75)``, and the tuning slice drops
+    every author who appears in the history that precedes it, ``[0, 0.50)``.
+
+    Mirroring the restriction rather than applying the test collection's author set to both is what
+    keeps the tuning slice a *simulation* -- and here the alternative is not merely worse, it is
+    empty: ``[0.50, 0.75)`` is itself inside ``[0, 0.75)``, so every author in the tuning slice
+    appears in the known side by definition and restricting it against that interval would leave no
+    documents at all. The history that precedes the slice is the only reference that means for it
+    what the known side means for the test collection.
+
+    The mirror is not exact, and the asymmetry is worth knowing: the test collection is at the end
+    of the corpus, so "absent from everything before it" also means "at least two documents inside
+    it" (the corpus keeps no author with fewer than two documents overall). The tuning slice has a
+    future its authors can write in, so it keeps a few single-document authors -- 4.9% of them on
+    WildChat, against 0.0% in the test collection. Measured, the two instances still match closely:
+    singleton-baseline F 0.365 against 0.343 on WildChat, 0.178 against 0.220 on swe-chat.
+    """
+    tuning_window, test_window = slice_bounds(len(authors))
+    tuning = np.arange(tuning_window.start, tuning_window.stop)
+    test = np.arange(test_window.start, test_window.stop)
+    if scope == "all":
+        return tuning, test
+    if scope != "unseen":
+        raise SystemExit(f"unknown scope {scope!r}; available: {list(TEST_AUTHOR_SCOPES)}")
+    known = np.unique(authors[:test_window.start])          # everything the attacker holds labels for
+    history = np.unique(authors[:tuning_window.start])       # ... as of the tuning slice
+    return (tuning[~np.isin(authors[tuning], history)],
+            test[~np.isin(authors[test], known)])
+
+
+def take_rows(matrix: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    """``matrix[positions]``, as a **view** when the positions are one contiguous run.
+
+    Fancy indexing always copies, and the ``all`` scope's positions are a whole slice -- so the
+    plain spelling would copy 530 MB of WildChat's Gemini matrix to hand back something already in
+    memory, on a run whose peak is what decides whether it survives the job's memory cap.
+    """
+    if len(positions) and positions[-1] - positions[0] == len(positions) - 1:
+        return matrix[positions[0]:positions[-1] + 1]
+    return matrix[positions]
 
 
 def score_partition(labels: np.ndarray, authors: np.ndarray) -> dict:
@@ -523,6 +630,101 @@ def tune(algorithm: str, graph, authors: np.ndarray, limit: int | None = None,
     return best, table
 
 
+@dataclass
+class Collection:
+    """One slice of the timeline under one author scope, with the graph built over it.
+
+    The unit everything below works on. Splitting the run by scope means every stage -- the graph,
+    the search, the baselines, the diagnostics -- has to be told *which* documents it is looking
+    at rather than reading a module-level slice, and this is that argument.
+    """
+
+    scope: str                      #: one of :data:`TEST_AUTHOR_SCOPES`
+    role: str                       #: ``"test"`` (under attack) or ``"tuning"`` (the simulation)
+    positions: np.ndarray           #: row indices into the whole ordered corpus
+    frame: pd.DataFrame             #: the documents themselves, re-indexed from 0
+    graph: object = None            #: the neighbour graph over them, once built
+
+    @property
+    def authors(self) -> np.ndarray:
+        return self.frame["author_id"].to_numpy()
+
+    @property
+    def name(self) -> str:
+        """Slice name as it appears in ``diagnostics.csv``: ``test``, ``tuning_unseen``, ..."""
+        return f"{self.role}{scope_suffix(self.scope)}"
+
+
+def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
+                  seconds: np.ndarray | None, args) -> tuple[Collection, Collection] | None:
+    """Both collections for one scope, graphs built, time-fused and rescored -- or ``None``.
+
+    ``None`` means the scope is too small to attack (:data:`MIN_SCOPE_DOCUMENTS`), which is a note
+    and not an error: the other scope's results are still worth having, and an author restriction
+    emptying a slice is itself a fact about the corpus.
+
+    The two graphs are built at one ``k``, the smaller of what either collection can supply, so a
+    configuration selected on the simulation slice is expressible on the collection under attack.
+    That makes ``k`` a property of the scope, and a scope whose collections are much smaller is
+    searched over a correspondingly narrower ``neighbors`` grid -- printed, because it is a
+    difference between the two runs that nothing else records.
+    """
+    tuning_positions, test_positions = scope_positions(frame["author_id"].to_numpy(), scope)
+    label = f"scope={scope}"
+    if min(len(tuning_positions), len(test_positions)) < MIN_SCOPE_DOCUMENTS:
+        print(f"  {label}: SKIPPED -- {len(test_positions):,} documents under attack and "
+              f"{len(tuning_positions):,} to tune on, under the {MIN_SCOPE_DOCUMENTS}-document "
+              f"floor.")
+        return None
+
+    collections = tuple(
+        Collection(scope, role, positions,
+                   frame.iloc[positions].reset_index(drop=True))
+        for role, positions in (("test", test_positions), ("tuning", tuning_positions)))
+
+    shape = collection_shape(collections[0].authors)
+    print(f"  {label}: test {shape['n_documents']:,} documents, {shape['n_authors']:,} authors "
+          f"(r={shape['authors_per_document']:.3f}); tuning {len(tuning_positions):,} documents, "
+          f"{len(np.unique(collections[1].authors)):,} authors")
+    print(f"  {'':<{len(label)}}  baselines: "
+          f"singleton F={singleton_baseline(collections[0].authors).f_score:.3f}, "
+          f"one-cluster F={single_cluster_baseline(collections[0].authors).f_score:.3f}")
+
+    k = min(args.max_neighbors, len(test_positions) - 1, len(tuning_positions) - 1)
+    started = time.perf_counter()
+    for collection in collections:
+        collection.graph = build_neighbor_graph(
+            take_rows(embeddings, collection.positions), k, metric=args.metric)
+    print(f"  {'':<{len(label)}}  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
+
+    if seconds is not None:
+        for collection in collections:
+            collection.graph = temporal_fusion(collection.graph, seconds[collection.positions],
+                                               args.time_weight)
+        print(f"  {'':<{len(label)}}  fused elapsed time at weight {args.time_weight:g} into both "
+              f"graphs")
+
+    if args.rescoring != "none":
+        # Applied to BOTH graphs, so the tuning slice simulates exactly what the test collection
+        # will be attacked with. Rescoring after the build is free: it re-ranks the candidates the
+        # build already found (see the rescoring module on why that is an approximation and a
+        # one-sided one).
+        for collection in collections:
+            collection.graph = rescore_graph(collection.graph, args.rescoring,
+                                             args.rescoring_locality)
+        print(f"  {'':<{len(label)}}  rescored both graphs with {args.rescoring}"
+              f"(locality={args.rescoring_locality}) -> metric {collections[0].graph.metric!r}")
+    return collections
+
+
+def elapsed_seconds(frame: pd.DataFrame) -> np.ndarray:
+    """``ended_at`` as POSIX seconds, NaN where the document carries no timestamp."""
+    stamps = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
+    seconds = stamps.astype("int64").to_numpy() / 1e9
+    seconds[stamps.isna().to_numpy()] = np.nan
+    return seconds
+
+
 def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
                   tuning_graph, tuning_authors: np.ndarray, args) -> tuple[dict, np.ndarray, pd.DataFrame]:
     """Tune on the simulation slice, then attack the test collection once with the winner."""
@@ -531,6 +733,9 @@ def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
                             search_spaces(args, algorithm))
     tuning_seconds = time.perf_counter() - started
     tuned_score = float(trials.iloc[0]["bcubed_f"])
+    # Named before the attack, not after: the failure path below returns this same table, and a
+    # trials frame missing the column its rows are keyed by concatenates into NaNs.
+    trials.insert(0, "algorithm", algorithm)
 
     # The winner is re-fitted on a *different* graph, so a configuration that ran on the
     # simulation slice can still fail on the collection under attack. That is worth one algorithm,
@@ -578,8 +783,6 @@ def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
     except Exception:
         row["untuned_bcubed_f"] = float("nan")       # defaults may not run on this graph
     row["tuning_gain_over_default"] = row["bcubed_f"] - row["untuned_bcubed_f"]
-
-    trials.insert(0, "algorithm", algorithm)
     return row, labels, trials
 
 
@@ -609,8 +812,17 @@ def oracle_sweep(algorithm: str, graph, authors: np.ndarray, limit: int | None,
     return table
 
 
-def run_baselines(frame: pd.DataFrame, authors: np.ndarray, graph) -> list[dict]:
-    """The reference partitions, scored through the same path as the attacks."""
+def run_baselines(collection: Collection) -> list[dict]:
+    """The reference partitions for one collection, scored through the same path as the attacks.
+
+    **Recomputed per scope, never shared.** A baseline is a property of the collection it is
+    computed on, and the two scopes are different collections: the singleton partition alone moves
+    from F = 0.285 to 0.343 on WildChat, because restricting to authors the attacker has no history
+    for also removes every author with a single document (see the module docstring). Sharing one
+    set of baseline rows would put the ``unseen`` attack's F against a line drawn for a different
+    problem.
+    """
+    frame, authors, graph = collection.frame, collection.authors, collection.graph
     rows = []
     for kind in ("singleton", "single_cluster"):
         labels = BaselineClustering(kind=kind).cluster(graph)
@@ -630,7 +842,7 @@ def run_baselines(frame: pd.DataFrame, authors: np.ndarray, graph) -> list[dict]
                                         metadata=frame[column].to_numpy()).cluster(graph)
             rows.append({"algorithm": f"baseline_{column}", "hyperparameters": "",
                          **score_partition(labels, authors)})
-    return rows
+    return [{"scope": collection.scope, **row} for row in rows]
 
 
 def parse_args() -> argparse.Namespace:
@@ -641,6 +853,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--algorithms", nargs="*", default=sorted(CLUSTERING_ATTACKS),
                         help="Methods to run. Pass none (`--algorithms`) with --diagnostics to "
                              "measure the corpus without attacking it.")
+    parser.add_argument("--scopes", nargs="+", default=list(TEST_AUTHOR_SCOPES),
+                        choices=list(TEST_AUTHOR_SCOPES),
+                        help="Author populations to attack the collection over. 'all' is the test "
+                             "quarter whole; 'unseen' keeps only the authors absent from the "
+                             "known side, i.e. the ones no hyper-parameter and no --projection "
+                             "was chosen with. Each is a complete run and lands in the same "
+                             "directory under a 'scope' column -- their BCubed scores are NOT "
+                             "comparable with each other (see the module docstring).")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--metric", default="cosine")
@@ -728,6 +948,83 @@ def projection_kwargs(args) -> dict:
     return {}
 
 
+def attack_scope(test: Collection, tuning: Collection, known_authors: np.ndarray,
+                 output_dir: Path, args) -> tuple[list[dict], list, list]:
+    """Baselines and every algorithm for one scope: ``(result rows, trials, oracle tables)``.
+
+    The whole per-scope run in one place, so that a second scope is a loop iteration rather than a
+    second copy of the pipeline. Per-algorithm files are written as each finishes, so an
+    interrupted run still leaves the partitions it did produce; the summary tables are the
+    caller's, since they hold every scope.
+    """
+    suffix = scope_suffix(test.scope)
+    test_authors, tuning_authors = test.authors, tuning.authors
+    rows = run_baselines(test)
+    for row in rows:
+        print(f"  [{test.scope}] {row['algorithm']:<28s} BCubed F={row['bcubed_f']:.4f}")
+    print()
+
+    trials_tables, oracle_tables = [], []
+    for algorithm in args.algorithms:
+        if algorithm not in CLUSTERING_ATTACKS:
+            raise SystemExit(f"unknown algorithm {algorithm!r}; "
+                             f"available: {sorted(CLUSTERING_ATTACKS)}")
+        # A method that cannot run at this scale is skipped with a note rather than killing the
+        # cell: the other algorithms' results are still worth having, and the reason is a property
+        # of the method (see MAX_DENSE_DOCUMENTS) that a reader of the table needs to know. The
+        # limit is on the collection, so a scope may clear it where another does not -- which is
+        # itself worth printing, since it means the two scopes ran different sets of algorithms.
+        if algorithm == "average_linkage" and len(test_authors) > MAX_DENSE_DOCUMENTS:
+            print(f"  [{test.scope}] {algorithm:<28s} SKIPPED: needs a dense "
+                  f"{len(test_authors):,}^2 matrix "
+                  f"({len(test_authors) ** 2 * 8 / 1e9:.1f} GB), over the "
+                  f"{MAX_DENSE_DOCUMENTS:,}-document limit.")
+            continue
+        row, labels, trials = run_algorithm(algorithm, test.graph, test_authors,
+                                            tuning.graph, tuning_authors, args)
+        trials.insert(0, "scope", test.scope)
+        trials_tables.append(trials)
+        if row is None:
+            continue
+        row = {"scope": test.scope, **row}
+        rows.append(row)
+        # `author_in_known` rides along so a downstream re-score can split this partition by
+        # whether the attacker held history for the document's author, without reloading the
+        # corpus and re-deriving the boundary. It is the column the `unseen` scope selects on, so
+        # it is constant *false* there -- carried anyway, so the two scopes' files have one schema
+        # and a reader never has to know which produced it.
+        pd.DataFrame({"doc_id": test.frame["doc_id"].to_numpy(), "cluster": labels,
+                      "author_in_known": np.isin(test_authors, known_authors)}).to_csv(
+            output_dir / f"clusters_{algorithm}{suffix}.csv", index=False)
+        table = ClusterContingency.from_labels(labels, test_authors)
+        per_author_clustering(table, np.unique(test_authors)).to_csv(
+            output_dir / f"author_report_{algorithm}{suffix}.csv", index=False)
+        print(f"  [{test.scope}] {algorithm:<28s} BCubed F={row['bcubed_f']:.4f} "
+              f"(P={row['bcubed_precision']:.3f} R={row['bcubed_recall']:.3f}), "
+              f"clusters={row['n_clusters']:,}, any-link={row['any_link_rate']:.3f}, "
+              f"amplification={row['amplification']:.2f}")
+        if args.oracle_sweep:
+            sweep = oracle_sweep(algorithm, test.graph, test_authors, args.tune_limit,
+                                 search_spaces(args, algorithm))
+            sweep.insert(0, "scope", test.scope)
+            oracle_tables.append(sweep)
+            usable = sweep["bcubed_f"].dropna()
+            row["oracle_best_bcubed_f"] = float(usable.max())
+            row["oracle_median_bcubed_f"] = float(usable.median())
+            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
+                  f"(tuning gain {row['tuning_gain_over_default']:+.4f}) | "
+                  f"grid on test: median={row['oracle_median_bcubed_f']:.4f} "
+                  f"best={row['oracle_best_bcubed_f']:.4f}")
+        else:
+            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
+                  f"(tuning gain {row['tuning_gain_over_default']:+.4f})")
+        print(f"  {'':<28s} tuned on slice F={row['tuning_bcubed_f']:.4f} "
+              f"(tuning optimism {row['tuning_optimism']:+.4f}), "
+              f"{row['seconds_tuning']:.0f}s tune + {row['seconds_attack']:.0f}s attack "
+              f"[{row['hyperparameters']}]")
+    return rows, trials_tables, oracle_tables
+
+
 def main() -> None:
     args = parse_args()
     tag = f"{args.source}_{args.defense}_{args.feature}"
@@ -765,61 +1062,33 @@ def main() -> None:
               f"({frame['author_id'].iloc[fit_window].nunique():,} authors), "
               f"{embeddings.shape[1]} dimensions, {time.perf_counter() - started:.0f}s")
 
-    tuning_window, test_window = slice_bounds(len(frame))
-
-    test_frame = frame.iloc[test_window].reset_index(drop=True)
-    test_authors = test_frame["author_id"].to_numpy()
-    tuning_authors = frame["author_id"].to_numpy()[tuning_window]
-
-    shape = collection_shape(test_authors)
-    print(f"{tag}\n  test: {shape['n_documents']:,} documents, {shape['n_authors']:,} authors "
-          f"(r={shape['authors_per_document']:.3f})")
-    print(f"  tuning slice: {len(tuning_authors):,} documents, "
-          f"{len(np.unique(tuning_authors)):,} authors")
-    print(f"  baselines: singleton F={singleton_baseline(test_authors).f_score:.3f}, "
-          f"one-cluster F={single_cluster_baseline(test_authors).f_score:.3f}")
-
-    k = min(args.max_neighbors, len(test_authors) - 1, len(tuning_authors) - 1)
-    started = time.perf_counter()
-    test_graph = build_neighbor_graph(embeddings[test_window], k, metric=args.metric)
-    tuning_graph = build_neighbor_graph(embeddings[tuning_window], k, metric=args.metric)
-    print(f"  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
-
-    if args.time_weight > 0:
-        seconds = (pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-                   .astype("int64").to_numpy() / 1e9)
-        seconds[pd.to_datetime(frame["ended_at"], errors="coerce", utc=True).isna().to_numpy()] = np.nan
-        test_graph = temporal_fusion(test_graph, seconds[test_window], args.time_weight)
-        tuning_graph = temporal_fusion(tuning_graph, seconds[tuning_window], args.time_weight)
-        print(f"  fused elapsed time at weight {args.time_weight:g} into both graphs")
-
-    if args.rescoring != "none":
-        # Applied to BOTH graphs, so the tuning slice simulates exactly what the test collection
-        # will be attacked with. Rescoring after the build is free: it re-ranks the candidates the
-        # build already found (see the rescoring module on why that is an approximation and a
-        # one-sided one).
-        test_graph = rescore_graph(test_graph, args.rescoring, args.rescoring_locality)
-        tuning_graph = rescore_graph(tuning_graph, args.rescoring, args.rescoring_locality)
-        print(f"  rescored both graphs with {args.rescoring}"
-              f"(locality={args.rescoring_locality}) -> metric {test_graph.metric!r}")
+    print(tag)
+    seconds = elapsed_seconds(frame) if args.time_weight > 0 else None
+    # Deduplicated, order preserved: a repeated --scopes value would otherwise attack the same
+    # collection twice and write two identical rows for it under one scope name.
+    scopes = list(dict.fromkeys(args.scopes))
+    prepared = {scope: prepare_scope(scope, frame, embeddings, seconds, args) for scope in scopes}
+    prepared = {scope: pair for scope, pair in prepared.items() if pair is not None}
+    if not prepared:
+        raise SystemExit("no scope has enough documents to attack; nothing to do.")
 
     # Before `embeddings` is released: the verification pass needs the vectors, not the graph.
     if args.diagnostics:
         started = time.perf_counter()
         diagnostic_rows, graph_tables = [], []
-        for name, window, subframe, subgraph in (
-                ("test", test_window, test_frame, test_graph),
-                ("tuning", tuning_window, frame.iloc[tuning_window].reset_index(drop=True),
-                 tuning_graph)):
-            row, per_k = slice_diagnostics(name, subframe, embeddings[window],
-                                           subgraph, args.metric)
-            diagnostic_rows.append(row)
-            graph_tables.append(per_k)
-            print(f"  diagnostics [{name}]: verification AUC={row['verification_auc']:.4f} "
-                  f"(macro {row['verification_auc_macro']:.4f}), AP={row['verification_ap']:.4f} "
-                  f"({row['verification_ap'] / row['verification_prevalence']:.0f}x prevalence), "
-                  f"1-NN edge precision={per_k.iloc[0]['nn_precision']:.3f} "
-                  f"({per_k.iloc[0]['nn_precision'] / per_k.iloc[0]['random_nn_precision']:.0f}x chance)")
+        for collections in prepared.values():
+            for collection in collections:
+                row, per_k = slice_diagnostics(
+                    collection.name, collection.frame,
+                    take_rows(embeddings, collection.positions), collection.graph, args.metric)
+                diagnostic_rows.append(row)
+                graph_tables.append(per_k)
+                print(f"  diagnostics [{collection.name}]: "
+                      f"verification AUC={row['verification_auc']:.4f} "
+                      f"(macro {row['verification_auc_macro']:.4f}), AP={row['verification_ap']:.4f} "
+                      f"({row['verification_ap'] / row['verification_prevalence']:.0f}x prevalence), "
+                      f"1-NN edge precision={per_k.iloc[0]['nn_precision']:.3f} "
+                      f"({per_k.iloc[0]['nn_precision'] / per_k.iloc[0]['random_nn_precision']:.0f}x chance)")
         pd.DataFrame(diagnostic_rows).to_csv(output_dir / "diagnostics.csv", index=False)
         pd.concat(graph_tables, ignore_index=True).to_csv(
             output_dir / "graph_diagnostics.csv", index=False)
@@ -827,59 +1096,18 @@ def main() -> None:
     del embeddings
     print()
 
-    rows = run_baselines(test_frame, test_authors, test_graph)
-    for row in rows:
-        print(f"  {row['algorithm']:<28s} BCubed F={row['bcubed_f']:.4f}")
-    print()
+    # Every author the attacker holds labelled documents for. Read once here, from the whole
+    # corpus, so it means the same thing in both scopes' output files.
+    known_authors = np.unique(frame["author_id"].to_numpy()[:slice_bounds(len(frame))[1].start])
 
-    all_trials, oracle_tables = [], []
-    for algorithm in args.algorithms:
-        if algorithm not in CLUSTERING_ATTACKS:
-            raise SystemExit(f"unknown algorithm {algorithm!r}; "
-                             f"available: {sorted(CLUSTERING_ATTACKS)}")
-        # A method that cannot run at this scale is skipped with a note rather than killing the
-        # cell: the other algorithms' results are still worth having, and the reason is a property
-        # of the method (see MAX_DENSE_DOCUMENTS) that a reader of the table needs to know.
-        if (algorithm == "average_linkage"
-                and len(test_authors) > MAX_DENSE_DOCUMENTS):
-            print(f"  {algorithm:<28s} SKIPPED: needs a dense "
-                  f"{len(test_authors):,}^2 matrix "
-                  f"({len(test_authors) ** 2 * 8 / 1e9:.1f} GB), over the "
-                  f"{MAX_DENSE_DOCUMENTS:,}-document limit.")
-            continue
-        row, labels, trials = run_algorithm(algorithm, test_graph, test_authors,
-                                            tuning_graph, tuning_authors, args)
-        all_trials.append(trials)
-        if row is None:
-            continue
-        rows.append(row)
-        pd.DataFrame({"doc_id": test_frame["doc_id"].to_numpy(), "cluster": labels}).to_csv(
-            output_dir / f"clusters_{algorithm}.csv", index=False)
-        table = ClusterContingency.from_labels(labels, test_authors)
-        per_author_clustering(table, np.unique(test_authors)).to_csv(
-            output_dir / f"author_report_{algorithm}.csv", index=False)
-        print(f"  {algorithm:<28s} BCubed F={row['bcubed_f']:.4f} "
-              f"(P={row['bcubed_precision']:.3f} R={row['bcubed_recall']:.3f}), "
-              f"clusters={row['n_clusters']:,}, any-link={row['any_link_rate']:.3f}, "
-              f"amplification={row['amplification']:.2f}")
-        if args.oracle_sweep:
-            sweep = oracle_sweep(algorithm, test_graph, test_authors, args.tune_limit,
-                                 search_spaces(args, algorithm))
-            oracle_tables.append(sweep)
-            usable = sweep["bcubed_f"].dropna()
-            row["oracle_best_bcubed_f"] = float(usable.max())
-            row["oracle_median_bcubed_f"] = float(usable.median())
-            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
-                  f"(tuning gain {row['tuning_gain_over_default']:+.4f}) | "
-                  f"grid on test: median={row['oracle_median_bcubed_f']:.4f} "
-                  f"best={row['oracle_best_bcubed_f']:.4f}")
-        else:
-            print(f"  {'':<28s} untuned default F={row['untuned_bcubed_f']:.4f} "
-                  f"(tuning gain {row['tuning_gain_over_default']:+.4f})")
-        print(f"  {'':<28s} tuned on slice F={row['tuning_bcubed_f']:.4f} "
-              f"(tuning optimism {row['tuning_optimism']:+.4f}), "
-              f"{row['seconds_tuning']:.0f}s tune + {row['seconds_attack']:.0f}s attack "
-              f"[{row['hyperparameters']}]")
+    rows, all_trials, oracle_tables = [], [], []
+    for test, tuning in prepared.values():
+        scope_rows, scope_trials, scope_oracle = attack_scope(test, tuning, known_authors,
+                                                              output_dir, args)
+        rows.extend(scope_rows)
+        all_trials.extend(scope_trials)
+        oracle_tables.extend(scope_oracle)
+        print()
 
     results = pd.DataFrame(rows)
     for column, value in (("time_weight", args.time_weight), ("rescoring", args.rescoring),
@@ -894,7 +1122,8 @@ def main() -> None:
     if oracle_tables:
         pd.concat(oracle_tables, ignore_index=True).to_csv(output_dir / "oracle_sweep.csv",
                                                            index=False)
-    print(f"\nWrote {output_dir}/clustering_results.csv, clusters_*.csv, author_report_*.csv")
+    print(f"Wrote {output_dir}/clustering_results.csv ({', '.join(prepared)} scope"
+          f"{'s' if len(prepared) > 1 else ''}), clusters_*.csv, author_report_*.csv")
 
 
 if __name__ == "__main__":
