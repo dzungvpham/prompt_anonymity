@@ -129,3 +129,14 @@ sbatch = [
 # covariance estimation past the cap. Bumping this one cell rather than the whole cpu_large profile.
 [overrides.wildchat_base_stylometrix_plda]
 sbatch = ["--mem=48g"]
+
+# wildchat_*_gemini_embedding_2_plda both OOM'd on cpu_large's 24g too (jobs 63465697, 63465699,
+# 2026-08-22), ~35 minutes in rather than 8 -- PLDA's covariance estimation over gemini's 3,072-dim
+# embeddings needs much more than over stylometrix's ~197-dim, unlike the stylometrix cells where
+# only one window OOM'd. Matching the 96g this repo already uses for wildchat+gemini_embedding_2 at
+# scale (the gpu_large profile) rather than guessing at a smaller number.
+[overrides.wildchat_base_gemini_embedding_2_plda]
+sbatch = ["--mem=96g"]
+
+[overrides.wildchat_styleremix_gemini_embedding_2_plda]
+sbatch = ["--mem=96g"]
