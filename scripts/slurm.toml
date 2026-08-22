@@ -122,3 +122,10 @@ sbatch = [
 #
 # [overrides.wildchat_openanonymity_gemini_embedding_2_nearest_neighbor]
 # sbatch = ["--mem=32g"]
+
+# wildchat_base_stylometrix_plda OOM'd at 8 minutes on cpu_large's 24g (job 63465696, 2026-08-22).
+# wildchat_styleremix_stylometrix_plda (same feature, different defense) completed fine at 24g, so
+# this is not a uniform PLDA cost -- likely just this window's known-side size pushing PLDA's
+# covariance estimation past the cap. Bumping this one cell rather than the whole cpu_large profile.
+[overrides.wildchat_base_stylometrix_plda]
+sbatch = ["--mem=48g"]
