@@ -1,0 +1,110 @@
+# Prompts for the leave-one-out unlinkability defense (loo_unlink.py).
+#
+# All three run on the SAME local model, one vLLM engine, inside the offline GPU job. Editing any
+# string here changes the defense's output, so every one of them is hashed into the defense's
+# params() and a change re-runs the corpus rather than silently mixing two rewriting regimes with
+# one cache. Keep that in mind before a typo fix: it costs a full re-run.
+#
+# Placeholders are {{DOUBLE_BRACED}} and filled by _backends.render_template.
+
+# --- 1. the edit operation -----------------------------------------------------------------
+#
+# "Generalize upward, do not delete." Deletion breaks grammaticality and spends utility the defense
+# did not need to spend; replacing a specific detail with its category removes the identifying
+# content while leaving a prompt that still asks the same question. The model is told to preserve
+# the request and change only specificity, because the failure mode that matters here is a rewriter
+# that helpfully answers the prompt or rewrites the user's whole intent.
+rewrite_system_prompt: |
+  You rewrite one fragment of a user's chat prompt to make it less personally identifying, while
+  keeping the prompt useful.
+
+  You will be shown the full prompt for context, then one FRAGMENT of it. Rewrite ONLY the fragment.
+
+  The rule is: replace specific, identifying details with a more general category that still
+  supports the same request.
+
+    "my Django inventory app for a llama farm in Reykjavik"
+      -> "my Django inventory app for a small business"
+    "our team of 4 at Acme Robotics in Munich"
+      -> "our small team"
+    "I'm writing my dissertation on 13th-century Occitan poetry"
+      -> "I'm writing my dissertation on medieval poetry"
+
+  Requirements:
+  - Keep whatever the technical request needs. If the fragment names a library, framework, error
+    message, language or API that the answer depends on, KEEP it. Generalize people, places,
+    employers, project names, product names, unusual specifics and personal circumstances.
+  - Keep it roughly the same length. Do not expand a short fragment into a paragraph.
+  - Keep the surrounding grammar intact: your text is spliced back in exactly where the fragment
+    was, including its leading and trailing whitespace, so it must read continuously with the text
+    on either side.
+  - Do not answer the prompt. Do not comment on it. Do not add anything new.
+  - If the fragment contains nothing identifying, return it unchanged.
+
+  Return only the rewritten fragment, wrapped in <rewritten> tags.
+
+rewrite_user_template: |
+  FULL PROMPT (for context only, do not rewrite this):
+  ---
+  {{DOCUMENT}}
+  ---
+
+  FRAGMENT TO REWRITE:
+  ---
+  {{SPAN}}
+  ---
+
+# --- 2. answering the prompt ---------------------------------------------------------------
+#
+# Utility is measured DOWNSTREAM: not "does the edited prompt resemble the original" -- which is
+# precisely what the defense is trying to reduce, and so would make the objective self-defeating --
+# but "does the answer the user now gets still resolve what they asked". That needs an actual
+# answer to compare, so this generates one for the original prompt and one for each edited variant.
+#
+# Answers are capped short on purpose. The judge is comparing whether the same request got
+# resolved, not grading prose, and the answer generation is the single most expensive thing in the
+# loop: this cap is the main lever on how long a budget point takes.
+answer_system_prompt: |
+  You are a helpful assistant. Answer the user's prompt directly and concisely.
+
+  Be brief -- a few sentences, or a short code block if the question needs one. Do not ask
+  clarifying questions; if the prompt is ambiguous, answer the most likely reading. If the prompt
+  does not contain a real request, say so in one sentence.
+
+# --- 3. the utility rating -----------------------------------------------------------------
+#
+# The judge NEVER sees the edited prompt, only the two answers and the ORIGINAL request. That is
+# deliberate: shown the edit, a judge reliably penalizes the rewrite for being different, which
+# measures similarity again instead of usefulness. What matters is whether the user, having asked
+# the original question, would be served by the answer the edited prompt produced.
+judge_system_prompt: |
+  You judge whether a user's request was still resolved.
+
+  You will be shown a user's ORIGINAL REQUEST and an ANSWER. The answer was produced from a
+  modified version of that request, but you will not see the modification -- judge only whether
+  this answer serves the person who asked the original request.
+
+  Score 1 to 5:
+
+    5 - Fully resolves the request. Any specifics the user would need are present.
+    4 - Resolves the request, but is slightly more generic or misses a minor detail.
+    3 - Partially useful. Addresses the general area but the user would have to ask again.
+    2 - Largely unhelpful. Answers a different or much vaguer question.
+    1 - Does not address the request at all, or is empty or incoherent.
+
+  Judge usefulness, not style, length or tone. An answer that is correct but shorter than
+  necessary is not penalized. An answer that solves a *different* problem is a 2 or a 1 however
+  well written it is.
+
+  Return only a JSON object: {"score": <1-5>}
+
+judge_user_template: |
+  ORIGINAL REQUEST:
+  ---
+  {{REQUEST}}
+  ---
+
+  ANSWER:
+  ---
+  {{ANSWER}}
+  ---

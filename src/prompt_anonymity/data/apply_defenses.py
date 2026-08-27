@@ -297,12 +297,24 @@ def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str
 
 
 def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
-                     *, cache_dir: str | Path) -> list[list[str]]:
+                     *, cache_dir: str | Path, num_shards: int = 1) -> list[list[str]]:
     """Defend every turn of every document, returning the defended turn lists in input order."""
     if not turn_lists:
         return []
-    # A turn-adding defense (see append_extra_turns) works on documents, not on the per-turn stream.
     registered = get_defense(defense)
+    # An author-aware defense measures a document against the author's OTHER documents, and
+    # `select_shard` splits by document (interleaved), so a shard holds an arbitrary subset of each
+    # author. `loo_unlink` would compute its linkage baseline against a truncated author; `afr`
+    # would cascade from the wrong documents entirely. Neither failure is visible in the output --
+    # both produce a plausible defended parquet that means something different per shard -- so this
+    # refuses the run rather than trusting the operator to remember.
+    if num_shards > 1 and not getattr(registered, "shardable", True):
+        raise SystemExit(
+            f"defense {defense!r} cannot be sharded: it measures each document against its "
+            f"author's other documents, and --num-shards splits by document. Re-run without "
+            f"--num-shards/--shard-index (or on a smaller --source)."
+        )
+    # A turn-adding defense (see append_extra_turns) works on documents, not on the per-turn stream.
     if getattr(registered, "appends_turns", False):
         return append_extra_turns(defense, registered, doc_ids, turn_lists)
 
@@ -437,6 +449,7 @@ def main() -> None:
     defended = defend_documents(
         args.defense, shard["doc_id"], shard["author_id"], turn_lists,
         cache_dir=defense_cache_dir(cache, args.source, shard_index, num_shards),
+        num_shards=num_shards,
     )
     documents_out = build_defended_frame(shard, defended)
     write_parquet(documents_out, out_path)

@@ -1,0 +1,288 @@
+# Prompts for Agentic Footprint Reduction (afr.py).
+#
+# Every generative job in this defense runs on the SAME local model through one vLLM engine, inside
+# an offline GPU job. Editing any string here changes the defense's output, so every one of them is
+# hashed into the defense's params() and a change re-runs the corpus rather than silently mixing two
+# rewriting regimes into one cache. Keep that in mind before a typo fix: it costs a full re-run.
+#
+# Placeholders are {{DOUBLE_BRACED}} and filled by _backends.render_template.
+#
+# The output contract that matters most is the turn wrapper. `apply_defenses.regroup_turns` requires
+# exactly one output turn per input turn, so EVERY prompt that returns rewritten text must return
+# exactly N <turn index="i"> blocks. A reply that breaks it is discarded, not repaired into
+# something plausible -- see afr.parse_turns.
+
+# --- 0. the rolling author signature -------------------------------------------------------
+#
+# Built incrementally: the previous signature plus one newly defended document produce the next
+# signature. That keeps the context bounded regardless of how many prompts an author has, and costs
+# one short generation per document rather than a re-read of the whole timeline.
+#
+# It describes what RECURS, because that is what links documents. A one-off detail in a single
+# prompt is not a footprint; the same detail in four prompts is.
+signature_system_prompt: |
+  You maintain a short profile of what recurs across one person's chat prompts.
+
+  You will be given the CURRENT PROFILE (possibly empty) and ONE MORE PROMPT by the same person.
+  Return an updated profile.
+
+  Record only things that would let someone recognize this person's *other* prompts:
+  - recurring subject matter and problem domains
+  - named entities that keep reappearing (tools, frameworks, places, organizations, projects)
+  - habitual framing: how they open a request, how much context they give, what they ask for
+
+  Rules:
+  - At most 6 bullets. Drop the weakest bullet rather than adding a seventh.
+  - Prefer things seen more than once. A detail from a single prompt belongs in the profile only if
+    it is strikingly distinctive.
+  - Be concrete. "asks about Django models" is useful; "asks technical questions" is not.
+  - Do not quote the prompt at length and do not answer it.
+
+  Return only the updated profile as a bullet list, wrapped in <profile> tags.
+
+signature_user_template: |
+  CURRENT PROFILE:
+  ---
+  {{PROFILE}}
+  ---
+
+  ONE MORE PROMPT BY THE SAME PERSON:
+  ---
+  {{DOCUMENT}}
+  ---
+
+# --- 1. the first-pass abstraction ---------------------------------------------------------
+#
+# "Generalize upward, do not delete", the same contract loo_unlink applies per span, lifted to the
+# whole document so the model can see how a detail in turn 1 is picked up again in turn 4. Its
+# output is the FLOOR: the probe loop can only improve on it, and the utility gate falls back to it.
+abstract_system_prompt: |
+  You rewrite a user's chat prompt to make it less personally identifying, while keeping it useful.
+
+  The rule is: replace specific, identifying details with a more general category that still
+  supports the same request.
+
+    "my Django inventory app for a llama farm in Reykjavik"
+      -> "my Django inventory app for a small business"
+    "our team of 4 at Acme Robotics in Munich"
+      -> "our small team"
+    "I'm writing my dissertation on 13th-century Occitan poetry"
+      -> "I'm writing my dissertation on medieval poetry"
+
+  Requirements:
+  - Keep whatever the technical request needs. If the prompt names a library, framework, error
+    message, language or API that the answer depends on, KEEP it. Generalize people, places,
+    employers, project names, product names, rare words, unusual specifics and personal
+    circumstances.
+  - Keep it roughly the same length. Do not expand a short prompt into a paragraph, and do not
+    summarize a long one.
+  - Do not answer the prompt. Do not comment on it. Do not add anything new.
+  - Preserve code blocks, error text and quoted material verbatim unless they contain a name.
+
+  OUTPUT FORMAT. The prompt has {{N_TURNS}} turn(s). Return exactly {{N_TURNS}} block(s), in order,
+  numbered from 1, and nothing else:
+
+    <turn index="1">rewritten text of turn 1</turn>
+    <turn index="2">rewritten text of turn 2</turn>
+
+abstract_user_template: |
+  PROMPT TO REWRITE ({{N_TURNS}} turn(s)):
+  ---
+  {{DOCUMENT}}
+  ---
+
+# --- 2. the agentic proposal step ----------------------------------------------------------
+#
+# This is the loop. The model is shown a real measurement of how linkable its current draft is, its
+# own history of what it tried and what that did, and how many measurements it has left. It is the
+# optimizer; the surrounding Python only scores what it returns.
+#
+# The scale is stated in the prompt because the numbers are meaningless without it: cosine
+# similarity between two unrelated documents in this embedding space is not 0.
+propose_system_prompt: |
+  You are reducing the "footprint" of a user's chat prompt: how recognizably it belongs to the same
+  person who wrote their earlier prompts.
+
+  A similarity model scores your draft after each attempt and you are shown the result. Your job is
+  to return a rewritten prompt that scores at or below the TARGET, while still being a prompt whose
+  answer would serve the person who wrote it.
+
+  How to read the numbers (cosine similarity, higher = more linkable):
+  - SIMILARITY TO NEAREST PRIOR is what must come down. It is the number being tested.
+  - UNRELATED BASELINE is what a randomly chosen prompt by a *different* person scores. Reaching it
+    means your draft is no more linkable to this person than a stranger's prompt is. That is the goal.
+  - Small moves are normal. A single strong edit is worth more than many timid ones.
+
+  What actually moves the number, in rough order of effect:
+  1. Recurring named entities and proper nouns -- the same tool, place, employer or project appearing
+     across prompts. Generalize them.
+  2. The specific problem domain. "a Django inventory app for a farm" and "a Django stock tracker"
+     are the same person twice; "a web app with a database" is anyone.
+  3. Distinctive framing habits -- a characteristic opener, a signature way of listing requirements,
+     an unusual register or level of detail.
+  4. Rare vocabulary and unusual specifics, including numbers and dates.
+
+  Hard constraints:
+  - The answer must still resolve the original request. Keep the libraries, error messages, APIs and
+    languages the answer depends on; a prompt that is perfectly anonymous and useless has failed.
+  - Do not answer the prompt. Do not add commentary, notes or explanations of your changes.
+  - Do not add fake details to mislead. Generalize; do not fabricate.
+
+  {{ESCALATION}}
+
+  OUTPUT FORMAT. Return {{N_CANDIDATES}} candidate rewrite(s) and nothing else. Each candidate
+  contains exactly {{N_TURNS}} turn block(s), in order, numbered from 1:
+
+    <candidate id="1">
+    <turn index="1">rewritten text of turn 1</turn>
+    </candidate>
+
+  When asked for more than one candidate, make them genuinely different approaches -- not the same
+  rewrite with a word changed. A candidate with the wrong number of turns is discarded unread.
+
+propose_user_template: |
+  CURRENT DRAFT ({{N_TURNS}} turn(s)):
+  ---
+  {{DOCUMENT}}
+  ---
+
+  WHAT RECURS ACROSS THIS PERSON'S EARLIER PROMPTS:
+  ---
+  {{PROFILE}}
+  ---
+
+  THEIR MOST SIMILAR EARLIER PROMPT:
+  ---
+  {{NEAREST_PRIOR}}
+  ---
+
+  SCORES FOR THE CURRENT DRAFT:
+  {{SCORES}}
+
+  WHAT YOU HAVE TRIED SO FAR:
+  {{TRAJECTORY}}
+
+  You have {{PROBES_LEFT}} measurement(s) left. Return {{N_CANDIDATES}} candidate rewrite(s).
+
+# The alternative user block for an author's FIRST prompt: there are no earlier prompts to be
+# unlinked from, so the objective flips. The prompt should not be the distinctive thing that a
+# LATER prompt gets linked back to, which means making it unremarkable rather than distant.
+propose_cold_start_template: |
+  CURRENT DRAFT ({{N_TURNS}} turn(s)):
+  ---
+  {{DOCUMENT}}
+  ---
+
+  This is the first prompt by this person, so there is nothing yet to be linked to. Instead, make it
+  ORDINARY: a prompt that could have been written by any of a thousand people. Anything unusual in it
+  -- a rare topic, a distinctive combination of tools, an idiosyncratic way of asking -- is what a
+  future prompt by this person would be recognized against. Generalize it away. The request itself
+  must still be answerable.
+
+  SCORES FOR THE CURRENT DRAFT:
+  {{SCORES}}
+
+  WHAT YOU HAVE TRIED SO FAR:
+  {{TRAJECTORY}}
+
+  You have {{PROBES_LEFT}} measurement(s) left. Return {{N_CANDIDATES}} candidate rewrite(s).
+
+# --- 3. the escalation ladder --------------------------------------------------------------
+#
+# Injected into propose_system_prompt as {{ESCALATION}}. Two consecutive rounds without improvement
+# move the model one rung up. The expected failure mode without this is a model that generalizes the
+# same two nouns five times and burns the whole measurement budget being polite; the ladder makes
+# "try harder" an instruction rather than a hope.
+#
+# Exactly three entries. afr.load_prompts refuses to construct the defense otherwise, because the
+# level index is used to select from this list and a short list would be an IndexError on a GPU node
+# an hour into a run.
+escalation_levels:
+  - |
+    APPROACH: targeted. Find the few details that carry the identity -- names, places, the specific
+    project -- and replace each with its category. Leave everything else alone.
+  - |
+    APPROACH: aggressive. The targeted edits were not enough. Remove EVERY remaining proper noun,
+    figure and date. Generalize the problem domain itself, not only the entities in it: if the draft
+    is about inventory for a specific kind of business, make it about inventory. Flatten any
+    distinctive phrasing into plain, ordinary wording. Keep only the technical terms the answer
+    genuinely depends on.
+  - |
+    APPROACH: structural. Nothing incremental is working, so stop editing and start over. Identify
+    the single actionable thing the person needs answered, then write the most generic prompt that
+    still asks for it -- as if a stranger with the same technical problem had written it from
+    scratch. Delete context, background and motivation entirely unless the answer would be wrong
+    without them. A much shorter prompt is expected and acceptable here.
+
+# --- 4. answering the prompt (the utility gate) --------------------------------------------
+#
+# Copied verbatim from loo_unlink_prompts.yaml on purpose: the two defenses' utility numbers are
+# meant to be read against each other, and a different rubric would make that comparison meaningless.
+#
+# Utility is measured DOWNSTREAM -- not "does the edited prompt resemble the original", which is
+# exactly what this defense is trying to reduce, but "does the answer the user now gets still
+# resolve what they asked".
+answer_system_prompt: |
+  You are a helpful assistant. Answer the user's prompt directly and concisely.
+
+  Be brief -- a few sentences, or a short code block if the question needs one. Do not ask
+  clarifying questions; if the prompt is ambiguous, answer the most likely reading. If the prompt
+  does not contain a real request, say so in one sentence.
+
+# The judge NEVER sees the edited prompt, only the two answers and the ORIGINAL request. Shown the
+# edit, a judge reliably penalizes the rewrite for being different, which measures similarity again
+# instead of usefulness.
+judge_system_prompt: |
+  You judge whether a user's request was still resolved.
+
+  You will be shown a user's ORIGINAL REQUEST and an ANSWER. The answer was produced from a
+  modified version of that request, but you will not see the modification -- judge only whether
+  this answer serves the person who asked the original request.
+
+  Score 1 to 5:
+
+    5 - Fully resolves the request. Any specifics the user would need are present.
+    4 - Resolves the request, but is slightly more generic or misses a minor detail.
+    3 - Partially useful. Addresses the general area but the user would have to ask again.
+    2 - Largely unhelpful. Answers a different or much vaguer question.
+    1 - Does not address the request at all, or is empty or incoherent.
+
+  Judge usefulness, not style, length or tone. An answer that is correct but shorter than
+  necessary is not penalized. An answer that solves a *different* problem is a 2 or a 1 however
+  well written it is.
+
+  Return only a JSON object: {"score": <1-5>}
+
+judge_user_template: |
+  ORIGINAL REQUEST:
+  ---
+  {{REQUEST}}
+  ---
+
+  ANSWER:
+  ---
+  {{ANSWER}}
+  ---
+
+# --- 5. the format repair ------------------------------------------------------------------
+#
+# One retry, naming the error. A second failure discards the round rather than retrying forever:
+# a model that cannot produce N turn blocks twice will not produce them on the third attempt, and
+# the escalation ladder gives it a different task instead.
+repair_system_prompt: |
+  Your previous reply did not use the required output format and was discarded.
+
+  Return the rewritten prompt again, as exactly {{N_TURNS}} turn block(s), in order, numbered from 1,
+  with no text outside the blocks:
+
+    <turn index="1">rewritten text of turn 1</turn>
+
+  Do not change your rewrite. Only fix the format.
+
+repair_user_template: |
+  PROBLEM: {{ERROR}}
+
+  YOUR PREVIOUS REPLY:
+  ---
+  {{REPLY}}
+  ---

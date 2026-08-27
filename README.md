@@ -190,6 +190,8 @@ whole split with `apply_defenses`; the result is a drop-in replacement for the s
 | `dp_mlm_var_a10`, `dp_mlm_var_a25` | the same at ε=100 **plus the paper's adaptive-length mode** (Algorithm 3): words are dropped with probability `D`=0.05 and extra DP-drawn words inserted with probability `A`, so the rewrite no longer preserves word count or text length | GPU |
 | `rtt_argos` | round-trip translation | — |
 | `collision_seeding` (+ `_k4`, `_k24`, `_full`, `_indep`) | the only **additive** defense here: instead of erasing style it manufactures *shared* style, giving one bundle of unusual-but-natural quirks (misspellings, punctuation and casing habits, openers/closers) to a whole group of unrelated authors, so an attacker who latches onto a quirk lands on a group rather than a person | — (pure string work, CPU, seconds) |
+| `loo_unlink`, `loo_unlink_b<budget>` | goes after **content** rather than style: deletes a span, re-embeds, and measures how far the prompt moved away from its author's other prompts, then generalizes the best `linkage / utility` span upward and repeats until a fractional linkage budget is met | GPU (a 3B generator + Harrier-0.6B) |
+| `afr`, `afr_a<residual>`, `afr_stage1` | the same objective with the **model as the optimizer**: it is shown its draft's real similarity to the author's earlier prompts and given up to 10 re-embeddings to close the gap, escalating how aggressively it rewrites when it stalls. The target is absolute — no closer to your own earlier prompts than a stranger's prompt is | 80 GB GPU (a 30B FP8 agent + Harrier-0.6B) |
 
 **The model-backed defenses run locally**, through vLLM, against checkpoints on disk — no API keys,
 no data leaving the machine. Point them elsewhere with `OPENANON_MODEL` / `STYLEREMIX_BASE_MODEL`,
@@ -197,6 +199,11 @@ which accept a checkpoint directory, a HuggingFace hub cache entry, or a repo id
 
 Two behaviours worth knowing:
 
+- **Two defenses are not per-turn.** `loo_unlink` scores a whole document against its author's other
+  documents, and `afr` cascades an author's whole timeline in order (each prompt defended against the
+  already-defended text of the ones before it). Both still return one turn per input turn, so
+  everything downstream is unchanged — but neither can be sharded, and `apply_defenses` refuses
+  `--num-shards` for them rather than silently defending each document against a truncated author.
 - **Long turns are split, not truncated.** A turn too long for the model's window is cut into
   fragments, each rewritten, then rejoined — so no text is silently dropped.
 - **Very short turns pass through undefended** by the style rewriters (under 16 characters). A

@@ -36,6 +36,7 @@ from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidfFeaturizer
 from .gemini_embedding import GeminiEmbedding001Featurizer, GeminiEmbedding2Featurizer
+from .harrier import (HarrierFeaturizer, HarrierImperativeFeaturizer, HarrierPlainFeaturizer)
 from .style_distance import StyleDistanceFeaturizer
 from .luar import LuarFeaturizer
 
@@ -50,6 +51,12 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "char_ngram_tfidf": CharNgramTfidfFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
     "luar": LuarFeaturizer,
+    # Local, offline, instruction-conditioned -- the encoder the leave-one-out defense scores
+    # against. The three entries differ only in their instruction string and exist to be A/B'd
+    # against each other on undefended text; see harrier.py's module docstring.
+    "harrier": HarrierFeaturizer,
+    "harrier_imperative": HarrierImperativeFeaturizer,
+    "harrier_plain": HarrierPlainFeaturizer,
 }
 
 def get_featurizer(name: str, **options) -> Featurizer:
@@ -75,5 +82,8 @@ __all__ = [
     "get_featurizer",
     "StyleDistanceFeaturizer",
     "LuarFeaturizer",
+    "HarrierFeaturizer",
+    "HarrierImperativeFeaturizer",
+    "HarrierPlainFeaturizer",
     "_REFERENCE_FEATURE",
 ]

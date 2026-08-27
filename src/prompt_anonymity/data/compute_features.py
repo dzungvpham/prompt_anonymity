@@ -115,7 +115,14 @@ from .config import cache_dir, dist_dir, hf_dir
 # from ``build_dataset`` (which it must match): featurizing does not otherwise need the build
 # pipeline, and importing it would pull the whole raw-source and language-detection stack in
 # behind ``--help``.
-SOURCES = ("wildchat", "swe_chat", "sharechat")
+#
+# ``wildchat_small`` is DERIVED, not built from raw: it is the seeded subset
+# ``prompt_anonymity.data.build_subset`` cuts out of ``wildchat``, carrying the identical schema so
+# every stage downstream reads it like any other split. It is deliberately absent from
+# ``build_dataset.SOURCES`` -- there is no raw adapter for it, and offering it there would advertise
+# a build that cannot run. The leave-one-out defense is roughly quadratic per document, so it needs
+# a split sized for iteration rather than for coverage.
+SOURCES = ("wildchat", "wildchat_small", "swe_chat", "sharechat")
 
 # A document's text is its turns joined by a blank line. The earlier per-source scripts joined
 # with "\n===\n"; that marker is not natural writing and leaves its own fingerprint in the

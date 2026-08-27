@@ -19,6 +19,7 @@ from typing import Callable, Union
 
 from ..caching import IndexedRowCache, TransformCache, logic_hash, params_hash, source_digest
 from ..core import AttackData
+from .afr import AFR_RESIDUALS, AgenticFootprintDefense
 from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
 from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
@@ -26,6 +27,7 @@ from .dp_mlm import DPMLMDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .frame_pad import FramePadDefense
 from .frame_shift import SINGLE_FRAMING_KEY, FrameShiftDefense
+from .loo_unlink import LOO_UNLINK_BUDGETS, LOOUnlinkDefense
 from .openanonymity import OpenAnonymityDefense
 from .qwen_rewrite import QwenRewriteDefense
 from .styleremix import StyleRemixDefense
@@ -135,6 +137,36 @@ for _add in DPMLM_VARLEN_ADD_PROBS:
     )
 del _add
 
+#: Leave-one-out content unlinkability, one entry per linkage budget. Unlike every sweep above, the
+#: axis here is a *target* rather than a mechanism parameter: ``loo_unlink_b30`` edits each prompt
+#: until its similarity to its author's other prompts has fallen 30%, or until the utility allowance
+#: runs out. So the arms are not equally expensive, and a prompt is allowed to fail its budget
+#: rather than be destroyed reaching for it -- ``edits.jsonl`` records which did.
+#: ``loo_unlink`` itself is ``loo_unlink_b30`` and shares its cache (the key is name + params, not
+#: the registry key), exactly as ``dp_mlm`` and ``dp_mlm_eps100`` do.
+DEFENSES["loo_unlink"] = LOOUnlinkDefense()
+for _budget in LOO_UNLINK_BUDGETS:
+    DEFENSES[f"loo_unlink_b{int(round(_budget * 100)):02d}"] = LOOUnlinkDefense(budget=_budget)
+del _budget
+
+#: Agentic footprint reduction, one entry per residual-linkage level. The axis is a target like
+#: ``loo_unlink``'s, but an ABSOLUTE one: ``afr_a00`` edits each prompt until it is no closer to its
+#: author's earlier prompts than a stranger's prompt is, and ``afr_a50`` until half that excess is
+#: gone. So the arms are not equally expensive, and a prompt is allowed to miss its target rather
+#: than be destroyed reaching for one -- ``edits_a<NN>.jsonl`` records which did.
+#:
+#: ``afr_stage1`` is the control the whole defense stands on. It runs the same first-pass abstraction
+#: with the same model and then stops, so ``afr`` vs ``afr_stage1`` isolates *the measurement loop*
+#: rather than the model -- the ``none`` baseline is what isolates the model. If the loop buys
+#: nothing over the abstraction pass, that is the finding, and this entry is how it gets reported.
+#: ``afr`` itself is ``afr_a00`` and shares its cache (the key is name + params, not the registry
+#: key), exactly as ``dp_mlm``/``dp_mlm_eps100`` and ``loo_unlink``/``loo_unlink_b30`` do.
+DEFENSES["afr"] = AgenticFootprintDefense()
+DEFENSES["afr_stage1"] = AgenticFootprintDefense(max_probes=0)
+for _alpha in AFR_RESIDUALS:
+    DEFENSES[f"afr_a{int(round(_alpha * 100)):02d}"] = AgenticFootprintDefense(alpha=_alpha)
+del _alpha
+
 
 def get_defense(name: str) -> Defense:
     """Look up a registered defense by name."""
@@ -181,4 +213,8 @@ __all__ = [
     "CollisionSeedingDefense",
     "FrameShiftDefense",
     "FramePadDefense",
+    "LOOUnlinkDefense",
+    "LOO_UNLINK_BUDGETS",
+    "AgenticFootprintDefense",
+    "AFR_RESIDUALS",
 ]

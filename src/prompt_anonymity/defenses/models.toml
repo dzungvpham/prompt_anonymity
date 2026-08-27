@@ -18,3 +18,42 @@
 
 [openanonymity]
 model = "openai/gpt-oss-safeguard-120b"
+
+# The embedder the leave-one-out defense scores against (prompt_anonymity.features.harrier).
+#
+# UNLIKE EVERY OTHER ENTRY HERE, this one is NOT expected to download. The featurizer passes
+# local_files_only=True on purpose: the defense runs on compute nodes assumed to have no outbound
+# network, and a silent download attempt there hangs the job instead of failing it. The repo id
+# below is identity for the cache key and a hint about which weights are meant -- point
+# $HARRIER_MODEL at the copy already on your cluster:
+#
+#     HARRIER_MODEL=/path/to/harrier-oss-v1-0.6b        # in .env, not in this committed file
+#
+# Only the 0.6b size is in scope. If it cannot mount a successful baseline attack on undefended
+# text, that is a finding to report -- not a reason to reach for larger weights or a paid API.
+[harrier]
+model = "microsoft/harrier-oss-v1-0.6b"
+
+# The local generator the leave-one-out defense uses for all three of its generative jobs: the
+# "generalize upward" span rewrite, the reference/edited answer pair, and the utility rating. Shared
+# with qwen_rewrite by default because it is small enough to sit on one GPU beside Harrier-0.6B,
+# which is what keeps the roughly-quadratic scoring loop affordable.
+[loo_unlink]
+model = "Qwen/Qwen2.5-3B-Instruct"
+
+# The agent in Agentic Footprint Reduction (prompt_anonymity.defenses.afr). Unlike loo_unlink, which
+# demotes its model to a span rewriter, this one IS the optimizer: it reads a real similarity
+# measurement and decides what to change, so it needs a model that can actually reason about the
+# feedback. A 30B-class model is the floor for that.
+#
+# FP8 rather than bf16 because Harrier-0.6B co-resides on the same card: ~33 GB of weights plus a KV
+# cache leaves room on an 80 GB A100/H100/H200, and none at all on a 48 GB L40S or a 40 GB A100 --
+# see experiments/run_afr.sbatch, which constrains the job accordingly. The MoE is chosen over a
+# dense 32B on purpose: only ~3B parameters are active per token, and this defense spends ~11
+# generations per document, so decode speed is the binding cost.
+#
+# If the cluster's vllm is too old to serve FP8 MoE, "Qwen/Qwen3-32B-AWQ" at gpu_memory_utilization
+# 0.55 is the fallback and fits the ordinary gpu profile. Point $AFR_MODEL at a local copy in your
+# .env rather than editing this committed file.
+[afr]
+model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
