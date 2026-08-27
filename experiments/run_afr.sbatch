@@ -19,6 +19,10 @@
 #   FEATURE=harrier sbatch experiments/run_afr.sbatch        # the surrogate-overfit check
 #   SOURCE=swe_chat sbatch experiments/run_afr.sbatch        # default wildchat_small
 #
+# No model paths are needed on Unity: both checkpoints resolve to the cluster's mirror under
+# /datasets/ai automatically. Set AFR_MODEL / HARRIER_MODEL in .env only if your copies are filed
+# somewhere that lookup will not find, or to swap the agent's quantization.
+#
 # Anything after the script name is forwarded to run_experiment.py only (not to the build stages):
 #
 #   sbatch experiments/run_afr.sbatch --attacks nearest_neighbor logistic
@@ -86,11 +90,19 @@ echo "Agentic Footprint Reduction: $DEFENSE  (source=$SOURCE feature=$FEATURE)"
 echo "Job $SLURM_JOB_ID on $(hostname), started $(date)"
 echo "=================================================================="
 
-# Fail before the queue time is spent rather than an hour into the defend stage. Both checkpoints
-# are local-only by construction: features/harrier.py passes local_files_only=True, and the agent
-# is served by vLLM from disk.
-: "${AFR_MODEL:?set AFR_MODEL to the local Qwen3-30B-A3B-Instruct-2507-FP8 checkpoint (see .env)}"
-: "${HARRIER_MODEL:?set HARRIER_MODEL to the local harrier-oss-v1-0.6b checkpoint (see .env)}"
+# Neither $AFR_MODEL nor $HARRIER_MODEL is required: both resolve through
+# _backends.model_checkpoint, which prefers the cluster's own mirror of the repo id in models.toml
+# (/datasets/ai/*/hub/models--<org>--<name>) and falls back only when there is none. Resolve both
+# here so the log says where the weights are coming from BEFORE the queue time is spent -- the
+# failure this catches is a defend stage that stalls for twenty minutes downloading 33 GB, or dies
+# in from_pretrained because Harrier is not where it was assumed to be.
+"${RUN[@]}" python -c "
+from prompt_anonymity.defenses._backends import model_checkpoint
+model_checkpoint('afr', 'AFR_MODEL')
+model_checkpoint('harrier', 'HARRIER_MODEL', local_only=True)" || {
+    echo "FATAL: could not resolve a checkpoint. Set AFR_MODEL / HARRIER_MODEL in .env." >&2
+    exit 1
+}
 
 # vLLM has to be recent enough to serve an FP8 MoE. If this line reports something old and the
 # defend stage dies in engine startup, the documented fallback is AFR_MODEL=<Qwen3-32B-AWQ> with

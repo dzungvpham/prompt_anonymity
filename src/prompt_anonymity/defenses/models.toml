@@ -19,15 +19,22 @@
 [openanonymity]
 model = "openai/gpt-oss-safeguard-120b"
 
-# The embedder the leave-one-out defense scores against (prompt_anonymity.features.harrier).
+# The embedder the loo_unlink and afr defenses score against (prompt_anonymity.features.harrier).
 #
-# UNLIKE EVERY OTHER ENTRY HERE, this one is NOT expected to download. The featurizer passes
-# local_files_only=True on purpose: the defense runs on compute nodes assumed to have no outbound
-# network, and a silent download attempt there hangs the job instead of failing it. The repo id
-# below is identity for the cache key and a hint about which weights are meant -- point
-# $HARRIER_MODEL at the copy already on your cluster:
+# UNLIKE THE FIRST ENTRY HERE, this one is NOT expected to download. The featurizer passes
+# local_files_only=True on purpose: the defenses run on compute nodes assumed to have no outbound
+# network, and a silent download attempt there hangs the job instead of failing it.
+#
+# It resolves like [afr] below, through `_backends.model_checkpoint`: $HARRIER_MODEL, else the
+# cluster's mirror of the repo id (/datasets/ai/*/hub/models--microsoft--harrier-oss-v1-0.6b), else
+# the HuggingFace cache. So on Unity this usually needs no configuration at all; the repo id below
+# is identity for the cache key and a hint about which weights are meant. Point $HARRIER_MODEL at
+# your copy only if it is filed somewhere the mirror lookup will not find it:
 #
 #     HARRIER_MODEL=/path/to/harrier-oss-v1-0.6b        # in .env, not in this committed file
+#
+# All three registered variants (harrier, harrier_imperative, harrier_plain) read THIS section --
+# they vary the instruction, not the weights -- so do not add a section per variant.
 #
 # Only the 0.6b size is in scope. If it cannot mount a successful baseline attack on undefended
 # text, that is a finding to report -- not a reason to reach for larger weights or a paid API.
@@ -52,8 +59,19 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 # dense 32B on purpose: only ~3B parameters are active per token, and this defense spends ~11
 # generations per document, so decode speed is the binding cost.
 #
-# If the cluster's vllm is too old to serve FP8 MoE, "Qwen/Qwen3-32B-AWQ" at gpu_memory_utilization
-# 0.55 is the fallback and fits the ordinary gpu profile. Point $AFR_MODEL at a local copy in your
-# .env rather than editing this committed file.
+# THE REPO ID BELOW IS NOT NORMALLY DOWNLOADED. Unlike the other entries here, afr resolves through
+# `_backends.model_checkpoint`, which looks for the cluster's own mirror of this repo id first:
+#
+#   $AFR_MODEL                                      an explicit override, always wins
+#   /datasets/ai/*/hub/models--Qwen--Qwen3-30B...   the Unity mirror, used when it exists
+#   the repo id                                     downloaded, only when there is no mirror
+#
+# So this file stays machine-independent (a fresh clone off-cluster still works) while a Unity job
+# loads from disk with no network. The run prints which of the three it took -- check that line
+# before assuming a slow startup is the model loading rather than downloading.
+#
+# If the mirror is filed under a name that does not match the repo id, or the cluster's vllm is too
+# old to serve an FP8 MoE, set $AFR_MODEL in your .env (NOT here). "Qwen/Qwen3-32B-AWQ" at
+# gpu_memory_utilization 0.55 is the documented fallback and fits the ordinary gpu profile.
 [afr]
 model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"

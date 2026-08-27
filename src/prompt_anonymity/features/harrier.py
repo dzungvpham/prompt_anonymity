@@ -46,12 +46,23 @@ files. Report the symmetric result as what it is.
 Offline by construction
 -----------------------
 
-The weights are expected to be on the cluster already. The checkpoint resolves through the same
-``$ENV`` -> ``models.toml`` ladder the vLLM defenses use
-(:func:`~prompt_anonymity.defenses._backends.model_path`), and every ``from_pretrained`` call passes
-``local_files_only=True`` so a mis-specified path fails immediately and loudly instead of silently
-attempting a download and hanging on a compute node with no outbound network. Set ``$HARRIER_MODEL``
-in your ``.env``; do not put a machine-specific path in the committed ``models.toml``.
+The weights are expected to be on the cluster already. The checkpoint resolves through
+:func:`~prompt_anonymity.defenses._backends.model_checkpoint`, the same ladder the vLLM defenses
+use::
+
+    $HARRIER_MODEL                                   an explicit override, always wins
+    /datasets/ai/*/hub/models--microsoft--harrier..  the cluster's mirror, when it exists
+    the [harrier] repo id                            the HuggingFace cache -- NOT a download
+
+Every ``from_pretrained`` call passes ``local_files_only=True``, so the last step is a cache lookup
+that fails immediately and loudly rather than silently attempting a download and hanging on a
+compute node with no outbound network. The middle step is what lets the committed ``models.toml``
+stay a portable repo id -- the mirror holds the *same* weights in a different place, so preferring
+it never changes what is being measured. Set ``$HARRIER_MODEL`` in your ``.env`` if your copy is
+somewhere else; do not put a machine-specific path in the committed ``models.toml``.
+
+All three variants resolve through the **same** ``[harrier]`` section (:attr:`
+HarrierFeaturizer.config_section`), because the A/B varies the instruction and not the weights.
 """
 
 from __future__ import annotations
@@ -101,6 +112,13 @@ class HarrierFeaturizer(Featurizer):
     name = "harrier"
     version = "1"
 
+    #: Which ``models.toml`` section holds the checkpoint. Fixed for all three variants rather than
+    #: taken from :attr:`name`, because the A/B varies the *instruction*, not the weights -- there is
+    #: one Harrier checkpoint and three ways of prompting it. Keying on ``name`` would demand
+    #: ``[harrier_imperative]`` and ``[harrier_plain]`` sections that describe the same file, and
+    #: their absence would fail the two variants the comparison exists to run.
+    config_section = "harrier"
+
     def __init__(self, *, instruction: str | None = TASK_INSTRUCTION,
                  model: str | None = None,
                  max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -136,12 +154,24 @@ class HarrierFeaturizer(Featurizer):
     # --- model loading -------------------------------------------------------
 
     def checkpoint(self) -> str:
-        """The resolved local checkpoint directory. Raises rather than falling back to a download."""
-        # Imported here rather than at module scope so importing the features registry does not pull
-        # in the defenses package; `model_path` reads .env and models.toml, nothing heavier.
-        from ..defenses._backends import model_path, resolve_model_path
+        """The resolved local checkpoint directory. Never downloads; see the module docstring.
 
-        return resolve_model_path(self.model or model_path(self.name, MODEL_ENV_VAR))
+        Resolution is ``$HARRIER_MODEL`` -> the cluster's mirror of ``models.toml``'s ``[harrier]``
+        repo id -> the repo id itself. That middle step is what lets the committed config stay a
+        portable repo id while a Unity job still loads from disk: the mirror is the *same* weights
+        in a different place, so it never changes what is being measured. Reaching the third step is
+        not a download here -- ``local_files_only=True`` below means the HuggingFace cache is
+        consulted and a miss fails loudly, which is the intended behaviour on a node with no
+        outbound network.
+        """
+        # Imported here rather than at module scope so importing the features registry does not pull
+        # in the defenses package; these read .env, models.toml and the mirror directory, nothing
+        # heavier.
+        from ..defenses._backends import model_checkpoint, resolve_model_path, shared_checkpoint
+
+        if self.model:
+            return resolve_model_path(shared_checkpoint(self.model) or self.model)
+        return model_checkpoint(self.config_section, MODEL_ENV_VAR, local_only=True)
 
     def _ensure_model(self):
         """Load tokenizer and checkpoint on first use; returns ``(tokenizer, model, device)``."""

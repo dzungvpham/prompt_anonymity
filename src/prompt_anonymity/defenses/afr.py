@@ -899,9 +899,14 @@ class _LocalBackend:
         if self._llm is None:
             from vllm import LLM, SamplingParams
 
-            from ._backends import model_path, resolve_model_path
+            from ._backends import model_checkpoint, resolve_model_path, shared_checkpoint
 
-            path = resolve_model_path(self.model or model_path("afr", MODEL_ENV_VAR))
+            # Prefer what is already on the cluster. `models.toml` holds a repo id so a fresh clone
+            # works anywhere, but a 30B download on a compute node with no outbound network is a job
+            # that hangs at startup rather than one that fails. `model_checkpoint` prints which of
+            # the three sources it took.
+            path = (resolve_model_path(shared_checkpoint(self.model) or self.model)
+                    if self.model else model_checkpoint("afr", MODEL_ENV_VAR))
             print(f"[afr] loading agent {path} (vLLM)")
             # `seed` and `enforce_eager` are both load-bearing for reproducibility, not tuning:
             # see the determinism note in the module docstring. Harrier co-resides, so the
@@ -1429,6 +1434,36 @@ def _selftest() -> None:
           "a reordered timeline is a different cache entry (the cascade depends on order)")
     round_tripped = decode_author_output(encode_author_output([["a", "b"], ["c"]]))
     check(round_tripped == [["a", "b"], ["c"]], "an author's defended output round-trips")
+
+    print("checkpoint resolution (prefer the cluster mirror over a download):")
+    import tempfile
+
+    from ._backends import model_path, shared_checkpoint
+    with tempfile.TemporaryDirectory() as root:
+        mirror = Path(root) / "qwen3" / "hub" / "models--Qwen--Qwen3-30B-A3B-Instruct-2507-FP8"
+        mirror.mkdir(parents=True)
+        check(shared_checkpoint("Qwen/Qwen3-30B-A3B-Instruct-2507-FP8", root) == str(mirror),
+              "a mirrored repo id resolves to the checkpoint on disk")
+        check(shared_checkpoint("Qwen/Not-Mirrored", root) is None,
+              "an unmirrored repo id falls through to the download path")
+        check(shared_checkpoint("/an/explicit/path", root) is None,
+              "an absolute path is passed over, never rewritten")
+        check(shared_checkpoint("bare-name", root) is None, "a bare name is passed over")
+    check(shared_checkpoint("Qwen/Anything", "/nonexistent-root") is None,
+          "a machine with no mirror root degrades rather than raising")
+    check(model_path("afr", MODEL_ENV_VAR) if os.environ.get(MODEL_ENV_VAR) else
+          model_path("afr", "AFR_MODEL_UNSET_FOR_SELFTEST").startswith("Qwen/"),
+          "models.toml [afr] holds a portable repo id, not a machine-specific path")
+
+    # The embedder resolves the same way, and all three of its variants must reach a checkpoint --
+    # they key on one [harrier] section because the A/B varies the instruction, not the weights.
+    from ..features import get_featurizer
+    sections = {name: get_featurizer(name).config_section
+                for name in ("harrier", "harrier_imperative", "harrier_plain")}
+    check(set(sections.values()) == {"harrier"},
+          f"every Harrier variant reads the [harrier] section (got {sections})")
+    check(all(get_featurizer(name).checkpoint() for name in sections),
+          "...so none of them dies on a missing models.toml section")
 
     print("reference pool:")
     doc_ids = [f"d{index:03d}" for index in range(100)]

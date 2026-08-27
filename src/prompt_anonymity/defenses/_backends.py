@@ -254,6 +254,84 @@ def resolve_model_path(model: str) -> str:
     return str(available[0])
 
 
+#: Root of the cluster's shared HuggingFace mirror. On Unity a checkpoint lives at
+#: ``/datasets/ai/<family>/hub/models--<org>--<name>`` -- the ordinary hub cache layout, one level
+#: below a *family* directory whose name is not derivable from the repo id (``llama3`` for
+#: ``meta-llama``, ``qwen3`` for ``Qwen``, ``salt-nlp`` for ``SALT-NLP``). That is why
+#: :func:`shared_checkpoint` globs for the entry instead of constructing a path: the one component
+#: that would have to be hardcoded is the one that is guessable only by inspection.
+#: Override with ``$PROMPT_ANONYMITY_MODEL_ROOT`` on a cluster that mirrors elsewhere.
+SHARED_MODEL_ROOT = "/datasets/ai"
+SHARED_MODEL_ROOT_ENV = "PROMPT_ANONYMITY_MODEL_ROOT"
+
+
+def shared_checkpoint(repo_id: str, root: str | Path | None = None) -> str | None:
+    """The cluster's local mirror of ``repo_id``, or ``None`` when there is none.
+
+    This resolves a repo id to **the same checkpoint in a different place** -- never to a different
+    model. That distinction is what makes it safe to leave out of a defense's ``params()``: two
+    machines, one mirroring and one downloading, share a cache namespace because they load identical
+    weights. Substituting a different quantization or size here would silently invalidate that, so a
+    swap like that must stay an explicit ``$<DEFENSE>_MODEL`` choice.
+
+    Anything that is not a bare ``org/name`` repo id -- an absolute path, a bare name -- is passed
+    over, so a user who already pointed the config at a checkpoint keeps it.
+    """
+    text = str(repo_id)
+    if "/" not in text or Path(text).is_absolute() or text.count("/") != 1:
+        return None
+    base = Path(root or os.environ.get(SHARED_MODEL_ROOT_ENV) or SHARED_MODEL_ROOT)
+    if not base.is_dir():
+        return None
+    entry = "models--" + text.replace("/", "--")
+    for match in sorted(base.glob(f"*/hub/{entry}")):
+        if match.is_dir():
+            return str(match)
+    return None
+
+
+def model_checkpoint(defense: str, env_var: str, *, local_only: bool = False) -> str:
+    """The checkpoint a model-backed component should load, preferring what is already on disk.
+
+    The resolution order, most specific first:
+
+    1. ``$env_var`` -- an explicit override, always wins.
+    2. The cluster's mirror of ``models.toml``'s ``[defense].model`` (:func:`shared_checkpoint`).
+    3. That repo id itself.
+
+    Step 2 is the point of this function. Committed configs hold repo ids so a fresh clone works
+    anywhere (see ``models.toml``'s header and ``fluency.DEFAULT_FLUENCY_MODEL``), but a compute node
+    with no outbound network turns that portability into a job that hangs at startup. Preferring the
+    mirror when it exists gets both: no download on the cluster, no local-path assumption off it.
+
+    ``local_only`` says what step 3 *means* for this caller, and only changes the message. A vLLM
+    defense that reaches step 3 will download; a loader that passes ``local_files_only=True``
+    (:class:`~prompt_anonymity.features.harrier.HarrierFeaturizer`) will instead look in the
+    HuggingFace cache and fail loudly. Telling a Harrier user their weights are about to be
+    downloaded would send them looking for a network problem they do not have.
+
+    Prints which of the three it took, because "why is this job downloading 30 GB" is otherwise
+    diagnosed by watching the network rather than by reading the log.
+    """
+    override = os.environ.get(env_var)
+    if override:
+        print(f"[{defense}] checkpoint from ${env_var}: {override}")
+        return resolve_model_path(override)
+    configured = model_path(defense, env_var)
+    mirrored = shared_checkpoint(configured)
+    if mirrored:
+        print(f"[{defense}] checkpoint from the cluster mirror: {mirrored}")
+        return resolve_model_path(mirrored)
+    if local_only:
+        print(f"[{defense}] no cluster mirror of {configured!r}; it must already be in the "
+              f"HuggingFace cache -- this loader never downloads. Set ${env_var} to the copy on "
+              f"disk if it is elsewhere.")
+    else:
+        print(f"[{defense}] no cluster mirror of {configured!r}; it will be DOWNLOADED "
+              f"(set ${env_var} to a checkpoint on disk to avoid this)")
+    return resolve_model_path(configured)
+
+
 def find_bundled_cuda_toolkit() -> Path | None:
     """The CUDA toolkit pip installed into this environment, if there is one.
 
