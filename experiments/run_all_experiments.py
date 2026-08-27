@@ -167,7 +167,7 @@ FEATURES = ("stylometrix", "char_ngram_tfidf", "gemini_embedding_2")
 #: same model as ``logistic`` but minibatched on a GPU, which is why it sits below it here despite
 #: being the only one of the three that runs at WildChat's 19,711 authors: the whole
 #: six-configuration StyloMetrix grid is 20 minutes on one A16.
-ATTACKS = ("nearest_neighbor", "logistic_sgd", "logistic", "xgboost")
+ATTACKS = ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd", "logistic", "xgboost")
 
 #: Per-source attack restrictions -- a source absent here gets all of :data:`ATTACKS`.
 #:
@@ -183,7 +183,7 @@ ATTACKS = ("nearest_neighbor", "logistic_sgd", "logistic", "xgboost")
 #: not an optional extra: it roughly **doubles** WildChat's StyloMetrix top-1 over
 #: ``nearest_neighbor`` (0.0655 -> 0.1387 at ``known0075``, 1.7-2.1x on every configuration), so a
 #: grid without it reports a corpus limit where there was only a solver limit.
-SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "logistic_sgd")}
+SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd")}
 
 #: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
 #: ``DEFAULT_KNOWN_WINDOWS``. Used only to decide whether a directory is complete; this script
