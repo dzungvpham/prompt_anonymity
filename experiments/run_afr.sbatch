@@ -104,9 +104,17 @@ model_checkpoint('harrier', 'HARRIER_MODEL', local_only=True)" || {
     exit 1
 }
 
-# vLLM has to be recent enough to serve an FP8 MoE. If this line reports something old and the
-# defend stage dies in engine startup, the documented fallback is AFR_MODEL=<Qwen3-32B-AWQ> with
-# gpu_memory_utilization dropped to 0.55 in defenses/afr.py's _LocalBackend.
+# vLLM has to be recent enough to serve an FP8 MoE. If the defend stage dies during engine startup,
+# the two knobs to reach for are environment variables -- no source edit, unlike the other defenses'
+# hardcoded fractions:
+#
+#   AFR_MAX_MODEL_LEN=16384   smaller KV reservation. Raises the number of documents skipped as
+#                             "too_long" (they are emitted UNDEFENDED and counted in the edit log).
+#   AFR_GPU_MEM_UTIL=0.65     leave more of the card free; try this on an OOM at startup.
+#   AFR_MODEL=<Qwen3-32B-AWQ> the dense 4-bit fallback if this vllm cannot serve an FP8 MoE.
+#
+# Only AFR_MODEL is part of the cache key -- the other two change where the model runs, not what it
+# emits, so tuning them does not invalidate completed work.
 "${RUN[@]}" python -c "import vllm; print(f'vllm {vllm.__version__}')"
 
 # 1. Defend: the long stage. ~11 generations per document against a 30B model, cascaded per author.
@@ -129,12 +137,16 @@ model_checkpoint('harrier', 'HARRIER_MODEL', local_only=True)" || {
 echo ""
 echo "Done $(date). Results in experiments/results/${SOURCE}_${DEFENSE}_${FEATURE}_*/"
 echo ""
-echo "Read the edit log before the results -- it says whether the defense did what it claims:"
+echo "Read the edit log before the results -- it says whether the defense did what it claims."
+echo "Its exact path was printed by the defend stage above ('[afr] edit log -> ...'); the two"
+echo "hash levels are the defense's logic and params fingerprints, so glob past them:"
 echo "  jq -s 'group_by(.stop_reason)|map({(.[0].stop_reason): length})|add' \\"
-echo "     data/.cache/defended/${SOURCE}/afr_logs/edits_a*.jsonl"
+echo "     data/.cache/defended/${SOURCE}/defenses/afr/*/*/afr_logs/edits_a*.jsonl"
 echo "  target_met dominating  -> the loop is working"
 echo "  ladder_exhausted       -> the agent stalls; the propose prompt needs work"
 echo "  max_level always 0     -> escalation never fires; the trigger is mistuned"
+echo "  too_long present       -> those documents were emitted UNDEFENDED because they exceed"
+echo "                            AFR_MAX_MODEL_LEN. Read prompt_tokens off the log and raise it."
 echo ""
 echo "Then compare against the controls:"
 echo "  ${SOURCE}_afr_stage1_${FEATURE}_*   the loop ablation (same model, no probes)"

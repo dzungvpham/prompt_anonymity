@@ -404,9 +404,11 @@ class _LocalBackend:
     # -- generation --
     def _engine(self):
         if self._llm is None:
-            from vllm import LLM, SamplingParams
+            from ._backends import configure_cuda_toolkit, model_path, resolve_model_path
 
-            from ._backends import model_path, resolve_model_path
+            configure_cuda_toolkit()  # must precede the import: vLLM reads the environment at import
+
+            from vllm import LLM, SamplingParams
 
             path = resolve_model_path(self.model or model_path("loo_unlink", MODEL_ENV_VAR))
             print(f"[loo_unlink] loading generator {path} (vLLM)")

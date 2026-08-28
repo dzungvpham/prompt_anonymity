@@ -162,6 +162,23 @@ DEFAULT_PROPOSE_TOKENS = 2048
 #: Tokens for the rolling author signature. Six bullets.
 DEFAULT_SIGNATURE_TOKENS = 256
 
+#: Served context window. **Not** the checkpoint's native window, which for Qwen3-30B-A3B-2507 is
+#: 262,144 tokens: at ~96 KiB of KV cache per token that is ~24 GB reserved on top of ~33 GB of FP8
+#: weights, which lands exactly on the "max seq len is larger than the maximum number of tokens that
+#: can be stored in KV cache" startup abort -- and reserves it for nothing, since the longest thing
+#: this defense ever generates is a 2,048-token proposal. Every other vLLM defense here pins a window
+#: (openanonymity 32k, qwen_rewrite 4k, styleremix 2k); this one had not, which is a startup failure
+#: an hour into a 16-hour job.
+#:
+#: Environment-overridable, like STYLEREMIX_MAX_MODEL_LEN / QWEN_VLLM_MAX_MODEL_LEN, because the
+#: recovery path for an OOM must not be "edit committed source on the cluster".
+AFR_MAX_MODEL_LEN = int(os.environ.get("AFR_MAX_MODEL_LEN", "32768"))
+
+#: Fraction of the card vLLM may take. Below the other defenses' 0.85-0.92 because Harrier co-resides
+#: -- and Harrier loads FIRST (the reference pool is embedded before the first generation), so this
+#: has to leave room for a model that is already resident.
+AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.75"))
+
 #: Characters of the nearest prior shown to the agent. Enough to recognize what recurs; bounded so a
 #: 400-turn session cannot crowd out the draft being edited.
 NEAREST_PRIOR_CHARS = 2000
@@ -201,6 +218,7 @@ STOP_REASONS = (
     "target_met",
     "probes_exhausted",
     "ladder_exhausted",     # every escalation level stalled
+    "too_long",             # the prompt exceeds the served window; emitted UNDEFENDED, see below
 )
 
 #: What was actually emitted, recorded alongside the stop reason. Kept separate because the loop's
@@ -499,6 +517,9 @@ class DocumentTrace:
     cold_start: bool = False
     alpha: float = 0.0
     n_turns: int = 0
+    #: Rendered prompt length in the served model's tokens, or 0 when the check was skipped. A run
+    #: with many ``too_long`` documents should be read off this rather than guessed at.
+    prompt_tokens: int = 0
     original_objective: float = 0.0   # the untouched document
     baseline_objective: float = 0.0   # the stage-1 abstraction (the floor)
     final_objective: float = 0.0
@@ -559,7 +580,7 @@ def defend_document(turns, priors, prior_texts, pool, *, embed, abstract, propos
                     escalate_after: int = DEFAULT_ESCALATE_AFTER,
                     top_m: int = DEFAULT_TOP_M,
                     first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
-                    centroid=None, g_median: float | None = None,
+                    centroid=None, g_median: float | None = None, fits=None,
                     ) -> tuple[Candidate, Candidate, list, DocumentTrace]:
     """Run the abstraction pass and the probe loop over one document.
 
@@ -572,6 +593,12 @@ def defend_document(turns, priors, prior_texts, pool, *, embed, abstract, propos
     ``embed(texts) -> (n, d)`` unit rows, ``abstract(turns) -> [turn]`` and ``propose(payload) ->
     [[turn], ...]`` are injected rather than constructed here, so the loop can be exercised against
     fakes with no GPU -- see :func:`_selftest`.
+
+    ``fits(text) -> (bool, n_tokens)`` reports whether a rendered document leaves room for a reply in
+    the served window. A document that does not fit is emitted **unchanged**, with
+    ``stop_reason="too_long"``. That check has to happen here rather than being left to vLLM: the
+    cascade unit is the cache unit, so one oversized document raising inside a batched ``chat`` call
+    would lose the whole author, not one document. ``None`` disables the check (the fakes).
     """
     turns = [str(turn) for turn in turns]
     n_turns = len(turns)
@@ -595,6 +622,21 @@ def defend_document(turns, priors, prior_texts, pool, *, embed, abstract, propos
     trace = DocumentTrace(n_priors=int(priors.shape[0]) if priors.size else 0,
                           cold_start=cold_start, alpha=float(alpha), n_turns=n_turns,
                           median_genericness=float(g_median), original=join_document(turns))
+
+    # --- does it fit in the served window at all? -----------------------------
+    # Checked before the first generation, because the alternative is vLLM raising mid-batch and
+    # taking the author's whole cascade with it. Passing the document through UNDEFENDED is the same
+    # judgement `_backends.MIN_DEFEND_CHARS` already encodes: visibly undefended text is a far better
+    # failure than silently truncated text, and it is countable in the log afterwards.
+    if fits is not None:
+        ok, n_tokens = fits(render_turn_blocks(turns))
+        trace.prompt_tokens = int(n_tokens)
+        if not ok:
+            trace.stop_reason = "too_long"
+            trace.outcome = "stage1_floor"
+            trace.defended = trace.original
+            passthrough = Candidate(turns=list(turns), level=0, round_index=0)
+            return passthrough, passthrough, [passthrough], trace
 
     # --- stage 1: the abstraction pass, which is also the floor ---------------
     proposed_floor = abstract(turns)
@@ -793,6 +835,7 @@ def defend_author(documents, pool, *, embed, abstract, propose, gate, signature,
                   escalate_after: int = DEFAULT_ESCALATE_AFTER, top_m: int = DEFAULT_TOP_M,
                   max_utility_loss: float = DEFAULT_MAX_UTILITY_LOSS,
                   first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
+                  fits=None,
                   ) -> tuple[list, list]:
     """Cascade one author's whole timeline. ``documents`` is ``[(doc_id, [turn, ...]), ...]``.
 
@@ -816,7 +859,7 @@ def defend_author(documents, pool, *, embed, abstract, propose, gate, signature,
             turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
             profile=profile, alpha=alpha, max_probes=max_probes, escalate_after=escalate_after,
             top_m=top_m, first_round_candidates=first_round_candidates,
-            centroid=centroid, g_median=g_median)
+            centroid=centroid, g_median=g_median, fits=fits)
         chosen = gate_and_select(winner, floor, history, join_document(turns),
                                  gate=gate, max_utility_loss=max_utility_loss, trace=trace)
 
@@ -881,7 +924,27 @@ class _LocalBackend:
         self.seed = seed
         self._featurizer = featurizer
         self._llm = None
+        self._tokenizer = None
         self._sampling = {}
+
+    @property
+    def prompt_budget(self) -> int:
+        """Tokens a prompt may occupy: the served window minus the longest completion asked for.
+
+        The longest completion is a ``propose`` round, which returns up to three full rewrites of the
+        document in one reply. Anything over this budget cannot be served and is skipped by
+        :func:`fits_budget`'s caller rather than being truncated."""
+        return max(1, AFR_MAX_MODEL_LEN - self.propose_tokens)
+
+    def count_tokens(self, text: str) -> int:
+        """Length of ``text`` in the served model's tokens, via the engine's own tokenizer.
+
+        The engine's, not a separately loaded one: the whole point is to measure against what vLLM
+        will actually accept. Building the engine is what makes the tokenizer available, so this
+        loads it on first use exactly as :meth:`chat` does."""
+        if self._tokenizer is None:
+            self._tokenizer = self._engine().get_tokenizer()
+        return len(self._tokenizer(text).input_ids)
 
     # -- embedding --
     def featurizer(self):
@@ -897,9 +960,12 @@ class _LocalBackend:
     # -- generation --
     def _engine(self):
         if self._llm is None:
-            from vllm import LLM, SamplingParams
+            from ._backends import (configure_cuda_toolkit, model_checkpoint, resolve_model_path,
+                                    shared_checkpoint)
 
-            from ._backends import model_checkpoint, resolve_model_path, shared_checkpoint
+            configure_cuda_toolkit()  # must precede the import: vLLM reads the environment at import
+
+            from vllm import LLM, SamplingParams
 
             # Prefer what is already on the cluster. `models.toml` holds a repo id so a fresh clone
             # works anywhere, but a 30B download on a compute node with no outbound network is a job
@@ -907,12 +973,13 @@ class _LocalBackend:
             # the three sources it took.
             path = (resolve_model_path(shared_checkpoint(self.model) or self.model)
                     if self.model else model_checkpoint("afr", MODEL_ENV_VAR))
-            print(f"[afr] loading agent {path} (vLLM)")
+            print(f"[afr] loading agent {path} (vLLM), max_model_len={AFR_MAX_MODEL_LEN:,}, "
+                  f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}")
             # `seed` and `enforce_eager` are both load-bearing for reproducibility, not tuning:
             # see the determinism note in the module docstring. Harrier co-resides, so the
             # utilization is left below what a 30B FP8 model would otherwise take.
-            self._llm = LLM(model=path, dtype="auto", gpu_memory_utilization=0.75,
-                            enforce_eager=True, seed=self.seed)
+            self._llm = LLM(model=path, dtype="auto", gpu_memory_utilization=AFR_GPU_MEM_UTIL,
+                            max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=True, seed=self.seed)
             self._sampling = {
                 # Temperature 0 everywhere: the defense must be a deterministic function of its
                 # input, or the content-addressed cache would return a different cascade on a hit
@@ -1100,6 +1167,42 @@ class AgenticFootprintDefense(CachedDefense):
             "propose", n_turns)
         return [repaired] if repaired else []
 
+    def _resolve_checkpoints(self) -> None:
+        """Fail now, with a message, if either checkpoint cannot be located.
+
+        Neither model is loaded here -- only the paths are resolved, which is filesystem work. The
+        point is that a mis-configured run dies in the first second naming ``$AFR_MODEL`` or
+        ``$HARRIER_MODEL``, instead of an hour later with an ``OSError`` from inside the cascade.
+        """
+        from ..features.harrier import HarrierFeaturizer
+        from ._backends import model_checkpoint, resolve_model_path, shared_checkpoint
+
+        if self.model:
+            print(f"[{self.name}] agent checkpoint: "
+                  f"{resolve_model_path(shared_checkpoint(self.model) or self.model)}")
+        else:
+            model_checkpoint(self.name, MODEL_ENV_VAR)
+        print(f"[{self.name}] embedder checkpoint: {HarrierFeaturizer().checkpoint()}")
+
+    def _fits(self, rendered_document: str) -> tuple[bool, int]:
+        """``(fits, n_tokens)`` for a rendered document against the served window.
+
+        Measured on the document alone rather than on the fully assembled prompt: the prompt also
+        carries a system prompt, the profile and a bounded prior excerpt, so this is an
+        under-estimate by a fixed few hundred tokens. That is deliberate -- the budget already
+        subtracts a whole ``propose`` completion, which is far larger than the shortfall, so the
+        check stays conservative without having to re-render every prompt variant to measure it.
+        """
+        backend = self.backend()
+        counter = getattr(backend, "count_tokens", None)
+        if counter is None:
+            # An injected backend (the tests, or a caller supplying their own) has no tokenizer to
+            # measure against. Not being able to measure is a reason to skip the guard, never a
+            # reason to skip the document -- so it fits by default.
+            return True, 0
+        n_tokens = counter(rendered_document)
+        return n_tokens <= backend.prompt_budget, n_tokens
+
     def _signature(self, profile: str, defended_document: str) -> str:
         """Stage 0: fold one newly defended document into the rolling author profile."""
         from ._backends import extract_tagged_output
@@ -1231,6 +1334,15 @@ class AgenticFootprintDefense(CachedDefense):
         print(f"[{self.name}] {len(order):,} documents / {len(author_order):,} authors, "
               f"alpha={self.alpha:.2f}, probes<={self.max_probes}, "
               f"reference pool {len(pool_ids):,}")
+
+        # Resolve BOTH checkpoints before anything expensive starts. Without this the first failure
+        # of a mis-pointed Harrier is a bare OSError from `from_pretrained`, raised deep inside
+        # `compute` -- after the log is opened, which is what makes the symptom "an empty
+        # edits_a<NN>.jsonl and no explanation" rather than a message naming the variable to set.
+        # Skipped when a backend was injected (the tests), which has no checkpoints to resolve.
+        if self._backend is None:
+            self._resolve_checkpoints()
+
         self._open_log(cache.dir)
 
         # The pool is embedded ONCE for the whole run and then sliced per author. Re-embedding it
@@ -1264,7 +1376,8 @@ class AgenticFootprintDefense(CachedDefense):
                     alpha=self.alpha, max_probes=self.max_probes,
                     escalate_after=self.escalate_after, top_m=self.top_m,
                     max_utility_loss=self.max_utility_loss,
-                    first_round_candidates=self.first_round_candidates)
+                    first_round_candidates=self.first_round_candidates,
+                    fits=self._fits)
                 for trace in traces:
                     trace.author_id = author
                     self._write_trace(trace)
@@ -1527,6 +1640,51 @@ def _selftest() -> None:
     check(cold_trace.cold_start and cold_trace.n_priors == 0,
           "an author's first prompt takes the cold-start path")
     check(len(cold.turns) == len(turns), "...and still preserves turn count")
+
+    print("engine startup (the defects that killed the first cluster run):")
+    import inspect as _inspect
+
+    from . import loo_unlink as _loo
+    for module, engine in (("afr", _LocalBackend._engine), ("loo_unlink", _loo._LocalBackend._engine)):
+        source = _inspect.getsource(engine)
+        toolkit = source.find("configure_cuda_toolkit()")
+        vllm_import = source.find("from vllm import")
+        check(toolkit != -1 and toolkit < vllm_import,
+              f"{module}: configure_cuda_toolkit() runs BEFORE `from vllm import` "
+              f"(vLLM reads its environment at import; without it the FlashInfer sampler JIT "
+              f"can kill startup)")
+    engine_source = _inspect.getsource(_LocalBackend._engine)
+    check("max_model_len=" in engine_source,
+          "afr pins max_model_len (the checkpoint's native 262k window does not fit the KV cache)")
+    check(AFR_MAX_MODEL_LEN > DEFAULT_PROPOSE_TOKENS,
+          f"the window leaves room for a reply ({AFR_MAX_MODEL_LEN} > {DEFAULT_PROPOSE_TOKENS})")
+    knobs = AgenticFootprintDefense().params()
+    check("max_model_len" not in knobs and "gpu_memory_utilization" not in knobs,
+          "the serving knobs stay OUT of params(): they change where it runs, not what it emits")
+
+    print("oversized documents:")
+    long_turns = ["word " * 5000]
+    over, over_floor, over_history, over_trace = defend_document(
+        long_turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
+        alpha=0.0, fits=lambda text: (False, 99_999))
+    check(over_trace.stop_reason == "too_long", "a document over the window stops at 'too_long'")
+    check(over.turns == long_turns and over_trace.defended == over_trace.original,
+          "...and is emitted UNDEFENDED rather than truncated")
+    check(over_trace.prompt_tokens == 99_999, "...with its measured token count recorded")
+    check(over is over_floor and over_history == [over],
+          "...and the gate has nothing to walk back to, so it cannot be 'improved' into a crash")
+    fitted, _, _, fitted_trace = defend_document(
+        turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
+        alpha=0.0, fits=lambda text: (True, 123))
+    check(fitted_trace.stop_reason != "too_long" and fitted_trace.prompt_tokens == 123,
+          "a document that fits is defended normally and still records its length")
+    check("too_long" in STOP_REASONS, "'too_long' is a known stop reason, so the report counts it")
+
+    class _NoTokenizer:
+        prompt_budget = 10
+    unmeasurable = AgenticFootprintDefense(backend=_NoTokenizer())
+    check(unmeasurable._fits("anything at all") == (True, 0),
+          "a backend with no tokenizer skips the guard rather than skipping every document")
 
     print("the escalation ladder:")
 

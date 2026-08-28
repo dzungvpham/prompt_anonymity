@@ -71,7 +71,17 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 # before assuming a slow startup is the model loading rather than downloading.
 #
 # If the mirror is filed under a name that does not match the repo id, or the cluster's vllm is too
-# old to serve an FP8 MoE, set $AFR_MODEL in your .env (NOT here). "Qwen/Qwen3-32B-AWQ" at
-# gpu_memory_utilization 0.55 is the documented fallback and fits the ordinary gpu profile.
+# old to serve an FP8 MoE, set $AFR_MODEL in your .env (NOT here). "Qwen/Qwen3-32B-AWQ" is the
+# documented fallback and fits the ordinary gpu profile.
+#
+# Two serving knobs go with it, both environment-only and both OUTSIDE the cache key (they change
+# where the model runs, not what it emits, so tuning them does not invalidate completed work):
+#
+#     AFR_MAX_MODEL_LEN=32768   served context. NOT the checkpoint's native 262,144 -- that much KV
+#                               cache does not fit beside the weights and aborts startup. A document
+#                               whose prompt exceeds this is emitted undefended and logged
+#                               "too_long", so raise it if the edit log shows many.
+#     AFR_GPU_MEM_UTIL=0.75     fraction of the card vLLM may take. Lower than the other defenses'
+#                               because Harrier co-resides and loads first.
 [afr]
 model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
