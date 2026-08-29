@@ -79,8 +79,13 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 # OFF-CLUSTER this path does not exist and the run fails immediately, naming $AFR_MODEL. That is
 # the intended trade: a loud failure on a laptop beats a silent 30 GB download on a compute node.
 # Set $AFR_MODEL to a repo id if you actually do want it fetched.
+#: FP8 rather than the bf16 sibling beside it: 27B at bf16 is ~54 GB of weights, and with
+#: AFR_GPU_MEM_UTIL=0.75 of an 80 GB card that leaves ~4 GB for the KV cache -- with Harrier already
+#: resident OUTSIDE vLLM's budget, since it loads first. FP8 halves the weights to ~27 GB and gives
+#: the cache real room. If this checkpoint is not mirrored, the bf16 one needs AFR_GPU_MEM_UTIL=0.90
+#: and a smaller AFR_MAX_MODEL_LEN to start at all.
 [afr]
-model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
+model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B-FP8"
 
 # The previous default, kept for the record: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8" (~33 GB, MoE,
 # ~3B active). Nothing that size is mirrored on this cluster, so it would have to be downloaded to
