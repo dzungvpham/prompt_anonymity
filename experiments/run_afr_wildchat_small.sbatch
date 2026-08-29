@@ -1,73 +1,77 @@
 #!/bin/bash
 #
-# run_afr_swe_chat.sbatch -- the full AFR arm on SWE-chat, end to end:
+# run_afr_wildchat_small.sbatch -- the full AFR arm on wildchat_small, end to end:
 # defend (GPU) -> featurize with Gemini -> attack with logistic -> plot.
 #
-#   sbatch experiments/run_afr_swe_chat.sbatch
+#   sbatch experiments/run_afr_wildchat_small.sbatch
 #
 # SUBMIT FROM THE REPO ROOT. --output below is a relative path, and SLURM resolves it against the
 # directory you submit from. One-time: mkdir -p scripts/logs
 #
-# READ THIS BEFORE SUBMITTING: HOW LONG STAGE 1 IS
-# ------------------------------------------------
-# SWE-chat is 4,334 documents / 157 authors and AFR spends roughly 11 generations on each. That is
-# ~48,000 generations -- but they are BATCHED: authors are stepped through their timelines in
-# lockstep, so each stage is one vLLM call across every author in the current chunk
-# ($AFR_AUTHOR_BATCH, default 32) rather than one call per document. An earlier version issued
-# batch-1 calls and could not finish; see the module docstring in defenses/afr.py.
+# THIS IS AFR'S DESIGN TARGET, and the run to do first
+# ----------------------------------------------------
+# ~1,000 documents / 200 authors, floored at 5 documents each by build_subset's --k-min. Two
+# properties make it the corpus AFR was built for, both the opposite of swe_chat's:
 #
-# It still CANNOT be sharded across nodes -- the cascade needs an author's timeline intact and
-# `apply_defenses --num-shards` splits by document -- so all the parallelism is inside one GPU.
+#   * SHORT, UNIFORM TIMELINES. The cascade's serial dimension is an author's timeline length, so
+#     ~5 documents means ~5 lockstep steps -- against swe_chat's mean of 27.6 and a tail reaching
+#     into the hundreds, where the last steps run with one or two authors still active and the GPU
+#     mostly idle. AFR_CASCADE_DEPTH (32) exists to bound that tail and is inert here.
+#   * MORE AUTHORS THAN swe_chat (200 vs 157) IN A QUARTER THE DOCUMENTS. Authors are the unit of
+#     parallelism, so batches stay wide for the whole run rather than decaying.
 #
-# The wall clock below may still be one preemptible slice of several. --requeue plus the cache's
-# per-chunk checkpointing is what makes that safe. Unlike before, the edit log now flushes per
-# DOCUMENT, so progress is visible within minutes instead of after a whole author.
+# ~1,000 documents x ~11 generations is ~11,000 generations, roughly a quarter of swe_chat's work
+# and far better shaped. Hence the shorter wall clock below.
 #
-# MEASURE FIRST. Before committing to the full run, do a timed subset and extrapolate:
+# PREREQUISITE: the split must exist. It is not downloaded -- it is cut locally from wildchat:
 #
-#     LIMIT=20 sbatch experiments/run_afr_swe_chat.sbatch
+#     python -m prompt_anonymity.data.build_subset --data-dir data/hf --out-dir data/dist
+#
+# That writes data/dist/wildchat_small.parquet, which is why $DIST_DIR defaults to data/dist here
+# (swe_chat, by contrast, is a published split that normally lives in data/hf).
+#
+# MEASURE FIRST, even though this corpus is small:
+#
+#     LIMIT=100 sbatch experiments/run_afr_wildchat_small.sbatch
 #
 # LIMIT is a SMOKE-TEST KNOB ONLY. It truncates the defended parquet to the first N documents, and
 # stages 2-4 then join a partial defended split against the full one -- so the attack numbers from a
-# LIMIT run are meaningless. Use it to time stage 1 and to check the edit log, nothing else.
-#
-# WHY ONE JOB RATHER THAN TWO
-# ---------------------------
-# Stages 2-4 want a CPU node (a Gemini embedding is a network call, logistic is scikit-learn,
-# plotting is matplotlib) and holding a GPU through them wastes it. They are also minutes against
-# stage 1's many hours on this corpus, so splitting them into a second submission would cost more in
-# queue time and operator attention than the idle GPU is worth. If you ever re-featurize this same
-# defended parquet on another channel, do NOT re-run this script -- copy the pattern in
-# run_dpmlm_var_a10_gemini.sbatch, which starts from the parquet and never defends.
+# LIMIT run are meaningless. Use it to time stage 1 and read the edit log, nothing else. Because the
+# split is sorted by (author_id, started_at), the first N documents are whole author timelines,
+# which is what the cascade needs to be exercised properly.
 #
 # COST. Stage 2 is the only stage that spends money: one OpenRouter embedding call per document at
-# $0.20/M tokens. SWE-chat is cents. It caches by text content, so a requeue re-embeds nothing.
+# $0.20/M tokens. At ~1,000 documents this is well under a dollar. It caches by text content, so a
+# requeue re-embeds nothing.
 #
 # Overrides (sbatch exports your submitting environment, so these are read at run time):
 #
-#   DEFENSE=afr_stage1 sbatch experiments/run_afr_swe_chat.sbatch   # the loop ablation -- run it
-#   DEFENSE=afr_a50 sbatch experiments/run_afr_swe_chat.sbatch      # a weaker residual target
-#   FEATURE=harrier sbatch experiments/run_afr_swe_chat.sbatch      # free, and the overfit check
-#   LIMIT=20 sbatch experiments/run_afr_swe_chat.sbatch             # smoke only, see above
-#   PLOT=0 sbatch experiments/run_afr_swe_chat.sbatch               # skip the figures
+#   DEFENSE=afr_stage1 sbatch experiments/run_afr_wildchat_small.sbatch  # the ablation -- run it
+#   DEFENSE=afr_a50 sbatch experiments/run_afr_wildchat_small.sbatch     # weaker residual target
+#   FEATURE=harrier sbatch experiments/run_afr_wildchat_small.sbatch     # free, the overfit check
+#   LIMIT=100 sbatch experiments/run_afr_wildchat_small.sbatch           # smoke only, see above
+#   PLOT=0 sbatch experiments/run_afr_wildchat_small.sbatch              # skip the figures
 #
 # Anything after the script name is forwarded to run_experiment.py only, after this script's own
 # --attacks, so it wins:
 #
-#   sbatch experiments/run_afr_swe_chat.sbatch --attacks logistic nearest_neighbor
+#   sbatch experiments/run_afr_wildchat_small.sbatch --attacks logistic nearest_neighbor
 #
 # RESOURCES. An 80 GB card: the bf16 27B agent is ~54 GB of weights and Harrier-0.6B co-resides,
 # loading FIRST (it embeds the reference pool before any generation) so it sits OUTSIDE vLLM's
 # gpu_memory_utilization budget. bf16 rather than the FP8 sibling because an A100 has no native FP8
-# and would dequantize through Marlin on every forward pass -- spending compute to save memory on
-# the one job whose bottleneck is compute. On an H100/H200, FP8 is the better choice: set
-# AFR_MODEL=<...-FP8> and drop AFR_GPU_MEM_UTIL back to 0.75.
+# and would dequantize through Marlin on every forward pass. On an H100/H200 prefer FP8:
+# AFR_MODEL=<...-FP8> with AFR_GPU_MEM_UTIL=0.75.
 #
-# Knobs, all environment-only and all OUTSIDE the cache key, so tuning them does not invalidate
-# completed authors: AFR_GPU_MEM_UTIL (0.90), AFR_MAX_MODEL_LEN (16384), AFR_AUTHOR_BATCH (32,
-# the batch width), AFR_CASCADE_DEPTH (32), AFR_ENFORCE_EAGER (0).
+# AFR_AUTHOR_BATCH is raised to 64 here (32 elsewhere): 200 short-timeline authors means a wide
+# batch is available and cheap to hold, since a 5-document author leaves the pool quickly. Drop it
+# back to 32 or 16 if the KV cache cannot hold that many in flight.
 #
-#SBATCH --job-name=afr-swe
+# Knobs, all environment-only and all OUTSIDE the cache key, so tuning them never invalidates
+# completed authors: AFR_GPU_MEM_UTIL, AFR_MAX_MODEL_LEN, AFR_AUTHOR_BATCH, AFR_CASCADE_DEPTH,
+# AFR_ENFORCE_EAGER.
+#
+#SBATCH --job-name=afr-wcs
 #SBATCH --output=scripts/logs/%x-%j.out
 #SBATCH --open-mode=append
 #SBATCH --nodes=1
@@ -76,7 +80,7 @@
 #SBATCH --constraint=a100-80g|h100|h200
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48g
-#SBATCH --time=0-16:00:00
+#SBATCH --time=0-08:00:00
 #SBATCH --requeue
 
 set -euo pipefail
@@ -84,12 +88,16 @@ set -euo pipefail
 PROJECT="${PROMPT_ANONYMITY_PROJECT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd "$PROJECT"
 
-SOURCE="swe_chat"                       # this script is the SWE-chat arm; see run_afr.sbatch for others
+SOURCE="wildchat_small"          # this script is the wildchat_small arm; see run_afr_swe_chat.sbatch
 FEATURE="${FEATURE:-gemini_embedding_2}"
 DEFENSE="${DEFENSE:-afr}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"
 PLOT="${PLOT:-1}"
 LIMIT="${LIMIT:-}"
+
+# Wider batches than the swe_chat arm: 200 authors with ~5 documents each, so there is always
+# plenty in flight and each author leaves the pool quickly.
+export AFR_AUTHOR_BATCH="${AFR_AUTHOR_BATCH:-64}"
 
 LIMIT_ARGS=()
 if [ -n "$LIMIT" ]; then
@@ -105,17 +113,27 @@ fi
 RUN=(bash scripts/slurm_job.sh)
 
 echo "=================================================================="
-echo "AFR on SWE-chat: $DEFENSE"
-echo "  source:  $SOURCE"
-echo "  feature: $FEATURE"
-echo "  attack:  logistic"
-[ -n "$LIMIT" ] && echo "  LIMIT:   $LIMIT  (SMOKE TEST -- attack numbers will be meaningless)"
+echo "AFR on wildchat_small: $DEFENSE"
+echo "  source:       $SOURCE"
+echo "  feature:      $FEATURE"
+echo "  attack:       logistic"
+echo "  author batch: $AFR_AUTHOR_BATCH"
+[ -n "$LIMIT" ] && echo "  LIMIT:        $LIMIT  (SMOKE TEST -- attack numbers will be meaningless)"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname), started $(date)"
 echo "=================================================================="
 
-# 0. Fail before the GPU stage, not after it. A missing key discovered at stage 2 would mean the
-#    hours already spent defending were spent to reach an error. Checking for the file as well as
-#    the variable because load_dotenv is what usually supplies it, from a .env at the repo root.
+# 0a. The split is cut locally, not downloaded, so its absence is the most likely way this job dies
+#     -- and it would die AFTER the queue wait. Check it first, and say how to make it.
+if [ ! -f "$DIST_DIR/${SOURCE}.parquet" ]; then
+    echo "ERROR: no $DIST_DIR/${SOURCE}.parquet"
+    echo "wildchat_small is cut from wildchat locally; build it first with:"
+    echo "  python -m prompt_anonymity.data.build_subset --data-dir data/hf --out-dir $DIST_DIR"
+    exit 1
+fi
+
+# 0b. Fail before the GPU stage, not after it. A missing key discovered at stage 2 would mean the
+#     hours already spent defending were spent to reach an error. Checking for the file as well as
+#     the variable because load_dotenv is what usually supplies it, from a .env at the repo root.
 if [ "$FEATURE" = "gemini_embedding_2" ] \
    && [ -z "${OPENROUTER_API_KEY:-}" ] && [ ! -f "$PROJECT/.env" ]; then
     echo "ERROR: $FEATURE needs an OPENROUTER_API_KEY and there is none in the environment,"
@@ -124,18 +142,18 @@ if [ "$FEATURE" = "gemini_embedding_2" ] \
     exit 1
 fi
 
-# 0b. Resolve both checkpoints now, so a mis-pointed model is a first-second failure naming the
+# 0c. Resolve both checkpoints now, so a mis-pointed model is a first-second failure naming the
 #     variable to set rather than an OSError an hour into the cascade. This also prints WHERE the
-#     weights come from -- if that line says anything about downloading, stop the job.
+#     weights come from -- if that line mentions downloading, stop the job.
 "${RUN[@]}" python -c "
 from prompt_anonymity.defenses import get_defense
 from prompt_anonymity.features.harrier import HarrierFeaturizer
 get_defense('${DEFENSE}').agent_checkpoint()
 print('[harrier] embedder checkpoint:', HarrierFeaturizer().checkpoint())"
 
-# 1. Defend. The long stage. Authors advance in lockstep so every model call is batched across the
-#    chunk; the log prints the chunk size as it starts each one. The edit log grows per DOCUMENT,
-#    so `wc -l` on it is a live throughput reading.
+# 1. Defend. Authors advance in lockstep, so every model call is batched across the chunk; the log
+#    prints the chunk size as it starts each one. The edit log grows per DOCUMENT, so `wc -l` on it
+#    is a live throughput reading rather than something that only moves once an author finishes.
 echo ""
 echo "------------------------------------------------------------------"
 echo "[1/4] defend  ($(date))"
@@ -166,8 +184,7 @@ echo "------------------------------------------------------------------"
 
 # 4. Draw the figures. Cheap and idempotent: recomputes no attack, reads the result CSVs on disk,
 #    and its cache skips every figure nothing has moved under. --jobs is pinned to the allocation
-#    because its own default reads the node's affinity mask, and each worker holds a replicate
-#    weight matrix.
+#    because its own default reads the node's affinity mask.
 if [ "$PLOT" != "0" ]; then
     echo ""
     echo "------------------------------------------------------------------"
@@ -192,6 +209,10 @@ echo "  target_met dominating -> the loop is working"
 echo "  ladder_exhausted      -> the agent stalls; the propose prompt needs work"
 echo "  too_long              -> emitted UNDEFENDED; raise AFR_MAX_MODEL_LEN (see prompt_tokens)"
 echo "  max_level always 0    -> escalation never fires; the trigger is mistuned"
+echo ""
+echo "On THIS corpus expect many cold-start documents: build_subset floors authors at 5 documents,"
+echo "so one in five is an author's first and takes the genericness path rather than the linkage"
+echo "one. A large 'no_priors' count is correct here, not a bug."
 echo ""
 echo "What to compare, and what each comparison answers:"
 echo "  vs ${SOURCE}_base_${FEATURE}_logistic        -- how much attribution the defense removed"

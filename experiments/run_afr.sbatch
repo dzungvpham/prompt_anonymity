@@ -37,24 +37,23 @@
 #       Harrier is what the defense optimized against, so a large drop here with no drop on
 #       gemini_embedding_2 is surrogate overfitting. Report it as such rather than burying it.
 #
-# WHY gpu_large RESOURCES. Unlike the other defense sbatch files, this one does NOT mirror
-# [profiles.gpu] in scripts/slurm.toml. The agent is a 30B-class model in FP8 (~33 GB of weights
-# plus a KV cache) and Harrier-0.6B co-resides on the same card, so a 48 GB L40S or a 40 GB A100
-# will OOM during engine startup. The constraint below asks for an 80 GB card. If your cluster
-# names those differently, this line and scripts/slurm.toml are the only places to change.
+# WHY AN 80 GB CARD. The bf16 27B agent is ~54 GB of weights and Harrier-0.6B co-resides, loading
+# FIRST (it embeds the reference pool) so it sits OUTSIDE vLLM's gpu_memory_utilization budget.
+# bf16 rather than FP8 because an A100 has no native FP8 and would dequantize through Marlin on
+# every forward pass. On H100/H200, prefer FP8: AFR_MODEL=<...-FP8> with AFR_GPU_MEM_UTIL=0.75.
 #
-# The wall clock is 16h rather than 12: AFR spends roughly 11 generations per document against a
-# large model, and unlike the DP-MLM jobs it cannot be sharded (see below).
+# THROUGHPUT. Authors advance in LOCKSTEP, so each stage is one batched vLLM call across the whole
+# chunk ($AFR_AUTHOR_BATCH, default 32) rather than one call per document. See the module docstring
+# in defenses/afr.py for why that matters and what it replaced.
 #
 # NO SHARDING. `apply_defenses --num-shards` splits by document, and this defense cascades each
 # author's timeline in order -- a shard holding an arbitrary subset of an author would defend
-# document k against the wrong priors. `apply_defenses` refuses the run outright. The subset this
-# is built for (`wildchat_small`, ~200 authors) does not need it.
+# document k against the wrong priors. `apply_defenses` refuses the run outright.
 #
 # PREEMPTION IS SAFE. gpu-preempt jobs get killed; --requeue puts this back in the queue and all
-# three stages resume rather than restart -- apply_defenses checkpoints its cache every 5 AUTHORS
-# (the cascade's atomic unit, so a resumed job never restarts an author mid-timeline),
-# compute_features caches per text, and run_experiment skips finished output.
+# three stages resume rather than restart -- apply_defenses checkpoints its cache per author chunk,
+# compute_features caches per text, and run_experiment skips finished output. The edit log flushes
+# per DOCUMENT, so progress is visible inside an unfinished chunk.
 #
 #SBATCH --job-name=afr
 #SBATCH --output=scripts/logs/%x-%j.out
@@ -62,7 +61,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=gpu-preempt
 #SBATCH --gpus=1
-#SBATCH --constraint=sm_90|a100-80g
+#SBATCH --constraint=a100-80g|h100|h200
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48g
 #SBATCH --time=0-16:00:00
@@ -104,16 +103,16 @@ model_checkpoint('harrier', 'HARRIER_MODEL', local_only=True)" || {
     exit 1
 }
 
-# vLLM has to be recent enough to serve an FP8 MoE. If the defend stage dies during engine startup,
-# the two knobs to reach for are environment variables -- no source edit, unlike the other defenses'
-# hardcoded fractions:
+# If the defend stage dies during engine startup, every knob is an environment variable -- no source
+# edit, unlike the other defenses' hardcoded fractions:
 #
-#   AFR_MAX_MODEL_LEN=16384   smaller KV reservation. Raises the number of documents skipped as
-#                             "too_long" (they are emitted UNDEFENDED and counted in the edit log).
-#   AFR_GPU_MEM_UTIL=0.65     leave more of the card free; try this on an OOM at startup.
-#   AFR_MODEL=<Qwen3-32B-AWQ> the dense 4-bit fallback if this vllm cannot serve an FP8 MoE.
+#   AFR_GPU_MEM_UTIL=0.85     leave more of the card free; try this first on an OOM at startup.
+#   AFR_MAX_MODEL_LEN=8192    smaller KV reservation. Raises the number of documents skipped as
+#                             "too_long" (emitted UNDEFENDED and counted in the edit log).
+#   AFR_AUTHOR_BATCH=16       narrower batches if the KV cache cannot hold 32 authors in flight.
+#   AFR_MODEL=<a smaller one> last resort.
 #
-# Only AFR_MODEL is part of the cache key -- the other two change where the model runs, not what it
+# Only AFR_MODEL is part of the cache key -- the rest change where the model runs, not what it
 # emits, so tuning them does not invalidate completed work.
 "${RUN[@]}" python -c "import vllm; print(f'vllm {vllm.__version__}')"
 

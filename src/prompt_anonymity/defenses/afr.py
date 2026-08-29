@@ -53,28 +53,48 @@ rather than per document (see :meth:`AgenticFootprintDefense.transform`). ``shar
 the same reason as ``loo_unlink``, one level stronger: a shard holding an arbitrary subset of an
 author would not merely mis-measure the baseline, it would cascade from the wrong documents.
 
-Determinism is engineered, not incidental
------------------------------------------
+Throughput: why this batches across authors
+-------------------------------------------
 
-A cascade compounds drift: one flipped token in document 2 means documents 3..k are computed from a
-different input, and a content-addressed cache that returns different text on a hit than on a miss
-puts two regimes in one parquet. Every source is closed deliberately:
+An earlier version of this file enforced **bitwise** determinism -- every ``chat()`` call at a fixed
+batch size (1 for most stages), ``enforce_eager=True``, authors processed strictly one at a time --
+on the reasoning that greedy decoding is not batch-invariant, so a cache hit could return different
+text than a cache miss.
 
-1. **The cascade unit is the cache unit.** An author is always recomputed from its first document.
-   There is no partial state to restore inconsistently.
-2. **vLLM greedy decoding is not batch-invariant.** ``temperature=0`` fixes the sampling rule, not
-   the arithmetic -- continuous batching changes reduction order, which occasionally flips a token.
-   So: ``seed=`` and ``enforce_eager=True`` on the engine; **every** generation is a fixed-size
-   ``chat()`` call (1 for signature/abstract/propose/repair -- a multi-candidate round asks for its
-   candidates inside *one* reply -- and 2 for the answer and judge pairs), never "however many are
-   pending"; and authors are processed strictly one at a time in sorted ``author_id`` order.
-3. **Seeded sampling over a sorted list.** The reference pool follows ``build_subset.select_authors``:
-   sort by ``doc_id`` *before* drawing, so a rebuild that changes row order does not move the sample.
-4. **No** :func:`hash`. Python's string hash is salted per process. (``loo_unlink._fake_backend``
-   uses it and is, as a result, not reproducible across processes; this module uses ``zlib.crc32``.)
-5. What is *not* claimed: bitwise equality across different GPU models, drivers or vLLM builds. The
-   reproducibility artifacts of record are the cache table and ``edits_a<NN>.jsonl``. Bump
-   :attr:`AgenticFootprintDefense.version` when the serving stack changes.
+That contract cost roughly two orders of magnitude and made the defense unrunnable. Decode is
+memory-bandwidth bound: at batch 1 the whole weight matrix is read from HBM to emit one token, and at
+batch 128 the same read emits 128. The sibling defenses hand vLLM **~1,000 sequences per call** and
+finish swe_chat in ~47 engine calls (:func:`~._backends.defend_conversations_per_turn`); this file
+was issuing ~35,000 calls of one sequence each. It was also a stricter bar than the project applies
+anywhere else -- ``styleremix`` ships with ``temperature=0.6``.
+
+So the contract is now **seeded and logged, not bitwise**, and the loop is structured for batching:
+
+1. **Lockstep across authors.** Documents *within* an author stay serial, because the cascade is
+   causal. Authors are independent, so :func:`defend_authors` steps every author's timeline together
+   and batches each stage across all of them -- one ``chat()`` per stage per position, not per
+   document. :func:`defend_documents` is the batched core; :func:`defend_document` is a
+   single-document wrapper over it, so both paths run the same code.
+2. **The abstraction pass is batched corpus-wide.** Stage 1 reads no prior state, so every document
+   in the split is abstracted before the cascade starts. This is also what makes the ``afr_stage1``
+   ablation cheap rather than as expensive as the full arm.
+3. **The cascade is capped** at :data:`AFR_CASCADE_DEPTH`, which bounds the number of lockstep steps
+   and stops a single 400-document author from serializing the endgame at batch 1.
+4. **Prefix caching is on.** The system prompt is shared by every call in the corpus and the author
+   profile repeats across a document's proposal rounds.
+
+What survives from the old contract, because it is free:
+
+* ``temperature=0.0`` and ``seed=`` everywhere -- greedy decoding is near-deterministic in practice;
+  what was dropped is the *guarantee*, not the intent.
+* **Seeded sampling over a sorted list.** The reference pool follows ``build_subset.select_authors``:
+  sort by ``doc_id`` *before* drawing, so a rebuild that changes row order does not move the sample.
+* **No** :func:`hash`. Python's string hash is salted per process. (``loo_unlink._fake_backend``
+  uses it and is, as a result, not reproducible across processes; this module uses ``zlib.crc32``.)
+
+The reproducibility artifacts of record are the cache table and ``edits_a<NN>.jsonl``, which record
+every score and edit per document. **Do not restore the fixed-batch rule to chase bit-equality**
+without measuring what it costs -- that is the mistake this note exists to prevent repeating.
 
 Command line::
 
@@ -147,9 +167,16 @@ DEFAULT_N_REFERENCE = 512
 #: Seed for the reference-pool draw. The project-wide default (build_subset, run_experiment).
 DEFAULT_SEED = 47
 
-#: Authors between cache checkpoints. An author is the atomic unit of the cascade, so this is also
-#: the granularity a preemption can cost -- roughly 25-100 documents at ``wildchat_small``'s shape.
-DEFAULT_CHECKPOINT_EVERY = 5
+#: Authors per cache chunk -- and therefore the **batch width**, since every author in a chunk is
+#: stepped through its timeline in lockstep and each stage is one batched model call across them.
+#: The two roles are inseparable here exactly as they are for the sibling defenses, where
+#: ``checkpoint_every`` is likewise both flush cadence and batch size.
+#:
+#: 32 rather than the 5 this started at: 5 authors meant ~5-wide batches, which on a
+#: memory-bandwidth-bound decode is barely better than the batch-1 loop it replaced. The cost of
+#: raising it is that a preemption discards up to one chunk of authors -- acceptable because the
+#: edit log now flushes per DOCUMENT, so progress is visible even inside an unfinished chunk.
+DEFAULT_CHECKPOINT_EVERY = int(os.environ.get("AFR_AUTHOR_BATCH", "32"))
 
 #: Tokens for a generated answer in the utility gate. Short on purpose: the judge compares whether a
 #: request was resolved, not prose quality.
@@ -174,10 +201,32 @@ DEFAULT_SIGNATURE_TOKENS = 256
 #: recovery path for an OOM must not be "edit committed source on the cluster".
 AFR_MAX_MODEL_LEN = int(os.environ.get("AFR_MAX_MODEL_LEN", "32768"))
 
-#: Fraction of the card vLLM may take. Below the other defenses' 0.85-0.92 because Harrier co-resides
-#: -- and Harrier loads FIRST (the reference pool is embedded before the first generation), so this
-#: has to leave room for a model that is already resident.
-AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.75"))
+#: Fraction of the card vLLM may take. Harrier co-resides -- and loads FIRST, since the reference
+#: pool is embedded before the first generation -- so this has to leave room for a model that is
+#: already resident. 0.90 because the default checkpoint is now bf16 (~54 GB) rather than FP8: an
+#: A100 has no native FP8, so an FP8 checkpoint there is dequantized through Marlin on every forward
+#: pass, which costs compute to save memory we do not need to save.
+AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.90"))
+
+#: CUDA graphs and torch.compile. **On by default now.** This was ``True`` (i.e. disabled) to keep
+#: greedy decoding bit-reproducible; see the determinism note in the module docstring for why that
+#: contract was dropped. It is unusually expensive here because the default checkpoint is a hybrid
+#: Mamba/attention model whose Triton kernels get neither fusion nor graph capture in eager mode.
+AFR_ENFORCE_EAGER = os.environ.get("AFR_ENFORCE_EAGER", "") == "1"
+
+#: How deep the causal cascade runs before an author's remaining documents stop extending the chain.
+#:
+#: The cascade is what serializes work: document ``k`` needs the defended text of ``1..k-1``, so an
+#: author's timeline is a chain of that length and the lockstep driver needs ``max(timeline)`` steps.
+#: On a corpus with a long tail -- swe_chat averages 27.6 documents per author but reaches into the
+#: hundreds -- the last few hundred steps run with one or two authors still active, at which point
+#: the GPU is idle and those steps dominate the wall clock.
+#:
+#: Past this depth an author's documents all score against the same first ``N`` defended documents.
+#: They are then mutually independent, so they batch together in one wide step instead of a chain.
+#: The causal ordering is preserved exactly where it carries information -- a 33rd prompt learns
+#: little from prompts 33..449 that it did not already learn from 1..32 -- and the endgame is bounded.
+AFR_CASCADE_DEPTH = int(os.environ.get("AFR_CASCADE_DEPTH", "32"))
 
 #: Opt-in to fetching a checkpoint that is not already on disk. **Off by default, and that default is
 #: the point.** vLLM treats anything that is not a local directory as a hub repo id and downloads it
@@ -582,6 +631,274 @@ def _format_trajectory(rounds, cold_start: bool) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class _DocState:
+    """One document's in-flight state inside the lockstep driver.
+
+    The probe loop used to be a ``while`` inside a per-document function, which meant one vLLM call
+    per document per round -- batch size 1, and the reason the defense could not finish. Hoisting
+    that loop's variables into a record lets :func:`defend_documents` advance many documents through
+    the *same* round together and issue one batched call per stage. See the module docstring.
+    """
+
+    turns: list
+    priors: np.ndarray
+    prior_texts: list
+    pool: np.ndarray
+    centroid: np.ndarray
+    g_median: float
+    profile: str
+    cold_start: bool
+    trace: DocumentTrace
+    top_m: int = DEFAULT_TOP_M
+    floor: Candidate | None = None
+    best: Candidate | None = None
+    history: list = field(default_factory=list)
+    rounds: list = field(default_factory=list)
+    target: float = 0.0
+    loop_target: float = 0.0
+    level: int = 0
+    stalled: int = 0
+    probes: int = 0
+    round_index: int = 0
+    stop_reason: str = ""
+    finished: bool = False
+    pending: list = field(default_factory=list)   # this round's admissible candidates
+
+    def score(self, vector: np.ndarray, level: int, round_index: int) -> Candidate:
+        s_max, s_top3, r_med = objective_scores(vector, self.priors, self.pool, self.top_m)
+        generic = float(vector @ self.centroid) if self.centroid.size else 0.0
+        candidate = Candidate(turns=[], level=level, round_index=round_index, s_max=s_max,
+                              s_top3=s_top3, r_med=r_med, genericness=generic, vector=vector)
+        # One lower-is-better number for both regimes, so the loop has a single comparison.
+        candidate.objective = -generic if self.cold_start else s_max
+        return candidate
+
+    def finish(self, reason: str) -> None:
+        self.stop_reason = reason
+        self.finished = True
+
+
+def _new_state(turns, priors, prior_texts, pool, *, profile, alpha, top_m,
+               centroid=None, g_median=None) -> _DocState:
+    """A :class:`_DocState` with its scoring context resolved but nothing computed yet."""
+    turns = [str(turn) for turn in turns]
+    priors = np.asarray(priors, dtype=float) if priors is not None else np.zeros((0, 0))
+    pool = np.asarray(pool, dtype=float) if pool is not None else np.zeros((0, 0))
+    if centroid is None:
+        centroid = pool_centroid(pool)
+    if g_median is None:
+        g_median = median_genericness(pool, centroid)
+    cold_start = priors.size == 0
+    trace = DocumentTrace(n_priors=int(priors.shape[0]) if priors.size else 0,
+                          cold_start=cold_start, alpha=float(alpha), n_turns=len(turns),
+                          median_genericness=float(g_median), original=join_document(turns))
+    return _DocState(turns=turns, priors=priors, prior_texts=list(prior_texts or []), pool=pool,
+                     centroid=centroid, g_median=float(g_median), profile=profile or "",
+                     cold_start=cold_start, trace=trace, top_m=top_m)
+
+
+def _round_payload(state: _DocState, max_probes: int, first_round_candidates: int) -> dict:
+    """The prompt context for one proposal round. Pure formatting; no model call."""
+    want = first_round_candidates if state.round_index == 0 else 1
+    want = min(want, max_probes - state.probes)
+    return {
+        "turns": state.best.turns,
+        "n_turns": len(state.turns),
+        "want": want,
+        "profile": state.profile,
+        "nearest_prior": nearest_prior_text(state.best, state.priors, state.prior_texts),
+        "scores": _format_scores(state.best, state.target, state.cold_start, state.top_m),
+        "trajectory": _format_trajectory(state.rounds, state.cold_start),
+        "probes_left": max_probes - state.probes,
+        "level": state.level,
+        "cold_start": state.cold_start,
+    }
+
+
+def _absorb_round(state: _DocState, vectors: np.ndarray, escalate_after: int) -> None:
+    """Score this round's candidates, update the best, and advance the escalation ladder."""
+    state.round_index += 1
+    record = RoundRecord(round_index=state.round_index, level=state.level,
+                         requested=len(state.pending) or 1, admissible=len(state.pending),
+                         probes_used=0)
+    if len(state.pending) == 0:
+        record.note = "no admissible candidate"
+        state.stalled += 1
+    else:
+        state.probes += len(state.pending)
+        record.probes_used = len(state.pending)
+        scored = []
+        for position, candidate_turns in enumerate(state.pending):
+            candidate = state.score(vectors[position], state.level, state.round_index)
+            candidate.turns = list(candidate_turns)
+            scored.append(candidate)
+            state.history.append(candidate)
+        round_best = min(scored, key=lambda item: item.objective)
+        record.objectives = [round(item.objective, 6) for item in scored]
+        record.best_objective = round_best.objective
+        if round_best.objective < state.best.objective - IMPROVEMENT_EPSILON:
+            state.best = round_best
+            record.improved = True
+            state.stalled = 0
+        else:
+            state.stalled += 1
+    state.rounds.append(record)
+    state.pending = []
+
+    if state.best.objective <= state.loop_target:
+        state.finish("target_met")
+    elif state.stalled >= escalate_after:
+        state.level += 1
+        state.stalled = 0
+        if state.level >= N_ESCALATION_LEVELS:
+            state.finish("ladder_exhausted")
+
+
+def _finalize(state: _DocState) -> tuple[Candidate, Candidate, list, DocumentTrace]:
+    trace = state.trace
+    trace.stop_reason = state.stop_reason
+    trace.rounds = state.rounds
+    trace.probes_used = state.probes
+    trace.n_rounds = len(state.rounds)
+    trace.max_level = max((candidate.level for candidate in state.history), default=0)
+    trace.final_objective = state.best.objective
+    trace.target_met = state.best.objective <= state.loop_target
+    trace.nearest_prior_index = nearest_prior_index(state.best, state.priors, state.prior_texts)
+    return state.best, state.floor, state.history, trace
+
+
+def defend_documents(items, *, embed, abstract, propose, alpha: float = DEFAULT_ALPHA,
+                     max_probes: int = DEFAULT_MAX_PROBES,
+                     escalate_after: int = DEFAULT_ESCALATE_AFTER,
+                     top_m: int = DEFAULT_TOP_M,
+                     first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
+                     fits=None) -> list:
+    """Defend many **independent** documents in lockstep, one batched model call per stage.
+
+    ``items`` is a list of dicts with ``turns``, ``priors``, ``prior_texts``, ``pool`` and optionally
+    ``profile``/``centroid``/``g_median``. Independence is the caller's contract: documents from the
+    same author at different cascade positions must NOT be passed together, because a later one is
+    conditioned on an earlier one's output. :func:`defend_authors` is what enforces that.
+
+    The injected callables are **batched**, mirroring
+    :meth:`~._backends.PerTurnBatchRewriteDefense.rewrite_batch`:
+
+    * ``embed(texts) -> (n, d)`` unit rows
+    * ``abstract(list_of_turnlists) -> list of turnlist-or-None``
+    * ``propose(list_of_payloads) -> list of list-of-candidate-turnlists``
+
+    ``fits(text) -> (bool, n_tokens)`` reports whether a rendered document leaves room for a reply in
+    the served window. A document that does not fit is emitted **unchanged**, with
+    ``stop_reason="too_long"``, rather than being left to raise inside a batched ``chat`` call and
+    take every other document in that batch with it. ``None`` disables the check (the fakes).
+    """
+    states = [_new_state(item["turns"], item.get("priors"), item.get("prior_texts"),
+                         item.get("pool"), profile=item.get("profile", ""), alpha=alpha,
+                         top_m=top_m, centroid=item.get("centroid"),
+                         g_median=item.get("g_median"))
+              for item in items]
+
+    # --- window check, before any generation (no model call) ------------------
+    for state in states:
+        if fits is None:
+            continue
+        ok, n_tokens = fits(render_turn_blocks(state.turns))
+        state.trace.prompt_tokens = int(n_tokens)
+        if not ok:
+            passthrough = Candidate(turns=list(state.turns), level=0, round_index=0)
+            state.floor = state.best = passthrough
+            state.history = [passthrough]
+            state.trace.outcome = "stage1_floor"
+            state.trace.defended = state.trace.original
+            state.finish("too_long")
+
+    live = [state for state in states if not state.finished]
+
+    # --- stage 1: one batched abstraction pass over every live document -------
+    if live:
+        proposals = abstract([state.turns for state in live])
+        for state, proposed in zip(live, proposals):
+            if not admissible(proposed, state.turns):
+                # A pass-through is visibly undefended, which is a far better failure than splicing
+                # a truncated or fabricated rewrite into the dataset. Recorded so a run where it is
+                # common is diagnosable as a prompt problem rather than read as a weak defense.
+                proposed = list(state.turns)
+                state.trace.stage1_ok = False
+            state.pending = [proposed]
+
+        # Floors and originals in ONE embedding call rather than two per document.
+        floor_texts = [join_document(state.pending[0]) for state in live]
+        original_texts = [join_document(state.turns) for state in live]
+        vectors = embed(floor_texts + original_texts)
+        for index, state in enumerate(live):
+            floor = state.score(vectors[index], 0, 0)
+            floor.turns = list(state.pending[0])
+            state.pending = []
+            state.floor = state.best = floor
+            state.history = [floor]
+            state.trace.stage1 = join_document(floor.turns)
+            state.trace.baseline_objective = floor.objective
+            state.trace.r_med_baseline = floor.r_med
+            state.trace.original_objective = state.score(
+                vectors[len(live) + index], 0, 0).objective
+
+            target = (genericness_target(floor.genericness, state.g_median, alpha)
+                      if state.cold_start else linkage_target(floor.s_max, floor.r_med, alpha))
+            state.trace.target = float(target)
+            state.target = target
+            # Both regimes compare lower-is-better, so the cold-start target is negated alongside
+            # its objective rather than special-casing every comparison.
+            state.loop_target = -target if state.cold_start else target
+
+            if state.cold_start and state.pool.size == 0:
+                state.finish("no_priors")
+            elif floor.objective <= state.loop_target:
+                state.finish("no_priors" if state.cold_start else "stage1_sufficient")
+            elif max_probes <= 0:
+                state.finish("no_probes")
+
+    # --- stage 2: the probe loop, all live documents advancing together -------
+    while True:
+        active = []
+        for state in states:
+            if state.finished:
+                continue
+            if state.probes >= max_probes:
+                state.finish("probes_exhausted")
+                continue
+            active.append(state)
+        if not active:
+            break
+
+        payloads = [_round_payload(state, max_probes, first_round_candidates)
+                    for state in active]
+        # A payload asking for zero candidates means the budget ran out mid-round; treat it as
+        # exhausted rather than sending an empty request.
+        exhausted = [state for state, payload in zip(active, payloads) if payload["want"] <= 0]
+        for state in exhausted:
+            state.finish("probes_exhausted")
+        active = [state for state, payload in zip(active, payloads) if payload["want"] > 0]
+        payloads = [payload for payload in payloads if payload["want"] > 0]
+        if not active:
+            break
+
+        for state, candidates in zip(active, propose(payloads)):
+            state.pending = [candidate for candidate in candidates
+                             if admissible(candidate, state.turns)]
+
+        # Every candidate from every document, embedded in one call.
+        flat = [join_document(candidate) for state in active for candidate in state.pending]
+        vectors = embed(flat) if flat else np.zeros((0, 0))
+        offset = 0
+        for state in active:
+            count = len(state.pending)
+            _absorb_round(state, vectors[offset:offset + count], escalate_after)
+            offset += count
+
+    return [_finalize(state) for state in states]
+
+
 def defend_document(turns, priors, prior_texts, pool, *, embed, abstract, propose,
                     profile: str = "", alpha: float = DEFAULT_ALPHA,
                     max_probes: int = DEFAULT_MAX_PROBES,
@@ -590,170 +907,22 @@ def defend_document(turns, priors, prior_texts, pool, *, embed, abstract, propos
                     first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
                     centroid=None, g_median: float | None = None, fits=None,
                     ) -> tuple[Candidate, Candidate, list, DocumentTrace]:
-    """Run the abstraction pass and the probe loop over one document.
+    """One document through :func:`defend_documents`. Returns ``(winner, floor, history, trace)``.
 
-    Returns ``(winner, floor, history, trace)``: the best-scoring candidate, the stage-1 abstraction
-    that the utility gate falls back to, every admissible candidate seen (so the gate can walk back
-    down the escalation ladder), and the trace. The gate itself runs in
-    :func:`gate_and_select`, one level up, because it is the only part that needs a second round of
-    generation *after* the loop has finished.
-
-    ``embed(texts) -> (n, d)`` unit rows, ``abstract(turns) -> [turn]`` and ``propose(payload) ->
-    [[turn], ...]`` are injected rather than constructed here, so the loop can be exercised against
-    fakes with no GPU -- see :func:`_selftest`.
-
-    ``fits(text) -> (bool, n_tokens)`` reports whether a rendered document leaves room for a reply in
-    the served window. A document that does not fit is emitted **unchanged**, with
-    ``stop_reason="too_long"``. That check has to happen here rather than being left to vLLM: the
-    cascade unit is the cache unit, so one oversized document raising inside a batched ``chat`` call
-    would lose the whole author, not one document. ``None`` disables the check (the fakes).
+    A thin wrapper, kept because a single document is the readable unit to reason about and to test.
+    It takes the **unbatched** callables (``abstract(turns)``, ``propose(payload)``) and adapts them,
+    so a caller with one document does not have to think in lists -- but the code underneath is the
+    same batched path production uses, which is what keeps the two from drifting apart.
     """
-    turns = [str(turn) for turn in turns]
-    n_turns = len(turns)
-    priors = np.asarray(priors, dtype=float) if priors is not None else np.zeros((0, 0))
-    pool = np.asarray(pool, dtype=float) if pool is not None else np.zeros((0, 0))
-    cold_start = priors.size == 0
-    if centroid is None:
-        centroid = pool_centroid(pool)
-    if g_median is None:
-        g_median = median_genericness(pool, centroid)
-
-    def score(vector: np.ndarray, level: int, round_index: int) -> Candidate:
-        s_max, s_top3, r_med = objective_scores(vector, priors, pool, top_m)
-        generic = float(vector @ centroid) if centroid.size else 0.0
-        candidate = Candidate(turns=[], level=level, round_index=round_index, s_max=s_max,
-                              s_top3=s_top3, r_med=r_med, genericness=generic, vector=vector)
-        # One lower-is-better number for both regimes, so the loop has a single comparison.
-        candidate.objective = -generic if cold_start else s_max
-        return candidate
-
-    trace = DocumentTrace(n_priors=int(priors.shape[0]) if priors.size else 0,
-                          cold_start=cold_start, alpha=float(alpha), n_turns=n_turns,
-                          median_genericness=float(g_median), original=join_document(turns))
-
-    # --- does it fit in the served window at all? -----------------------------
-    # Checked before the first generation, because the alternative is vLLM raising mid-batch and
-    # taking the author's whole cascade with it. Passing the document through UNDEFENDED is the same
-    # judgement `_backends.MIN_DEFEND_CHARS` already encodes: visibly undefended text is a far better
-    # failure than silently truncated text, and it is countable in the log afterwards.
-    if fits is not None:
-        ok, n_tokens = fits(render_turn_blocks(turns))
-        trace.prompt_tokens = int(n_tokens)
-        if not ok:
-            trace.stop_reason = "too_long"
-            trace.outcome = "stage1_floor"
-            trace.defended = trace.original
-            passthrough = Candidate(turns=list(turns), level=0, round_index=0)
-            return passthrough, passthrough, [passthrough], trace
-
-    # --- stage 1: the abstraction pass, which is also the floor ---------------
-    proposed_floor = abstract(turns)
-    if not admissible(proposed_floor, turns):
-        # A pass-through here is visibly undefended, which is a far better failure than splicing a
-        # truncated or fabricated rewrite into the dataset. Recorded so a run where it is common is
-        # diagnosable as a prompt problem rather than read as a weak defense.
-        proposed_floor = list(turns)
-        trace.stage1_ok = False
-    floor_vector = embed([join_document(proposed_floor)])[0]
-    floor = score(floor_vector, level=0, round_index=0)
-    floor.turns = list(proposed_floor)
-    trace.stage1 = join_document(proposed_floor)
-
-    original_candidate = score(embed([join_document(turns)])[0], level=0, round_index=0)
-    trace.original_objective = original_candidate.objective
-    trace.baseline_objective = floor.objective
-    trace.r_med_baseline = floor.r_med
-
-    target = (genericness_target(floor.genericness, g_median, alpha) if cold_start
-              else linkage_target(floor.s_max, floor.r_med, alpha))
-    # Both regimes are compared as lower-is-better, so the cold-start target is negated with its
-    # objective rather than being special-cased at every comparison below.
-    trace.target = float(target)
-    loop_target = -target if cold_start else target
-
-    best = floor
-    history: list[Candidate] = [floor]
-    rounds: list[RoundRecord] = []
-    level = 0
-    stalled = 0
-    probes = 0
-    round_index = 0
-
-    if cold_start and pool.size == 0:
-        stop_reason = "no_priors"
-    elif best.objective <= loop_target:
-        stop_reason = "no_priors" if cold_start else "stage1_sufficient"
-    elif max_probes <= 0:
-        stop_reason = "no_probes"
-    else:
-        stop_reason = "probes_exhausted"
-        while probes < max_probes:
-            round_index += 1
-            want = first_round_candidates if round_index == 1 else 1
-            want = min(want, max_probes - probes)
-            if want <= 0:
-                break
-
-            payload = {
-                "turns": best.turns,
-                "n_turns": n_turns,
-                "want": want,
-                "profile": profile,
-                "nearest_prior": nearest_prior_text(best, priors, prior_texts),
-                "scores": _format_scores(best, target, cold_start, top_m),
-                "trajectory": _format_trajectory(rounds, cold_start),
-                "probes_left": max_probes - probes,
-                "level": level,
-                "cold_start": cold_start,
-            }
-            proposals = propose(payload)
-            usable = [candidate for candidate in proposals if admissible(candidate, turns)]
-            record = RoundRecord(round_index=round_index, level=level, requested=want,
-                                 admissible=len(usable), probes_used=0)
-
-            if not usable:
-                record.note = "no admissible candidate"
-                stalled += 1
-            else:
-                vectors = embed([join_document(candidate) for candidate in usable])
-                probes += len(usable)
-                record.probes_used = len(usable)
-                scored = []
-                for position, candidate_turns in enumerate(usable):
-                    candidate = score(vectors[position], level=level, round_index=round_index)
-                    candidate.turns = list(candidate_turns)
-                    scored.append(candidate)
-                    history.append(candidate)
-                round_best = min(scored, key=lambda item: item.objective)
-                record.objectives = [round(item.objective, 6) for item in scored]
-                record.best_objective = round_best.objective
-                if round_best.objective < best.objective - IMPROVEMENT_EPSILON:
-                    best = round_best
-                    record.improved = True
-                    stalled = 0
-                else:
-                    stalled += 1
-            rounds.append(record)
-
-            if best.objective <= loop_target:
-                stop_reason = "target_met"
-                break
-            if stalled >= escalate_after:
-                level += 1
-                stalled = 0
-                if level >= N_ESCALATION_LEVELS:
-                    stop_reason = "ladder_exhausted"
-                    break
-
-    trace.stop_reason = stop_reason
-    trace.rounds = rounds
-    trace.probes_used = probes
-    trace.n_rounds = len(rounds)
-    trace.max_level = max((candidate.level for candidate in history), default=0)
-    trace.final_objective = best.objective
-    trace.target_met = best.objective <= loop_target
-    trace.nearest_prior_index = nearest_prior_index(best, priors, prior_texts)
-    return best, floor, history, trace
+    results = defend_documents(
+        [{"turns": turns, "priors": priors, "prior_texts": prior_texts, "pool": pool,
+          "profile": profile, "centroid": centroid, "g_median": g_median}],
+        embed=embed,
+        abstract=lambda batch: [abstract(item) for item in batch],
+        propose=lambda batch: [propose(item) for item in batch],
+        alpha=alpha, max_probes=max_probes, escalate_after=escalate_after, top_m=top_m,
+        first_round_candidates=first_round_candidates, fits=fits)
+    return results[0]
 
 
 def nearest_prior_index(candidate: Candidate, priors, prior_texts) -> int | None:
@@ -838,55 +1007,211 @@ def gate_and_select(winner: Candidate, floor: Candidate, history, original_docum
     return floor
 
 
+#: Documents per batch once the cascade cap is passed. Bounds the size of one embedding call and one
+#: proposal batch; vLLM schedules within it, so larger mostly costs memory rather than buying speed.
+DEFAULT_DOCUMENT_BATCH = 256
+
+
+def gate_and_select_batch(results, *, gate, max_utility_loss: float) -> list[Candidate]:
+    """The utility gate over many documents at once: at most **two** batched judging passes.
+
+    ``gate(pairs) -> list of per-variant losses``, where each pair is
+    ``(original_document, [variant, ...])``. Run per document this was four generations each and the
+    single largest avoidable cost in the loop; run as two passes over the whole batch it is two
+    calls total, regardless of how many documents are in flight.
+
+    Pass 1 judges every winner. Pass 2 judges a fallback only for the winners that failed, walking
+    *down* the escalation ladder to the least aggressive candidate that still beat the floor -- so a
+    level-2 structural rewrite that cost too much utility falls back to a level-0 edit rather than
+    all the way to the abstraction pass.
+    """
+    chosen: list[Candidate | None] = [None] * len(results)
+    judged: list[int] = []
+    for index, (winner, floor, _history, trace) in enumerate(results):
+        if winner is floor or not winner.turns:
+            trace.outcome = "stage1_floor"
+            trace.emitted_level = floor.level
+            trace.utility = {"checked": False, "reason": "loop kept the stage-1 output"}
+            chosen[index] = floor
+        else:
+            judged.append(index)
+
+    if judged:
+        losses = gate([(results[i][3].original, [join_document(results[i][0].turns)])
+                       for i in judged])
+        retry: list[int] = []
+        for index, per_variant in zip(judged, losses):
+            winner, floor, _history, trace = results[index]
+            loss = float(per_variant[0]) if per_variant else 1.0
+            trace.utility = {"checked": True, "winner_loss": round(loss, 4),
+                             "winner_level": winner.level, "max_utility_loss": max_utility_loss}
+            if loss <= max_utility_loss:
+                trace.outcome = "loop_winner"
+                trace.emitted_level = winner.level
+                chosen[index] = winner
+            else:
+                retry.append(index)
+
+        fallbacks: dict[int, Candidate] = {}
+        for index in retry:
+            winner, floor, history, _trace = results[index]
+            alternatives = sorted(
+                (item for item in history
+                 if item is not winner and item is not floor and item.turns
+                 and item.objective < floor.objective - IMPROVEMENT_EPSILON),
+                key=lambda item: (item.level, item.objective))
+            if alternatives:
+                fallbacks[index] = alternatives[0]
+
+        if fallbacks:
+            order = list(fallbacks)
+            losses = gate([(results[i][3].original, [join_document(fallbacks[i].turns)])
+                           for i in order])
+            for index, per_variant in zip(order, losses):
+                loss = float(per_variant[0]) if per_variant else 1.0
+                trace = results[index][3]
+                trace.utility["fallback_loss"] = round(loss, 4)
+                trace.utility["fallback_level"] = fallbacks[index].level
+                if loss <= max_utility_loss:
+                    trace.outcome = "gate_fallback"
+                    trace.emitted_level = fallbacks[index].level
+                    trace.final_objective = fallbacks[index].objective
+                    chosen[index] = fallbacks[index]
+
+        for index in retry:
+            if chosen[index] is None:
+                _winner, floor, _history, trace = results[index]
+                trace.outcome = "stage1_floor"
+                trace.emitted_level = floor.level
+                trace.final_objective = floor.objective
+                chosen[index] = floor
+
+    return [candidate for candidate in chosen]
+
+
+def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signature,
+                   alpha: float = DEFAULT_ALPHA, max_probes: int = DEFAULT_MAX_PROBES,
+                   escalate_after: int = DEFAULT_ESCALATE_AFTER, top_m: int = DEFAULT_TOP_M,
+                   max_utility_loss: float = DEFAULT_MAX_UTILITY_LOSS,
+                   first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
+                   cascade_depth: int = AFR_CASCADE_DEPTH,
+                   document_batch: int = DEFAULT_DOCUMENT_BATCH,
+                   fits=None, on_document=None) -> dict:
+    """Cascade many authors' timelines **in lockstep**, batching every stage across them.
+
+    ``timelines`` is ``[(author, [(doc_id, turns), ...]), ...]`` in the order the documents were
+    written; ``pool_for(author)`` returns that author's reference matrix. Returns
+    ``{author: [defended turn list, ...]}``.
+
+    Within an author the cascade is causal and therefore serial: document ``k`` is defended against
+    the *defended* text of ``1..k-1``. Across authors nothing is shared, so position ``p`` of every
+    author is one batch. That is the whole throughput story -- one model call per stage per position
+    instead of one per document (see the module docstring).
+
+    Two phases:
+
+    **Phase A, positions below** ``cascade_depth``: true lockstep, one batch per position, batch
+    width equal to the number of authors still that long.
+
+    **Phase B, everything past the cap**: those documents all score against the same frozen first
+    ``cascade_depth`` defended documents, so they are mutually independent and run as a few wide
+    batches rather than as a long thin tail. Without this a single 450-document author would
+    serialize ~400 steps at batch 1 and dominate the wall clock.
+
+    ``on_document(author, doc_id, position, trace)`` is called as each document completes, so a
+    caller can flush its log continuously rather than after a whole author.
+    """
+    timelines = [(author, list(documents)) for author, documents in timelines]
+    pools = {author: np.asarray(pool_for(author), dtype=float) for author, _ in timelines}
+    centroids = {author: pool_centroid(pools[author]) for author, _ in timelines}
+    medians = {author: median_genericness(pools[author], centroids[author])
+               for author, _ in timelines}
+
+    prior_texts: dict = {author: [] for author, _ in timelines}
+    prior_vectors: dict = {author: [] for author, _ in timelines}
+    profiles: dict = {author: "" for author, _ in timelines}
+    defended: dict = {author: [None] * len(documents) for author, documents in timelines}
+
+    def run(batch) -> None:
+        """Defend one batch of (author, position, doc_id, turns) and record the outcomes."""
+        items = [{"turns": turns,
+                  "priors": (np.vstack(prior_vectors[author]) if prior_vectors[author]
+                             else np.zeros((0, 0))),
+                  "prior_texts": prior_texts[author],
+                  "pool": pools[author],
+                  "profile": profiles[author],
+                  "centroid": centroids[author],
+                  "g_median": medians[author]}
+                 for author, _position, _doc_id, turns in batch]
+        results = defend_documents(
+            items, embed=embed, abstract=abstract, propose=propose, alpha=alpha,
+            max_probes=max_probes, escalate_after=escalate_after, top_m=top_m,
+            first_round_candidates=first_round_candidates, fits=fits)
+        winners = gate_and_select_batch(results, gate=gate, max_utility_loss=max_utility_loss)
+        for (author, position, doc_id, _turns), winner, result in zip(batch, winners, results):
+            trace = result[3]
+            turns_out = [str(turn) for turn in winner.turns]
+            trace.doc_id, trace.author_id, trace.position = str(doc_id), str(author), position
+            trace.defended = join_document(turns_out)
+            defended[author][position] = turns_out
+            if on_document is not None:
+                on_document(author, doc_id, position, trace)
+
+    # --- phase A: lockstep over the cascaded prefix ---------------------------
+    depth = max(0, int(cascade_depth))
+    for position in range(depth):
+        batch = [(author, position, documents[position][0], documents[position][1])
+                 for author, documents in timelines if position < len(documents)]
+        if not batch:
+            break
+        run(batch)
+        # The cascade step: what the attacker will see becomes the next document's prior. Only the
+        # embeddings and profiles of the capped prefix are ever extended.
+        fresh = [(author, join_document(defended[author][position]))
+                 for author, _position, _doc_id, _turns in batch]
+        vectors = embed([text for _author, text in fresh])
+        for index, (author, text) in enumerate(fresh):
+            prior_texts[author].append(text)
+            prior_vectors[author].append(vectors[index])
+        updated = signature([(profiles[author], text) for author, text in fresh])
+        for (author, _text), profile in zip(fresh, updated):
+            profiles[author] = profile
+
+    # --- phase B: everything past the cap, in wide independent batches --------
+    tail = [(author, position, documents[position][0], documents[position][1])
+            for author, documents in timelines
+            for position in range(depth, len(documents))]
+    for start in range(0, len(tail), max(1, document_batch)):
+        run(tail[start:start + document_batch])
+
+    return defended
+
+
 def defend_author(documents, pool, *, embed, abstract, propose, gate, signature,
                   alpha: float = DEFAULT_ALPHA, max_probes: int = DEFAULT_MAX_PROBES,
                   escalate_after: int = DEFAULT_ESCALATE_AFTER, top_m: int = DEFAULT_TOP_M,
                   max_utility_loss: float = DEFAULT_MAX_UTILITY_LOSS,
                   first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
-                  fits=None,
+                  cascade_depth: int = AFR_CASCADE_DEPTH, fits=None,
                   ) -> tuple[list, list]:
-    """Cascade one author's whole timeline. ``documents`` is ``[(doc_id, [turn, ...]), ...]``.
+    """One author through :func:`defend_authors`, with the unbatched callables. See that function.
 
-    Each document is defended against the **defended** text of the ones before it, and the rolling
-    profile is updated from the defended text too -- so nothing the attacker cannot see ever enters
-    the objective. This is the unit of both the cascade and the cache: an author is always computed
-    from its first document, which is what makes a cache hit and a cache miss the same text.
+    Kept because a single author's timeline is the readable unit to reason about and to test; the
+    code underneath is the batched path production uses.
     """
-    centroid = pool_centroid(np.asarray(pool, dtype=float))
-    g_median = median_genericness(np.asarray(pool, dtype=float), centroid)
-
-    prior_texts: list[str] = []
-    prior_vectors: list[np.ndarray] = []
-    profile = ""
-    defended_documents: list[list[str]] = []
-    traces: list[DocumentTrace] = []
-
-    for position, (doc_id, turns) in enumerate(documents):
-        priors = (np.vstack(prior_vectors) if prior_vectors else np.zeros((0, 0)))
-        winner, floor, history, trace = defend_document(
-            turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
-            profile=profile, alpha=alpha, max_probes=max_probes, escalate_after=escalate_after,
-            top_m=top_m, first_round_candidates=first_round_candidates,
-            centroid=centroid, g_median=g_median, fits=fits)
-        chosen = gate_and_select(winner, floor, history, join_document(turns),
-                                 gate=gate, max_utility_loss=max_utility_loss, trace=trace)
-
-        defended_turns = [str(turn) for turn in chosen.turns]
-        defended_text = join_document(defended_turns)
-        trace.doc_id = str(doc_id)
-        trace.position = position
-        trace.defended = defended_text
-
-        defended_documents.append(defended_turns)
-        traces.append(trace)
-
-        # The cascade step: what the attacker will see becomes the next document's prior.
-        if position + 1 < len(documents):
-            prior_texts.append(defended_text)
-            prior_vectors.append(embed([defended_text])[0])
-            profile = signature(profile, defended_text)
-
-    return defended_documents, traces
+    traces: list = []
+    defended = defend_authors(
+        [("_", documents)], lambda _author: pool,
+        embed=embed,
+        abstract=lambda batch: [abstract(item) for item in batch],
+        propose=lambda batch: [propose(item) for item in batch],
+        gate=lambda pairs: [gate(original, variants) for original, variants in pairs],
+        signature=lambda pairs: [signature(profile, text) for profile, text in pairs],
+        alpha=alpha, max_probes=max_probes, escalate_after=escalate_after, top_m=top_m,
+        max_utility_loss=max_utility_loss, first_round_candidates=first_round_candidates,
+        cascade_depth=cascade_depth, fits=fits,
+        on_document=lambda _a, _d, _p, trace: traces.append(trace))
+    return defended["_"], traces
 
 
 # --- the reference pool ------------------------------------------------------
@@ -988,12 +1313,15 @@ class _LocalBackend:
                         if self.model else model_checkpoint("afr", MODEL_ENV_VAR,
                                                             local_only=not AFR_ALLOW_DOWNLOAD))
             print(f"[afr] loading agent {path} (vLLM), max_model_len={AFR_MAX_MODEL_LEN:,}, "
-                  f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}")
-            # `seed` and `enforce_eager` are both load-bearing for reproducibility, not tuning:
-            # see the determinism note in the module docstring. Harrier co-resides, so the
-            # utilization is left below what a 30B FP8 model would otherwise take.
+                  f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}, "
+                  f"enforce_eager={AFR_ENFORCE_EAGER}")
+            # `enable_prefix_caching` is a real saving here rather than a default worth copying: the
+            # system prompt and escalation ladder are identical for every call in the corpus, and
+            # within one document the author profile and the nearest-prior excerpt repeat across all
+            # of its proposal rounds. Reusing that KV prefix removes the re-prefill each round.
             self._llm = LLM(model=path, dtype="auto", gpu_memory_utilization=AFR_GPU_MEM_UTIL,
-                            max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=True, seed=self.seed)
+                            max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=AFR_ENFORCE_EAGER,
+                            enable_prefix_caching=True, seed=self.seed)
             self._sampling = {
                 # Temperature 0 everywhere: the defense must be a deterministic function of its
                 # input, or the content-addressed cache would return a different cascade on a hit
@@ -1006,15 +1334,27 @@ class _LocalBackend:
             }
         return self._llm
 
-    def chat(self, system: str, users: list[str], kind: str) -> list[str]:
-        """One batched chat call: same system prompt, many user messages, replies in input order."""
-        if not users:
+    def chat_pairs(self, pairs, kind: str) -> list[str]:
+        """One batched call over ``(system, user)`` pairs; replies come back in input order.
+
+        Pairs rather than one shared system prompt because a proposal round's system prompt carries
+        the escalation rung, which differs per document -- and putting those in separate calls to
+        keep the system prompt uniform is exactly the batch-1 mistake this file was rewritten to
+        undo. vLLM batches heterogeneous prompts fine; prefix caching still shares whatever leading
+        tokens they do have in common.
+        """
+        pairs = list(pairs)
+        if not pairs:
             return []
         engine = self._engine()
         conversations = [[{"role": "system", "content": system},
-                          {"role": "user", "content": user}] for user in users]
+                          {"role": "user", "content": user}] for system, user in pairs]
         outputs = engine.chat(conversations, self._sampling[kind], use_tqdm=False)
         return [output.outputs[0].text.strip() for output in outputs]
+
+    def chat(self, system: str, users: list[str], kind: str) -> list[str]:
+        """One batched chat call: same system prompt, many user messages, replies in input order."""
+        return self.chat_pairs([(system, user) for user in users], kind)
 
     def close(self) -> None:
         if self._llm is not None:
@@ -1110,77 +1450,112 @@ class AgenticFootprintDefense(CachedDefense):
                                           checkpoint=self.agent_checkpoint)
         return self._backend
 
-    def _turns_with_repair(self, system: str, user: str, kind: str, n_turns: int):
-        """One generation, plus at most one format-repair retry. ``None`` if both fail.
+    def _repair_batch(self, failures, kind: str) -> dict:
+        """One batched format-repair pass. ``failures`` is ``[(key, n_turns, error, reply)]``.
 
         The repair is a separate call rather than a longer prompt because the failure it fixes is
         not a reasoning failure: the model produced a fine rewrite in the wrong wrapper, and showing
-        it its own reply is the shortest path to the same rewrite in the right one.
+        it its own reply is the shortest path to the same rewrite in the right one. Batched for the
+        same reason everything else here is -- a corpus-wide pass may have hundreds of malformed
+        replies, and repairing them one at a time would reintroduce the batch-1 cost.
         """
-        backend = self.backend()
-        replies = backend.chat(system, [user], kind)
-        reply = replies[0] if replies else ""
-        parsed = parse_turns(reply, n_turns)
-        if parsed is not None:
-            return parsed
-        repair_system = render_template(self.prompts["repair_system_prompt"],
-                                        {"N_TURNS": str(n_turns)})
-        repair_user = render_template(
-            self.prompts["repair_user_template"],
-            {"ERROR": f"expected exactly {n_turns} <turn> block(s), numbered 1..{n_turns}",
-             "REPLY": reply})
-        repaired = backend.chat(repair_system, [repair_user], kind)
-        return parse_turns(repaired[0] if repaired else "", n_turns)
+        failures = list(failures)
+        if not failures:
+            return {}
+        pairs = [(render_template(self.prompts["repair_system_prompt"], {"N_TURNS": str(n_turns)}),
+                  render_template(self.prompts["repair_user_template"],
+                                  {"ERROR": error, "REPLY": reply}))
+                 for _key, n_turns, error, reply in failures]
+        replies = self.backend().chat_pairs(pairs, kind)
+        repaired = {}
+        for (key, n_turns, _error, _reply), reply in zip(failures, replies):
+            parsed = parse_turns(reply, n_turns)
+            if parsed is not None:
+                repaired[key] = parsed
+        return repaired
 
-    def _abstract(self, turns) -> list[str] | None:
-        """Stage 1: generalize the whole document upward. Returns ``None`` on an unusable reply."""
-        n_turns = len(turns)
-        system = render_template(self.prompts["abstract_system_prompt"],
-                                 {"N_TURNS": str(n_turns)})
-        user = render_template(self.prompts["abstract_user_template"],
-                               {"DOCUMENT": render_turn_blocks(turns), "N_TURNS": str(n_turns)})
-        return self._turns_with_repair(system, user, "abstract", n_turns)
+    def _abstract(self, batch) -> list:
+        """Stage 1, batched: generalize each whole document upward.
 
-    def _propose(self, payload: dict) -> list[list[str]]:
-        """Stage 2: one proposal round. Returns the well-formed candidates in the reply.
-
-        A multi-candidate round is ONE call asking for several rewrites, not several calls -- both
-        because it is cheaper and because a fixed batch size of 1 is what keeps greedy decoding
-        reproducible (see the module docstring).
+        Returns one turn list (or ``None``) per input. This stage reads no prior state, so the
+        caller is free to hand it every document in the corpus at once -- which is what
+        :meth:`transform` does before the cascade starts.
         """
-        n_turns = int(payload["n_turns"])
-        want = int(payload["want"])
-        level = min(int(payload["level"]), N_ESCALATION_LEVELS - 1)
-        system = render_template(
-            self.prompts["propose_system_prompt"],
-            {"N_TURNS": str(n_turns), "N_CANDIDATES": str(want),
-             "ESCALATION": self.prompts["escalation_levels"][level]})
-        template = (self.prompts["propose_cold_start_template"] if payload["cold_start"]
-                    else self.prompts["propose_user_template"])
-        user = render_template(template, {
-            "DOCUMENT": render_turn_blocks(payload["turns"]),
-            "N_TURNS": str(n_turns),
-            "N_CANDIDATES": str(want),
-            "PROFILE": payload["profile"] or "(nothing recorded yet)",
-            "NEAREST_PRIOR": payload["nearest_prior"],
-            "SCORES": payload["scores"],
-            "TRAJECTORY": payload["trajectory"],
-            "PROBES_LEFT": str(payload["probes_left"]),
-        })
-        replies = self.backend().chat(system, [user], "propose")
-        reply = replies[0] if replies else ""
-        candidates = parse_candidates(reply, n_turns, want)
-        if candidates:
-            return candidates
-        # Nothing parsed: give the format one repair attempt, which recovers the common case of a
-        # single well-reasoned rewrite returned without the wrapper.
-        repaired = self._turns_with_repair(
-            render_template(self.prompts["repair_system_prompt"], {"N_TURNS": str(n_turns)}),
-            render_template(self.prompts["repair_user_template"],
-                            {"ERROR": f"expected {want} candidate(s), each with exactly {n_turns} "
-                                      f"<turn> block(s)", "REPLY": reply}),
-            "propose", n_turns)
-        return [repaired] if repaired else []
+        batch = [list(turns) for turns in batch]
+        if not batch:
+            return []
+        pairs = []
+        for turns in batch:
+            n_turns = len(turns)
+            pairs.append((
+                render_template(self.prompts["abstract_system_prompt"],
+                                {"N_TURNS": str(n_turns)}),
+                render_template(self.prompts["abstract_user_template"],
+                                {"DOCUMENT": render_turn_blocks(turns),
+                                 "N_TURNS": str(n_turns)})))
+        replies = self.backend().chat_pairs(pairs, "abstract")
+        results: list = [None] * len(batch)
+        failures = []
+        for index, (turns, reply) in enumerate(zip(batch, replies)):
+            n_turns = len(turns)
+            parsed = parse_turns(reply, n_turns)
+            if parsed is not None:
+                results[index] = parsed
+            else:
+                failures.append((index, n_turns,
+                                 f"expected exactly {n_turns} <turn> block(s), "
+                                 f"numbered 1..{n_turns}", reply))
+        for index, parsed in self._repair_batch(failures, "abstract").items():
+            results[index] = parsed
+        return results
+
+    def _propose(self, batch) -> list:
+        """Stage 2, batched: one proposal round for each in-flight document.
+
+        Each document asks for its candidates inside ONE reply (cheaper than one call per
+        candidate), and every document's request goes in the SAME batch. The escalation rung lives
+        in the system prompt, so the prompts differ per document -- which is why this goes through
+        :meth:`_LocalBackend.chat_pairs` rather than a shared-system ``chat``.
+        """
+        batch = list(batch)
+        if not batch:
+            return []
+        pairs = []
+        for payload in batch:
+            n_turns = int(payload["n_turns"])
+            want = int(payload["want"])
+            level = min(int(payload["level"]), N_ESCALATION_LEVELS - 1)
+            template = (self.prompts["propose_cold_start_template"] if payload["cold_start"]
+                        else self.prompts["propose_user_template"])
+            pairs.append((
+                render_template(self.prompts["propose_system_prompt"],
+                                {"N_TURNS": str(n_turns), "N_CANDIDATES": str(want),
+                                 "ESCALATION": self.prompts["escalation_levels"][level]}),
+                render_template(template, {
+                    "DOCUMENT": render_turn_blocks(payload["turns"]),
+                    "N_TURNS": str(n_turns),
+                    "N_CANDIDATES": str(want),
+                    "PROFILE": payload["profile"] or "(nothing recorded yet)",
+                    "NEAREST_PRIOR": payload["nearest_prior"],
+                    "SCORES": payload["scores"],
+                    "TRAJECTORY": payload["trajectory"],
+                    "PROBES_LEFT": str(payload["probes_left"]),
+                })))
+        replies = self.backend().chat_pairs(pairs, "propose")
+        results: list = [[] for _ in batch]
+        failures = []
+        for index, (payload, reply) in enumerate(zip(batch, replies)):
+            n_turns, want = int(payload["n_turns"]), int(payload["want"])
+            candidates = parse_candidates(reply, n_turns, want)
+            if candidates:
+                results[index] = candidates
+            else:
+                failures.append((index, n_turns,
+                                 f"expected {want} candidate(s), each with exactly {n_turns} "
+                                 f"<turn> block(s)", reply))
+        for index, parsed in self._repair_batch(failures, "propose").items():
+            results[index] = [parsed]
+        return results
 
     def agent_checkpoint(self) -> str:
         """The resolved agent checkpoint, refusing a download unless explicitly opted in.
@@ -1242,20 +1617,36 @@ class AgenticFootprintDefense(CachedDefense):
         n_tokens = counter(rendered_document)
         return n_tokens <= backend.prompt_budget, n_tokens
 
-    def _signature(self, profile: str, defended_document: str) -> str:
-        """Stage 0: fold one newly defended document into the rolling author profile."""
+    def _signature(self, batch) -> list:
+        """Stage 0, batched: fold each newly defended document into its author's rolling profile.
+
+        ``batch`` is ``[(profile, defended_document), ...]``; returns the updated profiles in order.
+        One call for every author advancing a cascade step, not one per author.
+        """
         from ._backends import extract_tagged_output
 
-        user = render_template(self.prompts["signature_user_template"],
-                               {"PROFILE": profile or "(empty)", "DOCUMENT": defended_document})
-        replies = self.backend().chat(self.prompts["signature_system_prompt"], [user], "signature")
-        extracted = extract_tagged_output(replies[0] if replies else "", "profile")
-        # An unusable reply keeps the previous profile rather than clearing it: a stale profile is
-        # weaker guidance, an empty one is none at all.
-        return extracted.strip() if extracted and extracted.strip() else profile
+        batch = list(batch)
+        if not batch:
+            return []
+        users = [render_template(self.prompts["signature_user_template"],
+                                 {"PROFILE": profile or "(empty)", "DOCUMENT": document})
+                 for profile, document in batch]
+        replies = self.backend().chat(self.prompts["signature_system_prompt"], users, "signature")
+        updated = []
+        for (profile, _document), reply in zip(batch, replies):
+            extracted = extract_tagged_output(reply, "profile")
+            # An unusable reply keeps the previous profile rather than clearing it: a stale profile
+            # is weaker guidance, an empty one is none at all.
+            updated.append(extracted.strip() if extracted and extracted.strip() else profile)
+        return updated
 
-    def _gate(self, original_document: str, variants: list[str]) -> list[float]:
-        """Stage 3: utility loss in [0, 1] per variant, judged on the ANSWER, not the prompt.
+    def _gate(self, pairs) -> list:
+        """Stage 3, batched: utility loss in [0, 1] per variant, judged on the ANSWER.
+
+        ``pairs`` is ``[(original_document, [variant, ...]), ...]``; returns one loss list per pair.
+        **Two model calls for the whole batch** -- one answer pass, one judge pass -- where the
+        per-document version cost four generations each. On a corpus this is the difference between
+        the gate being a rounding error and being a third of the run.
 
         Both sides are judged, so a reference answer that was itself poor is not charged to the
         rewrite. An unreadable verdict is the maximum loss rather than zero: a candidate whose cost
@@ -1263,32 +1654,49 @@ class AgenticFootprintDefense(CachedDefense):
         to ``loo_unlink._utility`` so the two defenses' utility numbers can be read against each
         other.
         """
-        backend = self.backend()
-        answers = backend.chat(self.prompts["answer_system_prompt"],
-                               [original_document, *variants], "answer")
-        if not answers:
-            return [1.0] * len(variants)
-        reference_answer, variant_answers = answers[0], answers[1:]
+        pairs = [(original, list(variants)) for original, variants in pairs]
+        if not pairs:
+            return []
 
-        judged = backend.chat(
-            self.prompts["judge_system_prompt"],
-            [render_template(self.prompts["judge_user_template"],
-                             {"REQUEST": original_document, "ANSWER": answer})
-             for answer in (reference_answer, *variant_answers)],
-            "judge")
-        reference_score = parse_judge_score(judged[0]) if judged else None
-        if reference_score is None:
-            reference_score = 5.0
+        # One flat answer batch: each document contributes its original plus each of its variants,
+        # and `spans` remembers which replies belong to which document.
+        prompts, spans = [], []
+        for original, variants in pairs:
+            start = len(prompts)
+            prompts.append(original)
+            prompts.extend(variants)
+            spans.append((start, len(variants)))
+        answers = self.backend().chat(self.prompts["answer_system_prompt"], prompts, "answer")
+        if len(answers) != len(prompts):
+            return [[1.0] * len(variants) for _original, variants in pairs]
 
-        losses = []
-        for reply in judged[1:]:
-            score = parse_judge_score(reply)
-            if score is None:
-                losses.append(1.0)
-                continue
-            # Normalized by the 4-point span of the 1-5 scale, clamped at 0: a rewrite that somehow
-            # improves the answer is free, not negative-cost.
-            losses.append(max(0.0, (reference_score - score) / 4.0))
+        # One flat judge batch over every answer, each against ITS OWN original request.
+        judge_users = []
+        for (original, _variants), (start, count) in zip(pairs, spans):
+            for offset in range(count + 1):
+                judge_users.append(render_template(
+                    self.prompts["judge_user_template"],
+                    {"REQUEST": original, "ANSWER": answers[start + offset]}))
+        judged = self.backend().chat(self.prompts["judge_system_prompt"], judge_users, "judge")
+        if len(judged) != len(judge_users):
+            return [[1.0] * len(variants) for _original, variants in pairs]
+
+        losses, cursor = [], 0
+        for _original, variants in pairs:
+            reference_score = parse_judge_score(judged[cursor])
+            if reference_score is None:
+                reference_score = 5.0
+            per_variant = []
+            for offset in range(1, len(variants) + 1):
+                score = parse_judge_score(judged[cursor + offset])
+                if score is None:
+                    per_variant.append(1.0)
+                    continue
+                # Normalized by the 4-point span of the 1-5 scale, clamped at 0: a rewrite that
+                # somehow improves the answer is free, not negative-cost.
+                per_variant.append(max(0.0, (reference_score - score) / 4.0))
+            losses.append(per_variant)
+            cursor += len(variants) + 1
         return losses
 
     # -- edit log --
@@ -1404,24 +1812,36 @@ class AgenticFootprintDefense(CachedDefense):
             return pool_matrix[0][np.asarray(keep, dtype=int)]
 
         def compute(missing: list[str]) -> list[str]:
-            outputs = []
-            for source in missing:
-                author = source_author[source]
-                _, documents = decode_author_source(source)
-                defended, traces = defend_author(
-                    documents, pool_for(author),
-                    embed=self.backend().embed, abstract=self._abstract, propose=self._propose,
-                    gate=self._gate, signature=self._signature,
-                    alpha=self.alpha, max_probes=self.max_probes,
-                    escalate_after=self.escalate_after, top_m=self.top_m,
-                    max_utility_loss=self.max_utility_loss,
-                    first_round_candidates=self.first_round_candidates,
-                    fits=self._fits)
-                for trace in traces:
-                    trace.author_id = author
-                    self._write_trace(trace)
-                outputs.append(encode_author_output(defended))
-            return outputs
+            """Defend a whole chunk of authors AT ONCE, in lockstep.
+
+            This is where the throughput lives. ``cache.apply`` hands over
+            ``checkpoint_every`` authors, and every one of them is stepped through its timeline
+            together so each stage is a single batched model call across the chunk -- rather than
+            the author-at-a-time loop this used to be, which produced batch-1 calls and could not
+            finish. ``checkpoint_every`` is therefore both the flush cadence AND the batch width,
+            exactly as it is for the sibling defenses (see ``_backends`` and the module docstring).
+            """
+            authors = [source_author[source] for source in missing]
+            timelines = [(author, decode_author_source(source)[1])
+                         for author, source in zip(authors, missing)]
+            documents = sum(len(entries) for _author, entries in timelines)
+            print(f"[{self.name}] chunk: {len(timelines):,} authors / {documents:,} documents "
+                  f"(cascade depth {AFR_CASCADE_DEPTH})", flush=True)
+
+            def record(author, doc_id, position, trace) -> None:
+                trace.author_id = str(author)
+                self._write_trace(trace)   # per DOCUMENT: the progress signal, flushed immediately
+
+            defended = defend_authors(
+                timelines, pool_for,
+                embed=self.backend().embed, abstract=self._abstract, propose=self._propose,
+                gate=self._gate, signature=self._signature,
+                alpha=self.alpha, max_probes=self.max_probes,
+                escalate_after=self.escalate_after, top_m=self.top_m,
+                max_utility_loss=self.max_utility_loss,
+                first_round_candidates=self.first_round_candidates,
+                cascade_depth=AFR_CASCADE_DEPTH, fits=self._fits, on_document=record)
+            return [encode_author_output(defended[author]) for author in authors]
 
         try:
             defended_authors = cache.apply("unknown", sources, compute, ids=author_order,
@@ -1777,6 +2197,73 @@ def _selftest() -> None:
                                   max_utility_loss=0.5, trace=strict_trace)
     check(rolled_back.turns == floor.turns and strict_trace.outcome == "stage1_floor",
           "a rewrite that destroys the answer falls back to the stage-1 floor")
+
+    print("batched core (the throughput fix):")
+    widths: list = []
+
+    def counting_abstract(batch):
+        widths.append(len(batch))
+        return [abstract(item) for item in batch]
+
+    def counting_propose(batch):
+        widths.append(len(batch))
+        return [propose(item) for item in batch]
+
+    many = [{"turns": turns, "priors": priors, "prior_texts": prior_texts, "pool": pool}
+            for _ in range(8)]
+    batched = defend_documents(many, embed=embed, abstract=counting_abstract,
+                               propose=counting_propose, alpha=0.0)
+    check(len(batched) == 8, "defend_documents returns one result per input document")
+    check(max(widths) == 8,
+          f"...and advances all of them together (max batch width {max(widths)} of 8)")
+    check(all(result[3].probes_used <= DEFAULT_MAX_PROBES for result in batched),
+          "every document respects its own probe budget")
+
+    solo = defend_document(turns, priors, prior_texts, pool, embed=embed, abstract=abstract,
+                           propose=propose, alpha=0.0)
+    check(solo[0].turns == batched[0][0].turns,
+          "the single-document wrapper and the batched core agree on the same input")
+    check(abs(solo[3].final_objective - batched[0][3].final_objective) < 1e-12,
+          "...including the score, so the two paths cannot drift apart")
+
+    print("the cascade cap:")
+    long_timeline = [(f"d{i}", [f"I run a llama farm in Reykjavik, note {i}."]) for i in range(6)]
+    capped, capped_traces = defend_author(long_timeline, pool, embed=embed, abstract=abstract,
+                                          propose=propose, gate=gate, signature=signature,
+                                          alpha=0.0, cascade_depth=2)
+    check(len(capped) == 6, "a capped cascade still returns every document")
+    check([t.n_priors for t in capped_traces][:3] == [0, 1, 2],
+          f"priors accumulate up to the cap ({[t.n_priors for t in capped_traces]})")
+    check(all(t.n_priors == 2 for t in capped_traces[2:]),
+          "...and freeze there, so documents past the cap are mutually independent")
+    uncapped, uncapped_traces = defend_author(long_timeline, pool, embed=embed, abstract=abstract,
+                                              propose=propose, gate=gate, signature=signature,
+                                              alpha=0.0, cascade_depth=99)
+    check([t.n_priors for t in uncapped_traces] == [0, 1, 2, 3, 4, 5],
+          "an uncapped cascade keeps extending the chain")
+
+    print("the batched utility gate:")
+    gate_calls: list = []
+
+    def counting_gate(pairs):
+        pairs = list(pairs)
+        gate_calls.append(len(pairs))
+        return [[0.0] * len(variants) for _original, variants in pairs]
+
+    results = defend_documents(many, embed=embed, abstract=counting_abstract,
+                               propose=counting_propose, alpha=0.0)
+    picked = gate_and_select_batch(results, gate=counting_gate, max_utility_loss=0.5)
+    check(len(picked) == len(results), "the gate returns one choice per document")
+    check(len(gate_calls) <= 2,
+          f"...in at most two batched passes, not one per document ({len(gate_calls)})")
+    strict_results = defend_documents(many, embed=embed, abstract=counting_abstract,
+                                      propose=counting_propose, alpha=0.0)
+    rolled = gate_and_select_batch(strict_results,
+                                   gate=lambda pairs: [[1.0] * len(v) for _o, v in pairs],
+                                   max_utility_loss=0.5)
+    check(all(choice.turns == result[1].turns
+              for choice, result in zip(rolled, strict_results)),
+          "a batch the judge rejects falls back to each document's own stage-1 floor")
 
     print("defend_author (the cascade):")
     documents = [("d1", ["I run a llama farm in Reykjavik. What Django models do I need?"]),
