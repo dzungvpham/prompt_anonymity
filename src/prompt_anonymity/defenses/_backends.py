@@ -318,6 +318,11 @@ def model_checkpoint(defense: str, env_var: str, *, local_only: bool = False) ->
         print(f"[{defense}] checkpoint from ${env_var}: {override}")
         return resolve_model_path(override)
     configured = model_path(defense, env_var)
+    if Path(configured).is_absolute():
+        # A configured path is already an answer: there is no mirror to look for and no download to
+        # warn about. Saying "no cluster mirror" here would describe a lookup that never applied.
+        print(f"[{defense}] checkpoint from models.toml: {configured}")
+        return resolve_model_path(configured)
     mirrored = shared_checkpoint(configured)
     if mirrored:
         print(f"[{defense}] checkpoint from the cluster mirror: {mirrored}")

@@ -59,20 +59,33 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 # dense 32B on purpose: only ~3B parameters are active per token, and this defense spends ~11
 # generations per document, so decode speed is the binding cost.
 #
-# THE REPO ID BELOW IS NOT NORMALLY DOWNLOADED. Unlike the other entries here, afr resolves through
-# `_backends.model_checkpoint`, which looks for the cluster's own mirror of this repo id first:
+# THIS ENTRY IS A LOCAL PATH, and deliberately so -- it is the one exception to the "no
+# machine-specific paths in this committed file" rule at the top, for the same reason
+# styleremix.py:92 hardcodes /datasets/ai/llama3/...: nothing of this size should ever be fetched
+# by accident. A repo id here means vLLM downloads ~30-50 GB into $HF_HOME on first use, and if
+# $HF_HOME still points at a home directory that is a filled disk quota rather than a slow start.
+# That has already happened once.
 #
-#   $AFR_MODEL                                      an explicit override, always wins
-#   /datasets/ai/*/hub/models--Qwen--Qwen3-30B...   the Unity mirror, used when it exists
-#   the repo id                                     downloaded, only when there is no mirror
+# Resolution order (`_backends.model_checkpoint`):
 #
-# So this file stays machine-independent (a fresh clone off-cluster still works) while a Unity job
-# loads from disk with no network. The run prints which of the three it took -- check that line
-# before assuming a slow startup is the model loading rather than downloading.
+#   $AFR_MODEL                          an explicit override, always wins
+#   the path below                      Unity's shared model tree
 #
-# If the mirror is filed under a name that does not match the repo id, or the cluster's vllm is too
-# old to serve an FP8 MoE, set $AFR_MODEL in your .env (NOT here). "Qwen/Qwen3-32B-AWQ" is the
-# documented fallback and fits the ordinary gpu profile.
+# Note this is NOT the hub-cache layout the rest of /datasets/ai uses
+# (/datasets/ai/qwen3/hub/models--Qwen--<name>) -- it is a plain checkpoint directory.
+# `resolve_model_path` accepts both: a directory holding config.json is used as-is, a hub cache
+# entry is followed into snapshots/<commit>/.
+#
+# OFF-CLUSTER this path does not exist and the run fails immediately, naming $AFR_MODEL. That is
+# the intended trade: a loud failure on a laptop beats a silent 30 GB download on a compute node.
+# Set $AFR_MODEL to a repo id if you actually do want it fetched.
+[afr]
+model = "/datasets/ai/qwen3/Qwen3.8-27B"
+
+# The previous default, kept for the record: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8" (~33 GB, MoE,
+# ~3B active). Nothing that size is mirrored on this cluster, so it would have to be downloaded to
+# scratch. "Qwen/Qwen3-32B-AWQ" (~19 GB dense 4-bit) is the smaller fallback if the 27B above turns
+# out not to fit beside Harrier -- see AFR_GPU_MEM_UTIL below.
 #
 # Two serving knobs go with it, both environment-only and both OUTSIDE the cache key (they change
 # where the model runs, not what it emits, so tuning them does not invalidate completed work):
@@ -83,5 +96,5 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 #                               "too_long", so raise it if the edit log shows many.
 #     AFR_GPU_MEM_UTIL=0.75     fraction of the card vLLM may take. Lower than the other defenses'
 #                               because Harrier co-resides and loads first.
-[afr]
-model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+#     AFR_ALLOW_DOWNLOAD=1      opt in to fetching a checkpoint that is not already on disk. Without
+#                               it a non-local checkpoint is a hard error, not a 30 GB download.

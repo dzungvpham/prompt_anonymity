@@ -179,6 +179,14 @@ AFR_MAX_MODEL_LEN = int(os.environ.get("AFR_MAX_MODEL_LEN", "32768"))
 #: has to leave room for a model that is already resident.
 AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.75"))
 
+#: Opt-in to fetching a checkpoint that is not already on disk. **Off by default, and that default is
+#: the point.** vLLM treats anything that is not a local directory as a hub repo id and downloads it
+#: -- 30-50 GB for a model this size, into ``$HF_HOME``, which on a cluster still pointing at a home
+#: directory fills the user's disk quota. That is not a hypothetical: it happened, silently, because
+#: the checkpoint resolver's fallback was "download" rather than "stop". A missing checkpoint is a
+#: configuration error and should read as one.
+AFR_ALLOW_DOWNLOAD = os.environ.get("AFR_ALLOW_DOWNLOAD", "") == "1"
+
 #: Characters of the nearest prior shown to the agent. Enough to recognize what recurs; bounded so a
 #: 400-turn session cannot crowd out the draft being edited.
 NEAREST_PRIOR_CHARS = 2000
@@ -916,9 +924,12 @@ class _LocalBackend:
     def __init__(self, prompts: dict, *, model: str | None = None,
                  answer_tokens: int = DEFAULT_ANSWER_TOKENS,
                  propose_tokens: int = DEFAULT_PROPOSE_TOKENS,
-                 seed: int = DEFAULT_SEED, featurizer=None):
+                 seed: int = DEFAULT_SEED, featurizer=None, checkpoint=None):
         self.prompts = prompts
         self.model = model
+        #: Callable returning the resolved checkpoint, supplied by the defense so the
+        #: download-refusal guard cannot be bypassed by reaching the engine another way.
+        self._checkpoint = checkpoint
         self.answer_tokens = answer_tokens
         self.propose_tokens = propose_tokens
         self.seed = seed
@@ -967,12 +978,15 @@ class _LocalBackend:
 
             from vllm import LLM, SamplingParams
 
-            # Prefer what is already on the cluster. `models.toml` holds a repo id so a fresh clone
-            # works anywhere, but a 30B download on a compute node with no outbound network is a job
-            # that hangs at startup rather than one that fails. `model_checkpoint` prints which of
-            # the three sources it took.
-            path = (resolve_model_path(shared_checkpoint(self.model) or self.model)
-                    if self.model else model_checkpoint("afr", MODEL_ENV_VAR))
+            # Resolved by the defense when it owns this backend, so the download-refusal guard in
+            # `AgenticFootprintDefense.agent_checkpoint` is on the only path that reaches vLLM.
+            # The fallback here covers a backend built directly (tests, a REPL).
+            if self._checkpoint is not None:
+                path = self._checkpoint()
+            else:
+                path = (resolve_model_path(shared_checkpoint(self.model) or self.model)
+                        if self.model else model_checkpoint("afr", MODEL_ENV_VAR,
+                                                            local_only=not AFR_ALLOW_DOWNLOAD))
             print(f"[afr] loading agent {path} (vLLM), max_model_len={AFR_MAX_MODEL_LEN:,}, "
                   f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}")
             # `seed` and `enforce_eager` are both load-bearing for reproducibility, not tuning:
@@ -1092,7 +1106,8 @@ class AgenticFootprintDefense(CachedDefense):
     def backend(self):
         if self._backend is None:
             self._backend = _LocalBackend(self.prompts, model=self.model,
-                                          answer_tokens=self.answer_tokens, seed=self.seed)
+                                          answer_tokens=self.answer_tokens, seed=self.seed,
+                                          checkpoint=self.agent_checkpoint)
         return self._backend
 
     def _turns_with_repair(self, system: str, user: str, kind: str, n_turns: int):
@@ -1167,21 +1182,45 @@ class AgenticFootprintDefense(CachedDefense):
             "propose", n_turns)
         return [repaired] if repaired else []
 
+    def agent_checkpoint(self) -> str:
+        """The resolved agent checkpoint, refusing a download unless explicitly opted in.
+
+        vLLM cannot tell "a path that does not exist" from "a hub repo id" -- both are just strings
+        it will happily fetch. So the check has to happen here: if the resolved checkpoint is not a
+        directory on disk and :data:`AFR_ALLOW_DOWNLOAD` is unset, stop. A 30-50 GB download nobody
+        asked for is worse than a failed job, and on a cluster whose ``$HF_HOME`` still points at a
+        home directory it takes the quota with it.
+        """
+        from ._backends import model_checkpoint, resolve_model_path, shared_checkpoint
+
+        if self.model:
+            path = resolve_model_path(shared_checkpoint(self.model) or self.model)
+            print(f"[{self.name}] agent checkpoint: {path}")
+        else:
+            path = model_checkpoint(self.name, MODEL_ENV_VAR, local_only=not AFR_ALLOW_DOWNLOAD)
+        if not AFR_ALLOW_DOWNLOAD and not Path(path).is_dir():
+            raise SystemExit(
+                f"[{self.name}] {path!r} is not a directory on this machine, so vLLM would try to "
+                f"DOWNLOAD it (30-50 GB for a model this size, into $HF_HOME -- check that it is "
+                f"not your home quota).\n"
+                f"  - point $AFR_MODEL at a checkpoint already on disk, or\n"
+                f"  - fix the [afr] path in models.toml, or\n"
+                f"  - set AFR_ALLOW_DOWNLOAD=1 (and $HF_HOME to scratch) if you really do want it "
+                f"fetched."
+            )
+        return path
+
     def _resolve_checkpoints(self) -> None:
         """Fail now, with a message, if either checkpoint cannot be located.
 
         Neither model is loaded here -- only the paths are resolved, which is filesystem work. The
         point is that a mis-configured run dies in the first second naming ``$AFR_MODEL`` or
-        ``$HARRIER_MODEL``, instead of an hour later with an ``OSError`` from inside the cascade.
+        ``$HARRIER_MODEL``, instead of an hour later with an ``OSError`` from inside the cascade --
+        or, worse, silently downloading its way through a disk quota.
         """
         from ..features.harrier import HarrierFeaturizer
-        from ._backends import model_checkpoint, resolve_model_path, shared_checkpoint
 
-        if self.model:
-            print(f"[{self.name}] agent checkpoint: "
-                  f"{resolve_model_path(shared_checkpoint(self.model) or self.model)}")
-        else:
-            model_checkpoint(self.name, MODEL_ENV_VAR)
+        self.agent_checkpoint()
         print(f"[{self.name}] embedder checkpoint: {HarrierFeaturizer().checkpoint()}")
 
     def _fits(self, rendered_document: str) -> tuple[bool, int]:
@@ -1564,9 +1603,21 @@ def _selftest() -> None:
         check(shared_checkpoint("bare-name", root) is None, "a bare name is passed over")
     check(shared_checkpoint("Qwen/Anything", "/nonexistent-root") is None,
           "a machine with no mirror root degrades rather than raising")
-    check(model_path("afr", MODEL_ENV_VAR) if os.environ.get(MODEL_ENV_VAR) else
-          model_path("afr", "AFR_MODEL_UNSET_FOR_SELFTEST").startswith("Qwen/"),
-          "models.toml [afr] holds a portable repo id, not a machine-specific path")
+    configured = model_path("afr", "AFR_MODEL_UNSET_FOR_SELFTEST")
+    check(Path(configured).is_absolute(),
+          f"models.toml [afr] points at a checkpoint on disk, not a repo id that would download "
+          f"({configured!r})")
+    check(not AFR_ALLOW_DOWNLOAD,
+          "downloading is OFF unless AFR_ALLOW_DOWNLOAD=1 is set explicitly")
+    try:
+        AgenticFootprintDefense(model="/definitely/not/here").agent_checkpoint()
+        check(False, "a non-existent checkpoint is refused rather than downloaded")
+    except SystemExit as error:
+        check("DOWNLOAD" in str(error) and "AFR_ALLOW_DOWNLOAD" in str(error),
+              "a non-existent checkpoint raises, naming the download risk and the opt-out")
+    with tempfile.TemporaryDirectory() as real:
+        check(AgenticFootprintDefense(model=real).agent_checkpoint() == real,
+              "a checkpoint that IS on disk passes through untouched")
 
     # The embedder resolves the same way, and all three of its variants must reach a checkpoint --
     # they key on one [harrier] section because the A/B varies the instruction, not the weights.
