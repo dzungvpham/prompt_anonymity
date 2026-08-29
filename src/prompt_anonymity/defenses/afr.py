@@ -258,6 +258,21 @@ AFR_ALLOW_DOWNLOAD = os.environ.get("AFR_ALLOW_DOWNLOAD", "") == "1"
 #: 400-turn session cannot crowd out the draft being edited.
 NEAREST_PRIOR_CHARS = 2000
 
+#: Characters of a document used where it is CONTEXT rather than the thing being rewritten -- the
+#: rolling profile's input and the judge's copy of the original request.
+#:
+#: These are summarizing and grading jobs, so a bounded view is sufficient; the rewrite paths still
+#: see the whole document because they have to reproduce it. Without this the profile call appends a
+#: full document to a full profile and overflows the window outright, which is not a degraded result
+#: but a hard ``VLLMValidationError`` that kills the chunk.
+CONTEXT_CHARS = 8000
+
+#: Tokens held back for everything wrapped AROUND a document in a prompt: the system prompt, the
+#: escalation rung, the author profile, the nearest-prior excerpt, the score block and the trajectory.
+#: :func:`_LocalBackend.prompt_budget` subtracts this as well as the completion, because measuring
+#: only the document is what let a 30,720-token document produce a 32,769-token prompt.
+PROMPT_RESERVE_TOKENS = 2048
+
 #: A candidate must land within these multiples of the original's total length. The floor catches a
 #: model that "anonymized" by deleting the prompt; the ceiling catches one that padded it with
 #: invented context. Both are footprint reductions on paper and useless in practice.
@@ -541,6 +556,19 @@ def render_turn_blocks(turns) -> str:
 def join_document(turns) -> str:
     """The string the featurizer will embed: turns joined by :data:`TURN_SEPARATOR`."""
     return TURN_SEPARATOR.join(str(turn) for turn in turns)
+
+
+def clip_context(text: str, max_chars: int = CONTEXT_CHARS) -> str:
+    """Bound a document used as CONTEXT in a prompt, marking the cut so the model knows.
+
+    Only for prompts that read a document rather than reproduce it -- the rolling profile and the
+    judge's copy of the original request. The rewrite paths are never clipped: a truncated document
+    there would be spliced into the dataset, which is the failure ``too_long`` exists to avoid.
+    """
+    text = str(text)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[...truncated]"
 
 
 # --- scoring records ---------------------------------------------------------
@@ -1283,12 +1311,15 @@ class _LocalBackend:
 
     @property
     def prompt_budget(self) -> int:
-        """Tokens a prompt may occupy: the served window minus the longest completion asked for.
+        """Tokens a DOCUMENT may occupy: the window, minus the longest completion, minus the wrapper.
 
-        The longest completion is a ``propose`` round, which returns up to three full rewrites of the
-        document in one reply. Anything over this budget cannot be served and is skipped by
-        :func:`fits_budget`'s caller rather than being truncated."""
-        return max(1, AFR_MAX_MODEL_LEN - self.propose_tokens)
+        Three terms, and the third was missing at first. The longest completion is a ``propose``
+        round returning up to three full rewrites in one reply; the wrapper is everything that
+        surrounds the document in that prompt (system prompt, escalation rung, author profile,
+        nearest-prior excerpt, scores, trajectory). Measuring only the document is how a 30,720-token
+        document became a 32,769-token prompt and hard-failed the request.
+        """
+        return max(1, AFR_MAX_MODEL_LEN - self.propose_tokens - PROMPT_RESERVE_TOKENS)
 
     def count_tokens(self, text: str) -> int:
         """Length of ``text`` in the served model's tokens, via the engine's own tokenizer.
@@ -1695,8 +1726,11 @@ class AgenticFootprintDefense(CachedDefense):
         batch = list(batch)
         if not batch:
             return []
+        # Both fields are clipped: an unbounded profile plus an unbounded document is exactly the
+        # pair that overflowed the window and hard-failed a whole chunk.
         users = [render_template(self.prompts["signature_user_template"],
-                                 {"PROFILE": profile or "(empty)", "DOCUMENT": document})
+                                 {"PROFILE": clip_context(profile or "(empty)", CONTEXT_CHARS // 4),
+                                  "DOCUMENT": clip_context(document)})
                  for profile, document in batch]
         replies = self.backend().chat(self.prompts["signature_system_prompt"], users, "signature")
         updated = []
@@ -1727,11 +1761,13 @@ class AgenticFootprintDefense(CachedDefense):
 
         # One flat answer batch: each document contributes its original plus each of its variants,
         # and `spans` remembers which replies belong to which document.
+        # The answer prompts are bounded too. A document that passed `_fits` sits just under the
+        # window on its own, so appending a completion to it can still overflow.
         prompts, spans = [], []
         for original, variants in pairs:
             start = len(prompts)
-            prompts.append(original)
-            prompts.extend(variants)
+            prompts.append(clip_context(original, CONTEXT_CHARS * 2))
+            prompts.extend(clip_context(variant, CONTEXT_CHARS * 2) for variant in variants)
             spans.append((start, len(variants)))
         answers = self.backend().chat(self.prompts["answer_system_prompt"], prompts, "answer")
         if len(answers) != len(prompts):
@@ -1743,7 +1779,8 @@ class AgenticFootprintDefense(CachedDefense):
             for offset in range(count + 1):
                 judge_users.append(render_template(
                     self.prompts["judge_user_template"],
-                    {"REQUEST": original, "ANSWER": answers[start + offset]}))
+                    {"REQUEST": clip_context(original),
+                     "ANSWER": clip_context(answers[start + offset], CONTEXT_CHARS // 2)}))
         judged = self.backend().chat(self.prompts["judge_system_prompt"], judge_users, "judge")
         if len(judged) != len(judge_users):
             return [[1.0] * len(variants) for _original, variants in pairs]
@@ -2223,6 +2260,25 @@ def _selftest() -> None:
     unmeasurable = AgenticFootprintDefense(backend=_NoTokenizer())
     check(unmeasurable._fits("anything at all") == (True, 0),
           "a backend with no tokenizer skips the guard rather than skipping every document")
+
+    print("prompt window arithmetic:")
+    budget = _LocalBackend({}, propose_tokens=DEFAULT_PROPOSE_TOKENS).prompt_budget
+    check(budget == AFR_MAX_MODEL_LEN - DEFAULT_PROPOSE_TOKENS - PROMPT_RESERVE_TOKENS,
+          f"the document budget reserves the completion AND the wrapper around it ({budget:,} of "
+          f"{AFR_MAX_MODEL_LEN:,})")
+    check(budget + DEFAULT_PROPOSE_TOKENS < AFR_MAX_MODEL_LEN,
+          "...so a document at the budget plus its reply still fits the window")
+    long_context = "word " * 20_000
+    check(len(clip_context(long_context)) < len(long_context),
+          "a long document is clipped where it is CONTEXT (profile input, judge request)")
+    check(clip_context("short") == "short", "a short one is untouched")
+    check(clip_context(long_context).endswith("[...truncated]"),
+          "...and the cut is marked, so the model is not shown a sentence that just stops")
+    # The rewrite paths must NEVER clip -- a truncated document there enters the dataset.
+    rewrite_source = _inspect.getsource(AgenticFootprintDefense._abstract) + \
+        _inspect.getsource(AgenticFootprintDefense._propose)
+    check("clip_context" not in rewrite_source,
+          "the abstract and propose paths never clip: over-long documents take the too_long exit")
 
     print("the escalation ladder:")
 
