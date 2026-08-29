@@ -71,16 +71,16 @@ model = "Qwen/Qwen2.5-3B-Instruct"
 #   $AFR_MODEL                          an explicit override, always wins
 #   the path below                      Unity's shared model tree
 #
-# Note this is NOT the hub-cache layout the rest of /datasets/ai uses
-# (/datasets/ai/qwen3/hub/models--Qwen--<name>) -- it is a plain checkpoint directory.
-# `resolve_model_path` accepts both: a directory holding config.json is used as-is, a hub cache
-# entry is followed into snapshots/<commit>/.
+# This is the same hub-cache layout the rest of /datasets/ai uses -- /datasets/ai/<family>/hub/
+# models--<org>--<name>, as in styleremix.py's llama3 entry and fluency.py's Qwen3-0.6B-Base. It is
+# NOT itself loadable: the checkpoint sits in snapshots/<commit>/, and `resolve_model_path` follows
+# it there (preferring refs/main when that snapshot is actually on disk).
 #
 # OFF-CLUSTER this path does not exist and the run fails immediately, naming $AFR_MODEL. That is
 # the intended trade: a loud failure on a laptop beats a silent 30 GB download on a compute node.
 # Set $AFR_MODEL to a repo id if you actually do want it fetched.
 [afr]
-model = "/datasets/ai/qwen3/Qwen3.8-27B"
+model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
 
 # The previous default, kept for the record: "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8" (~33 GB, MoE,
 # ~3B active). Nothing that size is mirrored on this cluster, so it would have to be downloaded to
