@@ -220,6 +220,18 @@ AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.85"))
 #: Mamba/attention model whose Triton kernels get neither fusion nor graph capture in eager mode.
 AFR_ENFORCE_EAGER = os.environ.get("AFR_ENFORCE_EAGER", "") == "1"
 
+#: Documents per Harrier forward pass. **Sized for the memory left AFTER vLLM, not before it.**
+#:
+#: vLLM's reservation is permanent: it takes ``AFR_GPU_MEM_UTIL`` of the card at startup and holds it
+#: for the engine's lifetime, so the embedder spends the whole run in the remainder -- roughly 10 GiB
+#: of an 80 GB card. Harrier's own default (32 documents x 8,192 tokens) needs ~2 GiB per forward
+#: pass, which is fine when it has the card to itself during the reference-pool embed and OOMs later
+#: when it does not. The lockstep driver made this reachable: it embeds every document in a chunk at
+#: once (2,356 texts for a 64-author chunk), where the old serial loop embedded one at a time.
+#:
+#: 8 keeps the peak near 0.5 GiB. Lower it if the embedder OOMs; raise it only if vLLM's share drops.
+AFR_EMBED_BATCH = int(os.environ.get("AFR_EMBED_BATCH", "8"))
+
 #: How deep the causal cascade runs before an author's remaining documents stop extending the chain.
 #:
 #: The cascade is what serializes work: document ``k`` needs the defended text of ``1..k-1``, so an
@@ -1293,11 +1305,40 @@ class _LocalBackend:
         if self._featurizer is None:
             from ..features.harrier import HarrierFeaturizer
 
-            self._featurizer = HarrierFeaturizer()
+            # batch_size is explicit because the default is sized for a card the embedder has to
+            # itself, and here it shares one with a 27B model whose reservation is permanent.
+            # It never changes a vector, so it stays out of the featurizer's params() and cache key.
+            self._featurizer = HarrierFeaturizer(batch_size=AFR_EMBED_BATCH)
         return self._featurizer
 
     def embed(self, texts: list[str]) -> np.ndarray:
-        return np.asarray(self.featurizer().featurize(list(texts)), dtype=float)
+        """Embed a batch, halving the forward-pass size and retrying if the GPU is momentarily full.
+
+        The embedder shares a card with a model that has already reserved most of it, and the amount
+        left over moves with vLLM's in-flight work. A transient OOM here is a reason to take smaller
+        bites, not to lose the job -- which is what it did before this: one OOM inside a forward pass
+        killed the run and discarded the chunk. The reduced size sticks, so the run settles at
+        whatever fits rather than rediscovering the limit on every call.
+        """
+        texts = list(texts)
+        if not texts:
+            return np.zeros((0, 0))
+        featurizer = self.featurizer()
+        while True:
+            try:
+                return np.asarray(featurizer.featurize(texts), dtype=float)
+            except Exception as error:  # noqa: BLE001 - torch.OutOfMemoryError without importing torch
+                if "out of memory" not in str(error).lower() or featurizer.batch_size <= 1:
+                    raise
+                featurizer.batch_size = max(1, featurizer.batch_size // 2)
+                print(f"[afr] embedder OOM; retrying at batch_size={featurizer.batch_size} "
+                      f"(set AFR_EMBED_BATCH lower to start there)", flush=True)
+                try:
+                    import torch
+
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 - the retry matters, the reclaim is a bonus
+                    pass
 
     # -- generation --
     def _engine(self):

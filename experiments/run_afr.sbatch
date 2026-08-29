@@ -72,6 +72,12 @@ set -euo pipefail
 PROJECT="${PROMPT_ANONYMITY_PROJECT:-${SLURM_SUBMIT_DIR:-$PWD}}"
 cd "$PROJECT"
 
+# Must be exported BEFORE anything initializes CUDA. The embedder and vLLM share one card and vLLM's
+# reservation is permanent, so the embedder works in a shrinking remainder; expandable segments let
+# the allocator grow a block instead of failing on a fragmented heap. vLLM's own OOM message
+# recommends exactly this.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 SOURCE="${SOURCE:-wildchat_small}"
 FEATURE="${FEATURE:-gemini_embedding_2}"
 DEFENSE="${DEFENSE:-afr}"
