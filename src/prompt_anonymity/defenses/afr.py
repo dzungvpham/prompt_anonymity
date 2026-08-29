@@ -206,7 +206,13 @@ AFR_MAX_MODEL_LEN = int(os.environ.get("AFR_MAX_MODEL_LEN", "32768"))
 #: already resident. 0.90 because the default checkpoint is now bf16 (~54 GB) rather than FP8: an
 #: A100 has no native FP8, so an FP8 checkpoint there is dequantized through Marlin on every forward
 #: pass, which costs compute to save memory we do not need to save.
-AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.90"))
+#:
+#: 0.85 rather than 0.90 for margin. vLLM's fraction is of the card's TOTAL memory but it refuses to
+#: start if that exceeds what is *free* -- and Harrier is already resident by then. Even after
+#: reclaiming its allocator cache (see ``_engine``), a couple of GiB stay held, so asking for 0.90 of
+#: an 80 GB card leaves no room for the request to be granted. bf16 27B needs ~54 GB of weights, so
+#: 0.85 still leaves ~13 GB of KV cache.
+AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.85"))
 
 #: CUDA graphs and torch.compile. **On by default now.** This was ``True`` (i.e. disabled) to keep
 #: greedy decoding bit-reproducible; see the determinism note in the module docstring for why that
@@ -1312,6 +1318,26 @@ class _LocalBackend:
                 path = (resolve_model_path(shared_checkpoint(self.model) or self.model)
                         if self.model else model_checkpoint("afr", MODEL_ENV_VAR,
                                                             local_only=not AFR_ALLOW_DOWNLOAD))
+            # Hand back what the embedder's allocator is hoarding, BEFORE vLLM profiles the device.
+            #
+            # Harrier runs first -- it embeds the whole reference pool before any generation -- and
+            # PyTorch's caching allocator keeps the blocks from that peak instead of returning them
+            # to the driver. Measured: a 0.6B model whose weights are ~1.2 GB left **18.3 GiB**
+            # unavailable, so vLLM saw 60.9 of 79.2 GiB free, refused a 0.9 request, and the job died
+            # at startup. `empty_cache` releases the cached-but-unused blocks; Harrier's weights stay
+            # resident, which is what we want, since it is used again between rounds.
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    free_before = torch.cuda.mem_get_info()[0] / 2**30
+                    torch.cuda.empty_cache()
+                    free_after = torch.cuda.mem_get_info()[0] / 2**30
+                    print(f"[afr] released the embedder's cached blocks: "
+                          f"{free_before:.1f} -> {free_after:.1f} GiB free")
+            except Exception as error:  # noqa: BLE001 - a diagnostic must not break the run
+                print(f"note: could not reclaim cached GPU memory ({type(error).__name__}: {error})")
+
             print(f"[afr] loading agent {path} (vLLM), max_model_len={AFR_MAX_MODEL_LEN:,}, "
                   f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}, "
                   f"enforce_eager={AFR_ENFORCE_EAGER}")
