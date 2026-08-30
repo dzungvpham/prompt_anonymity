@@ -346,6 +346,40 @@ def select_shard(documents: pd.DataFrame, shard_index: int, num_shards: int) -> 
     return documents.iloc[shard_index::num_shards]
 
 
+def select_author_shard(documents: pd.DataFrame, shard_index: int, num_shards: int,
+                        *, author_column: str = "author_id") -> pd.DataFrame:
+    """This shard's documents, split by AUTHOR so that no author is ever cut across shards.
+
+    :func:`select_shard` interleaves by row, which is right for featurization -- one document's
+    vector does not depend on any other's -- and wrong for a defense that measures a document
+    against its author's other documents. ``afr`` cascades document *k* against the *defended* text
+    of ``1..k-1``; handed documents 1, 9 and 17 of one author it would cascade them as though they
+    were consecutive, and emit a plausible parquet that means something else. Whole authors per
+    shard reproduce exactly what an unsharded run computes.
+
+    Balanced longest-processing-time-first rather than round-robin: author document counts are very
+    uneven (wildchat_small averages 23 but reaches into the hundreds), and an author's timeline is
+    *serial* inside the cascade, so a shard that draws two giant authors sets the array's wall clock
+    on its own. Taking the heaviest author first and always placing it on the currently-lightest
+    shard flattens that. Ties break on ``author_id``, so the assignment depends only on the
+    selection and ``num_shards`` -- never on frame order -- and a re-run reproduces it.
+
+    The index still carries each document's split row position, for :func:`read_texts` and
+    :func:`~prompt_anonymity.data.apply_defenses.read_turns`.
+    """
+    if num_shards <= 1:
+        return documents
+    counts = documents[author_column].value_counts()
+    load = [0] * num_shards
+    owner: dict = {}
+    for author in sorted(counts.index, key=lambda name: (-int(counts[name]), str(name))):
+        lightest = min(range(num_shards), key=lambda shard: (load[shard], shard))
+        owner[author] = lightest
+        load[lightest] += int(counts[author])
+    mine = {author for author, shard in owner.items() if shard == shard_index}
+    return documents[documents[author_column].isin(mine)]
+
+
 # --- featurization ----------------------------------------------------------
 
 def resolve_max_len(source: str, requested: int | None) -> int | None:

@@ -53,6 +53,14 @@ rather than per document (see :meth:`AgenticFootprintDefense.transform`). ``shar
 the same reason as ``loo_unlink``, one level stronger: a shard holding an arbitrary subset of an
 author would not merely mis-measure the baseline, it would cascade from the wrong documents.
 
+Whole **authors**, though, split perfectly -- they share nothing but the reference pool -- so
+``shardable_by = "author"`` opts into ``apply_defenses``' author-aware split and an array job
+defends the corpus N ways without changing a single output token. The one thing that must not be
+sharded with it is that pool: it defines ``r_med`` and therefore the target every document is
+optimized to, so a per-shard pool would give each task its own criterion and quietly break
+comparability. :meth:`AgenticFootprintDefense.reference_pool_ids` selects it over the whole split
+instead, and the caller hands the same documents to every task on the known side.
+
 Throughput: why this batches across authors
 -------------------------------------------
 
@@ -245,6 +253,37 @@ AFR_EMBED_BATCH = int(os.environ.get("AFR_EMBED_BATCH", "8"))
 #: The causal ordering is preserved exactly where it carries information -- a 33rd prompt learns
 #: little from prompts 33..449 that it did not already learn from 1..32 -- and the endgame is bounded.
 AFR_CASCADE_DEPTH = int(os.environ.get("AFR_CASCADE_DEPTH", "32"))
+
+#: Speculative decoding: tokens the n-gram drafter proposes per step. ``0`` disables it.
+#:
+#: WHY IT IS ON. Decode here is memory-bandwidth bound -- producing one token reads all ~54 GB of bf16
+#: weights -- so the arithmetic units idle. Speculative decoding spends that idle compute: a cheap
+#: drafter guesses ``N`` tokens and the real model verifies all ``N`` in ONE forward pass, at
+#: essentially the cost of producing one. Accepted tokens are exactly the tokens the model would have
+#: emitted alone; at ``temperature=0`` verification is a plain argmax comparison, and any drafted
+#: token the model would not have chosen is rejected and overwritten. The drafter has no vote.
+#:
+#: WHY N-GRAM RATHER THAN A DRAFT MODEL. The ``ngram`` method needs no second checkpoint and no extra
+#: GPU memory -- both decisive when a 27B agent and Harrier already share one card. It drafts by
+#: finding the last few generated tokens in the PROMPT and copying whatever followed them there,
+#: which fits this workload almost exactly: every propose round rewrites a document sitting in its
+#: own prompt, and the spans the defense deliberately preserves (code blocks, error text, untouched
+#: sentences) are copied verbatim and so draft at near-perfect acceptance.
+#:
+#: NOT IN THE CACHE KEY, with the rest of the serving knobs: it changes how fast tokens are produced,
+#: not which ones. The caveat is the same one that retired the bitwise-determinism contract --
+#: verifying N positions at once uses different kernels than stepping one at a time, so logits can
+#: differ in their last bits and a near-tied argmax can flip. Same class of non-determinism, not a
+#: new one. Set to 0 if a run must be compared token-for-token against a non-speculative one.
+#:
+#: Speed is not guaranteed: rejected drafts cost a wasted pass, so on a workload that copies little
+#: this can be slower. Measure before trusting it.
+AFR_SPEC_TOKENS = int(os.environ.get("AFR_SPEC_TOKENS", "5"))
+
+#: Longest and shortest prompt n-gram the drafter will match on. Small windows find more matches and
+#: draft worse; large ones draft well but rarely fire. 4/2 is vLLM's usual starting point.
+AFR_SPEC_NGRAM_MAX = int(os.environ.get("AFR_SPEC_NGRAM_MAX", "4"))
+AFR_SPEC_NGRAM_MIN = int(os.environ.get("AFR_SPEC_NGRAM_MIN", "2"))
 
 #: Opt-in to fetching a checkpoint that is not already on disk. **Off by default, and that default is
 #: the point.** vLLM treats anything that is not a local directory as a hub repo id and downloads it
@@ -1417,9 +1456,35 @@ class _LocalBackend:
             # system prompt and escalation ladder are identical for every call in the corpus, and
             # within one document the author profile and the nearest-prior excerpt repeat across all
             # of its proposal rounds. Reusing that KV prefix removes the re-prefill each round.
-            self._llm = LLM(model=path, dtype="auto", gpu_memory_utilization=AFR_GPU_MEM_UTIL,
-                            max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=AFR_ENFORCE_EAGER,
-                            enable_prefix_caching=True, seed=self.seed)
+            options = dict(model=path, dtype="auto", gpu_memory_utilization=AFR_GPU_MEM_UTIL,
+                           max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=AFR_ENFORCE_EAGER,
+                           enable_prefix_caching=True, seed=self.seed)
+            # Speculative decoding (see AFR_SPEC_TOKENS). Passed as a nested dict because the flat
+            # `speculative_model=` / `ngram_prompt_lookup_max=` spelling was removed in vLLM v1; the
+            # retry below covers the versions that still want the old one, or that were built
+            # without ngram support, since neither is worth failing a 10-hour job over.
+            speculative = None
+            if AFR_SPEC_TOKENS > 0:
+                speculative = {"method": "ngram",
+                               "num_speculative_tokens": AFR_SPEC_TOKENS,
+                               "prompt_lookup_max": AFR_SPEC_NGRAM_MAX,
+                               "prompt_lookup_min": AFR_SPEC_NGRAM_MIN}
+                print(f"[afr] speculative decoding: ngram, {AFR_SPEC_TOKENS} draft tokens, "
+                      f"lookup {AFR_SPEC_NGRAM_MIN}-{AFR_SPEC_NGRAM_MAX}")
+            try:
+                self._llm = LLM(**options, **({"speculative_config": speculative}
+                                              if speculative else {}))
+            except (TypeError, ValueError) as error:
+                if speculative is None:
+                    raise
+                # Do NOT swallow a real startup failure (an OOM, a bad checkpoint) as "no
+                # speculation": retry only when the complaint is about the argument itself.
+                blame = str(error).lower()
+                if "speculative" not in blame and "ngram" not in blame:
+                    raise
+                print(f"note: this vLLM rejected the speculative config, continuing without it "
+                      f"({type(error).__name__}: {error})")
+                self._llm = LLM(**options)
             self._sampling = {
                 # Temperature 0 everywhere: the defense must be a deterministic function of its
                 # input, or the content-addressed cache would return a different cascade on a hit
@@ -1482,8 +1547,15 @@ class AgenticFootprintDefense(CachedDefense):
     name = "afr"
     version = "1"
 
-    #: See the module docstring. Checked by ``apply_defenses``.
+    #: Never by DOCUMENT: ``select_shard`` interleaves rows, and a shard holding an arbitrary subset
+    #: of an author would cascade document ``k`` against the wrong priors. See the module docstring.
     shardable = False
+
+    #: But splitting whole AUTHORS across tasks is exact -- authors share nothing except the
+    #: reference pool, and :meth:`reference_pool_ids` keeps that identical in every shard. This is
+    #: the only lever that shortens the wall clock without changing a single output token.
+    #: ``apply_defenses`` reads it and switches to ``select_author_shard``.
+    shardable_by = "author"
 
     #: AUTHORS between cache checkpoints -- an author is the atomic unit of the cascade.
     checkpoint_every = DEFAULT_CHECKPOINT_EVERY
@@ -1803,6 +1875,54 @@ class AgenticFootprintDefense(CachedDefense):
             cursor += len(variants) + 1
         return losses
 
+    # -- the reference pool under sharding --
+
+    def reference_pool_ids(self, doc_ids) -> list[str]:
+        """Which documents form the reference pool, chosen over the WHOLE split's ``doc_id``s.
+
+        Exists for :mod:`~prompt_anonymity.data.apply_defenses`. An author-sharded task only holds
+        its own authors' rows, and the pool drawn from those would be a *different* pool per shard
+        -- which would be quietly fatal, because the pool defines ``r_med`` and therefore the target
+        every document is optimized to (``r_med + alpha * (s_max_0 - r_med)``). Each shard would
+        succeed against its own criterion and the arms would not be comparable.
+
+        So the caller selects here, over the full frame, reads those documents' turns, and passes
+        them on the *known* side; :meth:`_pool_from_known` picks them up. Because
+        :func:`select_reference_pool` samples over **sorted** ``doc_id``s with a fixed seed, the
+        result is identical to what an unsharded run picks for itself -- so ``pool_digest``, which
+        is part of every author's cache key, matches across shard layouts. The selftest asserts it
+        rather than trusting it.
+        """
+        doc_ids = [str(doc) for doc in doc_ids]
+        chosen = select_reference_pool(doc_ids, n_reference=self.n_reference, seed=self.seed)
+        return [doc_ids[index] for index in chosen]
+
+    def _pool_from_known(self, data: AttackData):
+        """``(ids, texts, authors)`` of a caller-supplied pool, or ``None`` if there is not one.
+
+        The known side arrives as the same per-TURN stream as the unknown side, so the documents are
+        rebuilt and joined with :func:`join_document` here -- byte-identical to how the unsharded
+        path builds ``document_text``, which is what keeps the digest stable. Sorted by ``doc_id``
+        for the same reason: :func:`select_reference_pool` returns its choice in that order, and the
+        rows may arrive in split order instead.
+        """
+        if data.known_texts is None or len(data.known_texts) == 0:
+            return None
+        if data.known_ids is None:
+            raise ValueError(f"defense {self.name!r}: a known-side reference pool needs known_ids.")
+        labels = ([str(label) for label in data.known_labels]
+                  if data.known_labels is not None and len(data.known_labels)
+                  else [""] * len(data.known_texts))
+        turns: dict[str, list[str]] = {}
+        author: dict[str, str] = {}
+        for row_id, text, label in zip(data.known_ids, data.known_texts, labels):
+            doc = document_id(str(row_id))
+            turns.setdefault(doc, []).append(str(text))
+            author.setdefault(doc, str(label))
+        pool_ids = sorted(turns)
+        return pool_ids, [join_document(turns[doc]) for doc in pool_ids], \
+            [author[doc] for doc in pool_ids]
+
     # -- edit log --
 
     def _open_log(self, cache_dir) -> None:
@@ -1868,10 +1988,17 @@ class AgenticFootprintDefense(CachedDefense):
         document_text = {doc: join_document(doc_turns[doc]) for doc in order}
 
         # --- the reference pool: "a median unrelated document" -----------------
-        pool_positions = select_reference_pool(order, n_reference=self.n_reference, seed=self.seed)
-        pool_ids = [order[index] for index in pool_positions]
-        pool_texts = [document_text[doc] for doc in pool_ids]
-        pool_authors = [doc_author[doc] for doc in pool_ids]
+        # From the KNOWN side when the caller supplied one, which is how an author-sharded run keeps
+        # every shard calibrated against the same "unrelated". See `reference_pool_ids`.
+        supplied = self._pool_from_known(data)
+        if supplied is not None:
+            pool_ids, pool_texts, pool_authors = supplied
+        else:
+            pool_positions = select_reference_pool(order, n_reference=self.n_reference,
+                                                   seed=self.seed)
+            pool_ids = [order[index] for index in pool_positions]
+            pool_texts = [document_text[doc] for doc in pool_ids]
+            pool_authors = [doc_author[doc] for doc in pool_ids]
         digest = pool_digest(pool_ids, pool_texts)
 
         # Authors in SORTED order, one at a time -- see the determinism note.
@@ -2435,7 +2562,77 @@ def _selftest() -> None:
     check(len(sweep) == len(AFR_RESIDUALS) + 2,
           f"the residual sweep and both controls are registered ({len(sweep)}: {sweep})")
     check(all(not DEFENSES[name].shardable for name in sweep),
-          "every registered variant refuses sharding")
+          "every registered variant refuses DOCUMENT sharding")
+    check(all(DEFENSES[name].shardable_by == "author" for name in sweep),
+          "every registered variant opts in to AUTHOR sharding")
+
+    print("author sharding:")
+    from ..data.compute_features import select_author_shard
+    import pandas as _pd
+    frame = _pd.DataFrame({
+        "doc_id": [f"d{index:03d}" for index in range(60)],
+        # deliberately lopsided: one author with 25 documents, a tail of singletons
+        "author_id": (["a"] * 25 + ["b"] * 12 + ["c"] * 8 + ["d"] * 5
+                      + [f"e{index}" for index in range(10)]),
+    })
+    shards = [select_author_shard(frame, index, 4) for index in range(4)]
+    check(sum(len(part) for part in shards) == len(frame),
+          "the author shards partition the frame exactly (no row lost or duplicated)")
+    check(sorted(sum((list(part["doc_id"]) for part in shards), [])) == sorted(frame["doc_id"]),
+          "and they cover every doc_id once")
+    owners = [set(part["author_id"]) for part in shards]
+    check(all(not (left & right) for index, left in enumerate(owners)
+              for right in owners[index + 1:]),
+          "no author appears in two shards -- the cascade is never cut")
+    check(max(len(part) for part in shards) - min(len(part) for part in shards) <= 25,
+          "longest-processing-time placement keeps the shards within one big author of each other")
+    check(list(select_author_shard(frame, 0, 1)["doc_id"]) == list(frame["doc_id"]),
+          "num_shards=1 is the whole frame, unchanged")
+    check(all(list(select_author_shard(frame, index, 4).index)
+              == list(select_author_shard(frame, index, 4).index) for index in range(4)),
+          "the assignment is deterministic")
+
+    print("the reference pool survives sharding:")
+    defense = DEFENSES["afr"]
+    all_ids = [f"d{index:03d}" for index in range(300)]
+    # What an UNSHARDED transform picks for itself, by the same call it makes internally...
+    positions = select_reference_pool(all_ids, n_reference=defense.n_reference, seed=defense.seed)
+    unsharded = [all_ids[index] for index in positions]
+    # ...must equal what a sharded run is told to hand every task.
+    check(defense.reference_pool_ids(all_ids) == unsharded,
+          "reference_pool_ids reproduces the unsharded pool exactly (so pool_digest matches)")
+    check(defense.reference_pool_ids(list(reversed(all_ids))) == unsharded,
+          "and it does not depend on the order the split hands over its doc_ids")
+
+    pool_turns = {doc: [f"{doc} turn one", f"{doc} turn two"] for doc in unsharded[:5]}
+    known_ids, known_texts, known_authors = [], [], []
+    for doc, turns_ in pool_turns.items():
+        for index, turn in enumerate(turns_):
+            known_ids.append(f"{doc}#{index}")
+            known_texts.append(turn)
+            known_authors.append("someone")
+    supplied = defense._pool_from_known(AttackData(
+        known_embeddings=np.zeros((len(known_texts), 0)),
+        unknown_embeddings=np.zeros((0, 0)),
+        known_labels=np.asarray(known_authors, dtype=object),
+        unknown_labels=np.empty(0, dtype=object),
+        known_texts=np.asarray(known_texts, dtype=object),
+        known_ids=np.asarray(known_ids, dtype=object)))
+    check(supplied is not None and supplied[0] == sorted(pool_turns),
+          "a known-side pool is rebuilt into documents, sorted by doc_id")
+    check(supplied[1] == [join_document(pool_turns[doc]) for doc in sorted(pool_turns)],
+          "and its texts are joined exactly as the unsharded path joins them")
+    check(defense._pool_from_known(AttackData(
+        known_embeddings=np.zeros((0, 0)), unknown_embeddings=np.zeros((0, 0)),
+        known_labels=np.empty(0, dtype=object),
+        unknown_labels=np.empty(0, dtype=object))) is None,
+          "no known side means the defense samples its own pool, as before")
+
+    print("serving knobs stay out of the cache key:")
+    keys = set(DEFENSES["afr"].params())
+    check(not (keys & {"speculative", "spec_tokens", "enforce_eager", "prefix_caching",
+                       "gpu_memory_utilization", "max_model_len", "cascade_depth"}),
+          f"params() carries no serving knob ({sorted(keys)})")
     check(DEFENSES["afr_stage1"].max_probes == 0,
           "afr_stage1 is the loop ablation, not the model ablation")
     check(DEFENSES["afr"].params()["alpha"] == DEFENSES["afr_a00"].params()["alpha"],

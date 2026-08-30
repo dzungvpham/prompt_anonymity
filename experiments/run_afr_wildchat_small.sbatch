@@ -57,30 +57,65 @@
 #
 #   sbatch experiments/run_afr_wildchat_small.sbatch --attacks logistic nearest_neighbor
 #
+# THIS IS AN ARRAY JOB, and that is the whole reason it finishes
+# ---------------------------------------------------------------
+# Measured on the first run that got far enough to produce a number: 458 documents in 7.5 hours,
+# i.e. 61 documents/hour, i.e. ~76 hours for all 4,673. One GPU cannot do this inside any
+# reasonable wall clock.
+#
+# So stage 1 runs as an 8-task array, each task defending a disjoint set of WHOLE AUTHORS. Authors
+# are independent in AFR -- nothing crosses between them -- so this changes not one output token.
+# It is pure parallelism, unlike lowering max_probes, which would trade away the defense itself.
+# `apply_defenses` picks the author split automatically because the defense declares
+# `shardable_by = "author"`; the shard index and count come from SLURM_ARRAY_TASK_ID/COUNT.
+#
+# THE REFERENCE POOL IS THE SUBTLE PART. A task holds an eighth of the split, but the pool defines
+# r_med and therefore the target every document is optimized to. A per-shard pool would give each
+# task a different criterion and the arms would silently stop being comparable. So the pool is
+# selected over the WHOLE split before sharding and handed to every task identically -- see
+# `AgenticFootprintDefense.reference_pool_ids`. The selftest asserts that the resulting pool_digest
+# matches what an unsharded run computes, which is the invariant that makes this safe.
+#
+# STAGES 2-4 RUN ONCE, in whichever task finishes last: the array auto-merges its shards, and the
+# task that writes the merged parquet claims the downstream stages under a lock.
+#
+# CHANGING THE ARRAY SIZE RESTARTS THE DEFEND CACHE. The shard layout is part of the cache path
+# (two shards sharing a table would overwrite each other), so `--array=0-3` after `--array=0-7`
+# recomputes everything. Pick a size and keep it.
+#
+# Sharding does not scale linearly, because the two halves of a round scale differently: prefill is
+# compute-bound and falls with the batch, decode is bandwidth-bound and does not (batch 25 reads the
+# same 54 GB per token step as batch 64, for fewer tokens). Expect the gain to flatten past ~8 tasks
+# -- which is why speculative decoding is on (AFR_SPEC_TOKENS): it attacks the decode term that
+# causes the flattening. MEASURE BOTH TOGETHER with LIMIT=100 before committing to the full run.
+#
 # RESOURCES. An 80 GB card: the bf16 27B agent is ~54 GB of weights and Harrier-0.6B co-resides,
 # loading FIRST (it embeds the reference pool before any generation) so it sits OUTSIDE vLLM's
 # gpu_memory_utilization budget. bf16 rather than the FP8 sibling because an A100 has no native FP8
 # and would dequantize through Marlin on every forward pass. On an H100/H200 prefer FP8:
 # AFR_MODEL=<...-FP8> with AFR_GPU_MEM_UTIL=0.75.
 #
-# AFR_AUTHOR_BATCH is raised to 64 here (32 elsewhere): 200 short-timeline authors means a wide
-# batch is available and cheap to hold, since a 5-document author leaves the pool quickly. Drop it
-# back to 32 or 16 if the KV cache cannot hold that many in flight.
+# AFR_AUTHOR_BATCH stays wide (64) so each task defends its ~25 authors as ONE lockstep chunk, which
+# is the widest batch available to it. The cost: `checkpoint_every` is both the flush cadence and the
+# batch width, so a preempted task loses its chunk and restarts. Exposure shrinks with more tasks
+# (shorter each), not with a narrower batch -- narrowing it slows every task down to protect against
+# an event that may not happen. Lower it only if the KV cache cannot hold 25 authors in flight.
 #
 # Knobs, all environment-only and all OUTSIDE the cache key, so tuning them never invalidates
 # completed authors: AFR_GPU_MEM_UTIL, AFR_MAX_MODEL_LEN, AFR_AUTHOR_BATCH, AFR_CASCADE_DEPTH,
-# AFR_ENFORCE_EAGER.
+# AFR_ENFORCE_EAGER, AFR_SPEC_TOKENS.
 #
 #SBATCH --job-name=afr-wcs
-#SBATCH --output=scripts/logs/%x-%j.out
+#SBATCH --output=scripts/logs/%x-%A_%a.out
 #SBATCH --open-mode=append
+#SBATCH --array=0-7
 #SBATCH --nodes=1
 #SBATCH --partition=gpu-preempt
 #SBATCH --gpus=1
 #SBATCH --constraint=a100-80g|h100|h200
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48g
-#SBATCH --time=0-08:00:00
+#SBATCH --time=0-16:00:00
 #SBATCH --requeue
 
 set -euo pipefail
@@ -118,14 +153,19 @@ fi
 # client's concurrency and plot_results' worker pool.
 RUN=(bash scripts/slurm_job.sh)
 
+SHARD="${SLURM_ARRAY_TASK_ID:-0}"
+NSHARDS="${SLURM_ARRAY_TASK_COUNT:-1}"
+
 echo "=================================================================="
 echo "AFR on wildchat_small: $DEFENSE"
 echo "  source:       $SOURCE"
 echo "  feature:      $FEATURE"
 echo "  attack:       logistic"
 echo "  author batch: $AFR_AUTHOR_BATCH"
+echo "  shard:        $SHARD of $NSHARDS  (whole authors; the pool is shared)"
+echo "  speculative:  ${AFR_SPEC_TOKENS:-5} draft tokens (0 disables)"
 [ -n "$LIMIT" ] && echo "  LIMIT:        $LIMIT  (SMOKE TEST -- attack numbers will be meaningless)"
-echo "Job ${SLURM_JOB_ID:-local} on $(hostname), started $(date)"
+echo "Job ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}} task ${SHARD} on $(hostname), $(date)"
 echo "=================================================================="
 
 # 0a. The split is cut locally, not downloaded, so its absence is the most likely way this job dies
@@ -157,15 +197,52 @@ from prompt_anonymity.features.harrier import HarrierFeaturizer
 get_defense('${DEFENSE}').agent_checkpoint()
 print('[harrier] embedder checkpoint:', HarrierFeaturizer().checkpoint())"
 
-# 1. Defend. Authors advance in lockstep, so every model call is batched across the chunk; the log
-#    prints the chunk size as it starts each one. The edit log grows per DOCUMENT, so `wc -l` on it
-#    is a live throughput reading rather than something that only moves once an author finishes.
+# 1. Defend THIS SHARD. Authors advance in lockstep, so every model call is batched across the chunk;
+#    the log prints the chunk size as it starts each one. The edit log grows per DOCUMENT, so `wc -l`
+#    on it is a live throughput reading rather than something that only moves once an author
+#    finishes. No --num-shards flag: apply_defenses reads SLURM_ARRAY_TASK_ID/COUNT itself, so this
+#    same script is an unsharded run when submitted without --array.
 echo ""
 echo "------------------------------------------------------------------"
-echo "[1/4] defend  ($(date))"
+echo "[1/4] defend shard $SHARD/$NSHARDS  ($(date))"
 echo "------------------------------------------------------------------"
 "${RUN[@]}" python -m prompt_anonymity.data.apply_defenses \
     --source "$SOURCE" --defense "$DEFENSE" --dist-dir "$DIST_DIR" "${LIMIT_ARGS[@]}"
+
+# 1b. Stages 2-4 must run EXACTLY ONCE, over the merged split, and only after every shard exists.
+#     The last task to finish is the one whose merge succeeds and writes the merged parquet, so
+#     "does it exist" is the signal. `mkdir` is the claim because it is atomic on POSIX: if two
+#     tasks somehow race here, exactly one creates the directory. The lock is keyed to this array's
+#     job id, so a fresh submission is never blocked by a previous one's lock, and re-entrant for
+#     its owner, so a requeued winner resumes the downstream stages instead of skipping them.
+MERGED="$DIST_DIR/${SOURCE}_${DEFENSE}.parquet"
+LOCK="$DIST_DIR/.afr_downstream_${SOURCE}_${DEFENSE}_${SLURM_ARRAY_JOB_ID:-solo}"
+CLAIMED=0
+if [ -f "$MERGED" ]; then
+    if mkdir "$LOCK" 2>/dev/null; then
+        echo "$SHARD" > "$LOCK/owner"
+        CLAIMED=1
+    elif [ "$(cat "$LOCK/owner" 2>/dev/null)" = "$SHARD" ]; then
+        CLAIMED=1                      # this task owns the downstream stages and was requeued
+    fi
+fi
+
+if [ "$CLAIMED" != "1" ]; then
+    echo ""
+    echo "Shard $SHARD defended. Another task runs featurize/attack/plot once every shard is in."
+    echo "  shards so far: $(ls "$DIST_DIR/shards/${SOURCE}_${DEFENSE}."*.parquet 2>/dev/null | wc -l) of $NSHARDS"
+    echo "Done $(date)."
+    exit 0
+fi
+
+echo ""
+echo "This task wrote the merged split, so it runs the downstream stages."
+
+# From here on the SLURM array variables must be OUT of the environment. compute_features resolves
+# its own sharding from exactly those variables, so leaving them set would make stage 2 featurize
+# only an eighth of the documents and write a shard file nobody merges.
+RUN=(env -u SLURM_ARRAY_TASK_ID -u SLURM_ARRAY_TASK_COUNT -u SLURM_ARRAY_JOB_ID
+     bash scripts/slurm_job.sh)
 
 # 2. Featurize the defended text. The ATTACKER's encoder, and deliberately not the one AFR optimized
 #    against -- that mismatch is what makes this a transfer result rather than self-grading. This is

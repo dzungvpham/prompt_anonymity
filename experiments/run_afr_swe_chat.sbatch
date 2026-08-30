@@ -91,6 +91,18 @@ cd "$PROJECT"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SOURCE="swe_chat"                       # this script is the SWE-chat arm; see run_afr.sbatch for others
+
+# This script is SINGLE-TASK. Submitted with --array it would do the wrong thing quietly: stage 1
+# would correctly defend one author shard, but stages 2-4 resolve their own sharding from the same
+# SLURM_ARRAY_* variables, so every task would featurize and attack only its own eighth and write
+# partial results over each other. run_afr_wildchat_small.sbatch is the array-shaped one -- it
+# merges the shards and elects a single task for the downstream stages. Copy that pattern here if
+# this arm needs it too.
+if [ "${SLURM_ARRAY_TASK_COUNT:-1}" -gt 1 ]; then
+    echo "ERROR: this script is not array-safe (stages 2-4 would shard themselves)." >&2
+    echo "       Use experiments/run_afr_wildchat_small.sbatch as the template for an array run." >&2
+    exit 1
+fi
 FEATURE="${FEATURE:-gemini_embedding_2}"
 DEFENSE="${DEFENSE:-afr}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"

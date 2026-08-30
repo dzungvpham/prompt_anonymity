@@ -46,9 +46,13 @@
 # chunk ($AFR_AUTHOR_BATCH, default 32) rather than one call per document. See the module docstring
 # in defenses/afr.py for why that matters and what it replaced.
 #
-# NO SHARDING. `apply_defenses --num-shards` splits by document, and this defense cascades each
-# author's timeline in order -- a shard holding an arbitrary subset of an author would defend
-# document k against the wrong priors. `apply_defenses` refuses the run outright.
+# SHARDING: BY AUTHOR ONLY. `apply_defenses --num-shards` splits by document, and this defense
+# cascades each author's timeline in order -- a shard holding an arbitrary subset of an author would
+# defend document k against the wrong priors, so that form is refused outright. Whole authors are
+# exact, though, and the defense declares `shardable_by = "author"` to say so: submit as an array
+# and `apply_defenses` splits by author automatically, keeping the reference pool identical across
+# tasks. See experiments/run_afr_wildchat_small.sbatch, which is set up that way -- and note that the
+# shard layout is part of the cache path, so changing the array size recomputes everything.
 #
 # PREEMPTION IS SAFE. gpu-preempt jobs get killed; --requeue puts this back in the queue and all
 # three stages resume rather than restart -- apply_defenses checkpoints its cache per author chunk,

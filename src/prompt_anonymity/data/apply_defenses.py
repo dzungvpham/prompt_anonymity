@@ -116,6 +116,7 @@ from .compute_features import (
     load_split,
     merge_shards,
     resolve_sharding,
+    select_author_shard,
     select_documents,
     select_shard,
     shard_path,
@@ -233,7 +234,8 @@ def defense_cache_dir(cache_root: str | Path, source: str,
     return path
 
 
-def as_attack_data(texts: list[str], ids: list[str], authors: list[str]) -> AttackData:
+def as_attack_data(texts: list[str], ids: list[str], authors: list[str],
+                   reference=None) -> AttackData:
     """Wrap a stream of turns as the :class:`~prompt_anonymity.core.AttackData` a defense takes.
 
     A defense's input type is the experiment's known/unknown bundle, but a defense only ever reads
@@ -243,16 +245,26 @@ def as_attack_data(texts: list[str], ids: list[str], authors: list[str]) -> Atta
     vectors, but an explicit statement that no features exist yet.
 
     Everything goes on the *unknown* side, the side a defense rewrites by default (the threat model
-    being that the adversary's known conversations are already out). Defending a whole dataset has
-    no known side, so that side is empty.
+    being that the adversary's known conversations are already out). Defending a whole dataset
+    normally has no known side, so that side is empty.
+
+    ``reference``, when given, is ``(texts, ids, authors)`` of read-only context documents that go
+    on the **known** side -- "labeled reference conversations", which is what that side means. Only
+    an author-sharded run needs it: the task holds a fraction of the split but a defense calibrating
+    against "a median unrelated document" must see the same reference pool as every other shard, or
+    each optimizes to a different target. Nothing on this side is rewritten or returned. It is the
+    same per-turn stream as the unknown side, so the defense rebuilds documents from it identically.
     """
     n = len(texts)
+    ref_texts, ref_ids, ref_authors = reference if reference else ([], [], [])
     return AttackData(
-        known_embeddings=np.zeros((0, 0), dtype=np.float32),
+        known_embeddings=np.zeros((len(ref_texts), 0), dtype=np.float32),
         unknown_embeddings=np.zeros((n, 0), dtype=np.float32),
-        known_labels=np.empty(0, dtype=object),
+        known_labels=np.asarray(ref_authors, dtype=object),
         unknown_labels=np.asarray(authors, dtype=object),
+        known_texts=np.asarray(ref_texts, dtype=object) if ref_texts else None,
         unknown_texts=np.asarray(texts, dtype=object),
+        known_ids=np.asarray(ref_ids, dtype=object) if ref_ids else None,
         unknown_ids=np.asarray(ids, dtype=object),
     )
 
@@ -297,8 +309,13 @@ def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str
 
 
 def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
-                     *, cache_dir: str | Path, num_shards: int = 1) -> list[list[str]]:
-    """Defend every turn of every document, returning the defended turn lists in input order."""
+                     *, cache_dir: str | Path, num_shards: int = 1,
+                     reference=None) -> list[list[str]]:
+    """Defend every turn of every document, returning the defended turn lists in input order.
+
+    ``reference`` is the optional known-side context described in :func:`as_attack_data`, passed
+    only for a defense that declares ``shardable_by = "author"``.
+    """
     if not turn_lists:
         return []
     registered = get_defense(defense)
@@ -308,7 +325,11 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
     # would cascade from the wrong documents entirely. Neither failure is visible in the output --
     # both produce a plausible defended parquet that means something different per shard -- so this
     # refuses the run rather than trusting the operator to remember.
-    if num_shards > 1 and not getattr(registered, "shardable", True):
+    #
+    # `shardable_by = "author"` is the exemption: main() gave that defense whole authors via
+    # `select_author_shard`, which is exact rather than merely tolerable.
+    if (num_shards > 1 and not getattr(registered, "shardable", True)
+            and getattr(registered, "shardable_by", None) != "author"):
         raise SystemExit(
             f"defense {defense!r} cannot be sharded: it measures each document against its "
             f"author's other documents, and --num-shards splits by document. Re-run without "
@@ -322,8 +343,31 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
     if not texts:
         return []
     report_workload(defense, len(counts), texts)
-    defended = apply_defense(defense, as_attack_data(texts, ids, authors), cache_dir=cache_dir)
+    defended = apply_defense(defense, as_attack_data(texts, ids, authors, reference),
+                             cache_dir=cache_dir)
     return regroup_turns([str(text) for text in defended.unknown_texts], counts)
+
+
+def reference_pool(defense, registered, documents: pd.DataFrame, source: str,
+                   dist_dir: str | Path):
+    """The known-side reference documents a sharded run owes the defense, as a per-turn stream.
+
+    Selected over the **whole** ``documents`` frame, before any shard is taken, so every task in the
+    array calibrates against the same "unrelated" -- see ``afr``'s ``reference_pool_ids``. Returns
+    ``None`` for a defense that does not ask for one, which is every defense but ``afr``.
+    """
+    chooser = getattr(registered, "reference_pool_ids", None)
+    if chooser is None:
+        return None
+    wanted = set(chooser(list(documents["doc_id"])))
+    rows = documents[documents["doc_id"].isin(wanted)]
+    if rows.empty:
+        return None
+    texts, ids, authors, _counts = flatten_turns(
+        rows["doc_id"], rows["author_id"], read_turns(source, dist_dir, rows.index))
+    print(f"[{defense}] reference pool: {len(rows):,} documents drawn from the full split "
+          f"({len(texts):,} turns), identical in every shard")
+    return texts, ids, authors
 
 
 # --- output -----------------------------------------------------------------
@@ -439,17 +483,28 @@ def main() -> None:
     print(f"[{args.source}] {len(documents):,} of {len(frame):,} documents selected{selected}")
 
     doc_order = list(documents["doc_id"])  # split order, for the merge
-    shard = select_shard(documents, shard_index, num_shards)
+
+    # A defense that cascades over an author's timeline gets WHOLE AUTHORS; everything else gets the
+    # row-interleaved split. Both are deterministic given the selection and the shard count.
+    registered = get_defense(args.defense)
+    by_author = getattr(registered, "shardable_by", None) == "author"
+    shard = (select_author_shard(documents, shard_index, num_shards) if by_author
+             else select_shard(documents, shard_index, num_shards))
     out_path = merged_path if num_shards == 1 else shard_path(out_dir, stem, shard_index, num_shards)
     if num_shards > 1:
-        print(f"[shard {shard_index}/{num_shards}] defending {len(shard):,} of them "
+        split_by = f" ({shard['author_id'].nunique():,} whole authors)" if by_author else ""
+        print(f"[shard {shard_index}/{num_shards}] defending {len(shard):,} of them{split_by} "
               f"-> {out_path.name}")
+
+    # Selected over `documents` (the whole split), NOT over `shard` -- the point of it.
+    reference = (reference_pool(args.defense, registered, documents, args.source, dist)
+                 if num_shards > 1 and by_author else None)
 
     turn_lists = read_turns(args.source, dist, shard.index)
     defended = defend_documents(
         args.defense, shard["doc_id"], shard["author_id"], turn_lists,
         cache_dir=defense_cache_dir(cache, args.source, shard_index, num_shards),
-        num_shards=num_shards,
+        num_shards=num_shards, reference=reference,
     )
     documents_out = build_defended_frame(shard, defended)
     write_parquet(documents_out, out_path)
