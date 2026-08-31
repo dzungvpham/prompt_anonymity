@@ -269,7 +269,7 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 #: part of a results directory. The plots directory follows: ``plots/swe_chat/``. (Only the
 #: ``source`` *column* inside the parquets differs, still ``swe-chat`` -- it is hashed into every
 #: ``author_id``, so it is data rather than a name. Nothing here reads it.)
-DATASETS = ("wildchat", "swe_chat")
+DATASETS = ("wildchat", "swe_chat", "wildchat_small")
 
 #: How an undefended run spells its defense. Written out rather than omitted so that every
 #: directory name has the same four parts and can be parsed positionally.
@@ -298,6 +298,19 @@ DEFENSES = (
     "qwen_rewrite",
     "rtt_argos",
     "example_normalization",
+    # The measurement-loop defenses. Ahead of the epsilon sweeps for the reason given above -- they
+    # carry an argument, so they should hold stable colours -- and `afr_stage1` sits beside `afr`
+    # because the two are only ever read against each other.
+    "afr",
+    "afr_stage1",
+    "afr_a00",          # the same run as `afr` (alpha 0.0); listed so its directory is not skipped
+    "afr_a25",
+    "afr_a50",
+    "loo_unlink_b10",
+    "loo_unlink_b20",
+    "loo_unlink_b30",
+    "loo_unlink_b50",
+    "loo_unlink_b70",
     *(f"dp_mlm_eps{epsilon}" for epsilon in (10, 25, 50, 100, 250, 500, 1000)),
 )
 
@@ -309,6 +322,12 @@ FEATURES = (
     "character_statistics",
     "char_ngram_tfidf",
     "style_distance",
+    # The local embedder `afr` and `loo_unlink` optimize against. Plotting it next to
+    # gemini_embedding_2 is the surrogate-overfit check: a large drop here and none there means the
+    # defense learned the surrogate rather than the signal.
+    "harrier",
+    "harrier_imperative",
+    "harrier_plain",
 )
 
 ATTACKS = (
@@ -329,7 +348,8 @@ ATTACKS = (
 
 #: Keyed by the directory spelling, valued by how the corpus is written in prose and on a figure
 #: -- which is the hyphenated "SWE-chat", and stays that way; only the filename changed.
-DATASET_LABELS = {"wildchat": "WildChat", "swe_chat": "SWE-chat"}
+DATASET_LABELS = {"wildchat": "WildChat", "swe_chat": "SWE-chat",
+                  "wildchat_small": "WildChat (small)"}
 DEFENSE_LABELS = {
     NO_DEFENSE: "No defense",
     "styleremix": "StyleRemix",
@@ -358,6 +378,18 @@ DEFENSE_LABELS = {
     "qwen_rewrite": "Qwen rewrite",
     "rtt_argos": "Round-trip translation",
     "example_normalization": "Text normalization",
+    # The residual-linkage target alpha is in the label because it is the knob the sweep varies:
+    # alpha 0 aims all the way down to a median unrelated document, higher keeps some linkage.
+    # "Stage 1 only" names the ABLATION rather than the defense -- same model, same abstraction
+    # pass, zero probes -- because on a figure it is the line "AFR" has to beat to mean anything.
+    "afr": "AFR (α=0)",
+    "afr_a00": "AFR (α=0)",
+    "afr_a25": "AFR (α=0.25)",
+    "afr_a50": "AFR (α=0.5)",
+    "afr_stage1": "AFR stage 1 only (no loop)",
+    # The utility budget is loo_unlink's knob, as a percentage.
+    **{f"loo_unlink_b{budget}": f"LOO-unlink (b={budget / 100:.1f})"
+       for budget in (10, 20, 30, 50, 70)},
     **{f"dp_mlm_eps{epsilon}": f"DP-MLM ε={epsilon}"
        for epsilon in (10, 25, 50, 100, 250, 500, 1000)},
 }
@@ -369,6 +401,9 @@ FEATURE_LABELS = {
     "character_statistics": "Character stats",
     "char_ngram_tfidf": "Char n-gram TF-IDF",
     "style_distance": "StyleDistance",
+    "harrier": "Harrier 0.6B",
+    "harrier_imperative": "Harrier 0.6B (imperative)",
+    "harrier_plain": "Harrier 0.6B (plain)",
 }
 ATTACK_LABELS = {
     "nearest_neighbor": "Nearest neighbor",
