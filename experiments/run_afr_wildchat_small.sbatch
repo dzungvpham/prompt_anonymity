@@ -103,7 +103,11 @@
 #
 # Knobs, all environment-only and all OUTSIDE the cache key, so tuning them never invalidates
 # completed authors: AFR_GPU_MEM_UTIL, AFR_MAX_MODEL_LEN, AFR_AUTHOR_BATCH, AFR_CASCADE_DEPTH,
-# AFR_ENFORCE_EAGER, AFR_SPEC_TOKENS.
+# AFR_ENFORCE_EAGER, AFR_SPEC_TOKENS, AFR_MAX_NUM_SEQS.
+#
+# If the engine dies at startup on "max_num_seqs exceeds available Mamba cache blocks", lower
+# AFR_MAX_NUM_SEQS (each concurrent decode sequence needs one recurrent-state block on this hybrid
+# checkpoint, and speculative decoding reserves extra). AFR_SPEC_TOKENS=0 is the other way out.
 #
 #SBATCH --job-name=afr-wcs
 #SBATCH --output=scripts/logs/%x-%A_%a.out
@@ -153,8 +157,23 @@ fi
 # client's concurrency and plot_results' worker pool.
 RUN=(bash scripts/slurm_job.sh)
 
-SHARD="${SLURM_ARRAY_TASK_ID:-0}"
-NSHARDS="${SLURM_ARRAY_TASK_COUNT:-1}"
+SHARD="${SHARD:-${SLURM_ARRAY_TASK_ID:-0}}"
+NSHARDS="${SHARDS:-${SLURM_ARRAY_TASK_COUNT:-1}}"
+
+# RE-RUNNING ONE FAILED TASK of an array needs $SHARDS, because the environment then describes only
+# the tasks actually queued: `sbatch --array=3` sets SLURM_ARRAY_TASK_COUNT=1, so the run would ask
+# for "shard 3 of 1" and apply_defenses rejects it (deliberately -- the alternative reading is
+# "shard 0 of 1", which would quietly recompute the whole split under the final output's name).
+# Say what the layout really is and it lines up with the original array:
+#
+#     SHARDS=8 sbatch --array=3 experiments/run_afr_wildchat_small.sbatch
+#
+# The shard layout is part of the defend cache path, so this re-uses task 3's completed work rather
+# than starting it over.
+SHARD_ARGS=()
+if [ -n "${SHARDS:-}" ]; then
+    SHARD_ARGS=(--num-shards "$SHARDS" --shard-index "$SHARD")
+fi
 
 echo "=================================================================="
 echo "AFR on wildchat_small: $DEFENSE"
@@ -207,7 +226,8 @@ echo "------------------------------------------------------------------"
 echo "[1/4] defend shard $SHARD/$NSHARDS  ($(date))"
 echo "------------------------------------------------------------------"
 "${RUN[@]}" python -m prompt_anonymity.data.apply_defenses \
-    --source "$SOURCE" --defense "$DEFENSE" --dist-dir "$DIST_DIR" "${LIMIT_ARGS[@]}"
+    --source "$SOURCE" --defense "$DEFENSE" --dist-dir "$DIST_DIR" \
+    "${LIMIT_ARGS[@]}" "${SHARD_ARGS[@]+"${SHARD_ARGS[@]}"}"
 
 # 1b. Stages 2-4 must run EXACTLY ONCE, over the merged split, and only after every shard exists.
 #     The last task to finish is the one whose merge succeeds and writes the merged parquet, so

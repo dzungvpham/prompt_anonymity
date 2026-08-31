@@ -254,6 +254,28 @@ AFR_EMBED_BATCH = int(os.environ.get("AFR_EMBED_BATCH", "8"))
 #: little from prompts 33..449 that it did not already learn from 1..32 -- and the endgame is bounded.
 AFR_CASCADE_DEPTH = int(os.environ.get("AFR_CASCADE_DEPTH", "32"))
 
+#: Sequences vLLM may decode concurrently. **Must be set explicitly for this checkpoint**, and not
+#: for throughput reasons -- vLLM's default (256) does not start.
+#:
+#: The agent is a hybrid Mamba/attention model, and every concurrent decode sequence needs its own
+#: Mamba recurrent-state block, carved out of what is left after the weights and the KV cache. On an
+#: 80 GB card at AFR_GPU_MEM_UTIL there is room for ~254 of them, so a default of 256 aborts startup:
+#:
+#:     ValueError: max_num_seqs (256) exceeds available Mamba cache blocks (254). Each decode
+#:     sequence requires one Mamba cache block, so CUDA graph capture cannot proceed.
+#:
+#: Speculative decoding is what made this reachable -- it reserves state for the drafted positions
+#: too, which pushed the block count just under the default. Raising gpu_memory_utilization is the
+#: error's other suggestion and the wrong lever here: Harrier co-resides on this card and that budget
+#: has already been tuned down twice to stop it OOMing.
+#:
+#: 128 rather than 254: it clears the ceiling with room for a checkpoint or a card that fits fewer
+#: blocks, and nothing here needs more. The lockstep batch is one author-chunk wide (~25 per task in
+#: an 8-way array), and the widest call any stage makes is the utility gate at a few sequences per
+#: document. A cap only bounds concurrency -- vLLM queues the remainder -- so exceeding it costs an
+#: extra wave, not correctness.
+AFR_MAX_NUM_SEQS = int(os.environ.get("AFR_MAX_NUM_SEQS", "128"))
+
 #: Speculative decoding: tokens the n-gram drafter proposes per step. ``0`` disables it.
 #:
 #: WHY IT IS ON. Decode here is memory-bandwidth bound -- producing one token reads all ~54 GB of bf16
@@ -1451,6 +1473,7 @@ class _LocalBackend:
 
             print(f"[afr] loading agent {path} (vLLM), max_model_len={AFR_MAX_MODEL_LEN:,}, "
                   f"gpu_memory_utilization={AFR_GPU_MEM_UTIL}, "
+                  f"max_num_seqs={AFR_MAX_NUM_SEQS}, "
                   f"enforce_eager={AFR_ENFORCE_EAGER}")
             # `enable_prefix_caching` is a real saving here rather than a default worth copying: the
             # system prompt and escalation ladder are identical for every call in the corpus, and
@@ -1458,6 +1481,7 @@ class _LocalBackend:
             # of its proposal rounds. Reusing that KV prefix removes the re-prefill each round.
             options = dict(model=path, dtype="auto", gpu_memory_utilization=AFR_GPU_MEM_UTIL,
                            max_model_len=AFR_MAX_MODEL_LEN, enforce_eager=AFR_ENFORCE_EAGER,
+                           max_num_seqs=AFR_MAX_NUM_SEQS,
                            enable_prefix_caching=True, seed=self.seed)
             # Speculative decoding (see AFR_SPEC_TOKENS). Passed as a nested dict because the flat
             # `speculative_model=` / `ngram_prompt_lookup_max=` spelling was removed in vLLM v1; the
@@ -1477,10 +1501,16 @@ class _LocalBackend:
             except (TypeError, ValueError) as error:
                 if speculative is None:
                     raise
-                # Do NOT swallow a real startup failure (an OOM, a bad checkpoint) as "no
-                # speculation": retry only when the complaint is about the argument itself.
+                # Do NOT swallow a real startup failure (a bad checkpoint, a missing file) as "no
+                # speculation": retry only when the complaint is about the argument itself, or about
+                # the cache blocks speculation is what reserves extra of. That second case is not
+                # hypothetical -- drafting costs one Mamba recurrent-state block per drafted position
+                # on this hybrid checkpoint, which is how a default max_num_seqs of 256 stopped
+                # fitting. AFR_MAX_NUM_SEQS is the real fix; this is the seatbelt for the next
+                # checkpoint that budgets differently, since a slower run beats a dead one.
                 blame = str(error).lower()
-                if "speculative" not in blame and "ngram" not in blame:
+                if not any(word in blame for word in
+                           ("speculative", "ngram", "cache block", "max_num_seqs")):
                     raise
                 print(f"note: this vLLM rejected the speculative config, continuing without it "
                       f"({type(error).__name__}: {error})")
