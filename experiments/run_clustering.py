@@ -186,7 +186,7 @@ from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
     singleton_baseline,
 )
 
-from run_experiment import load_documents_and_features  # noqa: E402
+from run_experiment import load_documents_and_features, standardize  # noqa: E402
 
 OUTPUT_ROOT = REPO_ROOT / "experiments" / "clustering"
 DATA_DIR = REPO_ROOT / "data" / "hf"
@@ -864,6 +864,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--metric", default="cosine")
+    parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=False,
+                        help="Z-score the features per column on known-side statistics before "
+                             "anything else, exactly as run_experiment.py does by default. "
+                             "**Off here, and that asymmetry between the two families is real, "
+                             "not an oversight of spelling**: cosine already normalises each "
+                             "document by its own norm (per row), which is a different axis from "
+                             "this (per column), and every clustering result on disk was produced "
+                             "without it. A non-default value is appended to the output directory "
+                             "name so the two cannot overwrite each other.")
     parser.add_argument("--projection", default="none", choices=sorted(PROJECTION_FITTERS) + ["none"],
                         help="Fit a metric-learning projection on the FIRST HALF of the timeline "
                              "and cluster in that space instead of the raw feature space. See "
@@ -1028,6 +1037,10 @@ def attack_scope(test: Collection, tuning: Collection, known_authors: np.ndarray
 def main() -> None:
     args = parse_args()
     tag = f"{args.source}_{args.defense}_{args.feature}"
+    # Before --projection rather than after it, unlike every other axis, because the name then
+    # reads in pipeline order: this rewrites the feature space the projection is then fitted on.
+    if args.standardize:
+        tag = f"{tag}_zscore"
     if args.projection != "none":
         tag = f"{tag}_{args.projection}"
     if args.rescoring != "none":
@@ -1048,6 +1061,22 @@ def main() -> None:
         args.data_dir, args.source, args.feature,
         defense="none" if args.defense == "base" else args.defense)
     embeddings = np.nan_to_num(embeddings)
+
+    if args.standardize:
+        # Known-side statistics, `[0, KNOWN_FRACTION)`, and NOT PROJECTION_FIT_FRACTION's first
+        # half: that bound exists because a *supervised* fit reaching into the tuning slice would
+        # have seen those documents' authors. A z-score reads no labels, so it cannot leak one,
+        # and matching run_experiment.py's known side is what makes this the same operation that
+        # family performs. Fixed rather than per-scope on purpose -- statistics that moved between
+        # `all` and `unseen` would put the two scopes in different spaces.
+        # `standardize` returns a block per argument; the first is the known side re-scored, which
+        # is a view's worth of wasted work and is dropped. The public function is called rather
+        # than the arithmetic inlined precisely because "what this project means by standardising"
+        # is the thing under test.
+        known_side = slice(0, int(round(KNOWN_FRACTION * len(frame))))
+        embeddings = standardize(embeddings[known_side], embeddings)[1]
+        print(f"  standardized on {known_side.stop:,} known-side documents "
+              f"({embeddings.shape[1]} columns)")
 
     if args.projection != "none":
         fit_window = slice(0, int(round(PROJECTION_FIT_FRACTION * len(frame))))
