@@ -106,6 +106,18 @@ if [ "$INDEX" -ge "${#DEFENSE_LIST[@]}" ]; then
     exit 1
 fi
 DEFENSE="${DEFENSE_LIST[$INDEX]}"
+ARRAY_JOB="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
+
+# CRITICAL: strip the SLURM array variables before any stage runs.
+#
+# In THIS script the array index selects a DEFENSE. But `apply_defenses` and `compute_features` both
+# resolve their own SHARDING from SLURM_ARRAY_TASK_ID/SLURM_ARRAY_TASK_COUNT (see
+# compute_features.slurm_array_shard), and they cannot tell the two meanings apart. Left set, every
+# task defends 1/12 of the corpus into a shard file and then dies looking for a merged parquet that
+# was never written -- which is exactly what happened on the first submission. Both values are
+# already captured above, so nothing below needs them.
+unset SLURM_ARRAY_TASK_ID SLURM_ARRAY_TASK_COUNT SLURM_ARRAY_JOB_ID
+unset SLURM_ARRAY_TASK_MIN SLURM_ARRAY_TASK_MAX SLURM_ARRAY_TASK_STEP
 
 # Redact through OpenRouter rather than downloading a 120B checkpoint. Applies to `openanonymity`
 # and to the second stage of `styleremix_openanon`; both put it in params(), so this is part of the
@@ -120,7 +132,7 @@ RUN=(bash scripts/slurm_job.sh)
 
 echo "=================================================================="
 echo "defense $INDEX/${#DEFENSE_LIST[@]}: $DEFENSE   ($SOURCE / $FEATURE / logistic)"
-echo "Job ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}} task $INDEX on $(hostname), $(date)"
+echo "Job $ARRAY_JOB task $INDEX on $(hostname), $(date)"
 echo "=================================================================="
 
 # 0a. The split is cut locally, not downloaded, so its absence is the likeliest way this dies --
