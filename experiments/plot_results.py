@@ -269,7 +269,7 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 #: part of a results directory. The plots directory follows: ``plots/swe_chat/``. (Only the
 #: ``source`` *column* inside the parquets differs, still ``swe-chat`` -- it is hashed into every
 #: ``author_id``, so it is data rather than a name. Nothing here reads it.)
-DATASETS = ("wildchat", "swe_chat", "wildchat_small")
+DATASETS = ("wildchat", "swe_chat", "wildchat_small", "wildchat_tiny")
 
 #: How an undefended run spells its defense. Written out rather than omitted so that every
 #: directory name has the same four parts and can be parsed positionally.
@@ -349,7 +349,11 @@ ATTACKS = (
 #: Keyed by the directory spelling, valued by how the corpus is written in prose and on a figure
 #: -- which is the hyphenated "SWE-chat", and stays that way; only the filename changed.
 DATASET_LABELS = {"wildchat": "WildChat", "swe_chat": "SWE-chat",
-                  "wildchat_small": "WildChat (small)"}
+                  "wildchat_small": "WildChat (small)",
+                  # The 40-author cut. The author count is IN the label because it is the pool the
+                  # attack chooses between, and every absolute number on a figure drawn from it is
+                  # conditional on that pool size -- see build_subset --n-authors.
+                  "wildchat_tiny": "WildChat (40 authors)"}
 DEFENSE_LABELS = {
     NO_DEFENSE: "No defense",
     "styleremix": "StyleRemix",

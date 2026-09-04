@@ -133,7 +133,14 @@ cd "$PROJECT"
 # recommends exactly this.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-SOURCE="wildchat_small"          # this script is the wildchat_small arm; see run_afr_swe_chat.sbatch
+# Defaults to the 200-author split. Override for the 40-author cut, which is sized to finish in one
+# job with NO array -- 40 authors in lockstep is a 40-wide batch, the fastest configuration there is.
+# Sharding it 8 ways would drop the batch to 5 and make it SLOWER per document; that is what produced
+# 10 documents/hour. Submit it as:
+#
+#     SOURCE=wildchat_tiny sbatch --array=0 experiments/run_afr_wildchat_small.sbatch
+#
+SOURCE="${SOURCE:-wildchat_small}"
 FEATURE="${FEATURE:-gemini_embedding_2}"
 DEFENSE="${DEFENSE:-afr}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"

@@ -53,6 +53,15 @@ OPENANON_TEMPERATURE = 0.0   # greedy -> deterministic, reproducible
 OPENANON_TOP_P = 1.0
 OPENANON_OUTPUT_TAG = "scrubbed_prompt"
 
+#: Scrub through OpenRouter instead of a local engine, e.g. ``openai/gpt-oss-120b``. Empty (the
+#: default) keeps the local vLLM path exactly as it was.
+#:
+#: This exists because the local checkpoint is 120B and is NOT mirrored under /datasets/ai: a local
+#: run resolves ``models.toml``'s bare repo id and downloads ~60 GB into $HF_HOME, which on a
+#: cluster still pointing at a home directory is a filled quota rather than a slow start. It is in
+#: :meth:`OpenAnonymityDefense.params`, so an API run and a local run never share a cache entry.
+OPENANON_API_MODEL = os.environ.get("OPENANON_API_MODEL", "")
+
 # --- vLLM engine knobs (env-tunable) ---
 # Context window to serve. Well under gpt-oss's native 131,072 because the KV cache competes with
 # the weights for GPU memory and a user turn needs nothing like that much; raise it only if turns
@@ -453,6 +462,114 @@ class _OpenAnonBackend:
         return results
 
 
+def openrouter_chat_class():
+    """The shared OpenRouter client class, imported lazily and from exactly one place.
+
+    Lazy so importing this module -- which the defense registry does at package import -- never
+    pulls in ``requests``/``python-dotenv`` or asks for an API key; a fully-cached run and the
+    offline selftest both need neither. The same reasoning, and the same one-place rule, as
+    ``frame_pad.openrouter_chat_class``.
+    """
+    from ..attacks.llm._openrouter import OpenRouterChat
+
+    return OpenRouterChat
+
+
+#: Characters per request when scrubbing through the API. The local backend fragments by *tokens*
+#: using the model's own tokenizer; over the network there is no tokenizer to ask, so this is a
+#: deliberately conservative character budget. gpt-oss serves 131,072 tokens, so even at one
+#: character per token this leaves the reply and the wrapper room several times over.
+OPENANON_API_CHARS = int(os.environ.get("OPENANON_API_CHARS", "48000"))
+
+#: Concurrent in-flight requests. Network-bound, so this is throughput; raise it if OpenRouter is
+#: not rate-limiting and the corpus is large.
+OPENANON_API_WORKERS = int(os.environ.get("OPENANON_API_WORKERS", "8"))
+
+
+class _OpenAnonAPIBackend:
+    """The same scrubber, served by OpenRouter instead of a local vLLM engine.
+
+    Exists because the checkpoint is 120B: ``models.toml`` names it as a bare repo id, so a local
+    run DOWNLOADS ~60 GB into ``$HF_HOME`` on first use unless the weights are already mirrored --
+    which on this cluster they are not, and which has filled a disk quota once already. Renting the
+    weights by the token is the cheaper and far less fragile way to get this arm measured.
+
+    Deliberately mirrors :class:`_OpenAnonBackend`'s contract rather than sharing code with it:
+    same system prompt, same input template, same :func:`parse_scrubbed_output`, same
+    fall-back-to-the-original-on-a-bad-generation rule, same "nothing is truncated" guarantee via
+    fragmenting. What differs is only how a completion is obtained -- and the one thing that cannot
+    be mirrored, that ``reasoning_effort`` is a chat-template argument for local gpt-oss and is not
+    exposed over OpenRouter's OpenAI-compatible endpoint. The API's replies carry no harmony channel
+    markers, which :func:`final_channel_text` already handles as a no-op.
+    """
+
+    def __init__(self, model: str, system_prompt: str, *, temperature: float = OPENANON_TEMPERATURE,
+                 top_p: float = OPENANON_TOP_P, max_chars: int = OPENANON_API_CHARS,
+                 max_workers: int = OPENANON_API_WORKERS,
+                 output_ratio: float = OPENANON_OUTPUT_RATIO):
+        self.max_chars = max(1, int(max_chars))
+        self.output_ratio = output_ratio
+        self.truncated = 0
+        print(f"OpenAnonymity scrubber using OpenRouter model '{model}' "
+              f"({max_workers} concurrent, fragmenting over {self.max_chars:,} characters)...")
+        self.client = openrouter_chat_class()(
+            model=model, system_prompt=system_prompt, temperature=temperature, top_p=top_p,
+            max_tokens=4096, max_workers=max_workers)
+
+    def _fragments(self, text: str) -> list[str]:
+        """Contiguous character slices that each fit a request. Nothing is dropped."""
+        if len(text) <= self.max_chars:
+            return [text]
+        return [text[start:start + self.max_chars]
+                for start in range(0, len(text), self.max_chars)]
+
+    def _max_new_tokens(self, fragment: str) -> int:
+        """A budget that scales with the input, as the local backend's does.
+
+        Characters over three rather than four: an under-estimate here truncates a rewrite (and
+        ``parse_scrubbed_output`` then correctly discards it), so the error is worth paying for.
+        """
+        return max(512, int((len(fragment) / 3.0) * self.output_ratio) + 256)
+
+    def rewrite_batch(self, texts: list[str]) -> list[str]:
+        """Scrub a batch of turns, preserving input order. Blank turns pass through untouched."""
+        texts = list(texts)
+        fragments: list[str] = []
+        owners: list[int] = []
+        for position, text in enumerate(texts):
+            if not text.strip():
+                continue
+            for fragment in self._fragments(text):
+                fragments.append(fragment)
+                owners.append(position)
+        if not fragments:
+            return texts
+
+        prompts = [render_template(OPENANON_INPUT_TEMPLATE, {"INPUT_PROMPT": fragment})
+                   for fragment in fragments]
+        replies = self.client.complete_batch(
+            prompts, max_tokens=[self._max_new_tokens(fragment) for fragment in fragments])
+
+        scrubbed = []
+        for reply, fragment in zip(replies, fragments):
+            piece = parse_scrubbed_output(reply, fragment)
+            if piece == fragment:
+                self.truncated += 1     # unusable generation -> the fragment is left undefended
+            scrubbed.append(piece)
+        if self.truncated:
+            print(f"  {self.truncated:,} fragment(s) so far kept their original text "
+                  f"(empty or truncated generation)", flush=True)
+
+        rejoined: dict[int, list[str]] = {}
+        for position, piece in zip(owners, scrubbed):
+            rejoined.setdefault(position, []).append(piece)
+        return ["".join(rejoined[i]) if i in rejoined else text
+                for i, text in enumerate(texts)]
+
+    def close(self) -> None:
+        """Nothing to release: the client holds a requests session, not a GPU."""
+
+
 class OpenAnonymityDefense(PerTurnBatchRewriteDefense):
     """Scrub every user turn with a local model (redact identifiers + de-identify style).
 
@@ -469,23 +586,39 @@ class OpenAnonymityDefense(PerTurnBatchRewriteDefense):
     checkpoint_every = OPENANON_CHECKPOINT_EVERY
 
     def __init__(self, *, model: str = OPENANON_MODEL, system_prompt: str = OPENANON_SYSTEM_PROMPT,
-                 reasoning_effort: str = OPENANON_REASONING_EFFORT):
+                 reasoning_effort: str = OPENANON_REASONING_EFFORT,
+                 api_model: str | None = None):
         self.model = model
         self.system_prompt = system_prompt
         self.reasoning_effort = reasoning_effort
+        #: Set (by ``$OPENANON_API_MODEL``, or explicitly) to scrub through OpenRouter instead of a
+        #: local engine. The 120B checkpoint is not mirrored on this cluster, so a local run would
+        #: download ~60 GB; renting it by the token is what makes this arm runnable at all.
+        self.api_model = api_model if api_model is not None else OPENANON_API_MODEL
         self._backend = None
 
     def params(self) -> dict:
         # What determines the (greedy) scrub: the model, the prompt it is given, and how much it
         # thinks first. The prompt is a module constant, not covered by the class source hash, so
         # include it verbatim so an edit re-caches.
-        return {"model": self.model, "system_prompt": self.system_prompt,
+        #
+        # `api_model` is in here because it changes WHICH WEIGHTS ANSWER -- unlike a serving knob,
+        # this genuinely changes the output, and a local run and an API run must never share a cache
+        # entry. Absent (the local path) it stays out, so existing local caches keep hitting.
+        base = {"model": self.model, "system_prompt": self.system_prompt,
                 "reasoning_effort": self.reasoning_effort}
+        return {**base, "api_model": self.api_model} if self.api_model else base
 
-    def _get_backend(self) -> _OpenAnonBackend:
+    def _get_backend(self):
         if self._backend is None:
-            self._backend = _OpenAnonBackend(self.model, self.system_prompt,
-                                             reasoning_effort=self.reasoning_effort)
+            if self.api_model:
+                # reasoning_effort is deliberately not forwarded: it is a gpt-oss chat-template
+                # argument that OpenRouter's OpenAI-compatible endpoint does not accept. It stays in
+                # params() so the two paths remain distinguishable in the cache.
+                self._backend = _OpenAnonAPIBackend(self.api_model, self.system_prompt)
+            else:
+                self._backend = _OpenAnonBackend(self.model, self.system_prompt,
+                                                 reasoning_effort=self.reasoning_effort)
         return self._backend
 
     def rewrite_batch(self, texts: list[str]) -> list[str]:

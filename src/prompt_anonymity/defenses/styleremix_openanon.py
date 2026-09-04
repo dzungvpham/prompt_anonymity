@@ -36,7 +36,8 @@ from ..caching import IndexedRowCache, params_hash
 from ..core import AttackData
 from ._backends import defend_conversations_per_turn
 from .base import CachedDefense
-from .openanonymity import OPENANON_MODEL, OPENANON_SYSTEM_PROMPT, _OpenAnonBackend
+from .openanonymity import (OPENANON_API_MODEL, OPENANON_MODEL, OPENANON_SYSTEM_PROMPT,
+                            _OpenAnonAPIBackend, _OpenAnonBackend)
 from .styleremix import STYLEREMIX_BASE_MODEL, STYLEREMIX_SLIDERS, StyleRemixDefense
 
 
@@ -52,25 +53,36 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
     rewrite_known: bool = False
 
     def __init__(self, *, sliders: dict | None = None, base_model: str = STYLEREMIX_BASE_MODEL,
-                 oa_model: str = OPENANON_MODEL, oa_system_prompt: str = OPENANON_SYSTEM_PROMPT):
+                 oa_model: str = OPENANON_MODEL, oa_system_prompt: str = OPENANON_SYSTEM_PROMPT,
+                 oa_api_model: str | None = None):
         self.sliders = dict(STYLEREMIX_SLIDERS if sliders is None else sliders)
         self.base_model = base_model
         self.oa_model = oa_model
         self.oa_system_prompt = oa_system_prompt
+        #: Redact through OpenRouter rather than a local 120B checkpoint -- see
+        #: :data:`~.openanonymity.OPENANON_API_MODEL`. It also removes this defense's one genuinely
+        #: awkward resource requirement: stage 1 and stage 2 no longer both need the same big GPU,
+        #: since the redactor is now a network call.
+        self.oa_api_model = oa_api_model if oa_api_model is not None else OPENANON_API_MODEL
         self._redactor = None
 
     def params(self) -> dict:
         # Stage 2 is keyed by the styled conversation text, so a slider/base-model change re-caches
         # automatically; include them anyway for reproducibility, plus the OA model + prompt (whose
         # source this class's hash does not cover) so an OA swap re-caches.
-        return {
+        base = {
             "sliders": self.sliders, "base_model": self.base_model,
             "oa_model": self.oa_model, "oa_system_prompt": self.oa_system_prompt,
         }
+        # Only when set, so existing local caches keep hitting. Different weights answer, so an API
+        # run and a local run must not share an entry.
+        return {**base, "oa_api_model": self.oa_api_model} if self.oa_api_model else base
 
-    def _get_redactor(self) -> _OpenAnonBackend:
+    def _get_redactor(self):
         if self._redactor is None:
-            self._redactor = _OpenAnonBackend(self.oa_model, self.oa_system_prompt)
+            self._redactor = (_OpenAnonAPIBackend(self.oa_api_model, self.oa_system_prompt)
+                              if self.oa_api_model
+                              else _OpenAnonBackend(self.oa_model, self.oa_system_prompt))
         return self._redactor
 
     def __call__(self, data: AttackData, *, cache_dir) -> AttackData:

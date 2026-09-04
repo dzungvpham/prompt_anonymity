@@ -331,7 +331,7 @@ NO_DEFENSE_TAG = "base"
 #: ``wildchat`` for the leave-one-out defense. It is a real split with the same schema and the same
 #: author-keyed structure, so everything below works on it unchanged -- it is simply small enough
 #: that a roughly-quadratic defense and a budget sweep over it finish in an afternoon.
-SOURCES = ("wildchat", "wildchat_small", "swe_chat")
+SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat")
 
 # The extra class: "this document's author is not among the known authors". Not a valid
 # author_id (those are ``<source>-<16 hex>``), so it can never collide with a real one.

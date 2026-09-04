@@ -74,6 +74,18 @@ DEFAULT_N_AUTHORS = 200
 #: every downstream sampling step share one number.
 DEFAULT_SEED = 47
 
+#: Appended where ``--max-chars`` cut inside a turn, so a truncated document is visibly truncated.
+TRUNCATION_MARK = " [...truncated]"
+
+#: Characters per document for ``--max-chars``, when it is passed without a value.
+#:
+#: Sized against the window the local defenses serve, not picked round. ``afr`` allows a document
+#: 28,672 tokens (``AFR_MAX_MODEL_LEN`` minus the reply and the prompt wrapper). At ~4 characters
+#: per token that is ~114,000 characters, but WildChat is multilingual and CJK runs closer to 1-2
+#: characters per token, so a corpus-wide character cap has to assume the dense case. 60,000 leaves
+#: headroom at ~2 characters/token and still keeps all but the extreme tail intact.
+DEFAULT_MAX_CHARS = 60_000
+
 #: Where the committed copy of the manifest goes. ``data/`` is gitignored, so the manifest beside the
 #: parquet is not a record anybody else can see; this one is.
 COMMITTED_MANIFEST_DIR = Path(__file__).resolve().parents[3] / "experiments" / "manifests"
@@ -136,6 +148,60 @@ def read_authors(path: Path, authors: set) -> pd.DataFrame:
     if not kept:
         raise SystemExit("the filters selected no documents; loosen --k-min or --n-authors.")
     return pd.concat(kept, ignore_index=True)
+
+
+def cap_document(turns, max_chars: int) -> list:
+    """One document's turns, cut down to ``max_chars`` total characters.
+
+    Whole turns are kept while they fit and the rest are dropped, so turn boundaries stay real
+    conversation boundaries; a *single* turn longer than the cap is truncated in place, because the
+    alternative is emitting an empty document. At least one turn always survives.
+
+    The cut is marked so a truncated document is never mistaken for a complete one -- by a reader,
+    by the judge that scores utility, or by anyone diffing this split against its parent.
+    """
+    kept: list[str] = []
+    used = 0
+    for turn in turns:
+        text = str(turn)
+        if used + len(text) <= max_chars:
+            kept.append(text)
+            used += len(text)
+            continue
+        if not kept:            # the first turn alone is over the cap: cut inside it
+            kept.append(text[:max_chars] + TRUNCATION_MARK)
+        break
+    return kept or [str(turns[0])[:max_chars] + TRUNCATION_MARK]
+
+
+def cap_documents(subset: pd.DataFrame, max_chars: int) -> tuple[pd.DataFrame, dict]:
+    """Apply :func:`cap_document` across the subset, returning it with a summary of what was cut.
+
+    WHY THIS IS A CORPUS FILTER AND NOT A DEFENSE ONE. ``afr`` cannot rewrite a document whose
+    prompt exceeds the served context window; its own escape hatch emits such documents
+    **undefended**, which is not admissible in an evaluation -- an untouched document inside the
+    defended split inflates the attack against the defense that never got to touch it.
+
+    Cutting here instead means every arm (``base``, ``afr_stage1``, ``afr``) reads the *same* text,
+    so the comparison stays honest and the truncation becomes a stated property of the split rather
+    than an artifact of one defense. Cutting inside the defense would do the opposite: only the
+    defended documents would be shorter, and shorter text carries less authorship signal, so the
+    defense would look effective for a reason that has nothing to do with the defense.
+    """
+    lengths = subset["turns"].map(lambda items: sum(len(str(turn)) for turn in items))
+    over = int((lengths > max_chars).sum())
+    capped = subset.copy()
+    capped["turns"] = subset["turns"].map(lambda items: cap_document(list(items), max_chars))
+    after = capped["turns"].map(lambda items: sum(len(str(turn)) for turn in items))
+    return capped, {
+        "max_chars": int(max_chars),
+        "documents_truncated": over,
+        "share_truncated": round(over / len(subset), 4) if len(subset) else 0.0,
+        "characters_before": int(lengths.sum()),
+        "characters_after": int(after.sum()),
+        "longest_before": int(lengths.max()) if len(lengths) else 0,
+        "longest_after": int(after.max()) if len(after) else 0,
+    }
 
 
 def token_estimate(turns: pd.Series) -> dict:
@@ -226,6 +292,15 @@ def main() -> None:
                              "data/hf)")
     parser.add_argument("--out-dir", default=None,
                         help="where the subset parquet goes (default: data/dist)")
+    parser.add_argument("--max-chars", type=int, nargs="?", const=DEFAULT_MAX_CHARS, default=None,
+                        metavar="N",
+                        help=f"cap every document at N characters, dropping whole trailing turns "
+                             f"and marking any cut (default: no cap; bare --max-chars uses "
+                             f"{DEFAULT_MAX_CHARS:,}). Use this when a local defense has a context "
+                             f"window: afr cannot rewrite a document that exceeds it and would "
+                             f"otherwise emit it UNDEFENDED into the defended split, which is not "
+                             f"admissible in an evaluation. Capping here keeps every arm on the "
+                             f"same text")
     parser.add_argument("--force", action="store_true",
                         help="overwrite an existing subset parquet. Without this an existing file "
                              "is left alone, so re-running the pipeline's sbatch is cheap and "
@@ -264,9 +339,21 @@ def main() -> None:
     # Pass 2: the full rows for those authors, streamed.
     subset = read_authors(source_path, authors)
 
+    # Cap BEFORE the manifest, so its statistics describe the split that is actually written.
+    truncation = None
+    if args.max_chars:
+        subset, truncation = cap_documents(subset, args.max_chars)
+        print(f"  capped at {args.max_chars:,} characters: "
+              f"{truncation['documents_truncated']:,} of {len(subset):,} documents truncated "
+              f"({truncation['share_truncated']:.1%}), longest now "
+              f"{truncation['longest_after']:,} characters")
+
     manifest = build_manifest(source=args.source, out_source=out_source, source_path=source_path,
                               parent=index, subset=subset, k_min=args.k_min,
                               n_authors=n_authors, seed=args.seed)
+    # Recorded with the split because it changes what the corpus IS: every downstream number is
+    # conditional on it, and the committed manifest is where that has to be discoverable.
+    manifest["truncation"] = truncation
 
     write_parquet(subset, out_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)

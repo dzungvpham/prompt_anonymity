@@ -146,17 +146,40 @@ DEFAULT_ALPHA = 0.0
 
 #: Candidate embeddings allowed per document. The stage-1 baseline, the priors and the reference pool
 #: are fixed overhead and do NOT count against it -- only text the agent proposed does.
-DEFAULT_MAX_PROBES = 10
+#:
+#: **4, lowered from 10, on evidence rather than to save time.** The first corpus-scale run logged
+#: 414 documents ending at ``ladder_exhausted`` against 20 at ``target_met`` -- 70% against 3%. A
+#: document that has stalled through all three escalation rungs is not going to be rescued by
+#: probes 5 through 10; it is paying full generation cost to re-confirm a dead end, and the extra
+#: rounds more than doubled the wall clock for a few percent of outcomes. Four keeps the shape of
+#: the loop intact: round 1 explores :data:`DEFAULT_FIRST_ROUND_CANDIDATES` candidates at once, and
+#: three refinement rounds are enough to climb the whole ladder at
+#: :data:`DEFAULT_ESCALATE_AFTER` = 2 stalls per rung.
+#:
+#: In ``params()``, so changing it starts a new cache namespace rather than mixing budgets.
+DEFAULT_MAX_PROBES = 4
 
 #: Candidates requested in the first (exploratory) round, inside one reply. Later rounds ask for one
-#: and refine. Explore-then-exploit: three genuinely different approaches cost the same generation as
-#: one, and the loop cannot tell a dead end from a slow start without having tried more than one.
-DEFAULT_FIRST_ROUND_CANDIDATES = 3
+#: and refine. Explore-then-exploit: several genuinely different approaches cost the same generation
+#: as one, and the loop cannot tell a dead end from a slow start without having tried more than one.
+#:
+#: **2, not 3, and it is tied to** :data:`DEFAULT_MAX_PROBES`. The first round spends this many
+#: probes at once, so at a budget of 4 a value of 3 leaves exactly one refinement round -- the loop
+#: would spend its whole budget at escalation level 0 and never reach the rungs that do the real
+#: work. Two keeps a choice in round one and still leaves room to climb. See the selftest, which
+#: asserts the ladder is actually walkable at these defaults rather than leaving it to arithmetic.
+DEFAULT_FIRST_ROUND_CANDIDATES = 2
 
 #: Consecutive rounds without improvement before the escalation ladder moves up a rung. A round that
 #: produced no admissible candidate at all counts as non-improving: a model stuck on the output
 #: format is stuck, and a different instruction is a better response than another identical retry.
-DEFAULT_ESCALATE_AFTER = 2
+#:
+#: **1, lowered with the probe budget.** Two stalls per rung needs six rounds to cross three rungs,
+#: which only made sense at a budget of 10. With four probes there is no room to be patient: one
+#: non-improving round IS the signal, and spending a second confirming it costs a rung the document
+#: will never get to try. At these defaults a stubborn document walks 0 -> 1 -> 2 in three rounds
+#: and exits at ``ladder_exhausted`` having actually used the structural rewrite.
+DEFAULT_ESCALATE_AFTER = 1
 
 #: How many of the author's most-similar prior prompts feed the smoothed feedback signal. The
 #: *criterion* is the single nearest prior (the attack succeeds on one match); this is what the model
@@ -275,6 +298,24 @@ AFR_CASCADE_DEPTH = int(os.environ.get("AFR_CASCADE_DEPTH", "32"))
 #: document. A cap only bounds concurrency -- vLLM queues the remainder -- so exceeding it costs an
 #: extra wave, not correctness.
 AFR_MAX_NUM_SEQS = int(os.environ.get("AFR_MAX_NUM_SEQS", "128"))
+
+#: Whether a document too long for the served window may be emitted UNDEFENDED. **Off.**
+#:
+#: It used to be unconditional, and on the first corpus-scale run it fired on 63 of 594 documents --
+#: 11% of the defended split was original text the defense never touched. That is not admissible in
+#: an evaluation: those documents keep their full authorship signal, the attack links them, and the
+#: defense is charged for it. The comparison silently measures a corpus, not a method.
+#:
+#: The fix belongs in the CORPUS, not here -- ``build_subset --max-chars`` caps documents before any
+#: arm runs, so ``base``, ``afr_stage1`` and ``afr`` all read the same text and the truncation is a
+#: property of the split (recorded in its manifest) rather than an artifact of one defense.
+#: Truncating inside the defense would be worse than the pass-through it replaces: only the defended
+#: documents would be shorter, and shorter text carries less authorship signal, so the defense would
+#: score well for a reason that has nothing to do with the defense.
+#:
+#: So this now stops the run and says how to cap the corpus. Set it to 1 only for an exploratory run
+#: whose numbers nobody will report.
+AFR_TOO_LONG_PASSTHROUGH = os.environ.get("AFR_TOO_LONG_PASSTHROUGH", "") == "1"
 
 #: Speculative decoding: tokens the n-gram drafter proposes per step. ``0`` disables it.
 #:
@@ -453,6 +494,92 @@ def pool_digest(pool_ids, pool_texts) -> str:
         digest.update(str(text).encode("utf-8", "replace"))
         digest.update(b"\0")
     return digest.hexdigest()[:16]
+
+
+def document_key(digest: str, doc_id, turns, prior_texts) -> str:
+    """Cache key for ONE document in its exact cascade position.
+
+    The author table (:func:`encode_author_source`) is the unit the parquet is assembled from, and
+    it is only written when a whole chunk of authors finishes. That is what made a preempted task
+    lose everything: on a 16-hour job with one chunk, the commit never happened. This key is the
+    finer grain -- it identifies a document *together with the defended prior chain it was produced
+    against*, which is the only thing that makes a cascaded document reusable.
+
+    Including ``prior_texts`` is what keeps resume correct rather than merely fast. Document ``k``
+    is defended against the defended text of ``1..k-1``; if any of those changes, ``k``'s input
+    changed and the stored answer is wrong. Folding the whole chain into the key means that case
+    is a miss, automatically, instead of a silently stale hit. Documents past
+    :data:`AFR_CASCADE_DEPTH` share one frozen chain, so they key off the same prefix and stay
+    independent of each other -- exactly as the cap intends.
+
+    ``digest`` is the reference pool's, since the pool sets the target. Everything else that
+    changes the output -- alpha, the probe budget, the prompts, the model -- is already in the
+    cache directory's ``params_hash``/``logic_hash``, so it is deliberately not repeated here.
+    """
+    key = hashlib.sha256()
+    key.update(str(digest).encode("utf-8", "replace"))
+    key.update(b"\0doc\0")
+    key.update(str(doc_id).encode("utf-8", "replace"))
+    for turn in turns:
+        key.update(b"\0")
+        key.update(str(turn).encode("utf-8", "replace"))
+    key.update(b"\0priors\0")
+    for text in prior_texts:
+        key.update(str(text).encode("utf-8", "replace"))
+        key.update(b"\0")
+    return key.hexdigest()[:32]
+
+
+class DocumentStore:
+    """One small JSON file per finished document, written the moment it is done.
+
+    Deliberately not part of :class:`~prompt_anonymity.caching.IndexedRowCache`: that cache rewrites
+    a whole table per side and cannot express "this one row is final" mid-chunk. This sits beside
+    it. The author table is still what assembles the parquet; this only decides how much a resumed
+    run has to recompute to rebuild it.
+
+    Each record holds the defended turns and the rolling author profile *after* that document, so a
+    fully-cached author costs zero generations on resume -- without the profile, replaying the
+    cascade would still pay one ``signature`` call per document.
+
+    Writes go through a temporary file and an atomic ``replace``, because the failure mode this
+    exists for is the process being killed without warning: a half-written record must not be
+    readable. A record that fails to parse is treated as absent and recomputed.
+    """
+
+    def __init__(self, directory) -> None:
+        self.dir = Path(directory)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.hits = 0
+        self.writes = 0
+
+    def get(self, key: str):
+        """``(turns, profile)`` for a finished document, or ``None`` to recompute it."""
+        try:
+            record = json.loads((self.dir / f"{key}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        turns, profile = record.get("turns"), record.get("profile")
+        if not isinstance(turns, list) or not isinstance(profile, str):
+            return None
+        self.hits += 1
+        return [str(turn) for turn in turns], profile
+
+    def put(self, key: str, turns, profile: str) -> None:
+        path = self.dir / f"{key}.json"
+        # The pid keeps two processes sharing a directory from colliding on the temporary name.
+        # They cannot disagree about the CONTENT of a key (it is content-addressed), so whichever
+        # rename lands last is still correct.
+        temporary = self.dir / f"{key}.{os.getpid()}.tmp"
+        try:
+            temporary.write_text(
+                json.dumps({"turns": [str(turn) for turn in turns], "profile": str(profile)}),
+                encoding="utf-8")
+            temporary.replace(path)
+            self.writes += 1
+        except OSError as error:      # a full disk must not kill a run that is otherwise fine
+            print(f"note: could not checkpoint document {key[:12]} ({error})", flush=True)
+            temporary.unlink(missing_ok=True)
 
 
 def encode_author_source(digest: str, documents) -> str:
@@ -913,12 +1040,27 @@ def defend_documents(items, *, embed, abstract, propose, alpha: float = DEFAULT_
         ok, n_tokens = fits(render_turn_blocks(state.turns))
         state.trace.prompt_tokens = int(n_tokens)
         if not ok:
-            passthrough = Candidate(turns=list(state.turns), level=0, round_index=0)
-            state.floor = state.best = passthrough
-            state.history = [passthrough]
-            state.trace.outcome = "stage1_floor"
-            state.trace.defended = state.trace.original
-            state.finish("too_long")
+            if AFR_TOO_LONG_PASSTHROUGH:
+                passthrough = Candidate(turns=list(state.turns), level=0, round_index=0)
+                state.floor = state.best = passthrough
+                state.history = [passthrough]
+                state.trace.outcome = "stage1_floor"
+                state.trace.defended = state.trace.original
+                state.finish("too_long")
+            else:
+                raise SystemExit(
+                    f"afr: document {state.trace.doc_id or '<unknown>'} renders to "
+                    f"{int(n_tokens):,} tokens, over the {AFR_MAX_MODEL_LEN:,}-token window, and "
+                    f"AFR_TOO_LONG_PASSTHROUGH is off.\n"
+                    f"Emitting it undefended would put untouched text inside the defended split, "
+                    f"where it inflates the attack against a defense that never saw it -- so this "
+                    f"stops instead.\n"
+                    f"Cap the CORPUS rather than this defense, so every arm reads the same text:\n"
+                    f"    python -m prompt_anonymity.data.build_subset --max-chars 40000 "
+                    f"--out-source <name> ...\n"
+                    f"Or raise AFR_MAX_MODEL_LEN (costs KV cache), or set "
+                    f"AFR_TOO_LONG_PASSTHROUGH=1 to accept undefended pass-throughs."
+                )
 
     live = [state for state in states if not state.finished]
 
@@ -1203,7 +1345,7 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
                    first_round_candidates: int = DEFAULT_FIRST_ROUND_CANDIDATES,
                    cascade_depth: int = AFR_CASCADE_DEPTH,
                    document_batch: int = DEFAULT_DOCUMENT_BATCH,
-                   fits=None, on_document=None) -> dict:
+                   fits=None, on_document=None, store=None, pool_key: str = "") -> dict:
     """Cascade many authors' timelines **in lockstep**, batching every stage across them.
 
     ``timelines`` is ``[(author, [(doc_id, turns), ...]), ...]`` in the order the documents were
@@ -1227,6 +1369,12 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
 
     ``on_document(author, doc_id, position, trace)`` is called as each document completes, so a
     caller can flush its log continuously rather than after a whole author.
+
+    ``store`` is an optional :class:`DocumentStore`. When given, every finished document is written
+    to it immediately and a resumed run replays the cascade from it without touching the model. The
+    replay is exact rather than approximate: a document's key carries the defended prior chain it
+    was produced against (see :func:`document_key`), so a hit is only ever a document whose input is
+    identical, and anything downstream of a change recomputes.
     """
     timelines = [(author, list(documents)) for author, documents in timelines]
     pools = {author: np.asarray(pool_for(author), dtype=float) for author, _ in timelines}
@@ -1239,23 +1387,46 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
     profiles: dict = {author: "" for author, _ in timelines}
     defended: dict = {author: [None] * len(documents) for author, documents in timelines}
 
-    def run(batch) -> None:
-        """Defend one batch of (author, position, doc_id, turns) and record the outcomes."""
-        items = [{"turns": turns,
-                  "priors": (np.vstack(prior_vectors[author]) if prior_vectors[author]
-                             else np.zeros((0, 0))),
-                  "prior_texts": prior_texts[author],
-                  "pool": pools[author],
-                  "profile": profiles[author],
-                  "centroid": centroids[author],
-                  "g_median": medians[author]}
-                 for author, _position, _doc_id, turns in batch]
+    def run(batch) -> list[int]:
+        """Defend one batch of ``(author, position, doc_id, turns)``.
+
+        Returns the positions **within this batch** that were actually computed, so phase A knows
+        which authors still need a ``signature`` call and which had their profile restored from the
+        store. A cached document costs no generation at all.
+        """
+        pending, keys = [], {}
+        for index, (author, position, doc_id, turns) in enumerate(batch):
+            if store is None:
+                pending.append(index)
+                continue
+            key = document_key(pool_key, doc_id, turns, prior_texts[author])
+            keys[index] = key
+            record = store.get(key)
+            if record is None:
+                pending.append(index)
+                continue
+            turns_out, profile = record
+            defended[author][position] = turns_out
+            restored[author] = profile
+        if not pending:
+            return []
+
+        items = [{"turns": batch[index][3],
+                  "priors": (np.vstack(prior_vectors[batch[index][0]])
+                             if prior_vectors[batch[index][0]] else np.zeros((0, 0))),
+                  "prior_texts": prior_texts[batch[index][0]],
+                  "pool": pools[batch[index][0]],
+                  "profile": profiles[batch[index][0]],
+                  "centroid": centroids[batch[index][0]],
+                  "g_median": medians[batch[index][0]]}
+                 for index in pending]
         results = defend_documents(
             items, embed=embed, abstract=abstract, propose=propose, alpha=alpha,
             max_probes=max_probes, escalate_after=escalate_after, top_m=top_m,
             first_round_candidates=first_round_candidates, fits=fits)
         winners = gate_and_select_batch(results, gate=gate, max_utility_loss=max_utility_loss)
-        for (author, position, doc_id, _turns), winner, result in zip(batch, winners, results):
+        for index, winner, result in zip(pending, winners, results):
+            author, position, doc_id, _turns = batch[index]
             trace = result[3]
             turns_out = [str(turn) for turn in winner.turns]
             trace.doc_id, trace.author_id, trace.position = str(doc_id), str(author), position
@@ -1263,6 +1434,10 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
             defended[author][position] = turns_out
             if on_document is not None:
                 on_document(author, doc_id, position, trace)
+        return pending
+
+    #: Profiles recovered from the store this position, so phase A can skip their signature call.
+    restored: dict = {}
 
     # --- phase A: lockstep over the cascaded prefix ---------------------------
     depth = max(0, int(cascade_depth))
@@ -1271,7 +1446,8 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
                  for author, documents in timelines if position < len(documents)]
         if not batch:
             break
-        run(batch)
+        restored = {}
+        need = run(batch)
         # The cascade step: what the attacker will see becomes the next document's prior. Only the
         # embeddings and profiles of the capped prefix are ever extended.
         fresh = [(author, join_document(defended[author][position]))
@@ -1280,16 +1456,37 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
         for index, (author, text) in enumerate(fresh):
             prior_texts[author].append(text)
             prior_vectors[author].append(vectors[index])
-        updated = signature([(profiles[author], text) for author, text in fresh])
-        for (author, _text), profile in zip(fresh, updated):
+        # Only the documents that were actually computed need their profile advanced by the model;
+        # a cached one carries the profile it produced, which is the whole point of storing it.
+        if need:
+            updated = signature([(profiles[fresh[index][0]], fresh[index][1]) for index in need])
+            for index, profile in zip(need, updated):
+                profiles[fresh[index][0]] = profile
+        for author, profile in restored.items():
             profiles[author] = profile
+        # Written only now, because the record carries the profile AFTER this document and that is
+        # not known until the signature call above has run.
+        if store is not None:
+            for index in need:
+                author, position_, doc_id, turns = batch[index]
+                store.put(document_key(pool_key, doc_id, turns,
+                                       prior_texts[author][:position_]),
+                          defended[author][position_], profiles[author])
 
     # --- phase B: everything past the cap, in wide independent batches --------
     tail = [(author, position, documents[position][0], documents[position][1])
             for author, documents in timelines
             for position in range(depth, len(documents))]
     for start in range(0, len(tail), max(1, document_batch)):
-        run(tail[start:start + document_batch])
+        slice_ = tail[start:start + document_batch]
+        restored = {}
+        computed = run(slice_)
+        # Phase B never extends the chain, so the profile is unchanged and is stored as-is.
+        if store is not None:
+            for index in computed:
+                author, position, doc_id, turns = slice_[index]
+                store.put(document_key(pool_key, doc_id, turns, prior_texts[author]),
+                          defended[author][position], profiles[author])
 
     return defended
 
@@ -2053,6 +2250,14 @@ class AgenticFootprintDefense(CachedDefense):
 
         self._open_log(cache.dir)
 
+        # Per-DOCUMENT durability, beside the per-author table. The author table is only written
+        # when a whole chunk finishes, which on a preemptible 16-hour job meant a killed task
+        # committed nothing at all -- seven tasks lost their full wall clock that way. This makes
+        # every finished document survive independently, so a resumed run pays only for what it had
+        # not already done. It lives under the cache directory, so it is scoped by logic_hash and
+        # params_hash exactly like the table and is discarded by the same invalidation.
+        documents_store = DocumentStore(Path(cache.dir) / "afr_docs")
+
         # The pool is embedded ONCE for the whole run and then sliced per author. Re-embedding it
         # per author would be ~n_authors x n_reference forward passes -- 100k on wildchat_small --
         # to produce vectors that are identical every time.
@@ -2101,7 +2306,11 @@ class AgenticFootprintDefense(CachedDefense):
                 escalate_after=self.escalate_after, top_m=self.top_m,
                 max_utility_loss=self.max_utility_loss,
                 first_round_candidates=self.first_round_candidates,
-                cascade_depth=AFR_CASCADE_DEPTH, fits=self._fits, on_document=record)
+                cascade_depth=AFR_CASCADE_DEPTH, fits=self._fits, on_document=record,
+                store=documents_store, pool_key=digest)
+            if documents_store is not None:
+                print(f"[{self.name}] chunk done: {documents_store.hits:,} documents restored from "
+                      f"the document store, {documents_store.writes:,} newly written", flush=True)
             return [encode_author_output(defended[author]) for author in authors]
 
         try:
@@ -2396,10 +2605,32 @@ def _selftest() -> None:
 
     print("oversized documents:")
     long_turns = ["word " * 5000]
-    over, over_floor, over_history, over_trace = defend_document(
-        long_turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
-        alpha=0.0, fits=lambda text: (False, 99_999))
-    check(over_trace.stop_reason == "too_long", "a document over the window stops at 'too_long'")
+
+    # BY DEFAULT an over-long document stops the run. Emitting it undefended would leave untouched
+    # text in the defended split, where it keeps its full authorship signal and is charged to the
+    # defense that never saw it -- 11% of the first corpus-scale run. The fix is a corpus-level cap
+    # (build_subset --max-chars), which keeps every arm on the same text; the error says so.
+    refused = None
+    try:
+        defend_document(long_turns, priors, prior_texts, pool, embed=embed, abstract=abstract,
+                        propose=propose, alpha=0.0, fits=lambda text: (False, 99_999))
+    except SystemExit as error:
+        refused = str(error)
+    check(refused is not None, "an over-long document STOPS the run rather than passing through")
+    check(refused is not None and "build_subset --max-chars" in refused,
+          "...and the error names the corpus-level fix, not just the failure")
+
+    # The old behaviour stays reachable, explicitly, for exploratory runs.
+    global AFR_TOO_LONG_PASSTHROUGH
+    AFR_TOO_LONG_PASSTHROUGH = True
+    try:
+        over, over_floor, over_history, over_trace = defend_document(
+            long_turns, priors, prior_texts, pool, embed=embed, abstract=abstract, propose=propose,
+            alpha=0.0, fits=lambda text: (False, 99_999))
+    finally:
+        AFR_TOO_LONG_PASSTHROUGH = False
+    check(over_trace.stop_reason == "too_long",
+          "with AFR_TOO_LONG_PASSTHROUGH=1 it stops at 'too_long' instead")
     check(over.turns == long_turns and over_trace.defended == over_trace.original,
           "...and is emitted UNDEFENDED rather than truncated")
     check(over_trace.prompt_tokens == 99_999, "...with its measured token count recorded")
@@ -2443,9 +2674,32 @@ def _selftest() -> None:
         # Never improves: the exact draft it was given, returned unchanged.
         return [list(payload["turns"])] * int(payload["want"])
 
+    # max_probes is explicit because this exercises the LADDER, not the budget: walking all three
+    # rungs at escalate_after=2 needs six rounds, and the first spends
+    # DEFAULT_FIRST_ROUND_CANDIDATES probes at once, so the default budget of 4 runs out first and
+    # the document would stop at 'probes_exhausted' without ever reaching the top.
     _, _, _, stalled_trace = defend_document(
         turns, priors, prior_texts, pool, embed=embed, abstract=abstract,
-        propose=stubborn_propose, alpha=0.0, escalate_after=2)
+        propose=stubborn_propose, alpha=0.0, escalate_after=2, max_probes=10)
+    # THE BUDGET MUST BE ABLE TO WALK THE LADDER. This is the check that would have caught cutting
+    # max_probes 10 -> 4 while leaving first_round_candidates at 3: the loop then spent every probe
+    # at level 0 and the structural rung was unreachable, quietly removing the defense's most
+    # aggressive mode. Run at the REAL defaults, so any future change to any of the three constants
+    # has to keep them consistent with each other.
+    _, _, _, budget_trace = defend_document(
+        turns, priors, prior_texts, pool, embed=embed, abstract=abstract,
+        propose=stubborn_propose, alpha=0.0)
+    check(budget_trace.max_level == N_ESCALATION_LEVELS - 1,
+          f"the DEFAULT probe budget reaches the top escalation rung "
+          f"(reached {budget_trace.max_level}, top is {N_ESCALATION_LEVELS - 1}; "
+          f"max_probes={DEFAULT_MAX_PROBES}, first_round={DEFAULT_FIRST_ROUND_CANDIDATES}, "
+          f"escalate_after={DEFAULT_ESCALATE_AFTER})")
+    check(budget_trace.stop_reason == "ladder_exhausted",
+          f"...and exhausts the ladder rather than running out of probes first "
+          f"({budget_trace.stop_reason!r})")
+    check(budget_trace.probes_used <= DEFAULT_MAX_PROBES,
+          f"...without exceeding the budget ({budget_trace.probes_used} <= {DEFAULT_MAX_PROBES})")
+
     check(stalled_trace.stop_reason == "ladder_exhausted",
           f"a stalled agent climbs the ladder and stops at the top "
           f"({stalled_trace.stop_reason!r})")
@@ -2521,6 +2775,76 @@ def _selftest() -> None:
                                               alpha=0.0, cascade_depth=99)
     check([t.n_priors for t in uncapped_traces] == [0, 1, 2, 3, 4, 5],
           "an uncapped cascade keeps extending the chain")
+
+    print("per-document resume (the store):")
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temporary:
+        two_authors = [("a", [(f"a{i}", [f"I run a llama farm in Reykjavik, note {i}."])
+                              for i in range(4)]),
+                       ("b", [(f"b{i}", [f"Our team of 4 at Acme Robotics, item {i}."])
+                              for i in range(3)])]
+        calls: list = []
+
+        # defend_authors takes the BATCHED callables (see defend_author for the same adapters).
+        def counted_abstract(batch):
+            batch = list(batch)
+            calls.append(len(batch))
+            return [abstract(item) for item in batch]
+
+        def batched_propose(batch):
+            batch = list(batch)
+            calls.append(len(batch))
+            return [propose(item) for item in batch]
+
+        def batched_gate(pairs):
+            return [gate(original, variants) for original, variants in pairs]
+
+        def batched_signature(pairs):
+            calls.append(len(list(pairs)))
+            return [signature(profile, text) for profile, text in pairs]
+
+        def cascade(timelines, store, key="pooldigest"):
+            return defend_authors(timelines, lambda _author: pool, embed=embed,
+                                  abstract=counted_abstract, propose=batched_propose,
+                                  gate=batched_gate, signature=batched_signature,
+                                  alpha=0.0, cascade_depth=2, store=store, pool_key=key)
+
+        store = DocumentStore(Path(temporary) / "docs")
+        cold = cascade(two_authors, store)
+        cold_calls = sum(calls)
+        check(cold_calls > 0 and store.writes == 7,
+              f"a cold run computes every document and stores all 7 ({store.writes})")
+
+        calls.clear()
+        warm_store = DocumentStore(Path(temporary) / "docs")
+        warm = cascade(two_authors, warm_store)
+        check(sum(calls) == 0,
+              f"a resumed run makes NO generation calls at all ({sum(calls)} calls)")
+        check(warm_store.hits == 7, f"...because all 7 documents were restored ({warm_store.hits})")
+        check(warm == cold, "and it reproduces the cold run's output exactly")
+
+        # The point of folding the prior chain into the key: an edit upstream must invalidate
+        # everything downstream of it, not just the document that changed.
+        edited = [("a", [("a0", ["Something else entirely."])] + two_authors[0][1][1:]),
+                  two_authors[1]]
+        calls.clear()
+        edited_store = DocumentStore(Path(temporary) / "docs")
+        cascade(edited, edited_store)
+        check(edited_store.hits == 3,
+              f"editing author a's first document invalidates a's whole chain, and only b's 3 "
+              f"documents still hit ({edited_store.hits})")
+
+        # A different reference pool means a different target, so nothing may be reused.
+        other_store = DocumentStore(Path(temporary) / "docs")
+        cascade(two_authors, other_store, key="a different pool")
+        check(other_store.hits == 0, "a different reference pool shares nothing")
+
+        # A truncated record (a task killed mid-write) must read as absent, never as a hit.
+        victim = next(iter((Path(temporary) / "docs").glob("*.json")))
+        victim.write_text('{"turns": [', encoding="utf-8")
+        check(DocumentStore(Path(temporary) / "docs").get(victim.stem) is None,
+              "a half-written record is treated as missing rather than trusted")
 
     print("the batched utility gate:")
     gate_calls: list = []

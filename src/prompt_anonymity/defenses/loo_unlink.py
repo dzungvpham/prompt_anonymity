@@ -404,13 +404,25 @@ class _LocalBackend:
     # -- generation --
     def _engine(self):
         if self._llm is None:
-            from ._backends import configure_cuda_toolkit, model_path, resolve_model_path
+            from ._backends import (configure_cuda_toolkit, local_checkpoint, resolve_model_path,
+                                    shared_checkpoint)
 
             configure_cuda_toolkit()  # must precede the import: vLLM reads the environment at import
 
             from vllm import LLM, SamplingParams
 
-            path = resolve_model_path(self.model or model_path("loo_unlink", MODEL_ENV_VAR))
+            # Through `local_checkpoint`, not the old `model_path` + `resolve_model_path` pair:
+            # models.toml names this model by REPO ID, and `resolve_model_path` only maps a
+            # HuggingFace *cache directory* to its snapshot -- it never looks at /datasets/ai. So
+            # the old line handed vLLM a bare repo id and silently downloaded ~6 GB on a cluster
+            # that already mirrors the weights. Same resolution `afr` uses.
+            if self.model:
+                path = resolve_model_path(shared_checkpoint(self.model) or self.model)
+                print(f"[loo_unlink] generator checkpoint: {path}")
+            else:
+                path = local_checkpoint("loo_unlink", MODEL_ENV_VAR,
+                                        allow_env="LOO_UNLINK_ALLOW_DOWNLOAD",
+                                        size_hint="~6 GB for a 3B model")
             print(f"[loo_unlink] loading generator {path} (vLLM)")
             # gpu_memory_utilization is left well below the default: Harrier is on the same card,
             # and vLLM pre-allocates its KV cache greedily enough to OOM a co-resident model.

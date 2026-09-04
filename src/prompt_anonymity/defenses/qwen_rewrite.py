@@ -91,12 +91,25 @@ class _QwenVLLMRewriter:
     whole batch of turns through one shared system prompt, so an A100/H100 stays saturated."""
 
     def __init__(self, model_id, system_prompt, max_tokens=1024):
+        from ._backends import local_checkpoint, resolve_model_path, shared_checkpoint
         from vllm import LLM, SamplingParams
 
+        # Resolved before vLLM sees it. `model_id` is a REPO ID by default, and vLLM cannot tell a
+        # repo id from a path that does not exist -- it fetches either. On a cluster that already
+        # mirrors these weights that is ~6 GB downloaded into $HF_HOME for nothing, so prefer
+        # /datasets/ai and refuse rather than download. Same resolution as afr and loo_unlink.
+        if model_id and model_id != DEFAULT_VLLM_MODEL:
+            path = resolve_model_path(shared_checkpoint(model_id) or model_id)
+            print(f"[qwen_rewrite] checkpoint: {path}")
+        else:
+            path = local_checkpoint("qwen_rewrite", "QWEN_HF_REPO",
+                                    allow_env="QWEN_ALLOW_DOWNLOAD",
+                                    size_hint="~6 GB for a 3B model")
+
         self.system_prompt = system_prompt
-        print(f"Loading Qwen (vLLM) '{model_id}' ({_VLLM_DTYPE}) for rewrite...")
+        print(f"Loading Qwen (vLLM) '{path}' ({_VLLM_DTYPE}) for rewrite...")
         self.llm = LLM(
-            model=model_id, dtype=_VLLM_DTYPE,
+            model=path, dtype=_VLLM_DTYPE,
             gpu_memory_utilization=_VLLM_GPU_MEM_UTIL,
             max_model_len=_VLLM_MAX_MODEL_LEN, enforce_eager=_VLLM_ENFORCE_EAGER,
         )

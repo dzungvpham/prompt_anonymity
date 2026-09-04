@@ -122,7 +122,7 @@ from .config import cache_dir, dist_dir, hf_dir
 # ``build_dataset.SOURCES`` -- there is no raw adapter for it, and offering it there would advertise
 # a build that cannot run. The leave-one-out defense is roughly quadratic per document, so it needs
 # a split sized for iteration rather than for coverage.
-SOURCES = ("wildchat", "wildchat_small", "swe_chat", "sharechat")
+SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "sharechat")
 
 # A document's text is its turns joined by a blank line. The earlier per-source scripts joined
 # with "\n===\n"; that marker is not natural writing and leaves its own fingerprint in the

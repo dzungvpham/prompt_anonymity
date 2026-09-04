@@ -337,6 +337,34 @@ def model_checkpoint(defense: str, env_var: str, *, local_only: bool = False) ->
     return resolve_model_path(configured)
 
 
+def local_checkpoint(defense: str, env_var: str, *, allow_env: str, size_hint: str = "") -> str:
+    """:func:`model_checkpoint`, but it REFUSES to hand back something that would be downloaded.
+
+    vLLM cannot tell "a path that does not exist" from "a hub repo id" -- both are strings it will
+    happily fetch -- so the check has to happen before it is handed over. Every model-backed defense
+    on a cluster wants the same rule: prefer ``$env_var``, then the ``/datasets/ai`` mirror, and if
+    neither exists, stop with a message naming the three ways out rather than pulling gigabytes into
+    ``$HF_HOME``. On a node whose ``$HF_HOME`` still points at a home directory that download takes
+    the disk quota with it, which is not hypothetical -- it has happened here.
+
+    ``allow_env`` is the opt-in that turns the refusal back into a download, for the machine where
+    fetching really is what you want. ``size_hint`` goes in the message, because "this will download
+    6 GB" and "this will download 50 GB" call for different reactions.
+    """
+    allowed = os.environ.get(allow_env, "") == "1"
+    path = model_checkpoint(defense, env_var, local_only=not allowed)
+    if not allowed and not Path(path).is_dir():
+        raise SystemExit(
+            f"[{defense}] {path!r} is not a directory on this machine, so the loader would try to "
+            f"DOWNLOAD it{f' ({size_hint})' if size_hint else ''}, into $HF_HOME -- check that it "
+            f"is not your home quota.\n"
+            f"  - point ${env_var} at a checkpoint already on disk, or\n"
+            f"  - mirror it under {SHARED_MODEL_ROOT}/<family>/hub/, or\n"
+            f"  - set {allow_env}=1 (and $HF_HOME to scratch) if you really do want it fetched."
+        )
+    return path
+
+
 def find_bundled_cuda_toolkit() -> Path | None:
     """The CUDA toolkit pip installed into this environment, if there is one.
 

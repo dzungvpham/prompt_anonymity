@@ -48,6 +48,16 @@ model = "microsoft/harrier-oss-v1-0.6b"
 [loo_unlink]
 model = "Qwen/Qwen2.5-3B-Instruct"
 
+# The per-turn rewriter (prompt_anonymity.defenses.qwen_rewrite), same weights as [loo_unlink] above
+# and for the same reason: small enough to sit on one GPU, and the rewrite is a style transfer
+# rather than anything that needs a large model.
+#
+# A repo id, resolved like the others through `_backends.local_checkpoint` -- $QWEN_HF_REPO, then
+# the cluster's mirror (/datasets/ai/*/hub/models--Qwen--Qwen2.5-3B-Instruct), and a HARD ERROR
+# rather than a download if neither exists. Set QWEN_ALLOW_DOWNLOAD=1 to opt into fetching it.
+[qwen_rewrite]
+model = "Qwen/Qwen2.5-3B-Instruct"
+
 # The agent in Agentic Footprint Reduction (prompt_anonymity.defenses.afr). Unlike loo_unlink, which
 # demotes its model to a span rewriter, this one IS the optimizer: it reads a real similarity
 # measurement and decides what to change, so it needs a model that can actually reason about the
