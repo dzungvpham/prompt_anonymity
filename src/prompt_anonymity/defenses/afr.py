@@ -2585,9 +2585,27 @@ def _selftest() -> None:
     print("engine startup (the defects that killed the first cluster run):")
     import inspect as _inspect
 
+    # EVERY vLLM-backed defense, not just this one. `qwen_rewrite` was missing the call and died in
+    # `warmup_kernels` -> `worker_sample_tokens` when the FlashInfer sampler JIT ran on a node with
+    # no CUDA toolkit -- a whole arm lost to a defect this check already covered for two modules.
+    # Enumerated from the loaders themselves so a NEW vLLM defense is caught by the same net.
     from . import loo_unlink as _loo
-    for module, engine in (("afr", _LocalBackend._engine), ("loo_unlink", _loo._LocalBackend._engine)):
+    from . import openanonymity as _oa
+    from . import qwen_rewrite as _qwen
+    from . import styleremix as _sr
+
+    loaders = [
+        ("afr", _LocalBackend._engine),
+        ("loo_unlink", _loo._LocalBackend._engine),
+        ("openanonymity", _oa._OpenAnonBackend.__init__),
+        ("qwen_rewrite", _qwen._QwenVLLMRewriter.__init__),
+        ("styleremix", _sr.load_styleremix_model if hasattr(_sr, "load_styleremix_model") else None),
+    ]
+    for module, engine in [(name, fn) for name, fn in loaders if fn is not None]:
         source = _inspect.getsource(engine)
+        if "from vllm import" not in source:
+            continue        # not a vLLM loader (styleremix uses transformers/PEFT)
+
         toolkit = source.find("configure_cuda_toolkit()")
         vllm_import = source.find("from vllm import")
         check(toolkit != -1 and toolkit < vllm_import,

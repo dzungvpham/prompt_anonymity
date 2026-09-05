@@ -91,7 +91,16 @@ class _QwenVLLMRewriter:
     whole batch of turns through one shared system prompt, so an A100/H100 stays saturated."""
 
     def __init__(self, model_id, system_prompt, max_tokens=1024):
-        from ._backends import local_checkpoint, resolve_model_path, shared_checkpoint
+        from ._backends import (configure_cuda_toolkit, local_checkpoint, resolve_model_path,
+                                shared_checkpoint)
+
+        # MUST precede the vLLM import below: vLLM reads its environment at import time, and this
+        # is what sets VLLM_USE_FLASHINFER_SAMPLER=0. Without it the FlashInfer sampler JITs during
+        # `warmup_kernels` -> `worker_sample_tokens` and kills engine startup on a node with no CUDA
+        # toolkit. Every other vLLM-backed defense here already does this; this one did not, which
+        # is exactly how it failed.
+        configure_cuda_toolkit()
+
         from vllm import LLM, SamplingParams
 
         # Resolved before vLLM sees it. `model_id` is a REPO ID by default, and vLLM cannot tell a
