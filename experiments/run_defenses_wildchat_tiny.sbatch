@@ -30,6 +30,11 @@
 # -------------------------------
 #   dp_mlm*        excluded on request. It is a sweep of 11 registered variants and would dominate
 #                  both the array and the figures.
+#   rtt_argos      dropped: the round-trip translations are poor enough that the arm is not worth
+#                  the wall clock. It is also the only defense here that downloads at run time
+#                  (Argos fetches its language packages on first use), so removing it takes the last
+#                  compute-node network dependency with it. Still registered -- add it to $DEFENSES
+#                  to bring it back.
 #
 # THE OPENANONYMITY REDACTOR RUNS THROUGH OPENROUTER HERE, not locally. Its models.toml entry is a bare repo id
 # for a 120B checkpoint that is NOT mirrored under /datasets/ai, so a local run would download
@@ -43,7 +48,6 @@
 #
 #   none                   the undefended baseline -- spelled 'base' in results/ and on figures
 #   example_normalization  trivial text normalization; the floor any defense must beat
-#   rtt_argos              round-trip translation
 #   collision_seeding      collision seeding at the default K
 #   frame_shift            scene rewrite, 50-frame codebook
 #   frame_pad              adds a scene turn and rewrites nothing -- splits dilution from rewriting
@@ -61,7 +65,7 @@
 # that a 27B model rewrote the text.
 #
 # COST. Only the featurize stage spends money: one OpenRouter embedding call per document at
-# $0.20/M tokens. ~900 documents x 12 arms is well under a dollar, and it caches by text content,
+# $0.20/M tokens. ~900 documents x 11 arms is well under a dollar, and it caches by text content,
 # so a requeued task re-embeds nothing.
 #
 # Overrides (sbatch exports your submitting environment):
@@ -73,7 +77,7 @@
 #SBATCH --job-name=def-wct
 #SBATCH --output=scripts/logs/%x-%A_%a.out
 #SBATCH --open-mode=append
-#SBATCH --array=0-11
+#SBATCH --array=0-10
 #SBATCH --nodes=1
 #SBATCH --partition=gpu-preempt
 #SBATCH --gpus=1
@@ -97,7 +101,7 @@ SOURCE="${SOURCE:-wildchat_tiny}"
 FEATURE="${FEATURE:-gemini_embedding_2}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"
 
-read -r -a DEFENSE_LIST <<< "${DEFENSES:-none example_normalization rtt_argos collision_seeding frame_shift frame_pad qwen_rewrite styleremix styleremix_openanon loo_unlink_b30 afr_stage1 afr}"
+read -r -a DEFENSE_LIST <<< "${DEFENSES:-none example_normalization collision_seeding frame_shift frame_pad qwen_rewrite styleremix styleremix_openanon loo_unlink_b30 afr_stage1 afr}"
 
 INDEX="${SLURM_ARRAY_TASK_ID:-0}"
 if [ "$INDEX" -ge "${#DEFENSE_LIST[@]}" ]; then

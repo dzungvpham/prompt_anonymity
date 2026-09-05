@@ -554,18 +554,23 @@ class DocumentStore:
         self.writes = 0
 
     def get(self, key: str):
-        """``(turns, profile)`` for a finished document, or ``None`` to recompute it."""
+        """``(turns, profile)`` for a finished document, or ``None`` to recompute it.
+
+        ``profile`` is ``None`` for a record written mid-position -- the document's own work is
+        complete and reusable, but the rolling profile that follows it had not been generated when
+        the process was killed. The caller regenerates just that, at one ``signature`` call.
+        """
         try:
             record = json.loads((self.dir / f"{key}.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
         turns, profile = record.get("turns"), record.get("profile")
-        if not isinstance(turns, list) or not isinstance(profile, str):
+        if not isinstance(turns, list) or not (profile is None or isinstance(profile, str)):
             return None
         self.hits += 1
         return [str(turn) for turn in turns], profile
 
-    def put(self, key: str, turns, profile: str) -> None:
+    def put(self, key: str, turns, profile) -> None:
         path = self.dir / f"{key}.json"
         # The pid keeps two processes sharing a directory from colliding on the temporary name.
         # They cannot disagree about the CONTENT of a key (it is content-addressed), so whichever
@@ -573,7 +578,8 @@ class DocumentStore:
         temporary = self.dir / f"{key}.{os.getpid()}.tmp"
         try:
             temporary.write_text(
-                json.dumps({"turns": [str(turn) for turn in turns], "profile": str(profile)}),
+                json.dumps({"turns": [str(turn) for turn in turns],
+                            "profile": None if profile is None else str(profile)}),
                 encoding="utf-8")
             temporary.replace(path)
             self.writes += 1
@@ -1407,7 +1413,13 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
                 continue
             turns_out, profile = record
             defended[author][position] = turns_out
-            restored[author] = profile
+            if profile is None:
+                # Committed mid-position: the expensive work is here, but the profile that follows
+                # it was never written. Restoring costs one `signature` call instead of the ~11
+                # generations the document itself took.
+                profileless.append(index)
+            else:
+                restored[author] = profile
         if not pending:
             return []
 
@@ -1432,12 +1444,22 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
             trace.doc_id, trace.author_id, trace.position = str(doc_id), str(author), position
             trace.defended = join_document(turns_out)
             defended[author][position] = turns_out
+            # COMMIT NOW, before anything else in this position runs. This is the whole point of the
+            # store: a document that took ~11 generations must survive the next preemption, and on a
+            # 2-hour preempt window a position of 40 documents does not reliably finish. The profile
+            # is not known yet (it needs the signature call that ends the position), so it is written
+            # as null and filled in below; a resume that finds a null profile pays one signature
+            # call rather than redoing the document.
+            if store is not None:
+                store.put(keys[index], turns_out, None)
             if on_document is not None:
                 on_document(author, doc_id, position, trace)
         return pending
 
     #: Profiles recovered from the store this position, so phase A can skip their signature call.
     restored: dict = {}
+    #: Documents restored from a mid-position commit, whose profile still has to be generated.
+    profileless: list = []
 
     # --- phase A: lockstep over the cascaded prefix ---------------------------
     depth = max(0, int(cascade_depth))
@@ -1446,7 +1468,7 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
                  for author, documents in timelines if position < len(documents)]
         if not batch:
             break
-        restored = {}
+        restored, profileless = {}, []
         need = run(batch)
         # The cascade step: what the attacker will see becomes the next document's prior. Only the
         # embeddings and profiles of the capped prefix are ever extended.
@@ -1456,18 +1478,20 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
         for index, (author, text) in enumerate(fresh):
             prior_texts[author].append(text)
             prior_vectors[author].append(vectors[index])
-        # Only the documents that were actually computed need their profile advanced by the model;
-        # a cached one carries the profile it produced, which is the whole point of storing it.
-        if need:
-            updated = signature([(profiles[fresh[index][0]], fresh[index][1]) for index in need])
-            for index, profile in zip(need, updated):
+        # A profile is generated for a document computed this position, and for one restored from a
+        # mid-position commit that never got its profile written. A restored record that HAS a
+        # profile costs nothing at all -- that is the fully-cached path.
+        advance = sorted(set(need) | set(profileless))
+        if advance:
+            updated = signature([(profiles[fresh[index][0]], fresh[index][1]) for index in advance])
+            for index, profile in zip(advance, updated):
                 profiles[fresh[index][0]] = profile
         for author, profile in restored.items():
             profiles[author] = profile
-        # Written only now, because the record carries the profile AFTER this document and that is
-        # not known until the signature call above has run.
+        # Re-write those records now that the profile exists, completing the entries `run` wrote
+        # with a null profile. Same key, so this replaces rather than duplicates.
         if store is not None:
-            for index in need:
+            for index in advance:
                 author, position_, doc_id, turns = batch[index]
                 store.put(document_key(pool_key, doc_id, turns,
                                        prior_texts[author][:position_]),
@@ -1479,11 +1503,13 @@ def defend_authors(timelines, pool_for, *, embed, abstract, propose, gate, signa
             for position in range(depth, len(documents))]
     for start in range(0, len(tail), max(1, document_batch)):
         slice_ = tail[start:start + document_batch]
-        restored = {}
+        restored, profileless = {}, []
         computed = run(slice_)
-        # Phase B never extends the chain, so the profile is unchanged and is stored as-is.
+        # Phase B never extends the chain, so the profile is unchanged. `run` already committed each
+        # document as it finished; this only completes those records with the (unchanged) profile so
+        # a later resume reads them as fully cached rather than profile-less.
         if store is not None:
-            for index in computed:
+            for index in sorted(set(computed) | set(profileless)):
                 author, position, doc_id, turns = slice_[index]
                 store.put(document_key(pool_key, doc_id, turns, prior_texts[author]),
                           defended[author][position], profiles[author])
@@ -2831,8 +2857,12 @@ def _selftest() -> None:
         store = DocumentStore(Path(temporary) / "docs")
         cold = cascade(two_authors, store)
         cold_calls = sum(calls)
-        check(cold_calls > 0 and store.writes == 7,
-              f"a cold run computes every document and stores all 7 ({store.writes})")
+        # Distinct FILES, not writes: each document is now written twice -- once the instant it
+        # finishes (profile null) and once when the position's profile is known. Same key, so the
+        # second replaces the first.
+        stored = len(list((Path(temporary) / "docs").glob("*.json")))
+        check(cold_calls > 0 and stored == 7,
+              f"a cold run computes every document and stores all 7 ({stored})")
 
         calls.clear()
         warm_store = DocumentStore(Path(temporary) / "docs")
@@ -2857,6 +2887,47 @@ def _selftest() -> None:
         other_store = DocumentStore(Path(temporary) / "docs")
         cascade(two_authors, other_store, key="a different pool")
         check(other_store.hits == 0, "a different reference pool shares nothing")
+
+        # THE TEST THAT WAS MISSING, and whose absence cost days of GPU time. The resume checks
+        # above all resume a run that FINISHED, which is exactly the case where everything happens
+        # to be committed -- they passed while the store was in fact committing once per lockstep
+        # POSITION, so a job preempted mid-position (40 documents on the real corpus, every two
+        # hours) saved nothing at all. This kills the run partway through a position instead.
+        class _Preempted(Exception):
+            pass
+
+        class _DyingStore(DocumentStore):
+            def __init__(self, directory, die_after):
+                super().__init__(directory)
+                self.die_after, self.n = die_after, 0
+
+            def put(self, key, turns, profile):
+                super().put(key, turns, profile)
+                self.n += 1
+                if self.n >= self.die_after:
+                    raise _Preempted()
+
+        killed_dir = Path(temporary) / "killed"
+        try:
+            cascade(two_authors, _DyingStore(killed_dir, die_after=2))
+        except _Preempted:
+            pass
+        # Position 0 holds one document per author (2 here), so dying on the 2nd commit means both
+        # of that position's documents are already durable -- with the OLD per-position commit,
+        # nothing at all would have been.
+        survived = len(list(killed_dir.glob("*.json")))
+        check(survived == 2,
+              f"a run killed mid-position leaves its finished documents on disk ({survived})")
+
+        calls.clear()
+        after_kill = DocumentStore(killed_dir)
+        recovered = cascade(two_authors, after_kill)
+        check(after_kill.hits == survived,
+              f"...and the resumed run reuses every one of them ({after_kill.hits} hits)")
+        check(recovered == cold,
+              "...and still reproduces the uninterrupted run's output exactly")
+        check(sum(calls) < cold_calls,
+              f"...having done strictly less work ({sum(calls)} vs {cold_calls} calls)")
 
         # A truncated record (a task killed mid-write) must read as absent, never as a hit.
         victim = next(iter((Path(temporary) / "docs").glob("*.json")))

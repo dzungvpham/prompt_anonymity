@@ -296,7 +296,9 @@ DEFENSES = (
     "dp_mlm_var_a10",
     "dp_mlm_var_a25",
     "qwen_rewrite",
-    "rtt_argos",
+    # "rtt_argos" is deliberately absent: the round-trip translations are too poor to report, and a
+    # name missing here makes plot_results SKIP that results directory rather than draw it. Add it
+    # back to put the arm on the figures again.
     "example_normalization",
     # The measurement-loop defenses. Ahead of the epsilon sweeps for the reason given above -- they
     # carry an argument, so they should hold stable colours -- and `afr_stage1` sits beside `afr`
@@ -380,7 +382,6 @@ DEFENSE_LABELS = {
     "dp_mlm_var_a10": "DP-MLM ± (A=0.1)",
     "dp_mlm_var_a25": "DP-MLM ± (A=0.25)",
     "qwen_rewrite": "Qwen rewrite",
-    "rtt_argos": "Round-trip translation",
     "example_normalization": "Text normalization",
     # The residual-linkage target alpha is in the label because it is the knob the sweep varies:
     # alpha 0 aims all the way down to a median unrelated document, higher keeps some linkage.
