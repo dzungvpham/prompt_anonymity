@@ -50,7 +50,29 @@
 
 set -euo pipefail
 
-PROJECT="${PROMPT_ANONYMITY_PROJECT:-${SLURM_SUBMIT_DIR:-$PWD}}"
+# Resolve the repo root, then CHECK it -- do not just trust $SLURM_SUBMIT_DIR.
+#
+# Open OnDemand exports SLURM_SUBMIT_DIR into interactive shells, pointing at its own dashboard app
+# (/var/www/ood/apps/sys/dashboard). Under a real `sbatch` SLURM sets that variable itself and it is
+# right; run by hand from an OOD shell it is inherited garbage, and `cd` fails before anything else
+# has a chance to. So each candidate is tried in order and accepted only if it actually looks like
+# this repo.
+looks_like_repo() { [ -d "$1/src/prompt_anonymity" ] && [ -d "$1/experiments" ]; }
+
+PROJECT=""
+for candidate in "${PROMPT_ANONYMITY_PROJECT:-}" "${SLURM_SUBMIT_DIR:-}" "$PWD"; do
+    if [ -n "$candidate" ] && looks_like_repo "$candidate"; then
+        PROJECT="$candidate"
+        break
+    fi
+done
+if [ -z "$PROJECT" ]; then
+    echo "ERROR: cannot find the repo root. Tried \$PROMPT_ANONYMITY_PROJECT" \
+         "(${PROMPT_ANONYMITY_PROJECT:-unset}), \$SLURM_SUBMIT_DIR (${SLURM_SUBMIT_DIR:-unset})" \
+         "and \$PWD ($PWD)." >&2
+    echo "       Run this from the repo root, or set PROMPT_ANONYMITY_PROJECT=/path/to/repo." >&2
+    exit 1
+fi
 cd "$PROJECT"
 
 SOURCE="${SOURCE:-wildchat_tiny}"
