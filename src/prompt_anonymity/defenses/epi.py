@@ -691,12 +691,24 @@ def _selftest() -> None:
 
     # 11. The registry entries exist and are wired to this class. `epi_single` in particular is easy
     #     to register against the wrong constant, and it would fail only at corpus scale.
+    #
+    #     The class is imported back through the package rather than taken from this module's own
+    #     namespace, and that is load-bearing rather than tidy: run as
+    #     `python -m prompt_anonymity.defenses.epi`, runpy executes this file a SECOND time under the
+    #     name `__main__`, so the `EmbeddingPromptInjectionDefense` in scope here is a different class
+    #     object from the one the registry instantiated -- and `isinstance` against it is False for a
+    #     perfectly correct registration. (That is the same double-import the sbatch scripts filter a
+    #     RuntimeWarning about; it is harmless until something compares across the two copies, which
+    #     is exactly what this check used to do.) Importing through the package gets the registry's
+    #     own class under either entry point.
     from . import DEFENSES
+    from .epi import EmbeddingPromptInjectionDefense as RegisteredClass
 
-    check("registered as 'epi'", isinstance(DEFENSES.get("epi"), EmbeddingPromptInjectionDefense))
+    registered = DEFENSES.get("epi")
+    check("registered as 'epi'", isinstance(registered, RegisteredClass), f"{registered!r}")
     registered_single = DEFENSES.get("epi_single")
     check("registered as 'epi_single'",
-          isinstance(registered_single, EmbeddingPromptInjectionDefense)
+          isinstance(registered_single, RegisteredClass)
           and registered_single.single_topic is not None,
           f"{registered_single!r}")
 
