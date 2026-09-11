@@ -759,6 +759,9 @@ def main() -> None:
                    help="print the topic codebook and the sentence each one produces")
     p.add_argument("--preview", action="store_true",
                    help="defend a few real documents and print what changed")
+    p.add_argument("--fit-report", action="store_true",
+                   help="defend the WHOLE split and print only the summary: what share of documents "
+                        "overran the window and how much text the fitting cut. Free, no API calls")
     p.add_argument("--manifest", action="store_true",
                    help="write the doc_id -> topic assignment")
     p.add_argument("--source", default="wildchat_tiny",
@@ -783,8 +786,8 @@ def main() -> None:
         _selftest()
         return
 
-    if not (args.list_topics or args.preview or args.manifest):
-        p.error("choose one of --selftest, --list-topics, --preview, --manifest")
+    if not (args.list_topics or args.preview or args.manifest or args.fit_report):
+        p.error("choose one of --selftest, --list-topics, --preview, --fit-report, --manifest")
 
     defense = EmbeddingPromptInjectionDefense(seed=args.seed, single_topic=args.single,
                                               window_tokens=args.window_tokens,
@@ -801,6 +804,21 @@ def main() -> None:
 
     if args.preview:
         _preview(args.source, args.dist_dir, args.limit or 5, defense)
+
+    if args.fit_report:
+        # The number that decides whether this arm is interpretable, measured on the whole corpus
+        # rather than on --preview's handful. Every document is fitted and thrown away; only the
+        # counters survive, so this costs one tokenization of the corpus and no API calls.
+        from .frame_shift import _load_documents
+
+        doc_ids, turn_lists = _load_documents(args.source, args.dist_dir, None)
+        if not doc_ids:
+            raise SystemExit(f"no documents in {args.source}")
+        for doc_id, turns in zip(doc_ids, turn_lists):
+            defense.rewrite_document(doc_id, turns)
+        print(f"fit report for {args.source}: {len(doc_ids):,} documents, window "
+              f"{defense.window_tokens:,} tokens")
+        defense.report()
 
     if args.manifest:
         from ..data.config import dist_dir
