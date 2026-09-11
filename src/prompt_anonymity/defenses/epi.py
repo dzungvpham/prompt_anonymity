@@ -457,6 +457,11 @@ class EmbeddingPromptInjectionDefense:
         print(f"[epi] appended an injection turn to {total:,} documents across "
               f"{len(self.assigned):,} topic(s); groups of {sizes[0]:,}-{sizes[-1]:,} documents "
               f"(median {sizes[len(sizes) // 2]:,})")
+        if self.window_tokens <= 0:
+            print("[epi] window fitting is DISABLED (window_tokens=0): the injection was appended "
+                  "to every document whatever its length, so on any document past the embedder's "
+                  "window it will not be read at all.")
+            return
         if not self.truncated:
             print(f"[epi] every document fitted the {self.window_tokens:,}-token window; no text "
                   f"was cut and every original turn is byte-identical")
@@ -712,6 +717,33 @@ def _selftest() -> None:
           and registered_single.single_topic is not None,
           f"{registered_single!r}")
 
+    # 12. Every human-facing format string actually runs. This looks like a check on nothing, and it
+    #     is here because it is not: `--preview` printed a document's LENGTH as `{text:,}` and the
+    #     error ("Cannot specify ',' with 's'") surfaced only on the cluster, three stages into a
+    #     queued job, because no offline check had ever executed those lines. Formatting is the one
+    #     kind of bug that cannot be reasoned about from the surrounding code, so it is executed
+    #     instead -- over a short document, a truncated one and an empty one, which between them
+    #     reach every branch. Output is swallowed; only an exception matters.
+    import contextlib
+    import io
+
+    shapes = (["a short turn", "and another"], ["opening", long_turn, "trailing turn"], [""])
+    printer = EmbeddingPromptInjectionDefense(seed=7)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            preview_documents([f"doc-{i}" for i in range(len(shapes))], shapes, printer)
+            printer.report()                     # the truncated branch
+            # ...and the two branches that one cannot reach: fitting disabled, and nothing cut.
+            for unfitted in (EmbeddingPromptInjectionDefense(seed=7, window_tokens=0),
+                             EmbeddingPromptInjectionDefense(seed=7)):
+                unfitted.rewrite_document("doc-x", ["a short turn"])
+                unfitted.report()
+    except Exception as error:  # noqa: BLE001 - reporting the failure IS the check
+        check("the preview and report format strings run", False,
+              f"{type(error).__name__}: {error}")
+    else:
+        check("the preview and report format strings run", True)
+
     print(f"\n{len(failures)} failure(s)" + (f": {', '.join(failures)}" if failures else ""))
     if failures:
         raise SystemExit(1)
@@ -732,7 +764,17 @@ def _preview(source: str, dist_dir, limit: int, defense: EmbeddingPromptInjectio
     doc_ids, turn_lists = _load_documents(source, dist_dir, limit)
     if not doc_ids:
         raise SystemExit(f"no documents in {source}")
+    preview_documents(doc_ids, turn_lists, defense)
 
+
+def preview_documents(doc_ids, turn_lists, defense: EmbeddingPromptInjectionDefense) -> None:
+    """Print :func:`_preview`'s report for documents already in hand.
+
+    Split from the loading half deliberately. Everything here is formatting, needs no corpus, and is
+    therefore the half the selftest can run -- which it does, because a format string that raises is
+    a crash in the middle of a cluster job that has already queued, and this file has had exactly
+    that (a length printed as ``{text:,}``) reach the cluster once.
+    """
     for doc_id, turns in zip(doc_ids, turn_lists):
         before = TURN_SEPARATOR.join(str(t) for t in turns)
         fitted = defense.rewrite_document(doc_id, turns)
@@ -740,7 +782,7 @@ def _preview(source: str, dist_dir, limit: int, defense: EmbeddingPromptInjectio
         cut = len(before) - len(TURN_SEPARATOR.join(fitted[:-1]))
 
         print(f"\n{'=' * 100}\n{doc_id}  ->  {defense.topic_for(str(doc_id))}\n{'=' * 100}")
-        print(f"--- {len(turns)} original turn(s), {before:,} chars, "
+        print(f"--- {len(turns)} original turn(s), {len(before):,} chars, "
               f"{count_tokens(before):,} tokens ---")
         if cut:
             print(f"!! TRUNCATED: {len(fitted) - 1} turn(s) kept, {cut:,} chars "
