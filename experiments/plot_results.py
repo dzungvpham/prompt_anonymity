@@ -291,6 +291,8 @@ DEFENSES = (
     "frame_shift_single",
     "frame_pad",
     "frame_pad_single",
+    "epi",
+    "epi_single",
     "dp_mlm",
     "dp_mlm_pii",
     "dp_mlm_var_a10",
@@ -377,6 +379,11 @@ DEFENSE_LABELS = {
     # frame_shift splits that defense in two: dilution by added content, versus the rewrite.
     "frame_pad": "Frame pad (50 frames)",
     "frame_pad_single": "Frame pad (single frame)",
+    # EPI appends ten words of assertion where frame_pad appends 180 of prose, so the two
+    # read together as instruction-following versus dilution by volume. The topic count is in
+    # the label for the same reason K is above: it is the collision-group knob.
+    "epi": "EPI (30 topics)",
+    "epi_single": "EPI (single topic)",
     "dp_mlm": "DP-MLM",
     "dp_mlm_pii": "DP-MLM (PII only)",
     "dp_mlm_var_a10": "DP-MLM ± (A=0.1)",

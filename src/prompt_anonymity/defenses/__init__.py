@@ -24,6 +24,8 @@ from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
 from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
+from .epi import SINGLE_TOPIC_KEY as EPI_SINGLE_TOPIC
+from .epi import EmbeddingPromptInjectionDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .frame_pad import FramePadDefense
 from .frame_shift import SINGLE_FRAMING_KEY, FrameShiftDefense
@@ -62,6 +64,7 @@ DEFENSES: dict[str, Defense] = {
     "collision_seeding": CollisionSeedingDefense(marker_keys=SWE_CHAT_MARKERS),
     "frame_shift": FrameShiftDefense(),
     "frame_pad": FramePadDefense(),
+    "epi": EmbeddingPromptInjectionDefense(),
 }
 
 #: Frame shift's single-frame ablation: the whole corpus is rewritten into ONE scene instead of
@@ -80,6 +83,13 @@ DEFENSES["frame_shift_single"] = FrameShiftDefense(single_framing=SINGLE_FRAMING
 #: presence; read against ``frame_shift_single`` it holds the scene fixed and varies only whether the
 #: user's text was rewritten.
 DEFENSES["frame_pad_single"] = FramePadDefense(single_framing=SINGLE_FRAMING_KEY)
+
+#: Embedding prompt injection's single-topic ablation, the same control again: every document's
+#: appended sentence names ONE topic instead of one drawn from the 30-entry codebook, so the whole
+#: corpus ends on a byte-identical turn rather than splitting into 30 groups. Read against ``epi`` it
+#: asks whether topic *diversity* matters or only topic *presence* -- and it is the arm where the
+#: injected turn is maximal collision material, since every document shares it exactly.
+DEFENSES["epi_single"] = EmbeddingPromptInjectionDefense(single_topic=EPI_SINGLE_TOPIC)
 
 #: Collision-seeding variants. Unlike every other defense here this one is pure Python string work
 #: (no model, no GPU, seconds not hours), so a variant costs nothing to add and nothing to run --
@@ -213,6 +223,7 @@ __all__ = [
     "CollisionSeedingDefense",
     "FrameShiftDefense",
     "FramePadDefense",
+    "EmbeddingPromptInjectionDefense",
     "LOOUnlinkDefense",
     "LOO_UNLINK_BUDGETS",
     "AgenticFootprintDefense",

@@ -117,6 +117,6 @@ where = ["src"]
 # identities are built from.
 "prompt_anonymity.data" = ["datasets.toml", "resources/*.json"]
 # The machine-independent checkpoint defaults for the vLLM defenses and the local utility scorers.
-"prompt_anonymity.defenses" = ["models.toml"]
+"prompt_anonymity.defenses" = ["models.toml", "epi_topics.txt"]
 # The judge rubric (conversation_judge.yaml), read at import by prompt_judge.load_judge_prompt.
 "prompt_anonymity.evaluation.utility" = ["*.yaml"]

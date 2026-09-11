@@ -46,10 +46,19 @@ the rewrite, and a document's defended turns line up one-for-one with its origin
 
 The one exception is a defense that *adds* turns rather than rewriting them (``frame_pad``, which
 appends a shared off-topic turn to each document). Such a defense declares ``appends_turns = True``
-and exposes ``extra_turns(doc_id)``; it never sees the existing turns, which are copied through
-byte-identical, and it is applied per DOCUMENT rather than through the per-turn path below -- that
-path structurally cannot add a turn, since it must return one output per input row. For those
-defenses, and only those, the defended document has MORE turns than the original.
+and is applied per DOCUMENT rather than through the per-turn path below -- that path structurally
+cannot add a turn, since it must return one output per input row. For those defenses, and only
+those, the defended document has MORE turns than the original.
+
+There are two ways to be such a defense, and the difference is whether it needs to see the document:
+
+* ``extra_turns(doc_id)`` returns the turns to append. The existing turns are never handed over and
+  are copied through byte-identical (``frame_pad``).
+* ``rewrite_document(doc_id, turns)`` returns the document's whole new turn list, so it may shorten
+  the existing turns as well as add one (``epi``, which cuts a document to the embedding window so
+  that the turn it appends is actually read).
+
+:func:`append_extra_turns` prefers the second when a defense offers it.
 
 That is also the granularity the caching works at: the package's defense machinery caches one row
 per input it is handed (:class:`~prompt_anonymity.caching.IndexedRowCache`, keyed by the id passed
@@ -284,24 +293,45 @@ def report_workload(defense: str, n_documents: int, texts: list[str]) -> None:
 
 
 def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str]]:
-    """Apply a turn-ADDING defense: copy each document's turns through and append what it asks for.
+    """Apply a turn-ADDING defense, document by document.
 
-    The path for a defense that declares ``appends_turns`` (``frame_pad``). It is document-level, so
-    it skips the per-turn machinery entirely -- no flatten, no cache, no backend. That is not just an
-    optimisation: the per-turn path caches one row per input turn and requires one output per input
-    turn, so it can neither express "one more turn" nor gain anything from caching a defense whose
-    transform is a dictionary lookup keyed by ``doc_id``.
+    The path for a defense that declares ``appends_turns`` (``frame_pad``, ``epi``). It is
+    document-level, so it skips the per-turn machinery entirely -- no flatten, no cache, no backend.
+    That is not just an optimisation: the per-turn path caches one row per input turn and requires
+    one output per input turn, so it can neither express "one more turn" nor gain anything from
+    caching a defense whose transform is a dictionary lookup keyed by ``doc_id``.
 
-    The existing turns are never handed to the defense, which is the guarantee this kind of defense
-    is built on: whatever it appends, the user's own text is byte-identical to its input.
+    Two hooks, in order of preference (see this module's docstring):
+
+    * ``rewrite_document(doc_id, turns)`` -> the document's whole new turn list. A defense that must
+      see the document uses this; it may shorten the existing turns as well as add one, which
+      ``epi`` does to keep its appended turn inside the embedder's window.
+    * ``extra_turns(doc_id)`` -> the turns to append, with the existing ones copied through
+      byte-identical. The defense never sees the document at all.
+
+    The summary line says which happened, and counts characters as a signed delta rather than an
+    addition, because under the first hook a document can come out SHORTER than it went in.
     """
-    padded = [list(turns) + [str(turn) for turn in defense.extra_turns(doc_id)]
-              for doc_id, turns in zip(doc_ids, turn_lists)]
-    added = [new[len(old):] for new, old in zip(padded, turn_lists)]
-    characters = sum(len(turn) for turns in added for turn in turns)
-    print(f"[{name}] appending turns to {len(padded):,} documents: "
-          f"{sum(len(turns) for turns in added):,} turns / {characters:,} characters added; "
-          f"existing turns are copied through unchanged")
+    rewrite = getattr(defense, "rewrite_document", None)
+    if callable(rewrite):
+        padded = [[str(turn) for turn in rewrite(doc_id, list(turns))]
+                  for doc_id, turns in zip(doc_ids, turn_lists)]
+    else:
+        padded = [list(turns) + [str(turn) for turn in defense.extra_turns(doc_id)]
+                  for doc_id, turns in zip(doc_ids, turn_lists)]
+
+    # Both counts are SIGNED deltas. A defense that only appends makes them both positive; one that
+    # shortens a document to make room for what it appends can drive either negative, and a count of
+    # "turns added" would then read 0 on a document that did gain a turn and lose four.
+    turns_delta = sum(len(new) - len(old) for new, old in zip(padded, turn_lists))
+    delta = (sum(len(turn) for turns in padded for turn in turns)
+             - sum(len(str(turn)) for turns in turn_lists for turn in turns))
+    shortened = sum(list(new[:len(old)]) != [str(turn) for turn in old]
+                    for new, old in zip(padded, turn_lists))
+    print(f"[{name}] document-level pass over {len(padded):,} documents: {turns_delta:+,} turns, "
+          f"{delta:+,} characters net; "
+          + (f"{shortened:,} document(s) had their OWN turns shortened to make room"
+             if shortened else "existing turns are copied through unchanged"))
     report = getattr(defense, "report", None)
     if callable(report):
         report()
