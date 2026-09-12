@@ -182,7 +182,10 @@ def _parse_ranking(raw: str, k: int) -> tuple[list[int], list[str]]:
             continue
         seen.add(slot)
         order.append(slot)
-        reasons.append(str(why).strip())
+        # Whitespace collapsed to single spaces: a reason is one CSV field, and a model that answers
+        # with an embedded newline would otherwise make the detail table unreadable to every tool
+        # that is not a CSV parser. Nothing is lost -- it was asked for one or two sentences.
+        reasons.append(" ".join(str(why).split()))
     return order, reasons
 
 

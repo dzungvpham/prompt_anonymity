@@ -283,7 +283,9 @@ def main() -> None:
     print("baseline (nearest neighbor): "
           + ", ".join(f"top-{k} {base_accuracy[f'base_top_{k}']:.3f}" for k in SUMMARY_KS))
 
-    tag = f"{args.source}_{args.defense}_{args.feature}_{config.tag}"
+    # `none` is spelled `base` everywhere downstream (run_experiment.NO_DEFENSE_TAG), so a results
+    # directory for the undefended run is named the same way here as under any other script.
+    tag = f"{args.source}_{args.defense if defense else NO_DEFENSE_TAG}_{args.feature}_{config.tag}"
     output_dir = Path(args.output_dir) if args.output_dir else (
         Path(__file__).resolve().parent / "results" / "rerank" / tag)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -336,8 +338,36 @@ def main() -> None:
                     f"shortlist size -- fold_listwise has touched authors outside the shortlist."
                 )
 
-    pd.DataFrame(summary).to_csv(output_dir / "rerank_summary.csv", index=False)
-    print(f"\nwrote {len(summary)} configuration(s) to {output_dir}")
+    # Merge into the summary rather than replacing it. The Sonnet job runs one shortlist size per
+    # invocation -- a --no-wait submit can only queue one configuration at a time -- and the two
+    # variants are separate SLURM jobs, so a run that overwrote this file would leave the summary
+    # holding only whatever happened to finish last. Rows are keyed by (variant, top_k): a re-run of
+    # a configuration replaces its own row and leaves every other one alone. Same rule as
+    # experiments/eval_utility.py, which merges each metric's columns into one per-corpus table.
+    summary_path = output_dir / "rerank_summary.csv"
+    table = pd.DataFrame(summary)
+    if summary_path.exists():
+        previous = pd.read_csv(summary_path)
+        rewritten = set(zip(table["variant"], table["top_k"]))
+        mask = [(str(variant), int(k)) not in rewritten
+                for variant, k in zip(previous["variant"], previous["top_k"])]
+        # What was actually paid is a fact about the past, and a cached re-run pays nothing -- so it
+        # reports nan and must not erase the figure. Carry the recorded cost forward instead, which
+        # is the rule experiments/eval_utility.py states for its own judge_cost_usd column.
+        if "judge_cost_usd" in previous.columns and "judge_cost_usd" in table.columns:
+            paid = {(str(variant), int(k)): cost
+                    for variant, k, cost in zip(previous["variant"], previous["top_k"],
+                                                previous["judge_cost_usd"])
+                    if pd.notna(cost)}
+            table["judge_cost_usd"] = [
+                paid.get((str(variant), int(k)), cost) if pd.isna(cost) else cost
+                for variant, k, cost in zip(table["variant"], table["top_k"],
+                                            table["judge_cost_usd"])]
+        table = pd.concat([previous[mask], table], ignore_index=True)
+    table = table.sort_values(["variant", "top_k"], kind="mergesort")
+    table.to_csv(summary_path, index=False)
+    print(f"\nwrote {len(summary)} configuration(s) to {output_dir} "
+          f"({len(table)} in rerank_summary.csv)")
 
 
 if __name__ == "__main__":

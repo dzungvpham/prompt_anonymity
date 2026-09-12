@@ -59,6 +59,15 @@ SONNET_API_KEY_ENV = "SONNET_OR_KEY"
 #: Statuses that mean the batch is finished, one way or another.
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled", "canceled"}
 
+#: Exit status for "the batch is queued; come back and collect it" under ``wait=False``.
+#:
+#: Distinct from 1 on purpose. A submit job that exits 1 is indistinguishable from one that crashed,
+#: so SLURM would mark every successful submission FAILED and a script could not tell a queued batch
+#: from a broken build -- which is the difference between "wait an hour" and "something is wrong and
+#: you are about to pay for it again". Callers branch: 0 = nothing to submit (all cached), 3 =
+#: queued, anything else = a real failure.
+BATCH_QUEUED_EXIT = 3
+
 #: Variant suffix selecting OpenRouter's batch-priced copy of a model.
 #:
 #: **This is not cosmetic, and it is not implied by posting to the batch endpoint.**
@@ -379,12 +388,15 @@ class OpenRouterBatch:
             batch_ids.append(batch_id)
 
         if not self.wait:
-            raise SystemExit(
+            # Printed rather than carried on the exception, because the exit code is the part a
+            # calling script reads and a SystemExit(int) prints nothing.
+            print(
                 f"Submitted {len(batch_ids)} batch(es) ({len(texts):,} prompts) and stopped, as "
                 f"asked: {', '.join(batch_ids)}. They complete within 24h. Re-run the SAME command "
                 f"without --no-wait to collect the results -- the tickets under "
                 f"{self.ticket_dir} make it resume these batches rather than pay for them twice."
             )
+            raise SystemExit(BATCH_QUEUED_EXIT)
 
         replies: list[str] = []
         for chunk, ticket, batch_id in zip(chunks, tickets, batch_ids):
@@ -531,11 +543,18 @@ def _selftest(ticket_dir) -> None:
     queued = OpenRouterBatch("anthropic/claude-sonnet-5", "SYSTEM", max_tokens=3000,
                              reasoning_effort="high", ticket_dir=tickets, wait=False,
                              poll_interval=0)
+    import contextlib
+    import io
+
+    said = io.StringIO()
     try:
-        queued.complete_batch(["p0", "p1", "p2"])
+        with contextlib.redirect_stdout(said):
+            queued.complete_batch(["p0", "p1", "p2"])
         check("wait=False stops instead of polling", False, "no SystemExit raised")
     except SystemExit as stop:
-        check("wait=False says how to collect", "Re-run the SAME command" in str(stop))
+        check("wait=False exits with the distinct queued status",
+              stop.code == BATCH_QUEUED_EXIT, f"exit code {stop.code!r}")
+        check("wait=False says how to collect", "Re-run the SAME command" in said.getvalue())
     check("wait=False submitted exactly once", state["submitted"] == 1)
     check("wait=False left a ticket behind", len(list(tickets.glob("*.json"))) == 1)
 
