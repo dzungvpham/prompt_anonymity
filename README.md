@@ -65,6 +65,7 @@ accept anything registered, and adding one makes it selectable with no change to
 | --- | --- |
 | `FEATURIZERS` | `stylometrix`, `function_words`, `character_statistics`, `char_ngram_tfidf`, `style_distance`, `gemini_embedding_2`, `gemini_embedding_001` |
 | `ATTRIBUTION_ATTACKS` | `nearest_neighbor`, `cosine`, `wccn`, `lda`, `plda`, `logistic`, `svm`, `rlsc`, `xgboost` |
+| `LLM_ATTACKS` | `euclidean_llm_judge`, `bt_tournament`, `listwise_llm_rerank`, `listwise_jina_rerank` — rerankers over a nearest-neighbor shortlist. Not selectable with `--attacks`: they read conversation *text* rather than vectors, so they run through `experiments/run_rerank.py` instead. |
 | `DEFENSES` | `none`, `openanonymity`, `styleremix`, `styleremix_openanon`, `qwen_rewrite`, `dp_mlm` (+ `dp_mlm_eps<ε>` sweep, + `dp_mlm_var_a<A>` adaptive length), `collision_seeding` (+ `_k4`, `_k24`, `_full`, `_indep`), `rtt_argos`, `example_normalization`, `epi` (+ `_single`) |
 
 ## Installation

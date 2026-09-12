@@ -93,17 +93,28 @@ features = [
     "transformers",
     "einops",
 ]
+# listwise_jina_rerank.py: the local reranker behind the listwise rerank attack's control arm
+# (jina-reranker-v3.5, 0.6B). Reuses torch from [styleremix]; transformers is listed explicitly
+# because the attack imports it directly. Lazy-imported inside _ensure_model(), so only a run that
+# actually selects that attack needs this extra -- the LLM arm of the same attack needs nothing new
+# (requests + python-dotenv are already base dependencies).
+rerank = [
+    "prompt-anonymity[styleremix]",
+    "transformers",
+]
 defenses = [
     "prompt-anonymity[styleremix]",
     "prompt-anonymity[qwen]",
     "prompt-anonymity[dpmlm]",
     "prompt-anonymity[argos]",
 ]
-# Everything: all defenses + the model-backed featurizer + the PII variant. The one-shot extra.
+# Everything: all defenses + the model-backed featurizer + the PII variant + the local reranker.
+# The one-shot extra.
 all = [
     "prompt-anonymity[defenses]",
     "prompt-anonymity[features]",
     "prompt-anonymity[dpmlm-pii]",
+    "prompt-anonymity[rerank]",
 ]
 
 [tool.setuptools.packages.find]

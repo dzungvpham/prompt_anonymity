@@ -171,6 +171,9 @@ pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 #                Heavier (Presidio needs a spaCy pipeline; we fetch en_core_web_lg, its default);
 #                installed separately and non-fatally so a failure can't take the rest down. Only
 #                needed for dp_mlm_pii -- plain dp_mlm does not use it.
+#   [rerank]     transformers (on top of [styleremix]'s torch) for the listwise_jina_rerank attack's
+#                local reranker. Plain wheels; the 0.6B checkpoint is fetched right after. The
+#                listwise_llm_rerank attack beside it needs no extra -- it talks HTTP.
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
 STYLEREMIX_EXTRA="without"
 QWEN_EXTRA="without"
@@ -178,6 +181,7 @@ DPMLM_EXTRA="without"
 DPMLM_PII_EXTRA="without"
 FEATURES_EXTRA="without"
 ARGOS_EXTRA="without"
+RERANK_EXTRA="without"
 case "$ACCEL" in
   cuda12x|cuda13x)
     pip_install -e "$SCRIPT_DIR[styleremix]" -c "$CONSTRAINTS_FILE"
@@ -220,13 +224,27 @@ case "$ACCEL" in
       warn "the [dpmlm-pii] extra (presidio-analyzer/spaCy en_core_web_lg) failed to install --"
       warn "  --defense dp_mlm_pii won't work, but --defense dp_mlm is unaffected."
     fi
+    # listwise_jina_rerank attack: transformers on top of [styleremix]'s torch. Non-fatal -- the
+    # attacks that do not use a local reranker are unaffected.
+    if pip_install -e "$SCRIPT_DIR[rerank]" -c "$CONSTRAINTS_FILE"; then
+      RERANK_EXTRA="with"
+      # Fetch the reranker now rather than on first use, so a compute node with no outbound network
+      # can run the attack. The repo id is read from the attack itself to keep one source of truth;
+      # importing it costs nothing here because it imports torch/transformers lazily.
+      log "Downloading the jina-reranker checkpoint for the listwise_jina_rerank attack ..."
+      "$PYTHON" -c 'from huggingface_hub import snapshot_download as fetch; from prompt_anonymity.attacks.llm.listwise_jina_rerank import DEFAULT_MODEL_ID as model; fetch(model)' || \
+        warn "jina-reranker download failed; the attack will retry it lazily on first use (needs network)."
+    else
+      warn "the [rerank] extra (transformers) failed to install -- the listwise_jina_rerank attack"
+      warn "  won't work. listwise_llm_rerank is unaffected: it calls an API, not a local model."
+    fi
     ;;
   *)
-    warn "accelerator '$ACCEL' has no CUDA; skipping the GPU extras ([styleremix]/[qwen]/[dpmlm]/[dpmlm-pii]/[features]/[argos])."
+    warn "accelerator '$ACCEL' has no CUDA; skipping the GPU extras ([styleremix]/[qwen]/[dpmlm]/[dpmlm-pii]/[features]/[argos]/[rerank])."
     warn "run 'pip install -e .[all] -c <constraints>' manually if you need them here."
     pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
 esac
 
 log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm], $DPMLM_PII_EXTRA [dpmlm-pii], $FEATURES_EXTRA [features], $ARGOS_EXTRA [argos])."
+log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm], $DPMLM_PII_EXTRA [dpmlm-pii], $FEATURES_EXTRA [features], $ARGOS_EXTRA [argos], $RERANK_EXTRA [rerank])."
 log "See README.md for running the pipeline."

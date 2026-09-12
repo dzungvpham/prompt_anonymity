@@ -65,9 +65,13 @@ from .llm import (
     AuthorCandidates,
     BradleyTerryTournamentAttack,
     EuclideanLLMJudgeAttack,
+    ListwiseJinaRerankAttack,
+    ListwiseLLMRerankAttack,
     author_candidates,
     bt_tournament_attack,
     euclidean_llm_judge_attack,
+    listwise_jina_rerank_attack,
+    listwise_llm_rerank_attack,
 )
 from .multiclass import (
     MULTICLASS_ATTACKS,
@@ -131,6 +135,10 @@ __all__ = [
     "euclidean_llm_judge_attack",
     "BradleyTerryTournamentAttack",
     "bt_tournament_attack",
+    "ListwiseLLMRerankAttack",
+    "listwise_llm_rerank_attack",
+    "ListwiseJinaRerankAttack",
+    "listwise_jina_rerank_attack",
     "author_candidates",
     "AuthorCandidates",
     # pairwise verification

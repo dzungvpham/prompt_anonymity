@@ -117,3 +117,15 @@ model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
 #                               because Harrier co-resides and loads first.
 #     AFR_ALLOW_DOWNLOAD=1      opt in to fetching a checkpoint that is not already on disk. Without
 #                               it a non-local checkpoint is a hard error, not a 30 GB download.
+
+# The local reranker behind the listwise_jina_rerank attack
+# (prompt_anonymity.attacks.llm.listwise_jina_rerank). UNLIKE the large checkpoints above, this one
+# IS expected to download when it is not already on disk: it is 0.6B, it is public, and the attack
+# resolves it through `_local.resolve_checkpoint`, where a missing entry is not fatal. Point
+# $JINA_RERANKER_MODEL at a local copy (in .env, not in this committed file) when the download is
+# the problem rather than the model.
+#
+# Licensed CC BY-NC 4.0 -- non-commercial. That is fine for this repository's research use and is
+# worth knowing before the weights are reused elsewhere.
+[jina_reranker]
+model = "jinaai/jina-reranker-v3.5"
