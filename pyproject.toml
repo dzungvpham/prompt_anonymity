@@ -20,31 +20,14 @@ dependencies = [
     "python-dotenv",
     "tqdm",
     "xgboost>=3.3.0",
-    # Language detection for the build pipeline. Unlike the heavy ML dependencies below/behind the
-    # extras, this one is imported at MODULE level (`data/language_detection.py`, which
-    # `build_dataset` imports at module level), so a missing wheel is not a lazy failure on one code
-    # path -- `python -m prompt_anonymity.data.build_dataset` dies on import. It belongs in the base
-    # dependencies for that reason.
     "lingua-language-detector",
-    # Remote-API HTTP + token counting for the OpenAnonymity defense and the LLM-judge attacks
-    # (both lazy-import these, so a missing wheel only crashes when that path is actually used).
     "requests",
     "tiktoken",
-    # The utility judge's client. DeepSeek serves an OpenAI-compatible endpoint, so the `openai`
-    # library is the transport -- it does not imply an OpenAI model. Lazy-imported
-    # (`utility/_deepseek.py`), so a missing wheel only bites when a judge run reaches the API.
     "openai",
-    # The utility judge's rubric is a YAML file loaded at MODULE level by `utility/prompt_judge.py`,
-    # so this one is not a lazy failure: importing prompt_anonymity.utility needs it.
     "pyyaml",
 ]
 
 [project.optional-dependencies]
-# GPU model-backed defenses. Not needed for the default --defense none pass-through, which reuses
-# the committed StyloMetrix vectors and is GPU-free. Split from `qwen` below because `vllm` builds
-# from source on platforms/CUDA versions it has no prebuilt wheel for, and that build needs the
-# CUDA toolkit's nvcc (CUDA_HOME) rather than just a GPU driver -- a failure there shouldn't block
-# installing peft/transformers/etc for styleremix.py, which has no such build step.
 styleremix = [
     "torch",
     "transformers",
@@ -52,41 +35,22 @@ styleremix = [
     "accelerate",
     "bitsandbytes",
 ]
-# qwen_rewrite.py's vllm backend. Requires Linux+CUDA; if pip resolves a source build instead of a
-# prebuilt wheel (e.g. no wheel yet for your CUDA version), it also needs CUDA_HOME set to the CUDA
-# toolkit (not just a driver) to compile. llama-cpp-python is qwen_rewrite.py's CPU/laptop fallback.
 qwen = [
     "vllm",
     "llama-cpp-python",
 ]
-# dp_mlm.py: DP-MLM rewriting. Reuses torch/transformers from [styleremix]; adds nltk for the
-# word tokenizer/detokenizer + stopwords (NLTK data is fetched lazily on first backend build).
-# Covers every non-PII variant: --defense dp_mlm, the dp_mlm_eps<eps> sweep, and the adaptive-length
-# dp_mlm_var_a<A> entries, which need no dependency of their own (their coins are stdlib `random`).
 dpmlm = [
     "prompt-anonymity[styleremix]",
     "nltk",
 ]
-# The --defense dp_mlm_pii variant only: Presidio + spaCy for PII entity detection. Kept separate
-# so the core DP-MLM defense stays lightweight. Install a spaCy model too, e.g.
-# `python -m spacy download en_core_web_lg`.
 dpmlm-pii = [
     "prompt-anonymity[dpmlm]",
     "presidio-analyzer",
     "spacy",
 ]
-# argos.py: the rtt_argos round-trip-translation defense (offline; downloads language models at
-# runtime). Lazy-imported, so only --defense rtt_argos needs it.
 argos = [
     "argostranslate",
 ]
-# Model-backed featurizers: style_distance.py (StyleDistance sentence-transformer embeddings) and
-# luar.py (LUAR authorship embeddings, loaded straight from transformers with trust_remote_code).
-# Both reuse torch from [styleremix] and are lazy-imported, so only --feature style_distance / luar
-# needs this extra. transformers is listed explicitly rather than leaned on transitively, since
-# luar.py imports it directly. einops is NOT imported by our code: LUAR ships its own modeling code
-# on the Hub and that file imports einops, so trust_remote_code loading dies with ModuleNotFoundError
-# without it -- at first GPU use, long after install. Nothing else here pulls einops in transitively.
 features = [
     "prompt-anonymity[styleremix]",
     "sentence-transformers",
@@ -127,7 +91,6 @@ where = ["src"]
 # The dataset build's default source locations, and the user-agent -> device map WildChat
 # identities are built from.
 "prompt_anonymity.data" = ["datasets.toml", "resources/*.json"]
-# The machine-independent checkpoint defaults for the vLLM defenses and the local utility scorers.
-"prompt_anonymity.defenses" = ["models.toml", "epi_topics.txt"]
+"prompt_anonymity.defenses" = ["models.toml", "epi_topics.txt", "embad_topics.csv"]
 # The judge rubric (conversation_judge.yaml), read at import by prompt_judge.load_judge_prompt.
 "prompt_anonymity.evaluation.utility" = ["*.yaml"]

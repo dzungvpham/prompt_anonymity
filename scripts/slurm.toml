@@ -1,4 +1,4 @@
-# Resources for `python experiments/run_all_experiments.py --slurm`.
+# Resources for `python experiments/run_all_experiments.py --slurm`, both attack families.
 #
 # THIS IS THE FILE TO EDIT FOR A DIFFERENT CLUSTER. It is the only place partitions, limits and
 # accounting flags appear; the launcher itself knows nothing about them. Everything here is
@@ -45,9 +45,11 @@ sbatch = [
 
 # --- one per resource class the launcher asks for ----------------------------
 #
-# The names are `run_all_experiments.resource_profile`'s return values. That function encodes what
-# the *experiment* needs (an accelerator, a lot of memory); this file encodes what that costs
-# here. A missing profile is a hard error naming the cell that wanted it, not a silent default.
+# The names are `run_all_experiments.resource_profile`'s return values -- the four below for the
+# attribution family, the two at the bottom of the file for the clustering one. That function
+# encodes what the *experiment* needs (an accelerator, a lot of memory); this file encodes what
+# that costs here. A missing profile is a hard error naming the class that wanted it, not a
+# silent default.
 
 # Everything but xgboost: BLAS on the CPU, and one process. A GPU would sit idle.
 [profiles.cpu]
@@ -114,9 +116,65 @@ sbatch = [
     "--time=0-16:00:00",
 ]
 
+# --- the clustering family's classes -----------------------------------------
+#
+# What `resource_profile` returns for a clustering cell. Separate from `cpu` / `cpu_large`
+# rather than shared with them because the two families are large in different places: an
+# attribution cell's peak is its [n_unknown x n_authors] score matrix, a clustering cell's is two
+# neighbour graphs, HDBSCAN's minimum spanning tree and componentwise agglomeration's dense
+# per-component distance matrix. Both are CPU-only -- the graph is one BLAS matmul through the
+# project's blocked kernel and every algorithm here is a CPU graph algorithm, so a GPU would sit
+# idle for the whole job. (`--projection contrastive` is the one thing here that wants a device,
+# and it is a variant run this launcher does not submit; scripts/run_clustering_gpu_slurm.sh is
+# still the way to run it.)
+
+# swe-chat: ~1,000 documents in the test quarter, so every structure above is small.
+[profiles.clustering_cpu]
+sbatch = [
+    "--partition=cpu-preempt",
+    "--cpus-per-task=8",       # the threads go to BLAS; the tuning search is single-process
+    "--mem=16g",
+    "--time=0-04:00:00",
+]
+
+# WildChat: 43,127 documents in the test quarter, two feature blocks of 530 MB, the full
+# 172,509 x 3,072 matrix held while loading (2.1 GB), and a minimum spanning tree over a ~1.5M-edge
+# sparse graph. The by-hand scripts/run_clustering_slurm.sh has asked 32g for exactly this shape
+# and its measured diagnostics pass peaked well under it; the headroom over that measurement is for
+# componentwise agglomeration, whose dense per-component matrix the by-hand WildChat runs never
+# exercised (they passed an explicit three-algorithm list). Two scopes run in one job and the
+# measured WildChat cell was ~40 minutes, so four hours is ample.
+[profiles.clustering_cpu_large]
+sbatch = [
+    "--partition=cpu-preempt",
+    "--cpus-per-task=8",
+    "--mem=32g",
+    "--time=0-04:00:00",
+]
+
+# A clustering cell whose variant fits a contrastive projection. The fit is the only thing here
+# with a device to use -- 30,000 steps of a 3,072 x 1,024 matmul over a 2,048-document batch,
+# measured ~6 minutes on one A100 against hours on eight cores; everything after it is the same
+# CPU graph work as the profiles above, which is why this asks for host memory as well.
+#
+# NO `--qos=short`, for the reason spelled out under [profiles.gpu]: on Unity `short` carries
+# `MaxSubmitJobsPerUser = 1`, and a launcher whose whole job is submitting a grid cannot use a QOS
+# that permits one queued job. The by-hand scripts/run_clustering_gpu_slurm.sh does use it, which
+# is correct there -- it submits exactly one.
+[profiles.clustering_gpu]
+sbatch = [
+    "--partition=gpu-preempt",
+    "--gpus=1",
+    "--constraint=sm_80|sm_86|sm_89|sm_90",
+    "--cpus-per-task=8",
+    "--mem=48g",
+    "--time=0-03:59:59",
+]
+
 # --- per-cell exceptions (optional) ------------------------------------------
 #
-# Keyed by the results-directory tag, i.e. `<dataset>_<defense>_<feature>_<attack>`. For the one
+# Keyed by the results-directory tag: `<dataset>_<defense>_<feature>_<attack>` for
+# an attribution cell, `<dataset>_<defense>_<feature>` for a clustering one. For the one
 # cell that needs something its profile does not give it; delete these rather than growing a
 # profile that only ever applies to a single run.
 #

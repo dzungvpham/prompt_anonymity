@@ -64,18 +64,24 @@ from .graph import NeighborGraph
 DEFAULT_LOCALITY = 10
 
 
-def _resort(indices: np.ndarray, distances: np.ndarray, metric: str) -> NeighborGraph:
+def _resort(indices: np.ndarray, distances: np.ndarray, metric: str,
+            max_distance: float | None = None) -> NeighborGraph:
     """Re-order each row by the rewritten distance, keeping ``inf`` padding at the end.
 
     Every consumer relies on :class:`NeighborGraph` storing neighbours in increasing distance
     order -- ``truncate`` is a column slice, and the graph diagnostics read column 0 as the
     nearest neighbour. A transform that reorders distances without reordering rows would break
     both silently, which is why this is not left to the caller.
+
+    ``max_distance`` defaults to ``None`` because it is the right answer for the hubness family:
+    the input graph's ceiling does not survive a transform that subtracts a neighbourhood mean,
+    and CSLS distances are routinely negative. Only :func:`temporal_fusion`, whose output is
+    bounded by construction, passes one.
     """
     order = np.argsort(distances, axis=1, kind="stable")
     return NeighborGraph(np.take_along_axis(indices, order, axis=1).astype(np.int32),
                          np.take_along_axis(distances, order, axis=1).astype(np.float32),
-                         metric)
+                         metric, max_distance)
 
 
 def neighborhood_radius(graph: NeighborGraph, locality: int = DEFAULT_LOCALITY) -> np.ndarray:
@@ -265,47 +271,175 @@ def global_distance_moments(embeddings: np.ndarray, metric: str = "cosine",
     return mean, np.sqrt(np.maximum(total_square / count - mean ** 2, 0.0))
 
 
-def temporal_fusion(graph: NeighborGraph, seconds: np.ndarray,
-                    weight: float = 0.4) -> NeighborGraph:
+#: Fraction of each tail :func:`winsor_bounds` clips, in percent. 0.1% of a ~50,000-edge graph is
+#: ~50 edges per side -- enough to be immune to a single outlier (the failure that ruled out plain
+#: min-max) while clipping far less than a 3-sigma rule does on a skewed variable. Measured on
+#: swe-chat, a 3-sigma clip takes 0.9% off cosine's NEAR tail, where the strongest same-author
+#: evidence lives; a quantile clips the same fraction whatever the skew.
+WINSOR_PERCENTILE = 0.1
+
+def winsor_bounds(graph: NeighborGraph, seconds: np.ndarray | None
+                  ) -> tuple[tuple[float, float], tuple[float, float]]:
+    """``((d_lo, d_hi), (t_lo, t_hi))`` -- the winsorising bracket for each term.
+
+    The :data:`WINSOR_PERCENTILE` and its complement, over one graph's own finite edges.
+
+    **Called per graph -- the collection under attack is bracketed by its own quantiles, not the
+    tuning slice's.** Fixing the bracket on the tuning slice is the more obviously consistent
+    choice (the weight is selected under one scoring function and deployed with it) and it was the
+    first implementation, but it loses on both counts that were measured. A bracket clips at a
+    fixed *value*, so when the two slices' distributions move it puts real mass on the clip:
+    swe-chat's tuning slice ends at 372.9 h against the test collection's 643.5 h, which pinned
+    **14.4% of the test collection's time gaps** to exactly 1.0 -- not a tail but a seventh of the
+    edges collapsed into one tied value. Per-graph brackets removed that for +0.016 mean BCubed F
+    on ``all`` and +0.004 on ``unseen``, and **the selected weight did not change in any of the ten
+    (scope x algorithm) cells** -- the search runs on the tuning graph either way, so this changes
+    only how the winner is deployed.
+
+    It also matches what the rest of the package already does: :func:`~.algorithms.edge_quantile`
+    sets every threshold from the quantiles of *the graph being clustered*. Reading no labels, only
+    the anonymous collection's own edge weights, is inside the threat model in both places.
+
+    A degenerate term (every value identical, so ``hi == lo``) is widened to a unit interval rather
+    than allowed to divide by zero, which makes that term a constant 0 -- the right "this half
+    contributes nothing" behaviour.
+    """
+    def bracket(values: np.ndarray) -> tuple[float, float]:
+        usable = values[np.isfinite(values)]
+        if len(usable) == 0:
+            return 0.0, 1.0
+        low, high = np.percentile(usable, [WINSOR_PERCENTILE, 100.0 - WINSOR_PERCENTILE])
+        return (float(low), float(high)) if high > low else (float(low), float(low) + 1.0)
+
+    finite = np.isfinite(graph.distances)
+    if seconds is None:
+        return bracket(graph.distances[finite]), (0.0, 1.0)
+    hours = np.abs(seconds[:, None] - seconds[graph.indices]) / 3600.0
+    return bracket(graph.distances[finite]), bracket(hours[finite & np.isfinite(hours)])
+
+
+def balanced_time_weight(graph: NeighborGraph, seconds: np.ndarray, bounds) -> float:
+    """The weight at which both terms of :func:`temporal_fusion` contribute equal spread.
+
+    ``w* = IQR(text) / (IQR(text) + IQR(time))`` over the graph's finite edges, which is the
+    centre a weight grid should be laid around. It is not a tuned value and not a default -- it is
+    where "half and half" actually falls once both terms are on their own saturating curves, and
+    it moves with the corpus. IQR rather than standard deviation because the time gaps have a long
+    tail that a variance would chase.
+    """
+    text, time_term = _fusion_terms(graph, seconds, bounds)
+    finite = np.isfinite(graph.distances)
+    def iqr(values):
+        low, high = np.percentile(values[finite], [25, 75])
+        return float(high - low)
+    text_spread, time_spread = iqr(text), iqr(time_term)
+    total = text_spread + time_spread
+    return 0.5 if total <= 0 else text_spread / total
+
+
+def _squash(values: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
+    """One raw quantity mapped into ``[0, 1]``: linear between ``bounds``, clipped outside them."""
+    low, high = bounds
+    return np.clip((values - low) / (high - low), 0.0, 1.0)
+
+
+def _text_term(graph: NeighborGraph, bounds: tuple[float, float]) -> np.ndarray:
+    """The text half of the fusion, in ``[0, 1]``."""
+    finite = np.isfinite(graph.distances)
+    return _squash(np.where(finite, graph.distances, 0.0).astype(np.float64), bounds)
+
+
+def _time_term(graph: NeighborGraph, seconds: np.ndarray,
+               bounds: tuple[float, float]) -> np.ndarray:
+    """The elapsed-time half, in ``[0, 1]``."""
+    finite = np.isfinite(graph.distances)
+    hours = np.abs(seconds[:, None] - seconds[graph.indices]) / 3600.0
+    known = finite & np.isfinite(hours)
+    # A pair with no usable timestamp is placed at the far end -- treated as maximally far apart --
+    # so a corpus with missing times degrades toward the pure-text attack rather than failing.
+    gap = _squash(np.where(known, hours, 0.0), bounds)
+    gap[finite & ~known] = 1.0
+    return gap
+
+
+def _fusion_terms(graph: NeighborGraph, seconds: np.ndarray,
+                  bounds) -> tuple[np.ndarray, np.ndarray]:
+    """Both terms, each in ``[0, 1]``, before they are mixed."""
+    return _text_term(graph, bounds[0]), _time_term(graph, seconds, bounds[1])
+
+
+def temporal_fusion(graph: NeighborGraph, seconds: np.ndarray | None, weight: float,
+                    bounds) -> NeighborGraph:
     """Mix the elapsed time between two documents into the edge score.
 
-    ``d'(A, B) = (1 - w) * z(d) + w * z(log1p(hours apart))``, both terms standardised over the
-    graph's own finite edges so a cosine distance and a log-hour gap are on one scale.
+    ``d'(A, B) = (1 - w) * t(d) + w * t(hours apart)``, where ``t`` is each term's own
+    **winsorised linear map**: linear between that term's :data:`WINSOR_PERCENTILE` and its
+    complement (:func:`winsor_bounds`), clipped flat outside them. Both terms land in ``[0, 1]``,
+    so the fused score does too -- **non-negative and bounded by construction**, which is what lets
+    the agglomerative methods accept it (``sklearn``'s ``distance_threshold`` refuses a negative
+    radius) without an offset or a rank transform.
+
+    Two properties the earlier formulas lacked, in the order they were arrived at:
+
+    * **Bounded.** The original standardised each term (``z(d)``, ``z(log1p(hours))``), which put
+      roughly half the fused edges below zero and killed ``average_linkage`` and
+      ``componentwise_agglomerative`` outright -- and since the search raises when every
+      configuration fails, it took the whole cell with it, finished results included.
+    * **Equal range by construction.** Both terms span exactly ``[0, 1]``, so ``w`` means what it
+      says and the balance point (:func:`balanced_time_weight`) lands near 0.3 rather than having
+      to be discovered. An exponential CDF (``1 - exp(-x/s)``, the intermediate attempt) is bounded
+      too, but its spread depends on the shape of each variable, which is why it needed the balance
+      measured and why its grid sat in the wrong place.
+
+    The cost is ties: everything past a bound collapses to one value. That is deliberate and it
+    lands where it can be afforded -- clipping a fixed *fraction* rather than a fixed number of
+    standard deviations is what keeps it off the near tail. A 3-sigma rule would take **0.9% off
+    cosine's near side**, where the strongest same-author evidence is, because candidate-edge
+    cosine distances are left-skewed (skew -0.63); the quantile clips 0.1% per side whatever the
+    skew.
+
+    **At ``weight = 0`` this is the pure-text attack, and it is still applied.** There is no
+    short-circuit back to the raw cosine graph: ``w = 0`` is a value of the same formula, not a
+    different scoring function, so a run with no timing is the same pipeline with one term zeroed.
+    That is what makes ``plain`` and a tuned run that selects ``w = 0`` the same experiment. Only
+    the time term is skipped, which is why ``seconds`` may be ``None`` -- ``0 * gap`` is zero for
+    any gap, so a collection with no timestamps at all still has a ``w = 0`` result.
+
+    For the three threshold methods that changes nothing: the map is monotone in ``d`` and a
+    quantile threshold reads only the order. ``leiden`` and ``hdbscan`` do read magnitudes -- the
+    first weights edges ``1 - d``, the second computes stabilities from ``1/d`` -- so for those two
+    it is a real change. Measured on swe-chat's ``plain`` runs, leiden **gains** (BCubed F 0.5331
+    raw cosine -> 0.5883 on ``all``, 0.7154 -> 0.7629 on ``unseen``) and hdbscan loses a little
+    (0.3307 -> 0.3272, 0.6926 -> 0.6793).
 
     **Timing is attacker-visible metadata, not a leak.** An anonymised log carries timestamps; this
     project already scores ``baseline_language_primary`` and ``baseline_model_owner`` as metadata
     partitions for the same reason. What it changes is the *claim*: a result with ``weight > 0``
-    says writing style **and session structure** link a user, not style alone. Report the
-    ``weight = 0`` and ``weight = 1`` ends beside it -- they are the two controls, and on WildChat's
-    tuning slice they score 0.560 (style only) and 0.502 (timing only) against 0.572 fused, so
-    neither ingredient reaches the combination and the gain is genuinely joint.
+    says writing style **and session structure** link a user, not style alone.
 
-    Measured: same-author candidate pairs are a **median 4.3 minutes apart** against 36 minutes for
-    different-author ones, which is session structure -- a person's conversations arrive in bursts.
-    The time gap alone separates candidate edges at AUROC 0.757, against cosine's 0.772, and it is
-    almost uncorrelated with it.
-
-    Documents with no timestamp are placed at the maximum gap, i.e. treated as far apart, so a
-    corpus with missing times degrades toward the pure-cosine attack rather than failing.
+    **What it is worth, and where it is not.** On swe-chat's ``all`` scope the fusion never hurts:
+    +0.000, +0.012, +0.114, +0.103, +0.014 BCubed F over the same run's ``w = 0`` arm across the
+    five algorithms. On ``unseen`` it is negative for every algorithm (mean -0.098), and that is a
+    **weight-selection** failure rather than a fusion one -- the tuning slice ranks the candidate
+    weights almost independently of the test collection (Spearman +0.057 over the grid, measured
+    across ten cells), and on ``unseen`` it picks 0.657 where the test optimum is near 0.05. Read
+    any ``unseen`` timing result with that in mind, and see :func:`balanced_time_weight`.
     """
     finite = np.isfinite(graph.distances)
-    if not finite.any() or weight <= 0:
-        return graph
+    if not finite.any():
+        return graph                     # nothing to transform; a padding-only graph is degenerate
 
-    def standardise(values, mask):
-        centre, spread = values[mask].mean(), values[mask].std()
-        return (values - centre) / (spread if spread > 0 else 1.0)
-
-    hours = np.abs(seconds[:, None] - seconds[graph.indices]) / 3600.0
-    known = finite & np.isfinite(hours)
-    gap = np.log1p(np.where(known, hours, 0.0))
-    if known.any():
-        gap[finite & ~known] = gap[known].max()
-
-    fused = ((1 - weight) * standardise(graph.distances.astype(np.float64), finite)
-             + weight * standardise(gap, finite))
+    fused = (1 - weight) * _text_term(graph, bounds[0])
+    if weight > 0:
+        if seconds is None:
+            raise ValueError(f"temporal_fusion at weight {weight:g} needs timestamps; "
+                             f"`seconds` is None.")
+        fused += weight * _time_term(graph, seconds, bounds[1])
     fused[~finite] = np.inf
-    return _resort(graph.indices, fused, f"time{weight:g}({graph.metric})")
+    # Bounded by construction: both terms are in [0, 1] and the mixture is convex, so the fused
+    # score cannot leave [0, 1). The dense linkage methods need that ceiling for their absent-edge
+    # sentinel, and the graph is the only thing that knows it.
+    return _resort(graph.indices, fused, f"fuse{weight:g}({graph.metric})", max_distance=1.0)
 
 
 #: Name -> transform, so a driver selects one by string exactly as ``CLUSTERING_ATTACKS`` works

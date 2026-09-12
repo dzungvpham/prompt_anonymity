@@ -50,11 +50,17 @@ class NeighborGraph:
     metric : str
         The metric the distances were computed under, carried so a consumer cannot silently mix
         a cosine graph with a euclidean threshold.
+    max_distance : float or None
+        Largest distance :attr:`metric` admits, when it admits one -- 2.0 for cosine, 1.0 for the
+        saturating fused score. ``None`` means unbounded or unknown (CSLS distances are routinely
+        negative and have no ceiling), and consumers fall back to the observed maximum. Read
+        through :attr:`far_distance` rather than directly.
     """
 
     indices: np.ndarray
     distances: np.ndarray
     metric: str = "cosine"
+    max_distance: float | None = None
 
     @property
     def n_documents(self) -> int:
@@ -64,6 +70,26 @@ class NeighborGraph:
     def k(self) -> int:
         return self.indices.shape[1]
 
+    @property
+    def far_distance(self) -> float:
+        """A finite stand-in for "these two are not neighbours at all".
+
+        The dense linkage methods have to give an absent edge *some* number, because the linkage
+        arithmetic averages it, and the honest one is the largest distance the space admits.
+        Where the metric is bounded that is :attr:`max_distance`; where it is not, the observed
+        maximum is the best available stand-in.
+
+        **It is not a free choice.** The sentinel only means "far" relative to the real distances,
+        so a transform that compresses the real ones without moving the sentinel makes absent
+        edges look more repulsive than they are, and one that compresses the sentinel too makes
+        them look less. That is why the bound travels with the graph instead of being re-derived
+        from the metric's name at each call site.
+        """
+        if self.max_distance is not None:
+            return float(self.max_distance)
+        finite = self.distances[np.isfinite(self.distances)]
+        return float(finite.max()) if len(finite) else 1.0
+
     def truncate(self, k: int) -> "NeighborGraph":
         """The same graph restricted to the ``k`` nearest neighbours of each document.
 
@@ -72,7 +98,8 @@ class NeighborGraph:
         """
         if k > self.k:
             raise ValueError(f"cannot widen a graph built with k={self.k} to k={k}; rebuild it.")
-        return NeighborGraph(self.indices[:, :k], self.distances[:, :k], self.metric)
+        return NeighborGraph(self.indices[:, :k], self.distances[:, :k], self.metric,
+                             self.max_distance)
 
     def edges(self, k: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """The graph as a deduplicated **undirected** edge list ``(source, target, distance)``.
@@ -170,4 +197,7 @@ def build_neighbor_graph(embeddings: np.ndarray, k: int, *, metric: str = "cosin
         indices[start:start + len(block), :width] = np.take_along_axis(nearest, order, axis=1)
         distances[start:start + len(block), :width] = np.take_along_axis(
             nearest_distances, order, axis=1)
-    return NeighborGraph(indices, distances, metric)
+    # Cosine is the one metric here with a ceiling known before any distance is computed; every
+    # other name reaches `pairwise_distances_chunked`, where the bound is the metric's business
+    # and not this function's to assert.
+    return NeighborGraph(indices, distances, metric, 2.0 if metric == "cosine" else None)

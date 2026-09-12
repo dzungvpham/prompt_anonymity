@@ -26,6 +26,7 @@ from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
 from .epi import SINGLE_TOPIC_KEY as EPI_SINGLE_TOPIC
 from .epi import EmbeddingPromptInjectionDefense
+from .embad import EmBadDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .frame_pad import FramePadDefense
 from .frame_shift import SINGLE_FRAMING_KEY, FrameShiftDefense
@@ -178,6 +179,25 @@ for _alpha in AFR_RESIDUALS:
 del _alpha
 
 
+#: EmBad evolves an appended turn -- an island-model MAP-Elites search over natural-language
+#: passages, scored on the local embedding ensemble. The registry name carries the ensemble because
+#: it is in the filename: a defended split is ``<split>_<defense>.parquet``, and a turn evolved
+#: against one set of encoders is not the same artifact as one evolved against another.
+EMBAD_ENSEMBLE = ("harrier", "embeddinggemma_300m", "jina_v5_nano")
+
+#: One registered name per **objective**, because the objective is the arm being compared and the
+#: defended file is named ``<split>_<defense>.parquet`` -- three arms under one name would overwrite
+#: each other's parquet even though their searches cache separately. ``embad`` keeps the bare name
+#: for the local ensemble: it is the default, the cheap arm, and the one with results already on
+#: disk (``swe_chat_embad_gemini_embedding_2_*``).
+#:
+#: ``embad_gemini`` scores against the target encoder over the network and **bills real money** --
+#: roughly $1 for a default search, capped by ``DEFAULT_REMOTE_BUDGET``. Constructing it costs
+#: nothing (the objective is built lazily); running it spends.
+DEFENSES["embad"] = EmBadDefense()
+DEFENSES["embad_summary"] = EmBadDefense(objective="summary")
+DEFENSES["embad_gemini"] = EmBadDefense(objective="remote")
+
 def get_defense(name: str) -> Defense:
     """Look up a registered defense by name."""
     try:
@@ -220,6 +240,7 @@ __all__ = [
     "OpenAnonymityDefense",
     "StyleRemixOpenAnonymityDefense",
     "DPMLMDefense",
+    "EmBadDefense",
     "CollisionSeedingDefense",
     "FrameShiftDefense",
     "FramePadDefense",

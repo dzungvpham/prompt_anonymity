@@ -239,7 +239,12 @@ def cached_graph(embeddings: np.ndarray, width: int, tag: str, cache_dir: Path):
     if path.exists():
         stored = np.load(path)
         from prompt_anonymity.attacks.clustering import NeighborGraph
-        return NeighborGraph(stored["indices"], stored["distances"], str(stored["metric"]))
+        metric = str(stored["metric"])
+        # `max_distance` post-dates the earliest caches, so it is recovered from the metric rather
+        # than read: a cache restored without it would fall back to the observed maximum and give
+        # the dense linkage methods a different absent-edge sentinel than a freshly built graph.
+        return NeighborGraph(stored["indices"], stored["distances"], metric,
+                             2.0 if metric == "cosine" else None)
 
     started = time.perf_counter()
     graph = build_neighbor_graph(embeddings, width, metric="cosine")
@@ -537,7 +542,7 @@ def temporal_rows(graph, frame, author_codes, n_authors, projection_name, k_caps
     have the larger variance.
     """
     times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds = (times - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy()
     seconds[times.isna().to_numpy()] = np.nan
 
     def standardise(values):
@@ -594,7 +599,7 @@ def fused_edges(graph, frame, k_cap: int, weight: float):
     if weight <= 0:
         return source, target, distance.astype(np.float64)
     times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds = (times - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy()
     seconds[times.isna().to_numpy()] = np.nan
 
     def standardise(values):
@@ -672,7 +677,7 @@ def time_candidate_rows(graph, frame, features, author_codes, n_authors, project
     frontier decides how many offers to accept.
     """
     times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds = (times - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy()
     seconds[times.isna().to_numpy()] = np.nan
     dated = np.flatnonzero(np.isfinite(seconds))
     chronological = dated[np.argsort(seconds[dated], kind="stable")]
@@ -777,7 +782,7 @@ def pair_features(graph, frame, k_cap: int):
     radius = np.nan_to_num(radius, nan=float(np.nanmax(radius)))
 
     times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds = (times - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy()
     seconds[times.isna().to_numpy()] = np.nan
     gap = np.abs(seconds[source] - seconds[target]) / 3600.0
     gap[~np.isfinite(gap)] = np.nanmax(gap[np.isfinite(gap)]) if np.isfinite(gap).any() else 0.0
@@ -1136,8 +1141,8 @@ def main() -> None:
             # standardise over slightly different populations -- the (n, k) array counts a mutual
             # pair twice where the deduplicated edge list counts it once -- so they are expected
             # to agree closely rather than exactly.
-            seconds = (pd.to_datetime(eval_frame["ended_at"], errors="coerce", utc=True)
-                       .astype("int64").to_numpy() / 1e9)
+            seconds = ((pd.to_datetime(eval_frame["ended_at"], errors="coerce", utc=True)
+                        - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy())
             seconds[pd.to_datetime(eval_frame["ended_at"], errors="coerce",
                                    utc=True).isna().to_numpy()] = np.nan
             for weight in args.time_weights:

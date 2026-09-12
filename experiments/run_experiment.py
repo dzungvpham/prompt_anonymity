@@ -1592,7 +1592,8 @@ def split_background(scores: np.ndarray, authors: np.ndarray) -> tuple[np.ndarra
 def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
                tuning_cache: dict, languages: np.ndarray | None = None,
-               background: np.ndarray | None = None):
+               background: np.ndarray | None = None,
+               known_embeddings_source: np.ndarray | None = None):
     """Run one (known configuration, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
@@ -1624,7 +1625,14 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     181 groups.
     """
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
-    known_embeddings, unknown_embeddings = embeddings[known], embeddings[unknown]
+    # The two sides may come from DIFFERENT feature matrices. By default the known side is the
+    # undefended text (`--known-defense none`) while `embeddings` holds the defended vectors the
+    # attacker is querying with, so the slice has to be taken per configuration rather than once:
+    # a document that is unknown under `known0025` is known under `known0075`, and each side must
+    # be drawn from its own matrix at that boundary. Both matrices are row-aligned to `frame`
+    # (joined on `doc_id` at load), so one index means the same document in either.
+    known_source = embeddings if known_embeddings_source is None else known_embeddings_source
+    known_embeddings, unknown_embeddings = known_source[known], embeddings[unknown]
     if args.standardize:
         blocks = standardize(known_embeddings, unknown_embeddings,
                              *([] if background is None else [background]))
@@ -1943,6 +1951,14 @@ def parse_args() -> argparse.Namespace:
                         help="Which built split to attack (default: swe_chat).")
     parser.add_argument("--feature", default="stylometrix",
                         help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: stylometrix).")
+    parser.add_argument("--known-defense", default="none", choices=sorted(DEFENSES),
+                        help="Defense applied to the KNOWN side, i.e. the labelled history the "
+                             "attacker already holds (default: none). The default is deliberate "
+                             "and it is the threat model this project assumes: a user adopts a "
+                             "defense today, so whatever leaked before it is undefended. Set this "
+                             "equal to --defense for the matched condition, where the defense has "
+                             "always been on -- a strictly easier problem for the attacker, since "
+                             "the appended text is then a component both sides share.")
     parser.add_argument("--defense", default="none", choices=sorted(DEFENSES),
                         help="Attack the vectors of text this defense rewrote, i.e. "
                              "<split>_<defense>_<feature>.parquet (default: none, the original "
@@ -2182,8 +2198,14 @@ def output_tag(args: argparse.Namespace) -> str:
     held_out = ("" if abs(args.test_fraction - DEFAULT_TEST_FRACTION) < 1e-9
                 else f"_test{_percent(args.test_fraction)}")
     defense = NO_DEFENSE_TAG if args.defense == "none" else args.defense
+    # A defended known side is a different experiment, not a point on this one's curve: the
+    # attacker's history carries the same appended text as its queries, so what the defense adds
+    # is partly a component both sides share. Defended-known runs therefore take a suffix and
+    # leave the comparable set, exactly as `--language-aware` and `--background` do.
+    known_defense = ("" if args.known_defense == "none"
+                     else f"_knowndef-{args.known_defense}")
     attacks = "-".join(args.attacks)
-    return (f"{args.source}_{defense}_{args.feature}_{attacks}"
+    return (f"{args.source}_{defense}_{args.feature}_{attacks}{known_defense}"
             f"{owner}{language}{language_aware}{background}{fractions}{held_out}{openset}"
             f"{metric}{scaled}")
 
@@ -2281,9 +2303,27 @@ def main() -> None:
         args.data_dir, args.source, args.feature, args.undated, args.model_owner, args.language,
         args.defense,
     )
+    # The known side's vectors, when it is defended differently from the unknown side. Loaded as a
+    # second matrix rather than spliced here, because which rows are "known" depends on the known
+    # configuration and there are six of them. `load_documents_and_features` applies the same
+    # ordering and the same filters to both, so row i is the same document in each -- asserted
+    # below rather than assumed, since a silent misalignment would attribute documents to the
+    # wrong history.
+    known_embeddings_source = None
+    if args.known_defense != args.defense:
+        known_frame, known_embeddings_source = load_documents_and_features(
+            args.data_dir, args.source, args.feature, args.undated, args.model_owner,
+            args.language, args.known_defense,
+        )
+        if not known_frame["doc_id"].equals(frame["doc_id"]):
+            raise SystemExit(
+                f"the known-side and unknown-side feature files do not cover the same documents "
+                f"in the same order ({len(known_frame):,} vs {len(frame):,} rows). Both are "
+                f"joined to {args.source}.parquet on doc_id, so this means one of them is stale "
+                f"-- rebuild it with `compute_features --source {args.source} --defense ...`.")
     print(f"[{args.source}] {len(frame):,} documents x {embeddings.shape[1]} {args.feature} features | "
           f"{frame['author_id'].nunique():,} authors | {_period(frame)} | "
-          f"defense={args.defense} | "
+          f"defense={args.defense} (known side: {args.known_defense}) | "
           f"attacks={' '.join(args.attacks)}{' | standardized' if args.standardize else ''}")
     if not args.standardize:
         print("warning: --no-standardize is set. Every attack measured considerably worse without "
@@ -2335,7 +2375,8 @@ def main() -> None:
     for config, known, unknown in configurations:
         for attack in args.attacks:
             outcome = run_window(frame, embeddings, config, attack, known, unknown,
-                                 args, tuning_cache, languages, background)
+                                 args, tuning_cache, languages, background,
+                                 known_embeddings_source)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             cmcs.append(cmc)

@@ -144,6 +144,13 @@ Every figure is written as a PDF, and as a PNG beside it under ``--png``. Both h
 -- building the curves and drawing the figures -- run across ``--jobs`` processes; see
 :func:`run_jobs` for why the job table is a module global and the start method is pinned to fork.
 
+``--families`` draws one or more of these families and nothing else, named after the folders above
+(:data:`FIGURE_FAMILIES`). It narrows only what is *drawn*: every other figure keeps its cache
+entry, so ``--families clustering`` is a slice of a full sweep rather than a sweep of its own, and
+the families it skipped are still current afterwards. That is what it is for -- editing this file
+invalidates the whole tree at once (the cache keys on the file's digest), and redrawing every
+figure to look at one family is most of a sweep spent on figures nobody is reading.
+
 Every comparison figure is a **3x3 triangular facet grid, one panel per known configuration**,
 rows = known-side size, columns = staleness. **Nothing is averaged across the grid**: the
 configurations are experimental conditions, not repeated measurements, so a mean over them would
@@ -154,6 +161,14 @@ which is why every panel prints its own in-set counts and the grid is not collap
 axes. The shaded band is a 95 % percentile interval from a clustered bootstrap over *users*, one
 draw shared by every configuration and run of a dataset. Every figure is written alongside a
 ``.csv`` of the exact numbers plotted.
+
+**No figure carries a title, and none has since 2026-09-11** (the subtitle went on 2026-08-12).
+Both were caption text, and caption text belongs to the document that publishes the figure rather
+than to the image. What each figure *is*, is its path -- which is why the path scheme above is a
+contract and not a filing convenience -- while its panel headings name the configuration and its
+panel notes carry the counts. The prose is still written down: :data:`CURVE_TYPES`' fifth field
+per family, and the note above :func:`finish_facets` for the two facts a title used to be the
+only carrier of.
 """
 
 from __future__ import annotations
@@ -316,6 +331,9 @@ DEFENSES = (
     "loo_unlink_b50",
     "loo_unlink_b70",
     *(f"dp_mlm_eps{epsilon}" for epsilon in (10, 25, 50, 100, 250, 500, 1000)),
+    "embad",
+    "embad_summary",
+    "embad_gemini",
 )
 
 FEATURES = (
@@ -404,6 +422,9 @@ DEFENSE_LABELS = {
        for budget in (10, 20, 30, 50, 70)},
     **{f"dp_mlm_eps{epsilon}": f"DP-MLM ε={epsilon}"
        for epsilon in (10, 25, 50, 100, 250, 500, 1000)},
+    "embad": "EmBad (local ensemble)",
+    "embad_summary": "EmBad (summary)",
+    "embad_gemini": "EmBad (Gemini)",
 }
 FEATURE_LABELS = {
     "stylometrix": "StyloMetrix",
@@ -458,7 +479,21 @@ METHOD_SLOTS = {(feature, attack): feature_index * METHOD_STRIDE + attack_index
 # pairs, light surface). Never extend this by generating a ninth hue: past eight series a figure
 # needs fewer lines, not a made-up colour (see `resolve_slots`).
 
-SURFACE = "#fcfcfb"
+#: The chart surface, and **pure white on request** (2026-09-11) rather than the ``dataviz``
+#: skill's default off-white ``#fcfcfb``. A deliberate override of that parameter, not a value
+#: to "correct" back: these figures are printed into a white page, and an off-white panel on it
+#: reads as a grey box rather than as the paper.
+#:
+#: Safe on the skill's checks, and only one of them involves the surface at all -- contrast. Pure
+#: white is *lighter* than the off-white, so every mark's contrast against it goes **up** by
+#: 2.66%: the categorical hues run 2.17-8.56:1 against 2.11-8.34:1 before, and the chrome moves
+#: with them. The other five checks (lightness band, chroma floor, CVD separation, normal-vision
+#: floor, adjacent pairs) are properties of the palette and do not involve the surface.
+#:
+#: **It is also the marker ring and the bar-gap colour** (the skill's 2 px surface ring / 2 px
+#: spacer, which exist to separate overlapping marks by showing the surface through them), so it
+#: must stay one constant -- a ring in the old off-white on a white panel would draw a halo.
+SURFACE = "#ffffff"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
 TEXT_MUTED = "#8a8983"
@@ -478,9 +513,41 @@ BASELINE_DASH = (0, (4, 3))
 #: figure is one dataset throughout, so there would be nothing for the channel to say.
 DATASET_DASHES = {"wildchat": (), "swe_chat": (7, 2, 1.5, 2)}
 
+#: Every text size on every figure, in points. They were scattered literals until 2026-09-11,
+#: when "a little too small, increase a bit" had to be applied in fourteen places -- so the sizes
+#: now live here and a future nudge is four numbers.
+#:
+#: **An annotation inside a panel is set at the tick size** (on request): a direct label, a panel
+#: note, a value on a bar cap and an iso-F level are all things a reader reads *off the plot*, so
+#: they should not be smaller than the numbers on the axis they are read against. That took the
+#: smallest text on any figure from 7 pt to 10.5 pt. The ranking is otherwise unchanged --
+#: annotations and ticks at the bottom, then the legend, then axis labels, then a panel heading.
+FONT_TICK = 10.5         # axis tick labels
+FONT_ANNOTATION = FONT_TICK   # anything written inside the axes; deliberately the same number
+FONT_LEGEND = 10.0       # legend entries and legend titles
+FONT_AXIS_LABEL = 11.5   # the x and y axis titles
+FONT_PANEL_TITLE = 13.0  # a facet's column header, a clustering panel's defense
+
 LINE_WIDTH = 2.0
 MARKER_SIZE = 6.0  # >= 8px on the page once the 2px surface ring is added
 BAND_ALPHA = 0.15  # confidence band: readable under the line, never competing with it
+
+#: **Matplotlib's ``markersize`` is the marker's box, not its area**, so shapes drawn at one size
+#: do not *look* one size: at size ``m`` a square fills the whole ``m x m`` box, a circle fills
+#: pi/4 of it, a triangle or a diamond fill half, and a five-pointed star barely a third -- which
+#: is why a square reads as much larger than the triangle beside it. This is the correction that
+#: puts them all at one apparent size, so the size channel carries nothing and shape is free to
+#: mean one thing (the defense, on the clustering precision/recall figure).
+#:
+#: **It is not equal *ink*, and equal ink was tried first.** Scaling by
+#: ``sqrt(circle_area / own_area)`` -- 1.25 for a diamond, 1.67 for a star -- makes a pointed shape
+#: measurably bigger than the circle it is meant to match, because the eye reads a marker by its
+#: *extent* as well as by its area, and a pointed shape spends its extent on the points. Each
+#: factor here is the **geometric mean of the two corrections**, equal area and equal extent
+#: (``sqrt(area_scale)``): half-way between the two things a reader is doing at once. That is what
+#: took the diamond from 1.25 to 1.12, on the report that it still looked too big.
+MARKER_SIZE_SCALE = {"o": 1.00, "s": 0.94, "^": 1.12, "v": 1.12, "D": 1.12,
+                     "*": 1.29, "P": 1.09, "X": 1.09, ">": 1.12, "<": 1.12}
 
 #: Colour slot per defense and per (feature, attack) pair. A series' colour follows the thing it
 #: represents, not its position in a particular figure, so a defense keeps its colour whether it
@@ -489,6 +556,60 @@ BAND_ALPHA = 0.15  # confidence band: readable under the line, never competing w
 #: hue by :func:`series_style`, and :func:`resolve_slots` handles the case where two entities on
 #: one figure would land on the same hue.
 DEFENSE_SLOTS = {defense: index for index, defense in enumerate(DEFENSES)}
+
+#: The marker shapes a figure may use where **shape carries the defense**, in the order they are
+#: handed out. All filled, all distinguishable at 7 pt, and none of them the ``x`` the reference
+#: partitions are marked with. :data:`MARKER_SIZE_SCALE` has an entry for every one of them.
+MARKER_SHAPES = ("o", "s", "^", "*", "P", "X", "D", "v")
+
+#: Shape per defense -- what :data:`DEFENSE_SLOTS` is for colour, and for the same reason: a
+#: reader flipping between two figures should see one defense wearing one mark. Before this existed
+#: shapes were handed out by *position among the defenses present*, so EmBad (Gemini) was a plus on
+#: SWE-chat's five and a star on WildChat's four; each legend decoded itself, but nothing carried
+#: across.
+#:
+#: **It cannot be `DEFENSE_SLOTS` reduced modulo the shapes**, the way a hue is. There are eight
+#: shapes against 25 defenses, and the collisions land exactly where it would hurt: ``embad`` would
+#: share ``styleremix``'s mark and ``embad_summary`` would share ``openanonymity``'s, which are
+#: pairs that appear on one figure together. So the assignment is written down instead.
+#:
+#: **Register a defense here when it first appears on such a figure.** One that is not registered
+#: still draws -- :func:`defense_markers` gives it a shape no registered defense on that figure
+#: claimed -- but the shape it gets depends on who else is in the figure, which is the property
+#: this table exists to provide.
+DEFENSE_MARKERS = {
+    NO_DEFENSE: "o",
+    "styleremix": "s",
+    "openanonymity": "^",
+    "embad_summary": "*",
+    "embad_gemini": "P",
+    "embad": "X",
+}
+
+
+def defense_markers(defenses: list[str]) -> dict[str, str]:
+    """Marker shape for each of ``defenses``: fixed per defense where registered, distinct always.
+
+    Registered defenses take their :data:`DEFENSE_MARKERS` shape, which is what makes a mark mean
+    the same thing on every figure. Anything unregistered takes the first shape no registered
+    defense in *this* figure is using, in the order the defenses were given -- distinct within the
+    figure, but not stable outside it.
+
+    Past :data:`MARKER_SHAPES` the pool is exhausted and shapes repeat, at which point shape has
+    stopped being a key. Nothing draws close to eight defenses on one figure today; if something
+    does, the channel needs more shapes rather than a cleverer fallback.
+    """
+    taken = {DEFENSE_MARKERS[defense] for defense in defenses if defense in DEFENSE_MARKERS}
+    spare = [shape for shape in MARKER_SHAPES if shape not in taken]
+    markers, index = {}, 0
+    for defense in defenses:
+        if defense in DEFENSE_MARKERS:
+            markers[defense] = DEFENSE_MARKERS[defense]
+            continue
+        markers[defense] = (spare[index] if index < len(spare)
+                            else MARKER_SHAPES[index % len(MARKER_SHAPES)])
+        index += 1
+    return markers
 
 
 def series_style(slot: int) -> str:
@@ -525,10 +646,13 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str) -> None:
 
     Every figure in this file goes through here, which is what makes them look like one set.
 
-    **There is no subtitle any more** (removed 2026-08-12, on request): the explanatory sentence
-    that used to sit under a title is caption text, and it belongs in the document that publishes
-    the figure rather than burned into the image. The sentences themselves are kept -- see
-    :data:`CURVE_TYPES`' fifth field.
+    ``title`` is a **panel** heading and is the only text of its kind left: a facet's column
+    header, or the defense a clustering panel covers. A figure-level title is not drawn any more
+    (removed 2026-09-11) and neither is the subtitle under it (2026-08-12) -- both were caption
+    text, which belongs in the document that publishes the figure rather than burned into the
+    image. **A single-axes figure therefore passes ``""`` here**, since its axes title would be
+    that figure's title. The sentences themselves are kept -- see :data:`CURVE_TYPES`' fifth
+    field -- and the note above :func:`finish_facets` has the full record.
     """
     axes.set_facecolor(SURFACE)
     axes.grid(True, which="both", color=GRID, linewidth=0.7, linestyle="-")
@@ -538,20 +662,36 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str) -> None:
     for side in ("left", "bottom"):
         axes.spines[side].set_color(AXIS)
         axes.spines[side].set_linewidth(0.8)
-    axes.tick_params(colors=TEXT_SECONDARY, labelsize=9, length=3, width=0.8)
-    axes.set_xlabel(xlabel, color=TEXT_SECONDARY, fontsize=10)
-    axes.set_ylabel(ylabel, color=TEXT_SECONDARY, fontsize=10)
-    # Left-aligned rather than centred, matching `figure_heading`.
-    axes.set_title(title, color=TEXT_PRIMARY, fontsize=11.5, fontweight="bold",
+    # **Axis text is primary ink, the tick marks stay recessive** (2026-09-11, on request). The
+    # numbers on an axis and the name of that axis are read, not chrome, so they take the same ink
+    # as a panel heading; they were secondary grey until now. `labelcolor` is separate from
+    # `color` in `tick_params` precisely so the 3 px tick *marks* can stay where they were --
+    # blackening those would thicken the frame the skill wants recessive, and nobody reads a tick
+    # mark. Every axis in the file goes through here, including the ones whose tick labels are set
+    # by hand elsewhere (they inherit this call's `labelcolor`).
+    axes.tick_params(color=TEXT_SECONDARY, labelcolor=TEXT_PRIMARY, labelsize=FONT_TICK,
+                     length=3, width=0.8)
+    axes.set_xlabel(xlabel, color=TEXT_PRIMARY, fontsize=FONT_AXIS_LABEL)
+    axes.set_ylabel(ylabel, color=TEXT_PRIMARY, fontsize=FONT_AXIS_LABEL)
+    # Left-aligned rather than centred, matching the axis labels above.
+    axes.set_title(title, color=TEXT_PRIMARY, fontsize=FONT_PANEL_TITLE, fontweight="bold",
                    loc="left", pad=10)
 
 
 def add_legend(axes, **options):
-    """A frameless legend in text colours -- identity never rides on colour alone."""
-    legend = axes.legend(frameon=False, fontsize=8.5, labelcolor=TEXT_PRIMARY, **options)
+    """A frameless legend in text colours -- identity never rides on colour alone.
+
+    A surface wash and a border were added and then removed again on 2026-09-11, both on request.
+    Worth one line rather than nothing: the argument for them was that a legend inside the plot
+    puts marker keys among the marks, and on the precision/recall figure the keys are the same
+    shapes at the same size as the data. What actually solved that is geometry -- squaring the
+    axes and sizing the figure so the block clears the data entirely -- which is the better fix,
+    because a legend that overlaps nothing needs nothing drawn under it.
+    """
+    legend = axes.legend(frameon=False, fontsize=FONT_LEGEND, labelcolor=TEXT_PRIMARY, **options)
     if legend.get_title().get_text():
         legend.get_title().set_color(TEXT_SECONDARY)
-        legend.get_title().set_fontsize(8.5)
+        legend.get_title().set_fontsize(FONT_LEGEND)
     return legend
 
 
@@ -591,13 +731,40 @@ def stack_below(figure, axes, legend):
 WRITE_PNG = False
 
 
+#: Blank border left around a saved figure, in inches. **As near zero as prints correctly**
+#: (2026-09-11): ``bbox_inches="tight"`` crops the canvas to the artists' own bounding box and then
+#: pads it, and matplotlib's default pad is 0.1 in on every side -- a 20 px border at 200 dpi on
+#: every figure in the tree. A figure here is placed by the document that includes it, which adds
+#: its own space; burning a tenth of an inch into the file means that space cannot be taken away.
+#:
+#: **It is not 0, and the reason is a measurement rather than taste.** The box matplotlib crops to
+#: is built from each text artist's *font metrics*, and a rendered antialiased glyph spills one or
+#: two pixels past that, so at pad 0 the outermost label is shaved: the precision/recall figure's
+#: ``F=0.6`` put 4 ink pixels in the final column. Sweeping the pad over both corpora, ink stops
+#: touching an outer edge at **0.01 in** (2 px at 200 dpi) and still touches at 0.005. This is set
+#: to twice that floor, because the figures that could be rendered to measure it are the clustering
+#: ones, and a glyph with more overhang -- a parenthesis, an italic, a comma below a baseline --
+#: could need the extra pixel. It is still a fifth of matplotlib's default and ~1.4 pt on the page.
+#:
+#: **This is the OUTER margin only.** The padding *between* facet panels comes from
+#: ``tight_layout``'s own defaults and is deliberately left alone -- it is what keeps one panel's
+#: tick labels off the next panel's axis, so tightening it does not gain margin, it causes
+#: collisions.
+#:
+#: Artists drawn outside the axes on purpose (the iso-F labels past the right spine, drawn with
+#: ``annotation_clip=False``) are part of that bounding box, so the crop lands outside *them*
+#: rather than through them.
+FIGURE_PAD_INCHES = 0.02
+
+
 def save_figure(figure, stem: Path) -> Path:
     """Write ``figure`` as a PDF (and a PNG when :data:`WRITE_PNG`), return the PDF."""
     stem.parent.mkdir(parents=True, exist_ok=True)
     pdf_path = stem.parent / f"{stem.name}.pdf"
     paths = [pdf_path] + ([stem.parent / f"{stem.name}.png"] if WRITE_PNG else [])
     for path in paths:
-        figure.savefig(path, dpi=200, facecolor=SURFACE, bbox_inches="tight")
+        figure.savefig(path, dpi=200, facecolor=SURFACE, bbox_inches="tight",
+                       pad_inches=FIGURE_PAD_INCHES)
     plt.close(figure)
     return pdf_path
 
@@ -2400,39 +2567,56 @@ def panel_note(axes, text: str) -> None:
     someone has to look up.
     """
     axes.annotate(text, xy=(0, 1), xytext=(4, -6), xycoords="axes fraction",
-                  textcoords="offset points", color=TEXT_MUTED, fontsize=7.5,
+                  textcoords="offset points", color=TEXT_MUTED, fontsize=FONT_ANNOTATION,
                   va="top", ha="left", zorder=5)
 
 
-def figure_heading(figure, title: str) -> float:
-    """Place a figure-level title and return the top of the drawing area.
-
-    Left-aligned rather than centred, matching :func:`style_axes`. The reserved band scales with
-    the figure's height in inches, so a short figure does not have its title written across the
-    axes and a tall one does not leave a stripe of empty surface.
-
-    **The subtitle under it was removed 2026-08-12, on request.** It was a sentence of caveats,
-    which is caption text: it belongs in whatever publishes the figure, not burned into the image
-    where it cannot be edited, translated or footnoted. The band it occupied is reclaimed by the
-    panels. The sentences are still written down -- :data:`CURVE_TYPES`' fifth field is now
-    documentation for exactly that purpose.
-    """
-    height = figure.get_size_inches()[1]
-    figure.text(0.01, 1 - 0.30 / height, title, color=TEXT_PRIMARY, fontsize=12.5,
-                fontweight="bold", ha="left", va="top")
-    return 1 - 0.56 / height
+# --- NO FIGURE CARRIES A TITLE -----------------------------------------------
+#
+# `figure_heading` drew a left-aligned bold line across the top of every figure and reserved a
+# band in inches for it. It was removed 2026-09-11, on request, and with it the last piece of
+# prose burned into an image: first the subtitle (2026-08-12), now the title.
+#
+# The reasoning is the subtitle's, and it applies harder to a title: what a figure *is* belongs
+# to the document that publishes it, where it can be edited, translated, footnoted and set in the
+# publication's own type. Everything those titles said is still recoverable without opening the
+# image -- **the path is the identity** (`plots/<dataset>/<family>/<doc|author>/by_defense/
+# <feature>_<attack>.pdf` names the corpus, the family, the counting level and the method), the
+# panel headings name the configuration, the panel notes carry the counts, and `CURVE_TYPES`'
+# fifth field carries the caveats in prose meant for a caption.
+#
+# Two things were carried ONLY by a title and are now carried only by the path: the clustering
+# figures' author-scope clause (`CLUSTERING_SCOPES`' second field, kept as documentation and no
+# longer drawn -- `clustering/unseen/` in the path is what distinguishes the two now) and
+# `accuracy/macro_micro.pdf`'s known configuration (`HEADLINE_CONFIG`, still in the companion
+# CSV). Both would want a `panel_note` rather than a title if they have to be visible again.
+#
+# The band is reclaimed by the panels, so every figure's axes grow slightly taller than they
+# were. Nothing else moves: the legends, the companion CSVs and the paths are untouched.
+#
+# **Eight drawing functions still take a `dataset` they no longer read** -- the title was its only
+# use in `plot_defense_comparison`, `plot_attack_comparison`, `plot_separation_figures`,
+# `plot_openset_reach`, `plot_temporal_figure`, `plot_macro_micro`, `plot_clustering_bcubed` and
+# `plot_clustering_precision_recall`. It is kept on purpose rather than cleaned up: these
+# signatures are uniform by design (`PER_RUN_FAMILIES` dispatches `plot_separation_figures` and
+# `plot_language_figures` through the *same* call, and the latter does read it), the plan builds
+# every one of their argument tuples the same way, and anything put back on a figure -- a panel
+# note naming the corpus, say -- wants it in hand.
 
 
 def style_legend(legend) -> None:
     """The shared legend chrome: a title in secondary ink at the body size."""
     legend.get_title().set_color(TEXT_SECONDARY)
-    legend.get_title().set_fontsize(8.5)
+    legend.get_title().set_fontsize(FONT_LEGEND)
 
 
-def finish_facets(figure, handles: dict, legend_title: str, title: str,
+def finish_facets(figure, handles: dict, legend_title: str,
                   stem: Path, table: pd.DataFrame, legend_cell=None,
                   extra_legend: tuple[str, dict] | None = None) -> Path:
-    """Shared chrome for every facet figure: its legend(s), one title, one companion CSV.
+    """Shared chrome for every facet figure: its legend(s) and its companion CSV.
+
+    **No title** -- see the note above on why no figure here carries one. What the figure is, is
+    in its path; what its panels are, is in their headings.
 
     The legend goes inside ``legend_cell`` -- the corner of the triangular grid that holds no
     panel -- so it takes space the figure was giving away rather than a reserved strip that
@@ -2441,9 +2625,9 @@ def finish_facets(figure, handles: dict, legend_title: str, title: str,
     and to its left are the grid's other two holes.
 
     Without a ``legend_cell`` the legend needs a reserved strip under the axes instead, and its
-    size is worked out **in inches and then divided by the figure's height**, like
-    :func:`figure_heading`: a legend is a fixed physical size, so a fraction tuned on the 9-inch
-    facet grid leaves the short temporal figure's legend sitting on its x label. Three columns at
+    size is worked out **in inches and then divided by the figure's height**: a legend is a fixed
+    physical size, so a fraction tuned on the 9-inch facet grid leaves the short temporal
+    figure's legend sitting on its x label. Three columns at
     most for the same reason -- ``bbox_inches="tight"`` grows the canvas around an over-wide
     legend, and four of these labels are wider than the axes they belong to.
 
@@ -2465,8 +2649,9 @@ def finish_facets(figure, handles: dict, legend_title: str, title: str,
         bottom = (0.26 + 0.24 * rows) / figure.get_size_inches()[1]
     else:
         columns, bottom = 1, 0.0
-    figure.tight_layout(rect=(0, bottom, 1, figure_heading(figure, title)))
-    shared = dict(ncol=columns, frameon=False, fontsize=8.5, labelcolor=TEXT_PRIMARY)
+    # The top is the figure's own edge: there is no heading band to leave room for.
+    figure.tight_layout(rect=(0, bottom, 1, 1))
+    shared = dict(ncol=columns, frameon=False, fontsize=FONT_LEGEND, labelcolor=TEXT_PRIMARY)
     if legend_cell is None:
         legend = figure.legend(list(handles.values()), list(handles), title=legend_title,
                                loc="lower center", bbox_to_anchor=(0.5, 0.005), **shared)
@@ -2898,7 +3083,8 @@ def draw_separation_panel(axes, series: list[Series], handles: dict) -> pd.DataF
 #: The curve types, each as (panel drawer, subdirectory, x label, y label, description).
 #:
 #: **The description is no longer drawn.** It was the subtitle under each figure's title until
-#: 2026-08-12; that is caption text and belongs in whatever publishes the figure. It is kept here
+#: 2026-08-12, and the title itself went the same way on 2026-09-11; that is caption text and
+#: belongs in whatever publishes the figure. It is kept here
 #: because it is the one place each family's caveats are written down in a sentence -- copy it
 #: into the caption rather than re-deriving it, and keep it current when a family changes.
 #:
@@ -3049,7 +3235,7 @@ CURVE_FAMILIES = {
     "separation_authors": "separation_authors",
 }
 
-def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: str,
+def plot_config_comparison(kind: str, panels: dict[str, list[Series]],
                            legend_title: str, stem: Path,
                            extra_legend: tuple[str, dict] | None = None) -> Path:
     """One curve type, one figure, one panel per known configuration.
@@ -3073,7 +3259,7 @@ def plot_config_comparison(kind: str, panels: dict[str, list[Series]], title: st
             continue
         rows.append(draw(axes, series, handles).assign(known_config=tag))
     label_facets(grid, axes_for, xlabel, ylabel)
-    return finish_facets(figure, handles, legend_title, title, stem,
+    return finish_facets(figure, handles, legend_title, stem,
                          pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(),
                          legend_cell=legend_cell, extra_legend=extra_legend)
 
@@ -3129,8 +3315,6 @@ def plot_defense_comparison(dataset: str, method: tuple[str, str], runs: list[Ru
     feature, attack = method
     return [plot_config_comparison(
         kind, panels,
-        title=f"{DATASET_LABELS[dataset]}: defenses under "
-              f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
         legend_title="Defense",
         stem=output_dir / CURVE_TYPES[kind][1] / "by_defense" / f"{feature}_{attack}")]
 
@@ -3150,7 +3334,6 @@ def plot_attack_comparison(dataset: str, defense: str, runs: list[Run], curves: 
         return []
     return [plot_config_comparison(
         kind, panels,
-        title=f"{DATASET_LABELS[dataset]}: attacks against {DEFENSE_LABELS[defense]}",
         legend_title="Feature / attack",
         stem=output_dir / CURVE_TYPES[kind][1] / "by_attack" / defense)]
 
@@ -3178,8 +3361,6 @@ def plot_separation_figures(dataset: str, runs: list[Run], separation: dict, kin
         panels = {tag: [Series(run.method_label, 0, curve)] for tag, curve in curves.items()}
         written.append(plot_config_comparison(
             kind, panels,
-            title=f"{DATASET_LABELS[dataset]}: who looks out-of-set? "
-                  f"{run.defense_label}, {run.method_label}",
             legend_title=legend_title,
             stem=output_dir / CURVE_TYPES[kind][1] / run.directory.name))
     return written
@@ -3209,8 +3390,6 @@ def plot_language_figures(dataset: str, runs: list[Run], curves: dict, kind: str
                   for tag, languages in by_config.items()}
         written.append(plot_config_comparison(
             kind, panels,
-            title=f"{DATASET_LABELS[dataset]}: accuracy by language. "
-                  f"{run.defense_label}, {run.method_label}",
             legend_title="Primary language",
             stem=output_dir / CURVE_TYPES[kind][1] / run.directory.name))
     return written
@@ -3257,7 +3436,7 @@ def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> l
             axes.annotate(f"{getattr(row, part):,} / {getattr(row, whole):,}",
                           xy=(value, row.Index + offset), xytext=(5, 0),
                           textcoords="offset points", va="center", ha="left",
-                          color=TEXT_SECONDARY, fontsize=8)
+                          color=TEXT_SECONDARY, fontsize=FONT_ANNOTATION)
 
     # Rows are ordered by known-side size then staleness, the facet grid's own reading order, so
     # the tick leads with those two rather than with the interval -- otherwise three rows all
@@ -3266,8 +3445,7 @@ def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> l
     axes.set_yticklabels([f"{config.size:.0%} known, {config.gap_label}\n({config.label})"
                           for config in (parse_config_tag(tag) for tag in reach["known_config"])])
     axes.invert_yaxis()   # smallest, freshest known side at the top
-    style_axes(axes, "Share of the shared test set the known side reaches", "",
-               f"{DATASET_LABELS[dataset]}: what a bigger known side buys is reach")
+    style_axes(axes, "Share of the shared test set the known side reaches", "", "")
     axes.set_xlim(0, 1.15)   # headroom for the direct labels
     axes.set_xticks(np.linspace(0, 1, 6))
     axes.grid(False, axis="y")
@@ -3626,7 +3804,7 @@ def temporal_accuracy(run: Run, known_config: str = TEMPORAL_KNOWN_CONFIG,
                          known_config=known_config, level=level)
 
 
-def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_title: str,
+def plot_temporal_figure(dataset: str, series: list[Series], legend_title: str,
                          stem: Path) -> Path:
     """One temporal figure: top-1 accuracy against elapsed weeks, one line per :class:`Series`.
 
@@ -3680,7 +3858,7 @@ def plot_temporal_figure(dataset: str, series: list[Series], title: str, legend_
     # The bins are whole weeks; a tick at 1.5 weeks labels a point that cannot exist.
     bars.xaxis.set_major_locator(MaxNLocator(integer=True))
 
-    return finish_facets(figure, handles, legend_title, title, stem,
+    return finish_facets(figure, handles, legend_title, stem,
                          pd.concat(rows, ignore_index=True))
 
 
@@ -3699,8 +3877,6 @@ def plot_temporal_defense_comparison(dataset: str, method: tuple[str, str], runs
     feature, attack = method
     return [plot_temporal_figure(
         dataset, series,
-        title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
-              f"{FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}",
         legend_title="Defense",
         stem=(output_dir / "temporal" / LEVEL_DIRS[series[0].curve.level] / "by_defense"
               / f"{feature}_{attack}"))]
@@ -3716,8 +3892,6 @@ def plot_temporal_attack_comparison(dataset: str, defense: str, runs: list[Run],
         return []
     return [plot_temporal_figure(
         dataset, series,
-        title=f"{DATASET_LABELS[dataset]}: does re-identification go stale? "
-              f"{DEFENSE_LABELS[defense]}",
         legend_title="Feature / attack",
         stem=(output_dir / "temporal" / LEVEL_DIRS[series[0].curve.level] / "by_attack"
               / defense))]
@@ -3828,8 +4002,10 @@ def plot_macro_micro(dataset: str, runs: list[Run], modes: dict[Run, pd.DataFram
     axes.set_yticklabels([run.method_label if run.defense == NO_DEFENSE
                           else f"{run.method_label}\n{run.defense_label}" for run in ordered])
     axes.invert_yaxis()  # first run at the top, reading order
-    style_axes(axes, "Top-1 accuracy", "", f"{DATASET_LABELS[dataset]}: one result, three ways "
-               f"of counting it  ·  {parse_config_tag(HEADLINE_CONFIG).label}")
+    # Nothing on the figure names the known side it counts (:data:`HEADLINE_CONFIG`, chosen in
+    # `counting_modes`) now that there is no title. The companion CSV still does -- every row
+    # carries a `known_config` -- and a `panel_note` is where it would go if it has to be visible.
+    style_axes(axes, "Top-1 accuracy", "", "")
     axes.set_xlim(0, 1.02)
     axes.grid(False, axis="y")  # the bars already separate the groups; a y grid would fight them
     add_legend(axes, loc="best", title="Counting mode")
@@ -4205,7 +4381,6 @@ def plot_scaling_across_datasets_by_defense(
     feature, attack = method
     return [plot_config_comparison(
         kind, panels,
-        title=f"Defenses under {FEATURE_LABELS[feature]} / {ATTACK_LABELS[attack]}, both corpora",
         legend_title="Defense",
         stem=cross_dataset_stem(kind, "defense", f"{feature}_{attack}", output_dir),
         extra_legend=dataset_legend(panels))]
@@ -4233,7 +4408,6 @@ def plot_scaling_across_datasets_by_attack(
         return []
     return [plot_config_comparison(
         kind, panels,
-        title=f"Attacks against {DEFENSE_LABELS[defense]}, both corpora",
         legend_title="Feature / attack",
         stem=cross_dataset_stem(kind, "attack", defense, output_dir),
         extra_legend=dataset_legend(panels))]
@@ -4260,10 +4434,33 @@ def plot_scaling_across_datasets_by_attack(
 #: Clustering algorithms, in the order that fixes each one's colour everywhere. **Append only** --
 #: inserting a name shifts the hue of every algorithm below it, exactly the hazard
 #: :data:`DEFENSE_SLOTS` and :data:`METHOD_STRIDE` document at length.
+#:
+#: **This is the colour registry, not the guest list.** It holds every algorithm that has ever
+#: been drawn, including ones nothing draws today, precisely so that retiring one cannot move
+#: anybody else's hue. What the figures draw is :data:`CLUSTERING_DRAWN_ALGORITHMS`.
 CLUSTERING_ALGORITHMS = ("hdbscan", "leiden", "average_linkage", "connected",
                          "componentwise_agglomerative")
 
 CLUSTERING_ALGORITHM_SLOTS = {name: index for index, name in enumerate(CLUSTERING_ALGORITHMS)}
+
+#: The algorithms every clustering figure draws, **in the order it draws them** -- bar order on
+#: the BCubed chart, legend order on the precision/recall figure and the exposure curves.
+#:
+#: Separate from the registry above because the two questions are different: colour is a permanent
+#: property of an algorithm (its index there), while this is the subset on show today. Dropping a
+#: name here changes nothing about the others; dropping it *there* would recolour every algorithm
+#: below it and put a paper's existing figures out of step with a re-run.
+#:
+#: **``average_linkage`` is out and ``componentwise_agglomerative`` is in** (2026-09-11, on
+#: request). The two are the same method -- the second runs it one connected component at a time
+#: so it fits in memory at WildChat's scale -- and only the second exists on both corpora, which is
+#: what decided it: WildChat has no ``average_linkage`` row at all, so keeping that one would have
+#: left that corpus with three algorithms. Where both exist (SWE-chat, all five defenses) they
+#: agree on F to within **0.009**, the per-component variant trading a little recall for precision
+#: (up to +0.08 P, -0.04 R), which is visible on the precision/recall figure and invisible on the
+#: bar chart. It is labelled simply "Agglomerative" now: with nothing to distinguish it from, the
+#: qualifier said only that an implementation detail existed.
+CLUSTERING_DRAWN_ALGORITHMS = ("hdbscan", "leiden", "connected", "componentwise_agglomerative")
 
 #: Reference partitions, drawn beside the algorithms as **grey bars**. They are properties of the
 #: collection rather than measurements of an attack, and grey is the channel that says so -- the
@@ -4288,18 +4485,45 @@ CLUSTERING_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseli
 #: partitions land in the same corner as ``single_cluster`` and would only crowd it.
 CLUSTERING_PR_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseline_random")
 
+#: Iso-F contours drawn on the precision/recall figure, each labelled where it leaves the right
+#: edge. They are the figure's frame of reference: two points on one contour are the same F bought
+#: with different trades, which is the comparison F alone cannot show.
+#:
+#: **The range the results occupy, and no more** (settled 2026-09-11): every measured point on both
+#: corpora sits between F 0.3 and 0.6, which is where a reader interpolates, and the low levels
+#: place the baselines -- ``Random`` and ``One cluster`` sit beside 0.1, ``Singletons`` between 0.1
+#: and 0.3 on WildChat (0.285) and just above 0.1 on SWE-chat (0.112), which is what 0.2 is for.
+#: 0.7 and 0.9 were dropped: nothing comes near them, and they were the two contours that ran
+#: through the legend block in the top-right corner.
+CLUSTERING_ISO_F_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+
+#: How far above 1.0 a computed precision may sit and still count as "on the top edge". It exists
+#: for exactly one sample per contour -- the analytic end point at ``r = F / (2 - F)``, which
+#: binary arithmetic puts a couple of ULPs over 1.0 at some levels -- and it is orders of magnitude
+#: tighter than the gap to the next sample down, which is ~0.06.
+ISO_F_EDGE_TOLERANCE = 1e-9
+
+#: Marker size for the precision/recall figure, in points, before the per-shape correction below.
+CLUSTERING_PR_MARKER_SIZE = 7.0
+
+
 CLUSTERING_LABELS = {
     "hdbscan": "HDBSCAN",
     "leiden": "Leiden",
+    # Retired from `CLUSTERING_DRAWN_ALGORITHMS` 2026-09-11 and kept here for its colour slot and
+    # its meaning: it is average linkage over the whole graph, which only SWE-chat has a run of.
     "average_linkage": "Average linkage",
-    # Same method as `average_linkage`, run one connected component at a time so it fits in memory
-    # at WildChat's scale -- the label says "average linkage" because that is what it computes,
-    # with the qualifier only to distinguish the two rows on a figure that carries both.
-    "componentwise_agglomerative": "Average linkage (per component)",
-    "connected": "Connected components",
-    "baseline_singleton": "All singletons",
+    # The same method, run one connected component at a time so it fits in memory at WildChat's
+    # scale. It is the agglomerative row every figure draws now, and the qualifier came off with
+    # the row it used to be told apart from.
+    "componentwise_agglomerative": "Agglomerative",
+    "connected": "Connected comp.",
+    # Short names, on request (2026-09-11): these sit beside the measured methods, and a
+    # parenthetical qualifier on a reference partition reads as a caveat about the *attack*.
+    # What "matched" and "all" said is in each figure's own documentation instead.
+    "baseline_singleton": "Singletons",
     "baseline_single_cluster": "One cluster",
-    "baseline_random": "Random (matched)",
+    "baseline_random": "Random",
     "baseline_language_primary": "By language",
 }
 
@@ -4313,19 +4537,69 @@ CLUSTERING_BASELINE_ALPHA = 0.55
 CLUSTERING_GROUP_GAP = 0.9
 
 
+#: The fourth part of a clustering directory name -> the label a figure prints for it.
+#:
+#: The variant is ``run_clustering.variant_name``'s composition of the three axes that change what
+#: an edge score *means*: ``--projection``, ``--rescoring`` and the elapsed-time fusion, in that
+#: order, or ``plain`` when none is set. Order here is the variants figure's row order, and it is
+#: the order the ideas were built in: the pure-text run first, then each ingredient alone, then
+#: the combinations.
+#:
+#: **Append only, and only names ``variant_name`` can actually produce.** A directory whose
+#: variant is not in this dict does not parse at all, which is what keeps a trailing ``_zscore``
+#: or ``_quantile`` qualifier out of the comparable set. Not every projection x rescoring pair is
+#: here -- only the ones that have been run -- so registering a new combination is one line.
+#:
+#: The by-hand directories written before 2026-09-09 carried a *fixed* weight in the name
+#: (``time0.45``, ``contrastive_time0.45``) and are not registered: the weight is now searched, so
+#: ``time`` means "tuned" and a number in that slot would be a different experiment.
+CLUSTERING_VARIANT_LABELS = {
+    "plain": "Pure text",
+    "time": "Timing fused",
+    "contrastive": "Contrastive projection",
+    "contrastive_time": "Contrastive + timing",
+    "lda": "LDA projection",
+    "lda_time": "LDA + timing",
+    "wccn": "WCCN projection",
+    "wccn_csls": "WCCN + CSLS",
+    "wccn_local_scaling": "WCCN + local scaling",
+    "csls": "CSLS rescoring",
+    "local_scaling": "Local scaling",
+    "mutual_knn": "Mutual k-NN",
+    "shared_neighbors": "Shared neighbours",
+}
+
+#: The variant every other clustering family draws: the pure-text run, whose directory is the
+#: four-part name with no method applied to the graph. The ``bcubed``, ``precision_recall`` and
+#: ``exposure`` families key their panels on defense, so a run with a learned projection among
+#: them would collide with the plain run of the same defense.
+PLAIN_VARIANT = "plain"
+
+
 @dataclass(frozen=True)
 class ClusteringRun:
-    """One clustering directory, with its name parsed into the three axes it encodes.
+    """One clustering directory, with its name parsed into the four axes it encodes.
 
-    :class:`Run`'s counterpart, and three parts rather than four for a real reason: a clustering
-    attack has no ``--attacks`` axis. It takes the neighbour graph and partitions it, so what
-    varies is the corpus, what was done to the text, and how the text was represented.
+    :class:`Run`'s counterpart, and four parts for the same reason: a clustering attack has no
+    ``--attacks`` axis, but it does have a *variant* -- which representation was clustered -- and
+    that occupies the same positional slot. So what varies is the corpus, what was done to the
+    text, how the text was represented, and what was done to the graph.
+
+    The plain three-part names written before 2026-09-09 no longer parse. That is deliberate
+    rather than a migration gap: a directory with no variant part cannot say whether it holds a
+    pure-text run or something else, and guessing ``plain`` for it would file a timing-fused run
+    among the pure-text ones.
     """
 
     dataset: str
     defense: str
     feature: str
+    variant: str
     directory: Path
+
+    @property
+    def variant_label(self) -> str:
+        return CLUSTERING_VARIANT_LABELS[self.variant]
 
     @property
     def defense_label(self) -> str:
@@ -4336,21 +4610,31 @@ class ClusteringRun:
         return FEATURE_LABELS[self.feature]
 
 
-def parse_clustering_run_name(name: str) -> tuple[str, str, str] | None:
-    """Split ``<dataset>_<defense>_<feature>`` into its three parts, or return ``None``.
+def parse_clustering_run_name(name: str) -> tuple[str, str, str, str] | None:
+    """Split ``<dataset>_<defense>_<feature>_<variant>`` into its four parts, or ``None``.
 
-    :func:`parse_run_name` without the attack, and it cannot be split on ``_`` for the same
-    reason: every part may contain one. Each candidate defense is checked against the requirement
-    that what follows it is a whole feature name, which is what tells ``dp_mlm`` from
-    ``dp_mlm_pii``.
+    :func:`parse_run_name` with a variant where the attack goes, and it cannot be split on ``_``
+    for the same reason: every part may contain one. Each candidate defense is checked against the
+    requirement that what follows it is a whole feature name, which is what tells ``dp_mlm`` from
+    ``dp_mlm_pii``, and the remainder has to be a registered variant.
+
+    An unregistered variant returns ``None`` rather than being guessed at, so a run carrying a
+    trailing qualifier (``_zscore``, ``_quantile``, ``_knowndef-<defense>``) stays out of the
+    comparable set exactly as it did before -- those qualify a run rather than name a method, and
+    ``run_clustering.py`` deliberately appends them after the variant.
     """
     for dataset in DATASETS:
         if not name.startswith(f"{dataset}_"):
             continue
         remainder = name[len(dataset) + 1:]
         for defense in DEFENSES:
-            if remainder.startswith(f"{defense}_") and remainder[len(defense) + 1:] in FEATURES:
-                return dataset, defense, remainder[len(defense) + 1:]
+            if not remainder.startswith(f"{defense}_"):
+                continue
+            tail = remainder[len(defense) + 1:]
+            for feature in FEATURES:
+                if (tail.startswith(f"{feature}_")
+                        and tail[len(feature) + 1:] in CLUSTERING_VARIANT_LABELS):
+                    return dataset, defense, feature, tail[len(feature) + 1:]
     return None
 
 
@@ -4362,25 +4646,22 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
     """
     if not clustering_dir.exists():
         return []
-    runs, skipped, drawn_elsewhere = [], [], []
+    runs, skipped = [], []
     for directory in sorted(path for path in clustering_dir.iterdir() if path.is_dir()):
         parsed = parse_clustering_run_name(directory.name)
         if parsed is None:
-            # A variant directory is not unrecognised -- it is drawn by `plot_clustering_variants`
-            # instead, because a learned projection cannot share the by_defense figures' panels.
-            # Reporting it as "skipped" alongside a genuine typo sent a reader looking for a
-            # missing figure that was in fact drawn.
-            (drawn_elsewhere if parse_clustering_variant_name(directory.name)
-             else skipped).append(directory.name)
+            skipped.append(directory.name)
             continue
         runs.append(ClusteringRun(*parsed, directory=directory))
-    if drawn_elsewhere:
-        print(f"{len(drawn_elsewhere)} clustering director{'y' if len(drawn_elsewhere) == 1 else 'ies'} "
-              f"drawn by the variants family rather than by_defense: {', '.join(drawn_elsewhere)}")
     if skipped:
         print(f"skipped {len(skipped)} clustering director{'y' if len(skipped) == 1 else 'ies'} "
-              f"whose name is not <dataset>_<defense>_<feature>: {', '.join(skipped)}")
-    return runs
+              f"whose name is not <dataset>_<defense>_<feature>_<variant>: "
+              f"{', '.join(skipped)}")
+    # Sorted so the variants figure's rows come out in vocabulary order whatever the filesystem
+    # hands back, exactly as the old `discover_clustering_variants` did.
+    order = list(CLUSTERING_VARIANT_LABELS)
+    return sorted(runs, key=lambda run: (run.dataset, run.defense, run.feature,
+                                         order.index(run.variant)))
 
 
 #: The author scopes ``run_clustering.py --scopes`` writes into one ``clustering_results.csv``, and
@@ -4388,17 +4669,32 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
 #: scope, into its own subtree.
 #:
 #: **``all`` is spelled by absence in both**, mirroring ``run_clustering.scope_suffix``: it is the
-#: threat model and the headline, so it keeps the paths and the titles it has always had and no
-#: existing figure moves when a scope is added.
+#: threat model and the headline, so it keeps the paths it has always had and no existing figure
+#: moves when a scope is added.
 #:
-#: **The two are never put on one axis, and the heading clause is what stops a reader doing it by
-#: eye across two files.** Each scope is a differently-shaped problem with its own reference
-#: partitions -- the ``unseen`` collection has no single-document authors *at all*, because the
-#: corpus keeps no author with fewer than two documents, so an author absent from the known side
-#: must have at least two inside the test quarter. Its singleton baseline is 0.343 against 0.285 on
-#: WildChat. Raw F is therefore higher on ``unseen`` while the attack is slightly *weaker*; the
-#: comparable quantity is each bar's distance from the grey reference bar beside it, which is why
-#: those bars are on every panel.
+#: **The second field is documentation now, not drawing.** It was the clause a figure's title
+#: ended with, and titles were removed 2026-09-11; the subdirectory is what separates the scopes
+#: today, so a reader tells them apart by the path rather than by a line on the image. It is kept
+#: because it is the wording to reach for if a scope ever has to be visible on the figure again --
+#: as a :func:`panel_note`, which is where per-panel facts belong.
+#:
+#: **The two are never put on one axis.** Each scope is a differently-shaped problem with its own
+#: reference partitions, and the difference is not subtle: **BCubed's floor is a closed form of the
+#: collection's authors-per-document ratio**. The all-singleton partition has precision 1 and
+#: recall ``A / N`` -- the document-weighted mean of ``1 / m_author`` -- so its
+#: ``F = 2(A/N) / (1 + A/N)``, which is 0.343 on ``unseen`` against 0.285 on ``all`` (WildChat;
+#: 0.220 against 0.112 on SWE-chat). Raw F is therefore higher on ``unseen`` while the attack is
+#: slightly *weaker*: ``connected`` gains 0.033 against a floor that gains 0.058, so its margin
+#: falls 0.225 to 0.201. The comparable quantity is each bar's distance from the grey reference bar
+#: beside it, which is why those bars are on every panel.
+#:
+#: **What raises A/N is the loss of the heavy authors, not the absence of singletons.** It is true
+#: that ``unseen`` has no single-document authors -- the corpus keeps no author with fewer than two
+#: documents, so one absent from the known side has at least two inside the test quarter -- but
+#: that mechanism has the wrong sign, and this note used to claim it: a one-document author has
+#: ratio 1.0, far above the 0.166 average, so removing the 537 of them from ``all`` would take the
+#: floor *down* to 0.270. The rise comes from excluding everyone with known-side history, who are
+#: disproportionately the heavy users: mean documents per author 6.01 -> 4.84, max 509 -> 238.
 CLUSTERING_SCOPES = {
     "all": ("", ""),
     "unseen": ("unseen", ", authors with no known-side history"),
@@ -4438,7 +4734,11 @@ def clustering_results(run: ClusteringRun, scope: str = "all") -> pd.DataFrame:
 
 
 def clustering_style(name: str) -> str:
-    """Colour for one clustering algorithm, fixed by its position in :data:`CLUSTERING_ALGORITHMS`."""
+    """Colour for one clustering algorithm, fixed by its position in :data:`CLUSTERING_ALGORITHMS`.
+
+    The **registry**, not :data:`CLUSTERING_DRAWN_ALGORITHMS`: an algorithm keeps the hue it has
+    always had whether or not today's figures draw it, and a retirement moves nobody.
+    """
     return series_style(CLUSTERING_ALGORITHM_SLOTS[name])
 
 
@@ -4484,7 +4784,7 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     a defended run answers is how far its bars fall from the undefended panel's. ``runs`` is one
     feature's, which is what makes "one panel per defense" a well-defined statement.
     """
-    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    subdirectory = CLUSTERING_SCOPES[scope][0]
     defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])]
     tables = {run.defense: clustering_results(run, scope) for run in runs}
     panels = [defense for defense in defenses if not tables[defense].empty]
@@ -4500,10 +4800,11 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     # on it would leave dead space no reader could account for.
     tallest = max(value for defense in panels
                   for _, value in clustering_scores(
-                      tables[defense], CLUSTERING_ALGORITHMS + CLUSTERING_BASELINES, "bcubed_f"))
+                      tables[defense],
+                      CLUSTERING_DRAWN_ALGORITHMS + CLUSTERING_BASELINES, "bcubed_f"))
     for axes, defense in zip(axes_list[0], panels):
         table = tables[defense]
-        measured = clustering_scores(table, CLUSTERING_ALGORITHMS, "bcubed_f")
+        measured = clustering_scores(table, CLUSTERING_DRAWN_ALGORITHMS, "bcubed_f")
         reference = clustering_scores(table, CLUSTERING_BASELINES, "bcubed_f")
         # The two groups share one categorical axis with a gap between them, rather than two axes
         # or two figures: they are the same measure on the same collection, and comparing them is
@@ -4520,13 +4821,13 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
             # On the cap, in text ink rather than the bar's colour: the bar carries identity, the
             # number is text. Eight bars is few enough to label every one.
             axes.text(position, value + 0.012, f"{value:.3f}", ha="center", va="bottom",
-                      fontsize=7.5, color=TEXT_SECONDARY)
+                      fontsize=FONT_ANNOTATION, color=TEXT_SECONDARY)
 
         style_axes(axes, "", "BCubed F" if defense == panels[0] else "",
                    DEFENSE_LABELS[defense])
         axes.set_xticks(positions)
         axes.set_xticklabels([CLUSTERING_LABELS[name] for name, _ in measured + reference],
-                             rotation=30, ha="right", fontsize=8)
+                             rotation=30, ha="right", fontsize=FONT_TICK)
         axes.set_xlim(-0.7, positions[-1] + 0.7)
         # Headroom for the value labels on the caps, the panel note and the legend, which all
         # live in the band above the tallest bar. Taken from the tallest bar in the *figure* and
@@ -4546,15 +4847,22 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
             "bcubed_f": values,
             "is_reference": [False] * len(measured) + [True] * len(reference)}))
 
-    # One legend entry, on the last panel: the algorithms are named on the ticks, so all the
-    # legend has to say is what the grey means -- that those bars are not an attack.
-    add_legend(axes_list[0][-1],
-               handles=[plt.Rectangle((0, 0), 1, 1, color=TEXT_MUTED,
-                                      alpha=CLUSTERING_BASELINE_ALPHA)],
-               labels=["Reference partition"], loc="upper right")
-    figure.tight_layout(rect=(0, 0, 1, figure_heading(
-        figure, f"{DATASET_LABELS[dataset]}: author clustering under "
-                f"{FEATURE_LABELS[feature]}, BCubed F by algorithm{clause}")))
+    # One legend entry -- the algorithms are named on the ticks, so all the legend has to say is
+    # what the grey means: that those bars are not an attack.
+    #
+    # **Below the whole figure, not inside the last panel** (moved 2026-09-11). It used to sit at
+    # that panel's upper right, facing the panel note at the upper left, and the two fitted only
+    # while both were small: at the larger `FONT_ANNOTATION`/`FONT_LEGEND` the legend ran straight
+    # through "997 docs / 59 authors". A panel here is one fifth of the figure, so there is no
+    # in-axes corner wide enough for a legend beside a note -- the strip below is, and it also
+    # stops the legend belonging to one defense's panel when it describes all of them. The strip
+    # is measured in inches over the figure height, exactly as `finish_facets` does it, because a
+    # legend is a fixed physical size.
+    figure.legend([plt.Rectangle((0, 0), 1, 1, color=TEXT_MUTED,
+                                 alpha=CLUSTERING_BASELINE_ALPHA)],
+                  ["Reference partition"], loc="lower center", bbox_to_anchor=(0.5, 0.005),
+                  frameon=False, fontsize=FONT_LEGEND, labelcolor=TEXT_PRIMARY)
+    figure.tight_layout(rect=(0, 0.5 / figure.get_size_inches()[1], 1, 1))
 
     stem = output_dir / subdirectory / "bcubed" / "by_defense" / feature
     stem.parent.mkdir(parents=True, exist_ok=True)
@@ -4562,8 +4870,16 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     return [save_figure(figure, stem)]
 
 
+#: The variant whose points are drawn *beside* the pure-text ones on the timing figure, and the
+#: fill that tells them apart. The pair is ``plain`` -> ``time``: the same graph with elapsed time
+#: fused into the edge score, which is the one variant that changes what is measured rather than
+#: how the space is learned, so the two are the same method on two edge definitions.
+TIMING_VARIANT = "time"
+
+
 def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[ClusteringRun],
-                                     output_dir: Path, scope: str = "all") -> list[Path]:
+                                     output_dir: Path, scope: str = "all",
+                                     timing: list[ClusteringRun] | None = None) -> list[Path]:
     """Each algorithm as one point in BCubed precision x recall, marker shape per defense.
 
     The figure that makes the trade legible, and that F alone hides: a method can buy precision by
@@ -4571,52 +4887,111 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     a recall equal to the mean of 1/|documents by that author|). HDBSCAN sits near it -- very high
     precision, low recall, because it leaves documents as noise -- and connected components at the
     opposite corner. Colour carries the algorithm, so it still follows the entity; shape carries
-    the defense.
+    the defense; **size carries nothing** -- see :data:`MARKER_SIZE_SCALE`, which is what makes
+    that true across shapes.
+
+    ``timing`` turns this into the figure's second form, at ``precision_recall/timing/``: the same
+    plot with each method's :data:`TIMING_VARIANT` run drawn beside its pure-text one, **hollow**
+    (the surface showing through a coloured outline), and a segment joining the pair. Fill becomes
+    a fourth channel and it is the right one for this: the two points are the *same* algorithm
+    under the *same* defense, so they must share colour and shape, and what the reader wants is
+    the vector between them -- which way timing moved that method, and how far. The segment is
+    drawn in the algorithm's colour under both marks, so a pair reads as one object.
+
+    The dashed iso-F contours (:data:`CLUSTERING_ISO_F_LEVELS`) are the frame of reference, each
+    labelled with its level where it leaves the right-hand edge: two points on one contour scored
+    the same F with different trades, and a point between two contours can be read off them.
     """
-    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    subdirectory = CLUSTERING_SCOPES[scope][0]
     tables = {run.defense: clustering_results(run, scope) for run in runs}
     defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])
                 if not tables[run.defense].empty]
     if not defenses:
         return []
-    markers = dict(zip(defenses, ("o", "s", "^", "D", "v", "P")))
+    # A defense with no timing run simply draws its pure-text point alone, which is the honest
+    # reading -- there is no pair to show a direction for.
+    fused = {run.defense: clustering_results(run, scope) for run in (timing or [])}
+    fused = {defense: table for defense, table in fused.items() if not table.empty}
+    if timing is not None and not fused:
+        return []
+    # Shape per defense, from the cross-figure registry rather than from this figure's running
+    # order -- see `defense_markers`. It is what lets a reader carry a mark from one corpus's
+    # figure to the other's.
+    markers = defense_markers(defenses)
 
-    figure, axes = plt.subplots(figsize=(5.8, 5.2))
+    # Sized so the legend block clears the data. The legend is a **fixed physical size** (1.82 in
+    # wide at `FONT_LEGEND`, set by its longest label) while the axes scale with the figure, so the
+    # question is what fraction of the plot it covers: at the old (5.8, 5.2) the square axes came
+    # out 3.89 in and the block took 47% of it, putting its left edge at recall 0.543 -- on top of
+    # Leiden at 0.547. At (6.6, 5.9) the axes is 4.41 in, the block is 41%, and its edge sits at
+    # 0.599 against data reaching 0.547 on SWE-chat and 0.493 on WildChat.
+    #
+    # **The timing form needs more**, because its third legend block is taller *and* its points
+    # reach further right: SWE-chat's HDBSCAN pairs run out to recall 0.692 at precision 0.299,
+    # under where the block used to end. Measured over both corpora, (7.6, 6.9) puts the block's
+    # bottom edge at precision 0.390 (0.432 on WildChat) with nothing inside any of the three
+    # boxes; (7.2, 6.5) also clears but by 0.05 rather than 0.09.
+    #
+    # **What would break either is a longer defense label, not another one**: rows add height, and
+    # the width is the longest label. A future `styleremix_openanon` arm would want re-measuring.
+    figure, axes = plt.subplots(figsize=(7.6, 6.9) if fused else (6.6, 5.9))
     figure.patch.set_facecolor(SURFACE)
 
-    # Markers are drawn OPEN (no fill), and that is load-bearing rather than a style choice. The
+    # Markers are **solid and all one size** (2026-09-11, on request). Both were the other way
+    # round before, and the reason is worth keeping because it is what this now trades away: the
     # defenses land almost on top of each other -- WildChat's base and openanonymity differ by
-    # 0.005 in precision and 0.003 in recall -- so a filled marker with the usual opaque surface
-    # ring completely erased whichever arm was drawn first. The undefended `base` series vanished
-    # from the figure *because* OpenAnonymity barely moves the result, which is the finding the
-    # figure exists to show. Open outlines overlap legibly instead of occluding.
+    # 0.005 in precision and 0.003 in recall -- and open outlines of stepped sizes let a
+    # coincident pair read as nested rings, where solid marks of one size occlude each other
+    # completely. **A defense that barely moves the result can now hide under the arm it barely
+    # moved.** The mitigations if that bites: a jitter, a small alpha, or the old ladder back.
     #
-    # Sizes step down in defense order so a coincident pair reads as nested outlines rather than
-    # one thick one. That double-encodes the defense (shape already carries it), which is
-    # deliberate: redundant encoding costs nothing here and is what makes near-ties readable.
+    # Size carries nothing now, which is the gain: shape means defense, colour means algorithm,
+    # and `MARKER_SIZE_SCALE` evens the shapes out so a square does not read as a bigger result
+    # than the triangle beside it.
     rows = []
-    for index, defense in enumerate(defenses):
+    for defense in defenses:
         table = tables[defense]
-        for name, _ in clustering_scores(table, CLUSTERING_ALGORITHMS, "bcubed_f"):
+        marker = markers[defense]
+        size = CLUSTERING_PR_MARKER_SIZE * MARKER_SIZE_SCALE[marker]
+        for name, _ in clustering_scores(table, CLUSTERING_DRAWN_ALGORITHMS, "bcubed_f"):
             row = table[table["algorithm"] == name]
             recall, precision = float(row["bcubed_recall"].iloc[0]), \
                 float(row["bcubed_precision"].iloc[0])
-            axes.plot(recall, precision, marker=markers[defense],
-                      markersize=MARKER_SIZE + 4 - 1.5 * index, markerfacecolor="none",
-                      markeredgecolor=clustering_style(name), markeredgewidth=1.8,
-                      linestyle="none", zorder=4)
-            rows.append({"defense": defense, "algorithm": name, "bcubed_recall": recall,
-                         "bcubed_precision": precision,
+            colour = clustering_style(name)
+            pair = fused.get(defense, pd.DataFrame())
+            pair = pair[pair["algorithm"] == name] if not pair.empty else pair
+            if not pair.empty:
+                # Segment first, so both marks sit on top of it and the pair reads as one object.
+                fused_recall = float(pair["bcubed_recall"].iloc[0])
+                fused_precision = float(pair["bcubed_precision"].iloc[0])
+                axes.plot([recall, fused_recall], [precision, fused_precision], color=colour,
+                          linewidth=1.2, alpha=0.55, solid_capstyle="round", zorder=3)
+                # Hollow: the surface shows through, so the outline is the whole mark and the two
+                # ends of a pair are told apart by fill alone -- same colour, same shape.
+                axes.plot(fused_recall, fused_precision, marker=marker, markersize=size,
+                          markerfacecolor=SURFACE, markeredgecolor=colour, markeredgewidth=1.6,
+                          linestyle="none", zorder=4)
+                rows.append({"defense": defense, "algorithm": name,
+                             "variant": TIMING_VARIANT, "bcubed_recall": fused_recall,
+                             "bcubed_precision": fused_precision,
+                             "bcubed_f": float(pair["bcubed_f"].iloc[0]), "is_reference": False})
+            axes.plot(recall, precision, marker=marker, markersize=size,
+                      color=colour, markeredgewidth=0, linestyle="none", zorder=4)
+            rows.append({"defense": defense, "algorithm": name, "variant": PLAIN_VARIANT,
+                         "bcubed_recall": recall, "bcubed_precision": precision,
                          "bcubed_f": float(row["bcubed_f"].iloc[0]), "is_reference": False})
 
     # Offsets chosen per baseline rather than shared: all three sit against an edge of the unit
     # square, and a single offset direction pushes at least one of them into the data. Singletons
-    # are at precision 1.0 (top edge, beside the high-precision methods), one cluster at recall
-    # 1.0 (right edge), random near the origin corner.
-    offsets = {"baseline_singleton": (-8, 6), "baseline_single_cluster": (-8, 8),
-               "baseline_random": (8, 6)}
-    alignment = {"baseline_singleton": "right", "baseline_single_cluster": "right",
-                 "baseline_random": "left"}
+    # are at precision 1.0 (top edge) and random sits alone near the origin corner, so both take
+    # their label **centred directly above the mark** (2026-09-11, on request) -- nothing sits
+    # above either, and centred is what reads as "this label belongs to this point". One cluster
+    # is the exception: it is pinned to the right edge at recall 1.0, where a centred label would
+    # run off the figure, so it keeps its corner offset.
+    offsets = {"baseline_singleton": (0, 8), "baseline_single_cluster": (-8, 8),
+               "baseline_random": (0, 8)}
+    alignment = {"baseline_singleton": "center", "baseline_single_cluster": "right",
+                 "baseline_random": "center"}
     base = tables[defenses[0]]
     for name, _ in clustering_scores(base, CLUSTERING_PR_BASELINES, "bcubed_f"):
         row = base[base["algorithm"] == name]
@@ -4625,150 +5000,131 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
         axes.plot(recall, precision, marker="x", markersize=MARKER_SIZE, color=TEXT_MUTED,
                   linestyle="none", zorder=3)
         axes.annotate(CLUSTERING_LABELS[name], (recall, precision), textcoords="offset points",
-                      xytext=offsets[name], ha=alignment[name], fontsize=7, color=TEXT_MUTED)
-        rows.append({"defense": defenses[0], "algorithm": name, "bcubed_recall": recall,
-                     "bcubed_precision": precision, "bcubed_f": float(row["bcubed_f"].iloc[0]),
-                     "is_reference": True})
+                      xytext=offsets[name], ha=alignment[name], fontsize=FONT_ANNOTATION,
+                      color=TEXT_MUTED)
+        rows.append({"defense": defenses[0], "algorithm": name, "variant": PLAIN_VARIANT,
+                     "bcubed_recall": recall, "bcubed_precision": precision,
+                     "bcubed_f": float(row["bcubed_f"].iloc[0]), "is_reference": True})
 
     # Iso-F contours, so a reader can see which points are equivalent trades rather than guessing.
-    grid = np.linspace(0.01, 1.0, 200)
-    for level in (0.2, 0.4, 0.6, 0.8):
+    # **Dashed and labelled** (2026-09-11, on request): the dash is this file's mark for a line
+    # that is not a measurement, which a contour of the metric's own geometry certainly is not,
+    # and `AXIS` rather than `GRID` because a dashed hairline at the grid's weight disappears --
+    # these carry a number now, so they have to be readable. The label goes where the contour
+    # leaves the axes on the right, at ``p = F / (2 - F)`` (set ``r = 1`` in the contour below),
+    # which is inside the unit square for every level, so every contour gets one.
+    #
+    # **Each contour's own top end is forced into its grid**, and without it the low levels
+    # visibly failed to reach precision 1.0. A contour reaches it at ``r = F / (2 - F)`` and has
+    # its asymptote at ``r = F / 2``, so the whole run from p = 1 down to the first sampled point
+    # is only ``F^2 / (2(2 - F))`` wide -- **quadratic in F**: 0.0026 at F = 0.1 against a grid
+    # step of 0.005, so no sample landed in it at all and the curve began at p = 0.574 (0.92 at
+    # F = 0.3, 0.94 at F = 0.4; F = 0.5 looked right only because its crossing falls 0.0001 from a
+    # sample). Parametrising by precision instead would fix the top and lose the tail; one exact
+    # point costs nothing and puts every contour on the top edge where it belongs.
+    base_grid = np.linspace(0.01, 1.0, 200)
+    for level in CLUSTERING_ISO_F_LEVELS:
+        grid = np.union1d(base_grid, [level / (2 - level)])
         precision = level * grid / (2 * grid - level)
-        usable = (precision > 0) & (precision <= 1.0)
-        axes.plot(grid[usable], precision[usable], color=GRID, linewidth=0.9, zorder=1)
+        # The tolerance is what makes the point above actually land: at F = 0.4 and F = 0.5 the
+        # end point evaluates to 1 + 2e-16 (0.5 - 0.4 is 0.09999999999999998 in binary), so a bare
+        # `<= 1.0` dropped the one sample this exists to add and left those two contours short by
+        # the same 0.06 as before. Clamping the kept values is safe because nothing else comes
+        # within 1e-9 of the top -- the next sample down is at p = 0.94.
+        usable = (precision > 0) & (precision <= 1.0 + ISO_F_EDGE_TOLERANCE)
+        axes.plot(grid[usable], np.minimum(precision[usable], 1.0), color=AXIS, linewidth=0.9,
+                  linestyle=BASELINE_DASH, zorder=1)
+        axes.annotate(f"F={level:g}", (1.0, level / (2 - level)), textcoords="offset points",
+                      xytext=(5, 0), ha="left", va="center", fontsize=FONT_ANNOTATION,
+                      color=TEXT_MUTED,
+                      annotation_clip=False)   # the label sits outside the axes, by design
 
-    style_axes(axes, "BCubed recall", "BCubed precision",
-               f"{DATASET_LABELS[dataset]}: the precision/recall trade under "
-               f"{FEATURE_LABELS[feature]}{clause}")
+    style_axes(axes, "BCubed recall", "BCubed precision", "")
     # A hair past the unit square on both axes: the one-cluster reference sits at recall exactly
     # 1.0 and the singleton one at precision exactly 1.0, so a hard limit halves both markers.
     axes.set_xlim(0, 1.02)
     axes.set_ylim(0, 1.05)
+    # **One unit of recall is one unit of precision.** Both axes span [0, 1], so without this the
+    # box is whatever shape `figsize` leaves after the labels -- 4.50 x 4.00 in, stretching x by
+    # 15% and rendering the unit square as a landscape rectangle. That is not cosmetic here: the
+    # iso-F contours are curves in the P x R plane and a reader judges a point by how far it sits
+    # from the top-right corner, both of which an unequal scale distorts. `figsize` was chosen
+    # when the legend sat below the axes and its strip made up the height.
+    axes.set_aspect("equal", adjustable="box")
 
     # **Two legends, one per channel**, the same construction and for the same reason as the
     # cross-dataset scaling figures: a reader needs both to decode one marker, and a single list
-    # mixing them reads as one vocabulary -- with the defenses' neutral-ink circles filed under the
-    # algorithms' colours, "No defense" looks like a fifth algorithm.
+    # mixing them reads as one vocabulary -- with the defenses' neutral-ink marks filed under the
+    # algorithms' colours, "No defense" looks like another algorithm.
     #
-    # The keys must match the marks exactly -- open outlines, and the same size ladder -- or a
-    # reader matching a nested pair back to the legend gets the wrong defense.
-    drawn = {name for name in CLUSTERING_ALGORITHMS
+    # The keys must match the marks exactly -- solid, and through the same per-shape size
+    # correction -- or a reader matching a mark back to the legend gets the wrong defense.
+    drawn = {name for name in CLUSTERING_DRAWN_ALGORITHMS
              if any(not tables[defense][tables[defense]["algorithm"] == name].empty
                     for defense in defenses)}
-    by_algorithm = [plt.Line2D([], [], marker="o", linestyle="none", markersize=MARKER_SIZE + 4,
-                               markerfacecolor="none", markeredgecolor=clustering_style(name),
-                               markeredgewidth=1.8, label=CLUSTERING_LABELS[name])
-                    for name in CLUSTERING_ALGORITHMS if name in drawn]
+    by_algorithm = [plt.Line2D([], [], marker="o", linestyle="none",
+                               markersize=CLUSTERING_PR_MARKER_SIZE * MARKER_SIZE_SCALE["o"],
+                               color=clustering_style(name), markeredgewidth=0,
+                               label=CLUSTERING_LABELS[name])
+                    for name in CLUSTERING_DRAWN_ALGORITHMS if name in drawn]
     by_defense = [plt.Line2D([], [], marker=markers[defense], linestyle="none",
-                             markersize=MARKER_SIZE + 4 - 1.5 * index, markerfacecolor="none",
-                             markeredgecolor=TEXT_SECONDARY, markeredgewidth=1.8,
+                             markersize=(CLUSTERING_PR_MARKER_SIZE
+                                         * MARKER_SIZE_SCALE[markers[defense]]),
+                             color=TEXT_SECONDARY, markeredgewidth=0,
                              label=DEFENSE_LABELS[defense])
-                  for index, defense in enumerate(defenses)]
-    # Below the axes rather than inside it: the points and the three baseline markers between them
-    # occupy every corner of the unit square, so any in-axes placement sits on top of data.
-    first = add_legend(axes, handles=by_algorithm, ncol=2, title="Algorithm",
-                       loc="upper center", bbox_to_anchor=(0.5, -0.11))
-    # A second `.legend()` call on an axes *replaces* the first, so the first has to be adopted
-    # explicitly; the anchor is measured off it because its height grows a row per algorithm.
+                  for defense in defenses]
+    # **Inside the axes, top right** (2026-09-11, on request), one column each and Algorithm above
+    # Defense. That corner is the one place a precision/recall figure is reliably empty: it is high
+    # precision *and* high recall at once, which is the ideal no partition here comes near -- the
+    # best F on either corpus is ~0.57. The three baselines occupy the other three corners, which
+    # is why the block was under the axes before.
+    first = add_legend(axes, handles=by_algorithm, ncol=1, title="Algorithm",
+                       loc="upper right", bbox_to_anchor=(0.995, 0.995))
+    # A second `.legend()` call on an axes *replaces* the first, so each block has to be adopted
+    # explicitly; every anchor is measured off the block above it, because their heights grow a
+    # row per entry and none of them is known before the figure has been laid out once.
     axes.add_artist(first)
-    add_legend(axes, handles=by_defense, ncol=2, title="Defense", loc="upper center",
-               bbox_to_anchor=tuple(stack_below(figure, axes, first)),
-               borderaxespad=0.0)  # honour the measured anchor instead of re-padding off it
+    second = add_legend(axes, handles=by_defense, ncol=1, title="Defense", loc="upper center",
+                        bbox_to_anchor=tuple(stack_below(figure, axes, first)),
+                        borderaxespad=0.0)  # honour the measured anchor, do not re-pad off it
+    if fused:
+        # The fill channel needs naming or the hollow marks are unexplained. Neutral ink, like the
+        # shape keys: this block is about how a mark is drawn, not about any one algorithm.
+        axes.add_artist(second)
+        by_variant = [
+            plt.Line2D([], [], marker="o", linestyle="none", color=TEXT_SECONDARY,
+                       markersize=CLUSTERING_PR_MARKER_SIZE * MARKER_SIZE_SCALE["o"],
+                       markeredgewidth=0, label=CLUSTERING_VARIANT_LABELS[PLAIN_VARIANT]),
+            plt.Line2D([], [], marker="o", linestyle="none", markerfacecolor=SURFACE,
+                       markersize=CLUSTERING_PR_MARKER_SIZE * MARKER_SIZE_SCALE["o"],
+                       markeredgecolor=TEXT_SECONDARY, markeredgewidth=1.6,
+                       label=CLUSTERING_VARIANT_LABELS[TIMING_VARIANT])]
+        add_legend(axes, handles=by_variant, ncol=1, title="Edge score", loc="upper center",
+                   bbox_to_anchor=tuple(stack_below(figure, axes, second)), borderaxespad=0.0)
 
-    stem = output_dir / subdirectory / "precision_recall" / "by_algorithm" / feature
+    stem = (output_dir / subdirectory / "precision_recall"
+            / ("timing" if fused else "by_algorithm") / feature)
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
 
 
-#: Directory suffixes a variant run carries after ``<dataset>_<defense>_<feature>``, mapped to the
-#: label the figure prints. ``run_clustering.py`` appends one part per non-default scope choice
-#: (``--projection``, ``--rescoring``, ``--threshold-mode``), so the suffix *is* the strategy.
-#: Order fixes the row order on the figure, and it is the order the strategies were developed in:
-#: the baseline first, then what was added to it.
-#: Row label for the plain three-part run drawn beside the variants -- the method as it stood
-#: before any of them, searched over absolute distance thresholds.
-BASELINE_VARIANT_LABEL = "Baseline (absolute search)"
-
-CLUSTERING_VARIANTS = (
-    # Order is the figure's row order, and it is the order the ideas were built in: the controls
-    # first, then what was added, then the combination. Timing-only leads because it is the
-    # reference every timing-fused row has to be read against -- it reads no text at all.
-    ("time1_quantile", "Timing only (no text)"),
-    ("quantile", "Baseline (quantile search)"),
-    ("lda", "LDA projection"),
-    ("wccn_csls", "WCCN + CSLS"),
-    ("wccn_local_scaling", "WCCN + local scaling"),
-    ("time0.45_quantile", "Baseline + timing"),
-    ("time0.5_quantile", "Baseline + timing"),
-    ("contrastive", "Contrastive projection"),
-    ("contrastive_time0.45", "Contrastive + timing"),
-)
+#: Row label for the pure-text run drawn beside the variants -- the method with nothing applied
+#: to its graph, which is what every other row has to be read against.
+BASELINE_VARIANT_LABEL = CLUSTERING_VARIANT_LABELS[PLAIN_VARIANT]
 
 
-@dataclass(frozen=True)
-class ClusteringVariant:
-    """One clustering run that varies the *representation* rather than the defense or feature.
-
-    :class:`ClusteringRun`'s sibling for the directories ``parse_clustering_run_name``
-    deliberately refuses. Those four- and five-part names are not a defect: a run with a learned
-    projection is not comparable to a base run on the ``by_defense`` figures, whose panels key on
-    defense and would collide (every one of these is ``base``). They get their own family instead,
-    where the strategy is the axis rather than a contaminant.
-    """
-
-    dataset: str
-    variant: str
-    directory: Path
-
-    @property
-    def label(self) -> str:
-        return dict(CLUSTERING_VARIANTS)[self.variant]
-
-
-def parse_clustering_variant_name(name: str) -> tuple[str, str] | None:
-    """``(dataset, variant)`` for a variant directory, or ``None``.
-
-    Same defense/feature disambiguation as :func:`parse_clustering_run_name` -- every part may
-    contain an underscore, so the split is by matching known vocabulary rather than by ``_`` --
-    and then the remainder has to be a registered variant suffix. An unrecognised suffix returns
-    ``None`` rather than being guessed at, so a typo in a directory name is a skipped figure and
-    not a mislabelled series.
-    """
-    variants = dict(CLUSTERING_VARIANTS)
-    for dataset in DATASETS:
-        if not name.startswith(f"{dataset}_"):
-            continue
-        remainder = name[len(dataset) + 1:]
-        for defense in DEFENSES:
-            if not remainder.startswith(f"{defense}_"):
-                continue
-            tail = remainder[len(defense) + 1:]
-            for feature in FEATURES:
-                if tail == feature:
-                    return None                      # a plain three-part run, not a variant
-                if tail.startswith(f"{feature}_") and tail[len(feature) + 1:] in variants:
-                    return dataset, tail[len(feature) + 1:]
-    return None
-
-
-def discover_clustering_variants(clustering_dir: Path) -> list[ClusteringVariant]:
-    """Every variant directory under the clustering root, in :data:`CLUSTERING_VARIANTS` order."""
-    if not clustering_dir.exists():
-        return []
-    found = []
-    for directory in sorted(path for path in clustering_dir.iterdir() if path.is_dir()):
-        parsed = parse_clustering_variant_name(directory.name)
-        if parsed is not None:
-            found.append(ClusteringVariant(*parsed, directory=directory))
-    order = [name for name, _ in CLUSTERING_VARIANTS]
-    return sorted(found, key=lambda run: (run.dataset, order.index(run.variant)))
-
-
-def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
+def plot_clustering_variants(dataset: str, defense: str, runs: list[ClusteringRun],
                              base: ClusteringRun | None, output_dir: Path,
                              scope: str = "all") -> list[Path]:
     """Tuning-slice against test-slice BCubed F, one row per representation strategy.
+
+    **One figure per (dataset, defense).** The variant directories used to be parsed without their
+    defense, so every defended run of one corpus collapsed onto the same key and would have drawn
+    several identically-labelled rows on one figure. The four-part name carries the defense, so
+    the figure holds it fixed -- in its file name, since no figure here carries a title -- and
+    each defense's variants are read against the pure-text run of *that* defense rather than
+    against the undefended one.
 
     **The gap between the two dots is the finding, not the level of either.** Each strategy was
     selected by searching a labelled tuning slice, so its tuning score is the number that decided
@@ -4784,12 +5140,12 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
     per row make that a subtraction done by eye. Rows are ordered by the strategy vocabulary, not
     by score, so a strategy sits in the same place on both corpora's figures.
     """
-    # The plain three-part base run belongs on this figure as a row, not as an absent reference:
-    # it writes the same two columns from the same file, and on swe-chat it BEATS two of the three
-    # strategies -- a fact that is invisible if the figure only draws what was added to it.
-    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    # The pure-text run belongs on this figure as a row, not as an absent reference: it writes the
+    # same two columns from the same file, and on swe-chat it BEATS two of the three strategies --
+    # a fact that is invisible if the figure only draws what was added to it.
+    subdirectory = CLUSTERING_SCOPES[scope][0]
     candidates = ([(BASELINE_VARIANT_LABEL, base)] if base is not None else []) + \
-                 [(run.label, run) for run in runs]
+                 [(run.variant_label, run) for run in runs]
     rows, drawn = [], []
     for label, run in candidates:
         table = clustering_results(run, scope)
@@ -4799,8 +5155,8 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
         if not np.isfinite(record.get("tuning_bcubed_f", float("nan"))):
             continue
         drawn.append((label, float(record["tuning_bcubed_f"]), float(record["bcubed_f"])))
-        rows.append({"dataset": dataset,
-                     "variant": getattr(run, "variant", "absolute"), "label": label,
+        rows.append({"dataset": dataset, "defense": defense,
+                     "variant": run.variant, "label": label,
                      "algorithm": "connected",
                      "tuning_bcubed_f": float(record["tuning_bcubed_f"]),
                      "test_bcubed_f": float(record["bcubed_f"]),
@@ -4819,6 +5175,14 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
     for position, (_, tuning, test) in zip(positions, drawn):
         axes.plot([test, tuning], [position, position], color=TEXT_MUTED, linewidth=2.0,
                   zorder=1, solid_capstyle="round")
+        # An arrowhead at the midpoint, pointing train -> test (2026-09-11, on request). A dumbbell
+        # says how far the two scores are apart but not which way round they are, and here the
+        # direction IS the finding: a head pointing left is a strategy that lost what the search
+        # credited it with. It rides on the connector in the connector's own ink -- the endpoint
+        # colours are the two slices, and a third colour here would read as a third quantity.
+        axes.plot([(tuning + test) / 2], [position], marker=">" if test > tuning else "<",
+                  markersize=MARKER_SIZE * MARKER_SIZE_SCALE[">"], color=TEXT_MUTED,
+                  markeredgewidth=0, zorder=2)
         # Surface ring on both marks: they overlap the connector and, on a small gap, each other.
         for value, colour in ((tuning, tuning_colour), (test, test_colour)):
             axes.plot([value], [position], marker="o", markersize=MARKER_SIZE + 2,
@@ -4826,7 +5190,8 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
         # Direct-label the TEST value only. Labelling both would put a number on every mark, and
         # the test number is the one a reader takes away.
         axes.annotate(f"{test:.3f}", (test, position), textcoords="offset points",
-                      xytext=(0, -15), ha="center", color=TEXT_PRIMARY, fontsize=8.5)
+                      xytext=(0, -15), ha="center", color=TEXT_PRIMARY,
+                      fontsize=FONT_ANNOTATION)
 
     axes.set_yticks(positions, [label for label, _, _ in drawn])
     axes.tick_params(axis="y", length=0)
@@ -4844,14 +5209,14 @@ def plot_clustering_variants(dataset: str, runs: list[ClusteringVariant],
                    color=tuning_colour, markeredgecolor=SURFACE, markeredgewidth=2.0),
         plt.Line2D([], [], marker="o", linestyle="none", markersize=MARKER_SIZE + 2,
                    color=test_colour, markeredgecolor=SURFACE, markeredgewidth=2.0)],
-        labels=["Tuning slice (selected on)", "Test slice (held out)"],
+        labels=["Train", "Test"],
         loc="lower left", bbox_to_anchor=(0.0, 1.005), ncol=2, borderaxespad=0.0,
         handletextpad=0.4, columnspacing=1.6)
-    figure.tight_layout(rect=(0, 0, 1, figure_heading(
-        figure, f"{DATASET_LABELS[dataset]}: tuning-slice score against held-out "
-                f"test score{clause}")))
+    figure.tight_layout()
 
-    stem = output_dir / subdirectory / "variants" / "tuning_vs_test"
+    # The defense is in the file name, which is the only place it is now: one figure per
+    # (dataset, defense), so two defenses' variants cannot land on one path and overwrite it.
+    stem = output_dir / subdirectory / "variants" / f"{defense}_tuning_vs_test"
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
@@ -4871,14 +5236,14 @@ def plot_clustering_exposure(run: ClusteringRun, output_dir: Path,
     One figure per run rather than a defense comparison, for the reason :data:`PER_RUN_FAMILIES`
     gives: the series here are the algorithms, so there is no axis left for a view to vary.
     """
-    subdirectory, clause = CLUSTERING_SCOPES[scope]
+    subdirectory = CLUSTERING_SCOPES[scope][0]
     suffix = clustering_scope_suffix(scope)
     figure, axes = plt.subplots(figsize=(6.2, 4.4))
     figure.patch.set_facecolor(SURFACE)
     percentiles = EXPOSURE_GRID
     rows = []
 
-    for name in CLUSTERING_ALGORITHMS:
+    for name in CLUSTERING_DRAWN_ALGORITHMS:
         path = run.directory / f"author_report_{name}{suffix}.csv"
         if not path.exists():
             continue
@@ -4893,9 +5258,7 @@ def plot_clustering_exposure(run: ClusteringRun, output_dir: Path,
         return []
 
     style_axes(axes, "Author percentile, ordered by how much was reassembled",
-               "Share of the author's documents in one cluster",
-               f"{DATASET_LABELS[run.dataset]}: per-author reassembly. "
-               f"{run.defense_label}, {run.feature_label}{clause}")
+               "Share of the author's documents in one cluster", "")
     axes.set_ylim(0, 1.02)
     add_legend(axes, loc="upper left", title="Algorithm")
     figure.tight_layout()
@@ -4912,7 +5275,7 @@ def plot_clustering_exposure(run: ClusteringRun, output_dir: Path,
 # a run. They now live here, rebuilt from the same CSVs, so that the runners only produce numbers
 # and every figure in the project comes from one place.
 
-def plot_config_cmc(cmc: pd.DataFrame, title: str, stem: Path) -> Path:
+def plot_config_cmc(cmc: pd.DataFrame, stem: Path) -> Path:
     """One run's CMC curves, one line per known configuration -- the whole-future detail view.
 
     Unlike the comparison figures this reads ``cmc_results.csv``, which each configuration wrote
@@ -4936,7 +5299,7 @@ def plot_config_cmc(cmc: pd.DataFrame, title: str, stem: Path) -> Path:
                   label=config.label if config else str(tag))
         axes.plot(group["k"], group["random"], color=TEXT_MUTED, linewidth=1.0,
                   linestyle=BASELINE_DASH, alpha=0.6, zorder=2)
-    style_axes(axes, "k (candidate authors returned)", "Top-k accuracy", title)
+    style_axes(axes, "k (candidate authors returned)", "Top-k accuracy", "")
     axes.set_xscale("log")
     axes.set_ylim(0, 1.02)
     add_legend(axes, loc="upper left", ncols=2)
@@ -4944,7 +5307,7 @@ def plot_config_cmc(cmc: pd.DataFrame, title: str, stem: Path) -> Path:
     return save_figure(figure, stem)
 
 
-def plot_pool_growth(sweep: pd.DataFrame, top_k: int, title: str, stem: Path) -> Path:
+def plot_pool_growth(sweep: pd.DataFrame, top_k: int, stem: Path) -> Path:
     """Identity accuracy against the number of target users, one point per known configuration.
 
     Each point is a real experiment, and the pool grows because the known side does. Solid is the
@@ -4966,16 +5329,16 @@ def plot_pool_growth(sweep: pd.DataFrame, top_k: int, title: str, stem: Path) ->
         if config is not None:
             axes.annotate(config.tag[len("known"):], (row["n_identities"], row["id_acc"]),
                           textcoords="offset points", xytext=(0, 9), ha="center",
-                          fontsize=7.5, color=TEXT_MUTED)
-    style_axes(axes, "Target users on the unknown side", f"Top-{top_k} identification accuracy",
-               title)
+                          fontsize=FONT_ANNOTATION, color=TEXT_MUTED)
+    style_axes(axes, "Target users on the unknown side",
+               f"Top-{top_k} identification accuracy", "")
     axes.set_ylim(bottom=0)
     add_legend(axes, loc="best")  # the lines can sit anywhere in the frame; let it find the gap
     figure.tight_layout()
     return save_figure(figure, stem)
 
 
-def plot_topk_bars(headline: pd.DataFrame, title: str, stem: Path) -> Path:
+def plot_topk_bars(headline: pd.DataFrame, stem: Path) -> Path:
     """Identity accuracy against the random baseline at each measured k, as paired bars.
 
     ``headline`` needs the columns ``top``, ``id_acc`` and ``random_id``.
@@ -4993,9 +5356,9 @@ def plot_topk_bars(headline: pd.DataFrame, title: str, stem: Path) -> Path:
     for position, value in zip(positions, headline["id_acc"]):
         axes.annotate(f"{value:.3f}", (position - (width + gap) / 2, value),
                       textcoords="offset points", xytext=(0, 4), ha="center",
-                      color=TEXT_SECONDARY, fontsize=8.5)
+                      color=TEXT_SECONDARY, fontsize=FONT_ANNOTATION)
     axes.set_xticks(positions, [f"top-{int(k)}" for k in headline["top"]])
-    style_axes(axes, "", "Identification accuracy", title)
+    style_axes(axes, "", "Identification accuracy", "")
     axes.grid(axis="x", visible=False)
     axes.set_ylim(0, max(headline["id_acc"].max(), headline["random_id"].max()) * 1.12)
     add_legend(axes, loc="upper left")
@@ -5022,7 +5385,8 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
     missing one simply produces fewer figures rather than failing.
     """
     stem_dir = output_dir / "per_run" / run.directory.name
-    written, scope = [], f"{run.defense_label}, {run.method_label}"
+    # The directory is named after the run, which is what the figures' titles used to say.
+    written = []
 
     cmc_path = run.directory / "cmc_results.csv"
     if cmc_path.exists():
@@ -5030,8 +5394,7 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
         if "attack" in cmc.columns:
             cmc = cmc[cmc["attack"] == run.attack]
         if "known_config" in cmc.columns and not cmc.empty:
-            written.append(plot_config_cmc(
-                cmc, f"{DATASET_LABELS[run.dataset]}: {scope}", stem_dir / "cmc_curve"))
+            written.append(plot_config_cmc(cmc, stem_dir / "cmc_curve"))
 
     rolling_path = run.directory / "rolling_results.csv"
     if rolling_path.exists():
@@ -5041,32 +5404,64 @@ def plot_run_detail(run: Run, output_dir: Path, sweep_top_k: int = 1) -> list[Pa
             sweep = rolling.rename(columns={f"id_acc{sweep_top_k}": "id_acc",
                                             f"random_id{sweep_top_k}": "random_id"})
             written.append(plot_pool_growth(
-                sweep, sweep_top_k, f"{DATASET_LABELS[run.dataset]}: {scope}",
-                stem_dir / f"pool_growth_top{sweep_top_k}"))
+                sweep, sweep_top_k, stem_dir / f"pool_growth_top{sweep_top_k}"))
         for _, row in rolling.iterrows():
             headline = rolling_headline(rolling, row)
             if headline.empty or "known_config" not in rolling.columns:
                 continue
-            config = parse_config_tag(str(row["known_config"]))
+            # The configuration is in the file name, which is where it stayed when the title that
+            # spelled it out went.
             written.append(plot_topk_bars(
-                headline,
-                f"{DATASET_LABELS[run.dataset]}: {scope}\n"
-                f"{config.label if config else row['known_config']} → rest",
-                stem_dir / f"topk_accuracy_{row['known_config']}"))
+                headline, stem_dir / f"topk_accuracy_{row['known_config']}"))
 
     return written
 
 
 # --- driver ------------------------------------------------------------------
 
+#: The top-level folders a figure can land in, and the whole vocabulary of ``--families``.
+#:
+#: Derived from :data:`CURVE_TYPES`' own subdirectory strings rather than listed out, for the same
+#: reason the drawing code never spells a path: a family registered there is selectable here with
+#: no edit. ``openset`` therefore names all three of its subfamilies at once (``risk_coverage``,
+#: ``detection``, ``separation``) -- they are one folder in the tree and this flag follows the
+#: tree.
+#:
+#: The four literals are the families with no :data:`CURVE_TYPES` entry, each for a reason stated
+#: elsewhere in this file: ``temporal`` has its own wrappers (one known side, no configuration
+#: grid), ``clustering`` reads :data:`CLUSTERING_DIR` instead of :data:`RESULTS_DIR`, ``per_run``
+#: is the diagnostics tree, and ``cross_dataset`` is the one tree that sits outside a dataset's
+#: folder.
+FIGURE_FAMILIES = tuple(sorted(
+    {folder.split("/")[0] for _, folder, *_rest in CURVE_TYPES.values()}
+    | {"temporal", "clustering", "per_run", "cross_dataset"}))
+
+
+def figure_family(name: str) -> str:
+    """Which of :data:`FIGURE_FAMILIES` a planned figure belongs to, from its name alone.
+
+    A :class:`PlannedFigure`'s name *is* its output path without an extension, so the family is
+    already a segment of it -- the first one below the dataset -- and nothing has to be recorded
+    alongside the plan to recover it.
+
+    ``cross_dataset/`` is read as a family in its own right rather than as the "dataset" of a
+    ``scaling`` figure. Both readings are defensible; this one is what lets the per-corpus scaling
+    figures and the corpus-spanning ones be asked for separately, and it keeps every family a real
+    directory that a reader can point at in ``experiments/plots/``.
+    """
+    head, _, rest = name.partition("/")
+    return head if head == "cross_dataset" else rest.split("/")[0]
+
+
 def parse_args() -> argparse.Namespace:
-    """The one knob this script has: how many bootstrap replicates the bands are drawn from.
+    """How finely the uncertainty is estimated, which figures are drawn, and how fast.
 
     There is no window flag any more, and nothing here chooses what is measured. The experiment
     fixes that: ``run_experiment.py`` holds out the final :data:`TEST_FRACTION` of the corpus
     from every known side, so which documents a comparison is made on is a property of the run
-    rather than a decision taken at plot time. What is left to choose is only how finely the
-    uncertainty is estimated.
+    rather than a decision taken at plot time. What is left to choose is how finely the
+    uncertainty is estimated (``--bootstrap``), how much of the tree is drawn (``--families``,
+    ``--per-run``, ``--png``) and how fast (``--jobs``).
     """
     parser = argparse.ArgumentParser(
         description="Draw every figure in the project from experiments/results/.")
@@ -5092,6 +5487,17 @@ def parse_args() -> argparse.Namespace:
                              "top-k bar figures. Off by default: they are 160 of the 262 figures "
                              "a full sweep writes and none of them compares runs, so they are "
                              "diagnostics rather than results.")
+    parser.add_argument("--families", nargs="+", choices=FIGURE_FAMILIES, metavar="FAMILY",
+                        help=f"Draw only these families and leave the rest of the tree alone. The "
+                             f"names are the folders the figures land in: "
+                             f"{', '.join(FIGURE_FAMILIES)}. 'openset' covers all three of its "
+                             f"subfamilies, 'cross_dataset' is the corpus-spanning tree rather "
+                             f"than a per-corpus 'scaling', and naming 'per_run' implies "
+                             f"--per-run. Unselected figures keep their manifest entries, so a "
+                             f"filtered sweep is a subset of a full one rather than a different "
+                             f"one -- which makes this the flag for redrawing one family after "
+                             f"editing this file, an edit that marks every figure in the tree "
+                             f"stale at once.")
     parser.add_argument("--force", action="store_true",
                         help="Redraw every figure, ignoring the cache. Not needed after editing "
                              "this file (the cache keys on its contents) or after a re-run (they "
@@ -5171,12 +5577,22 @@ class PlannedFigure:
     moment any run of their dataset changes, but neither reads a curve family -- one wants the
     cheap per-run counting modes, the other reads the tables directly. Left at ``None`` it is
     ``runs``, which is the safe reading and what every comparison figure wants.
+
+    ``reads_context`` is the coarser question ``builds`` cannot answer: does this figure read
+    *anything* :func:`build_curves` produces? ``accuracy/macro_micro.pdf`` and
+    ``openset/reach.pdf`` build no curves and still answer yes -- they read its light tier -- while
+    ``per_run/`` and every clustering figure answer no, because they open their own CSVs when they
+    are drawn. Only a ``True`` puts a run into the sweep's ``touched`` set, which is what lets
+    ``--families per_run`` skip a dataset build whose every output it would throw away. Setting it
+    wrongly is not a slow figure but a silently incomplete one, so it is ``True`` by default and
+    turned off only where the drawing closure visibly ignores its ``ctx`` argument.
     """
 
     name: str
     runs: tuple
     build: object
     builds: tuple | None = None
+    reads_context: bool = True
 
     @property
     def needs_curves(self) -> tuple:
@@ -5204,7 +5620,11 @@ class PlotCache:
     def __init__(self, path: Path, settings: str, force: bool = False) -> None:
         self.path, self.settings, self.force = path, settings, force
         self.entries: dict[str, dict] = {}
-        if not force and path.exists():
+        # Loaded even under ``--force``, which suppresses the *check* rather than the memory: the
+        # manifest is rewritten from what this object holds, so discarding it here would make
+        # ``--force --families <one>`` evict every family it did not draw and turn the next full
+        # sweep into a cold one. A full ``--force`` sweep overwrites every entry anyway.
+        if path.exists():
             try:
                 self.entries = json.loads(path.read_text()).get("figures", {})
             except (OSError, ValueError):
@@ -5212,6 +5632,8 @@ class PlotCache:
                 print(f"  {path.name} is unreadable -- redrawing everything")
 
     def is_current(self, figure: PlannedFigure) -> bool:
+        if self.force:
+            return False
         entry = self.entries.get(figure.name)
         if entry is None or entry.get("key") != figure.key(self.settings):
             return False
@@ -5229,6 +5651,10 @@ class PlotCache:
         Pruning is what keeps a figure that no longer exists -- a run deleted, a family retired --
         from sitting in the file forever. The figures it drew are left on disk: this script has
         never deleted a figure and guessing which orphans are wanted is not its job.
+
+        ``planned`` is the **whole** plan even when ``--families`` narrowed what was drawn, which
+        is the invariant that makes that flag a subset of a full sweep: pruning to the selection
+        would evict every family it skipped and make the next full sweep redraw them.
         """
         names = {figure.name for figure in planned}
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -5470,9 +5896,10 @@ def dataset_figure_plan(dataset: str, runs: list[Run], output_dir: Path,
     """
     plan: list[PlannedFigure] = []
 
-    def add(name: str, figure_runs, build, builds=None) -> None:
+    def add(name: str, figure_runs, build, builds=None, reads_context: bool = True) -> None:
         plan.append(PlannedFigure(name=name, runs=tuple(figure_runs), build=build,
-                                  builds=None if builds is None else tuple(builds)))
+                                  builds=None if builds is None else tuple(builds),
+                                  reads_context=reads_context))
 
     for family, kind in CURVE_FAMILIES.items():
         folder = CURVE_TYPES[kind][1]
@@ -5523,14 +5950,19 @@ def dataset_figure_plan(dataset: str, runs: list[Run], output_dir: Path,
                   output_dir), {}))
 
     if per_run:
+        # `builds=()` for the same reason the two figures above carry it: `plot_run_detail` reads
+        # the run's own `cmc_results.csv` and `rolling_results.csv` when it is drawn, so it needs
+        # no curve family -- which is what stops `--families per_run` paying for a full curve
+        # build it never reads.
         for run in runs:
             add(f"{dataset}/per_run/{run.directory.name}", [run],
-                lambda ctx, run=run: (plot_run_detail, (run, output_dir), {}))
+                lambda ctx, run=run: (plot_run_detail, (run, output_dir), {}), builds=(),
+                reads_context=False)
     return plan
 
 
-def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
-                           output_dir: Path) -> list[PlannedFigure]:
+def clustering_figure_plan(dataset: str, runs: list[ClusteringRun], output_dir: Path,
+                           timing: list[ClusteringRun] = ()) -> list[PlannedFigure]:
     """One dataset's clustering figures, planned exactly like every other family's.
 
     They join the cache on the same terms as the attribution figures -- a figure's key is the runs
@@ -5538,14 +5970,20 @@ def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
     merging ``plot_clustering.py`` in here bought: those figures used to be redrawn on every
     invocation because nothing recorded that they were current.
 
-    Every one of them passes ``builds=()``: they read their own CSVs when they are drawn, so no
-    curve family and no bootstrap is involved, and a stale clustering figure must not drag its
-    corpus's attribution runs into a full curve rebuild.
+    Every one of them passes ``builds=()`` and ``reads_context=False``: they read their own CSVs
+    when they are drawn, so no curve family and no bootstrap is involved, and a stale clustering
+    figure must not drag its corpus's attribution runs into a full curve rebuild.
 
     **Every family is planned once per author scope** (:data:`CLUSTERING_SCOPES`), into its own
     subtree, so the two populations are never crossed inside one figure. A scope a run has no rows
     for draws nothing and is *recorded* as having drawn nothing, on the same terms as a `scaling`
     figure for a refitting attack -- which is what stops the sweep re-deciding it every time.
+
+    ``timing`` is this corpus's :data:`TIMING_VARIANT` runs, and they buy a *second*
+    precision/recall figure rather than changing the first: the pure-text figure is the comparable
+    set every other clustering family draws, and putting a fused-edge point on it would be a
+    second method under one defense's shape. The pair figure names both sets of runs in its cache
+    key, so it redraws when either side moves.
     """
     plan = []
     for scope in CLUSTERING_SCOPES:
@@ -5559,13 +5997,21 @@ def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
                 f"{prefix}/bcubed/by_defense/{feature}", tuple(members),
                 lambda ctx, feature=feature, members=members, scope=scope:
                 (plot_clustering_bcubed, (dataset, feature, members, output_dir, scope), {}),
-                builds=()))
+                builds=(), reads_context=False))
             plan.append(PlannedFigure(
                 f"{prefix}/precision_recall/by_algorithm/{feature}", tuple(members),
                 lambda ctx, feature=feature, members=members, scope=scope:
                 (plot_clustering_precision_recall,
                  (dataset, feature, members, output_dir, scope), {}),
-                builds=()))
+                builds=(), reads_context=False))
+            fused = [run for run in timing if run.feature == feature]
+            if fused:
+                plan.append(PlannedFigure(
+                    f"{prefix}/precision_recall/timing/{feature}", tuple(members) + tuple(fused),
+                    lambda ctx, feature=feature, members=members, fused=fused, scope=scope:
+                    (plot_clustering_precision_recall,
+                     (dataset, feature, members, output_dir, scope), {"timing": fused}),
+                    builds=(), reads_context=False))
         # Per run, not per view: the series are the algorithms, so there is nothing left for a
         # `by_defense`/`by_attack` split to vary -- the same argument `PER_RUN_FAMILIES` makes.
         for run in runs:
@@ -5573,7 +6019,7 @@ def clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
                 f"{prefix}/exposure/{run.directory.name}", (run,),
                 lambda ctx, run=run, scope=scope:
                 (plot_clustering_exposure, (run, output_dir, scope), {}),
-                builds=()))
+                builds=(), reads_context=False))
     return plan
 
 
@@ -5608,19 +6054,27 @@ def main() -> None:
     args = parse_args()
     global WRITE_PNG
     WRITE_PNG = args.png
+    families = None if args.families is None else set(args.families)
+    # `--families per_run` implies `--per-run`: the diagnostics tree is otherwise never planned at
+    # all, so the flag would select a family that does not exist in this sweep and the run would
+    # end with nothing drawn and no explanation for it.
+    per_run = args.per_run or (families is not None and "per_run" in families)
 
     # Two experiments, two result roots, and either one alone is enough to draw figures from --
     # a checkout that has only clustered is not an error.
     runs = discover_runs(RESULTS_DIR) if RESULTS_DIR.exists() else []
-    clustering = discover_clustering_runs(CLUSTERING_DIR)
-    # The variant directories the three-part parser refuses -- a learned projection or a rescoring
-    # is not comparable to a base run on the by_defense figures, so it gets its own family.
-    variants = discover_clustering_variants(CLUSTERING_DIR)
-    if not runs and not clustering:
+    # One parser now, and the variant splits the result: the pure-text runs are the comparable set
+    # every other clustering family draws, and the rest -- a learned projection, a rescoring, a
+    # timing fusion -- get the variants family, where the strategy is the axis rather than a
+    # contaminant on a panel keyed by defense.
+    all_clustering = discover_clustering_runs(CLUSTERING_DIR)
+    clustering = [run for run in all_clustering if run.variant == PLAIN_VARIANT]
+    variants = [run for run in all_clustering if run.variant != PLAIN_VARIANT]
+    if not runs and not all_clustering:
         raise SystemExit(
             f"no runs named <dataset>_<defense>_<feature>_<attack> under {RESULTS_DIR}, and none "
-            f"named <dataset>_<defense>_<feature> under {CLUSTERING_DIR} -- run an experiment "
-            f"first.")
+            f"named <dataset>_<defense>_<feature>_<variant> under {CLUSTERING_DIR} -- run an "
+            f"experiment first.")
 
     by_dataset: dict[str, list[Run]] = defaultdict(list)
     for run in runs:
@@ -5628,9 +6082,11 @@ def main() -> None:
     clustering_by_dataset: dict[str, list[ClusteringRun]] = defaultdict(list)
     for run in clustering:
         clustering_by_dataset[run.dataset].append(run)
-    variants_by_dataset: dict[str, list[ClusteringVariant]] = defaultdict(list)
+    # Keyed by (dataset, defense): the variants figure holds the defense fixed, so two defenses'
+    # runs of one corpus are two figures rather than two sets of rows on one.
+    variants_by_defense: dict[tuple[str, str], list[ClusteringRun]] = defaultdict(list)
     for run in variants:
-        variants_by_dataset[run.dataset].append(run)
+        variants_by_defense[(run.dataset, run.defense)].append(run)
 
     # --- plan every figure, before reading or building anything ---------------
     #
@@ -5644,37 +6100,57 @@ def main() -> None:
     for dataset in DATASETS:
         if by_dataset.get(dataset):
             plan += dataset_figure_plan(dataset, by_dataset[dataset], PLOTS_DIR / dataset,
-                                        args.per_run)
+                                        per_run)
         # Under the corpus it describes, not a tree of its own: the clustering experiment is a
         # different question about the *same* corpus, so `plots/<dataset>/clustering/` files it
         # the way every other family of that dataset's figures is filed.
         if clustering_by_dataset.get(dataset):
-            plan += clustering_figure_plan(dataset, clustering_by_dataset[dataset],
-                                           PLOTS_DIR / dataset / "clustering")
-        if variants_by_dataset.get(dataset):
-            members = variants_by_dataset[dataset]
+            plan += clustering_figure_plan(
+                dataset, clustering_by_dataset[dataset], PLOTS_DIR / dataset / "clustering",
+                timing=[run for run in variants
+                        if run.dataset == dataset and run.variant == TIMING_VARIANT])
+        for defense in DEFENSES:
+            members = variants_by_defense.get((dataset, defense))
+            if not members:
+                continue
+            # The reference is the pure-text run of THIS defense, not the undefended one: the
+            # figure asks what a strategy added to the method, and a defended run's variants have
+            # to be read against the defended pure-text run to answer that.
             base = next((run for run in clustering_by_dataset.get(dataset, [])
-                         if run.defense == NO_DEFENSE), None)
+                         if run.defense == defense), None)
             for scope in CLUSTERING_SCOPES:
                 prefix = "/".join(part for part in (f"{dataset}/clustering",
                                                     CLUSTERING_SCOPES[scope][0]) if part)
                 plan.append(PlannedFigure(
-                    f"{prefix}/variants/tuning_vs_test",
+                    f"{prefix}/variants/{defense}_tuning_vs_test",
                     tuple(members) + ((base,) if base is not None else ()),
-                    lambda ctx, dataset=dataset, members=members, base=base, scope=scope:
+                    lambda ctx, dataset=dataset, defense=defense, members=members, base=base,
+                    scope=scope:
                     (plot_clustering_variants,
-                     (dataset, members, base, PLOTS_DIR / dataset / "clustering", scope), {}),
-                    builds=()))
+                     (dataset, defense, members, base, PLOTS_DIR / dataset / "clustering",
+                      scope), {}),
+                    builds=(), reads_context=False))
     plan += cross_dataset_plan(runs, PLOTS_DIR)
 
     settings = f"{source_digest()}|bootstrap={args.bootstrap}|png={int(args.png)}"
     cache = PlotCache(PLOTS_DIR / CACHE_FILE, settings, force=args.force)
-    stale = [figure for figure in plan if not cache.is_current(figure)]
-    print(f"{len(plan) - len(stale)} of {len(plan)} figure(s) already current"
+    # `--families` narrows what is *drawn*, never what is planned: `plan` stays whole, so the
+    # manifest written at the end still describes the tree rather than this run's slice of it and
+    # an unselected figure keeps the entry that says it is current. Pruning it to the selection
+    # would make every filtered sweep invalidate every family it did not draw, which is exactly
+    # the full redraw the flag exists to avoid.
+    selected = plan if families is None else [figure for figure in plan
+                                             if figure_family(figure.name) in families]
+    stale = [figure for figure in selected if not cache.is_current(figure)]
+    print(f"{len(selected) - len(stale)} of {len(selected)} figure(s) already current"
           f"{'  (--force ignored the cache)' if args.force else ''}")
+    if families is not None:
+        print(f"{len(plan) - len(selected)} figure(s) outside "
+              f"{', '.join(sorted(families))} left as they are")
     if not stale:
         cache.save(plan)
-        print("nothing to draw.")
+        print("nothing to draw." if selected else
+              "no planned figure is in the selected family/families -- nothing to draw.")
         return
 
     # --- build only what those figures need -----------------------------------
@@ -5685,7 +6161,9 @@ def main() -> None:
     # `touched` decides which datasets are visited at all; `curved` which of their runs pay for
     # a full curve build. They differ for the two figures that are stale on any change but read no
     # curve family, and that difference is what keeps one changed run from rebuilding a corpus.
-    touched = {run for figure in stale for run in figure.runs}
+    # A figure that reads nothing the build produces (`reads_context=False`: `per_run/` and the
+    # clustering families) is in neither, so a sweep narrowed to those draws without building.
+    touched = {run for figure in stale if figure.reads_context for run in figure.runs}
     curved = {run for figure in stale for run in figure.needs_curves}
     for dataset in DATASETS:
         dataset_runs = by_dataset.get(dataset, [])
@@ -5729,7 +6207,7 @@ def main() -> None:
         print(f"  {path.relative_to(PLOTS_DIR)}")
     formats = "PDF + PNG" if WRITE_PNG else "PDF"
     print(f"\nWrote {len(written)} figure(s) ({formats}) to {PLOTS_DIR}/")
-    if not args.per_run:
+    if not per_run:
         print("per_run/ diagnostics skipped -- pass --per-run to draw them")
 
 

@@ -37,6 +37,8 @@ from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidfFeaturizer
 from .gemini_embedding import GeminiEmbedding001Featurizer, GeminiEmbedding2Featurizer
 from .harrier import (HarrierFeaturizer, HarrierImperativeFeaturizer, HarrierPlainFeaturizer)
+from .sentence_transformer import (EmbeddingGemma300mFeaturizer, Harrier270mFeaturizer,
+                                   JinaV5NanoFeaturizer, SentenceTransformerFeaturizer)
 from .style_distance import StyleDistanceFeaturizer
 from .luar import LuarFeaturizer
 
@@ -57,6 +59,9 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "harrier": HarrierFeaturizer,
     "harrier_imperative": HarrierImperativeFeaturizer,
     "harrier_plain": HarrierPlainFeaturizer,
+    "harrier_270m": Harrier270mFeaturizer,
+    "embeddinggemma_300m": EmbeddingGemma300mFeaturizer,
+    "jina_v5_nano": JinaV5NanoFeaturizer,
 }
 
 def get_featurizer(name: str, **options) -> Featurizer:

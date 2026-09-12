@@ -118,10 +118,15 @@ import pyarrow.parquet as pq
 from prompt_anonymity.core import AttackData
 from prompt_anonymity.defenses import DEFENSES, apply_defense, get_defense
 from prompt_anonymity.defenses._backends import TURN_ID_SEPARATOR
+from prompt_anonymity.defenses.embad import (
+    DEFAULT_GENERATIONS, DEFAULT_SEARCH_MAX_CHARS, DEFAULT_SEARCH_MIN_CHARS,
+    DEFAULT_SEARCH_SAMPLES, DEFAULT_SEARCH_SOURCE, DEFAULT_TOPICS_PER_DOCUMENT,
+    DEFAULT_VALIDATION_SAMPLES, MUTATORS, EmBadDefense)
 
 from .compute_features import (
     READ_BATCH_ROWS,
     SOURCES,
+    TURN_SEPARATOR,
     load_split,
     merge_shards,
     resolve_sharding,
@@ -338,6 +343,53 @@ def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str
     return padded
 
 
+def append_optimized_turns(defense: str, registered, doc_ids, author_ids, turn_lists,
+                           *, cache_dir) -> list[list[str]]:
+    """Apply a turn-ADDING defense that has to READ the document first.
+
+    **Unreached today.** ``embad`` took this path while it searched a trigger per document; since it
+    began fitting ONE universal trigger against a separate optimization corpus it declares
+    ``needs_document = False`` and goes through :func:`append_extra_turns` instead, and no other
+    registered defense declares the pair. Kept rather than deleted because it is the contract a
+    document-reading turn-adder would use, and because the per-document arm in
+    ``experiments/embad_direct_search.py`` is still measured.
+
+    The middle path between the two above, and it exists because the other two each rule out half of
+    what such a defense needs. :func:`append_extra_turns` never shows the defense any text -- a
+    guarantee ``frame_pad`` is built on, since a pad that tracked the topic would reinforce the
+    signal it is meant to bury -- while the per-turn path in :func:`defend_documents` shows text but
+    structurally cannot add a turn, because it must return one output per input row.
+
+    So this hands the defense one row per **document** (id ``doc_id``, source the joined turns) and
+    appends what comes back. Two consequences worth knowing:
+
+    * The cached unit is a document, not a turn, so a turn repeated across documents is optimized
+      once per document rather than once overall -- correct here, since the trigger is optimized
+      against the whole document's embedding and two documents sharing a turn are different problems.
+    * What the defense returns is the **turn to append**, not a rewritten document. That is the one
+      place its row semantics differ from every other defense in the registry.
+    """
+    from prompt_anonymity.defenses import apply_defense
+
+    texts = [TURN_SEPARATOR.join(turns) for turns in turn_lists]
+    ids = [str(doc_id) for doc_id in doc_ids]
+    authors = [str(author) for author in author_ids]
+    report_workload(defense, len(texts), texts)
+    result = apply_defense(defense, as_attack_data(texts, ids, authors), cache_dir=cache_dir)
+    extra = [str(turn) for turn in result.unknown_texts]
+    if len(extra) != len(turn_lists):
+        raise ValueError(f"defense {defense!r} returned {len(extra)} turns for "
+                         f"{len(turn_lists)} documents.")
+    padded = [list(turns) + ([turn] if turn else []) for turns, turn in zip(turn_lists, extra)]
+    characters = sum(len(turn) for turn in extra)
+    print(f"[{defense}] appending an optimized turn to {len(padded):,} documents: "
+          f"{characters:,} characters added; existing turns are copied through unchanged")
+    report = getattr(registered, "report", None)
+    if callable(report):
+        report()
+    return padded
+
+
 def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
                      *, cache_dir: str | Path, num_shards: int = 1,
                      reference=None) -> list[list[str]]:
@@ -365,8 +417,15 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
             f"author's other documents, and --num-shards splits by document. Re-run without "
             f"--num-shards/--shard-index (or on a smaller --source)."
         )
-    # A turn-adding defense (see append_extra_turns) works on documents, not on the per-turn stream.
+    # A turn-adding defense works on documents, not on the per-turn stream. Two flavours: one that
+    # never sees the text (`frame_pad`, and `embad` since it began fitting ONE universal trigger on
+    # a separate corpus) and one that has to. NO registered defense takes the second branch today --
+    # it is kept because `needs_document` is the contract a document-reading turn-adder would
+    # declare, not because anything currently declares it.
     if getattr(registered, "appends_turns", False):
+        if getattr(registered, "needs_document", False):
+            return append_optimized_turns(defense, registered, doc_ids, author_ids, turn_lists,
+                                          cache_dir=cache_dir)
         return append_extra_turns(defense, registered, doc_ids, turn_lists)
 
     texts, ids, authors, counts = flatten_turns(doc_ids, author_ids, turn_lists)
@@ -438,11 +497,134 @@ def report_written(frame: pd.DataFrame, path: Path, kind: str = "defended docume
           f"({path.stat().st_size / 1e6:.1f} MB)")
 
 
+def configure_embad(args):
+    """Return the defense instance for this run, rebuilding ``embad`` from the ``--embad-*`` flags.
+
+    The registry holds ready-made instances, which is what makes selecting a defense free. ``embad``
+    is the one defense whose behaviour a user is expected to steer from the command line, so its
+    entry is **replaced for this process** with an instance carrying the flags. Everything
+    downstream still resolves it by name through :func:`~prompt_anonymity.defenses.get_defense`, so
+    nothing else has to know this happened.
+
+    A non-embad defense is returned untouched, flags and all -- they are documented as ignored.
+    """
+    registered = get_defense(args.defense)
+    if not isinstance(registered, EmBadDefense):
+        return registered
+
+    # Keep whatever the registry entry configured, and override only what the user ACTUALLY asked
+    # for on the command line. Two fields are deliberately registry-only, with no flag at all:
+    # `objective`, which is the whole difference between `embad`, `embad_summary` and
+    # `embad_gemini` -- naming the defense is how you choose it, and a flag would let the search's
+    # objective disagree with the filename it writes -- and `aggregation`, which reduces across the
+    # ENSEMBLE's members rather than across documents.
+    configured = EmBadDefense(
+        aggregation=registered.aggregation,
+        objective=registered.objective_kind,
+        mutator=args.embad_mutator,
+        document_aggregation=args.embad_document_aggregation,
+        generations=args.embad_generations,
+        topics_per_document=args.embad_topics_per_document,
+        search_source=args.embad_search_source,
+        search_samples=args.embad_search_samples,
+        validation_samples=args.embad_validation_samples,
+        search_min_chars=args.embad_search_min_chars,
+        search_max_chars=args.embad_search_max_chars,
+        search_data_dir=Path(args.dist_dir) if args.dist_dir else None,
+        cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+        seed=args.embad_seed,
+    )
+    DEFENSES[args.defense] = configured
+    return configured
+
+
+def merge_one_source(source: str, args, *, language, dist: Path, out_dir: Path) -> None:
+    """Reassemble one split's shards into its final parquet.
+
+    Builds no defense, so no model is loaded and no API key is needed, and reads only the columns
+    the selection needs. Deliberately never resolves sharding: a merge is about what an array
+    already wrote, not about which shard this process would have computed.
+    """
+    documents = select_documents(
+        load_split(source, dist, columns=["doc_id", "language_primary"]),
+        language=language, limit=args.limit,
+    )
+    merged = merge_shards(out_dir, defended_stem(source, args.defense), list(documents["doc_id"]))
+    if merged is None:
+        raise SystemExit(f"cannot merge {source} yet: the shards listed above have not been "
+                         f"defended. Re-run those array tasks, then merge again.")
+    merged_path = output_path(out_dir, source, args.defense)
+    write_parquet(merged, merged_path)
+    report_written(merged, merged_path)
+
+
+def defend_one_source(source: str, args, *, language, dist: Path, cache: Path, out_dir: Path,
+                      shard_index: int, num_shards: int) -> None:
+    """Defend one split, writing ``<split>_<defense>.parquet`` (or this run's shard of it).
+
+    One call is one corpus. With several ``--source`` values the caller loops, which is safe
+    precisely because ``num_shards`` is then guaranteed to be 1 -- every source is defended whole,
+    so no per-source shard layout has to be invented.
+    """
+    merged_path = output_path(out_dir, source, args.defense)
+    stem = defended_stem(source, args.defense)
+
+    # Only the columns this needs: the two that are written out, plus the one --language filters on.
+    # `turns` is read separately, and only for this shard's rows, since it is the bulk of the split.
+    frame = load_split(source, dist, columns=["doc_id", "author_id", "language_primary"])
+    documents = select_documents(frame, language=language, limit=args.limit)
+    if documents.empty:
+        raise SystemExit(f"no documents in {source} match --language {args.language}.")
+    selected = f" (language_primary == {language!r})" if language else " (all languages)"
+    print(f"[{source}] {len(documents):,} of {len(frame):,} documents selected{selected}")
+
+    doc_order = list(documents["doc_id"])  # split order, for the merge
+
+    # A defense that cascades over an author's timeline gets WHOLE AUTHORS; everything else gets the
+    # row-interleaved split. Both are deterministic given the selection and the shard count.
+    registered = configure_embad(args)
+    by_author = getattr(registered, "shardable_by", None) == "author"
+    shard = (select_author_shard(documents, shard_index, num_shards) if by_author
+             else select_shard(documents, shard_index, num_shards))
+    out_path = merged_path if num_shards == 1 else shard_path(out_dir, stem, shard_index, num_shards)
+    if num_shards > 1:
+        split_by = f" ({shard['author_id'].nunique():,} whole authors)" if by_author else ""
+        print(f"[shard {shard_index}/{num_shards}] defending {len(shard):,} of them{split_by} "
+              f"-> {out_path.name}")
+
+    # Selected over `documents` (the whole split), NOT over `shard` -- the point of it.
+    reference = (reference_pool(args.defense, registered, documents, source, dist)
+                 if num_shards > 1 and by_author else None)
+
+    turn_lists = read_turns(source, dist, shard.index)
+    defended = defend_documents(
+        args.defense, shard["doc_id"], shard["author_id"], turn_lists,
+        cache_dir=defense_cache_dir(cache, source, shard_index, num_shards),
+        num_shards=num_shards, reference=reference,
+    )
+    documents_out = build_defended_frame(shard, defended)
+    write_parquet(documents_out, out_path)
+    report_written(documents_out, out_path,
+                   "defended documents" if num_shards == 1 else "defended shard documents")
+
+    if num_shards > 1 and not args.no_auto_merge:
+        # Every task tries this; only the last one to finish finds a complete set of shards, so the
+        # array assembles its own final file with no follow-up job.
+        merged = merge_shards(out_dir, stem, doc_order)
+        if merged is not None:
+            write_parquet(merged, merged_path)
+            report_written(merged, merged_path)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
-                   help="which built split to defend (default: swe_chat)")
+    p.add_argument("--source", nargs="+", default=["swe_chat"], choices=sorted(SOURCES),
+                   metavar="SOURCE",
+                   help="which built split(s) to defend; several are defended one after another, "
+                        "each to its own <split>_<defense>.parquet. Sharding is refused with more "
+                        "than one, since the corpora differ in size by ~40x and one shard layout "
+                        "cannot serve both (default: swe_chat)")
     p.add_argument("--defense", default="openanonymity", choices=sorted(DEFENSES),
                    help="registered defense to apply (default: openanonymity). 'none' copies the "
                         "split through unchanged, as a control")
@@ -475,79 +657,92 @@ def main() -> None:
     p.add_argument("--no-auto-merge", action="store_true",
                    help="a sharded run writes only its shard, leaving the merge to an explicit "
                         "--merge")
+
+    embad = p.add_argument_group(
+        "embad",
+        "Ignored unless --defense is an embad variant. embad searches ONE universal trigger "
+        "against a pool of documents from its own optimization corpus -- never from --source -- "
+        "and appends that same turn to every defended document. These flags control the search; "
+        "any of them changes the cache key, so a changed flag re-runs it. What the search is "
+        "SCORED AGAINST is not a flag: pick embad (local ensemble), embad_summary (summary "
+        "bottleneck) or embad_gemini (the target encoder, billed) with --defense, so the objective "
+        "and the output filename can never disagree.")
+    embad.add_argument("--embad-mutator", default="claude", choices=sorted(MUTATORS),
+                       help="who writes the candidate mechanisms -- the search's mutation "
+                            "operator. 'claude' is the hosted model on Microsoft Foundry (needs "
+                            "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL, no GPU of its own, bills "
+                            "per call, does NOT reproduce); 'local' is Qwen3-1.7B through vLLM "
+                            "(free, seeded, replays exactly). The two land in the same place and "
+                            "differ ~3x in speed (default: claude)")
+    embad.add_argument("--embad-search-source", default=DEFAULT_SEARCH_SOURCE,
+                       choices=sorted(SOURCES),
+                       help=f"corpus the search draws its documents from, independent of --source "
+                            f"(default: {DEFAULT_SEARCH_SOURCE})")
+    embad.add_argument("--embad-search-samples", type=int, default=DEFAULT_SEARCH_SAMPLES,
+                       help=f"documents every candidate is scored against "
+                            f"(default: {DEFAULT_SEARCH_SAMPLES})")
+    embad.add_argument("--embad-validation-samples", type=int,
+                       default=DEFAULT_VALIDATION_SAMPLES,
+                       help=f"held-out documents the winner is CHOSEN on, disjoint from the "
+                            f"search pool; 0 disables the held-out choice and takes the search's "
+                            f"own best (default: {DEFAULT_VALIDATION_SAMPLES})")
+    embad.add_argument("--embad-generations", type=int, default=DEFAULT_GENERATIONS,
+                       help=f"search rounds (default: {DEFAULT_GENERATIONS})")
+    embad.add_argument("--embad-topics-per-document", type=int,
+                       default=DEFAULT_TOPICS_PER_DOCUMENT,
+                       help=f"decoy subjects each document is scored under per round. Averaged "
+                            f"out per document before any aggregation, so it buys precision "
+                            f"rather than changing what is measured -- and a round costs "
+                            f"candidates x documents x this, which under --defense embad_gemini is "
+                            f"paid embeddings and under embad_summary is 9B-model generations "
+                            f"(default: {DEFAULT_TOPICS_PER_DOCUMENT})")
+    embad.add_argument("--embad-document-aggregation", default="mean", choices=("mean", "worst"),
+                       help="how a candidate's per-document cosines become one fitness: 'mean' "
+                            "asks for a trigger that works on average, 'worst' for one with no "
+                            "bad document (default: mean)")
+    embad.add_argument("--embad-search-min-chars", type=int, default=DEFAULT_SEARCH_MIN_CHARS,
+                       help=f"shortest document the search will sample. The default excludes a "
+                            f"degenerate regime -- ShareChat's median document is 156 characters, "
+                            f"where the appended turn is most of the text "
+                            f"(default: {DEFAULT_SEARCH_MIN_CHARS})")
+    embad.add_argument("--embad-search-max-chars", type=int, default=DEFAULT_SEARCH_MAX_CHARS,
+                       help=f"longest document the search will sample "
+                            f"(default: {DEFAULT_SEARCH_MAX_CHARS})")
+    embad.add_argument("--embad-seed", type=int, default=0,
+                       help="seeds both the document sample and the search (default: 0)")
     args = p.parse_args()
 
     language = None if (args.language or "all").lower() == "all" else args.language
+    # Deduplicated but order-preserving: naming a split twice is a typo, not a request to defend it
+    # twice into the same file.
+    sources = list(dict.fromkeys(args.source))
     # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
     # lives in the installed package, the data does not.
     dist = Path(args.dist_dir) if args.dist_dir else hf_dir()
     cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
     out_dir = Path(args.out_dir) if args.out_dir else dist_dir()
-    merged_path = output_path(out_dir, args.source, args.defense)
-    stem = defended_stem(args.source, args.defense)
 
     # --merge only reassembles what an array already computed -- no defense is built, so no model is
-    # loaded and no API key is needed -- and reads only the columns the selection needs.
+    # loaded and no API key is needed. It never resolves sharding, so it stays usable with or
+    # without the array flags still on the command line.
     if args.merge:
-        documents = select_documents(
-            load_split(args.source, dist, columns=["doc_id", "language_primary"]),
-            language=language, limit=args.limit,
-        )
-        merged = merge_shards(out_dir, stem, list(documents["doc_id"]))
-        if merged is None:
-            raise SystemExit("cannot merge yet: the shards listed above have not been defended. "
-                             "Re-run those array tasks, then merge again.")
-        write_parquet(merged, merged_path)
-        report_written(merged, merged_path)
+        for source in sources:
+            merge_one_source(source, args, language=language, dist=dist, out_dir=out_dir)
         return
 
     shard_index, num_shards = resolve_sharding(args.shard_index, args.num_shards)
+    # Checked on the RESOLVED count, not on the flags, so a multi-source run submitted into a SLURM
+    # array is caught too -- `resolve_sharding` fills these in from the environment.
+    if num_shards > 1 and len(sources) > 1:
+        p.error(f"--source names {len(sources)} splits and this run is shard {shard_index} of "
+                f"{num_shards}. A shard layout is per-corpus -- WildChat is ~40x swe_chat, so one "
+                f"count cannot serve both, and the defense cache is scoped per (split, layout) so "
+                f"a wrong one costs a full recompute. Shard one source per job, or defend several "
+                f"unsharded.")
 
-    # Only the columns this needs: the two that are written out, plus the one --language filters on.
-    # `turns` is read separately, and only for this shard's rows, since it is the bulk of the split.
-    frame = load_split(args.source, dist, columns=["doc_id", "author_id", "language_primary"])
-    documents = select_documents(frame, language=language, limit=args.limit)
-    if documents.empty:
-        raise SystemExit(f"no documents in {args.source} match --language {args.language}.")
-    selected = f" (language_primary == {language!r})" if language else " (all languages)"
-    print(f"[{args.source}] {len(documents):,} of {len(frame):,} documents selected{selected}")
-
-    doc_order = list(documents["doc_id"])  # split order, for the merge
-
-    # A defense that cascades over an author's timeline gets WHOLE AUTHORS; everything else gets the
-    # row-interleaved split. Both are deterministic given the selection and the shard count.
-    registered = get_defense(args.defense)
-    by_author = getattr(registered, "shardable_by", None) == "author"
-    shard = (select_author_shard(documents, shard_index, num_shards) if by_author
-             else select_shard(documents, shard_index, num_shards))
-    out_path = merged_path if num_shards == 1 else shard_path(out_dir, stem, shard_index, num_shards)
-    if num_shards > 1:
-        split_by = f" ({shard['author_id'].nunique():,} whole authors)" if by_author else ""
-        print(f"[shard {shard_index}/{num_shards}] defending {len(shard):,} of them{split_by} "
-              f"-> {out_path.name}")
-
-    # Selected over `documents` (the whole split), NOT over `shard` -- the point of it.
-    reference = (reference_pool(args.defense, registered, documents, args.source, dist)
-                 if num_shards > 1 and by_author else None)
-
-    turn_lists = read_turns(args.source, dist, shard.index)
-    defended = defend_documents(
-        args.defense, shard["doc_id"], shard["author_id"], turn_lists,
-        cache_dir=defense_cache_dir(cache, args.source, shard_index, num_shards),
-        num_shards=num_shards, reference=reference,
-    )
-    documents_out = build_defended_frame(shard, defended)
-    write_parquet(documents_out, out_path)
-    report_written(documents_out, out_path,
-                   "defended documents" if num_shards == 1 else "defended shard documents")
-
-    if num_shards > 1 and not args.no_auto_merge:
-        # Every task tries this; only the last one to finish finds a complete set of shards, so the
-        # array assembles its own final file with no follow-up job.
-        merged = merge_shards(out_dir, stem, doc_order)
-        if merged is not None:
-            write_parquet(merged, merged_path)
-            report_written(merged, merged_path)
+    for source in sources:
+        defend_one_source(source, args, language=language, dist=dist, cache=cache,
+                          out_dir=out_dir, shard_index=shard_index, num_shards=num_shards)
 
 
 if __name__ == "__main__":
