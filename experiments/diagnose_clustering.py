@@ -150,7 +150,7 @@ def pair_signals(graph, frame: pd.DataFrame, codes: np.ndarray, k: int) -> pd.Da
     signals = {"cosine distance": distance}
 
     times = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = times.astype("int64").to_numpy() / 1e9
+    seconds = (times - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy()
     seconds[times.isna().to_numpy()] = np.nan
     signals["|time gap| hours"] = np.abs(seconds[source] - seconds[target]) / 3600.0
 

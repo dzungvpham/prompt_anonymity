@@ -117,3 +117,19 @@ model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
 #                               because Harrier co-resides and loads first.
 #     AFR_ALLOW_DOWNLOAD=1      opt in to fetching a checkpoint that is not already on disk. Without
 #                               it a non-local checkpoint is a hard error, not a 30 GB download.
+
+# The model that rewrites Library of Congress subject headings into EmBad decoy-topic phrases
+# (prompt_anonymity.defenses.embad_topics). A repo id, not a path, and resolved through the cluster
+# mirror by `_backends.model_checkpoint` -- on Unity that finds
+# /datasets/ai/qwen3/hub/models--Qwen--Qwen3.5-9B and nothing is downloaded.
+#
+# The job is ~181,000 independent one-line rewrites of a *supplied* subject: un-invert a cataloguing
+# heading into plain English and name three concrete things inside it. That is a constrained rewrite,
+# not open-ended generation -- the diversity comes from LCSH, not from the model -- so a 9B is
+# comfortably sized for it and a larger one would buy nothing but hours. Note this is a
+# Qwen3_5ForConditionalGeneration (vision-language) checkpoint; embad_topics loads it with
+# language_model_only=True, since the image and video towers are dead weight for a text job.
+#
+#     EMBAD_TOPIC_MODEL=/path/to/checkpoint     # in .env, to override
+[embad_topics]
+model = "Qwen/Qwen3.5-9B"

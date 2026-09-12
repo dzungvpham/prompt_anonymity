@@ -245,6 +245,15 @@ class AverageLinkageClustering(ClusteringAttack):
     distance_threshold: float = 0.5
     linkage: str = "average"
 
+    #: When set, overrides :attr:`distance_threshold` with the corresponding quantile of this
+    #: graph's own edge weights (:func:`edge_quantile`), as on :class:`ThresholdComponents` and
+    #: :class:`ComponentwiseAgglomerative` and for the same reason. Resolved over the k-truncated
+    #: **edge list**, not over the dense matrix the fit runs on: the edge list is the population
+    #: every other method's quantile is taken over, so one quantile means one thing across the
+    #: search, and the dense matrix is mostly the "far apart" filler value below rather than
+    #: candidate pairs.
+    distance_quantile: float | None = None
+
     def cluster(self, graph: NeighborGraph) -> np.ndarray:
         from sklearn.cluster import AgglomerativeClustering
 
@@ -257,18 +266,21 @@ class AverageLinkageClustering(ClusteringAttack):
                 f"sparse form, so this method does not scale to WildChat; the other three run on "
                 f"the neighbour graph and do."
             )
+        cut = (self.distance_threshold if self.distance_quantile is None
+               else edge_quantile(view.edges()[2], self.distance_quantile))
         model = AgglomerativeClustering(
             n_clusters=None,
-            distance_threshold=float(self.distance_threshold),
+            distance_threshold=float(cut),
             metric="precomputed",
             linkage=self.linkage,
             connectivity=view.to_sparse(),
         )
         # Absent edges have to be a finite "far apart" rather than infinity: the linkage arithmetic
-        # averages them. Two documents the graph does not join are given the maximum distance the
-        # metric admits, which is 2.0 for cosine and the observed maximum otherwise.
+        # averages them. Two documents the graph does not join are given the largest distance the
+        # space admits -- see `NeighborGraph.far_distance`, which knows the bound because the graph
+        # carries it, rather than this line re-deriving it from the metric's name.
         dense = view.to_sparse().toarray()
-        far = 2.0 if view.metric == "cosine" else float(view.distances[np.isfinite(view.distances)].max())
+        far = view.far_distance
         dense[dense == 0] = far
         np.fill_diagonal(dense, 0.0)
         return model.fit_predict(dense)
@@ -350,7 +362,7 @@ class ComponentwiseAgglomerative(ClusteringAttack):
         members_order = np.argsort(component, kind="stable")
         member_starts = np.searchsorted(component[members_order], np.arange(n_components + 1))
 
-        far = 2.0 if view.metric == "cosine" else float(distance.max() if len(distance) else 1.0)
+        far = view.far_distance
         labels = np.empty(n, dtype=np.int64)
         next_label = 0
         for index in range(n_components):
@@ -516,6 +528,16 @@ CLUSTERING_SPACES: dict[str, dict[str, list]] = {
 #: Only the two threshold-based methods appear: Leiden's ``resolution`` and HDBSCAN's
 #: ``min_cluster_size`` are not distances, so their grids carry over unchanged.
 CLUSTERING_SPACES_QUANTILE: dict[str, dict[str, list]] = {
+    # Bracketed wider than `connected`'s and NOT yet validated against a measured optimum, unlike
+    # the entries below it. Average linkage merges on the *mean* distance between two groups, so
+    # it tolerates a larger radius than single linkage does -- its absolute grid ran to 0.55 where
+    # `connected`'s stopped at 0.3. Over-bracketing is the safe error here: the documented failure
+    # on this file was a grid too coarse to contain the optimum, which selected 0.15/k=2 for
+    # F=0.4991 where the true peak scored 0.5164. Narrow this once a sweep says where the peak is.
+    "average_linkage": {
+        "neighbors": [5, 10, 25],
+        "distance_quantile": [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70],
+    },
     "connected": {
         "neighbors": [2, 3, 5, 10, 25],
         "distance_quantile": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50],

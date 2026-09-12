@@ -1,20 +1,59 @@
 #!/usr/bin/env python
-"""Drive ``run_experiment.py`` over the whole experiment grid, once per cell.
+"""Drive this project's two attack runners over the whole experiment grid, once per cell.
 
-The grid is ``{dataset} x {defense} x {feature} x {attack}`` -- :data:`SOURCES`,
-:data:`DEFENSES`, :data:`FEATURES`, :data:`ATTACKS`, minus the cells :data:`SOURCE_ATTACKS`
-rules out. Each cell becomes one ``run_experiment.py`` invocation and one results directory,
-``experiments/results/<dataset>_<defense>_<feature>_<attack>/``, which is the four-part name
-``experiments/plot_results.py`` parses. Nothing here plots; run that afterwards.
+**One launcher, two families**, selected with ``--families`` (default: both):
+
+* ``attribution`` -- ``run_experiment.py`` over ``{dataset} x {defense} x {feature} x {attack}``,
+  minus the cells :data:`SOURCE_ATTACKS` rules out. One cell is one results directory,
+  ``experiments/results/<dataset>_<defense>_<feature>_<attack>/``, the four-part name
+  ``plot_results.parse_run_name`` parses.
+* ``clustering`` -- ``run_clustering.py`` over ``{dataset} x {defense} x {feature}``. There is no
+  attack axis: a clustering run attacks the collection with every algorithm in one process and
+  files them all in one directory, ``experiments/clustering/<dataset>_<defense>_<feature>/`` --
+  the **three**-part name ``plot_results.parse_clustering_run_name`` parses, deliberately a
+  separate function so a run of one kind can never parse as the other.
+
+Nothing here plots; run ``plot_results.py`` afterwards.
+
+Each clustering cell is run under every configuration in :data:`CLUSTERING_VARIANTS` -- by
+default both ``plain``, the pure-text run the ``by_defense`` figures draw, and
+``contrastive_time``, the strongest configuration measured (WildChat test BCubed F 0.510
+baseline, 0.537 with the contrastive projection, **0.562** with elapsed time fused in as well).
+The variant is the fourth part of the directory name, so the second lands in
+``plot_results.py``'s *variants* family rather than the comparable set, which is deliberate: a
+learned projection is not a point on a defense's curve.
+
+**The clustering family has no known-side grid**, unlike the attribution one. ``run_clustering.py``
+cuts the timeline once at ``KNOWN_FRACTION`` = 0.75 -- the final quarter is the collection under
+attack, [0.50, 0.75) is the labelled slice hyper-parameters are selected on, and [0, 0.50) is what
+a ``--projection`` is fitted on. There is no ``--known-windows`` and no six-cell grid, so a
+clustering cell is one experiment where an attribution cell is six.
+
+**Every cell of a family gets the same command line, and for clustering that is why this script
+exists.** The clustering runs that predate it were submitted by hand and did not agree: WildChat
+got ``--oracle-sweep`` and an explicit three-algorithm list, swe-chat got the runner's defaults
+and all five, so the two corpora answered different questions and neither could be read against
+the other. Here :data:`CLUSTERING_ALGORITHMS`, :data:`CLUSTERING_SCOPES` and the oracle sweep are
+properties of the *batch*, spelled once and passed to every cell whatever its source.
+
+The one thing that still differs between corpora is not a setting: ``average_linkage`` needs a
+dense ``n^2`` distance matrix and the runner skips it, with a note, above ``MAX_DENSE_DOCUMENTS``
+= 20,000 documents. That is a property of the method and the corpus, so
+:data:`CLUSTERING_SCALE_LIMITED` records it here too -- otherwise a WildChat cell would be
+missing a result it was never going to produce and would look permanently unfinished (see
+:func:`expected_results`).
 
 Two things are skipped, and the distinction matters when reading the plan:
 
-* **Already run.** A cell is done when its directory holds a ``rolling_results.csv`` row for
-  every known configuration in :data:`KNOWN_CONFIGS` *and* the matching ``predictions_*.csv``
-  beside it (see :func:`completed_configs`). A directory that covers only some of them -- a
-  sharded run that was killed part way, which is a real outcome under the 16 GB job cap -- is
-  reported as partial and re-run rather than counted as done. ``--force`` re-runs everything
-  that has data regardless.
+* **Already run.** What counts as finished is per family. An attribution cell is done when its
+  directory holds a ``rolling_results.csv`` row for every known configuration in
+  :data:`KNOWN_CONFIGS` *and* the matching ``predictions_*.csv`` beside it
+  (:func:`completed_configs`); a clustering cell when ``clustering_results.csv`` holds a row for
+  every (scope, algorithm) the batch asked for *and* the matching
+  ``clusters_<algorithm>[_unseen].csv`` (:func:`completed_results`). A directory covering only
+  some of them -- a run killed part way, which is a real outcome under the 16 GB job cap and on
+  ``cpu-preempt`` -- is reported as partial and re-run rather than counted as done. ``--force``
+  re-runs everything that has data regardless.
 * **No data.** A cell needs ``<split>.parquet`` and ``<split>[_<defense>]_<feature>.parquet``
   in ``--data-dir`` (``data/hf`` by default, *not* ``data/dist`` -- see the note on
   :data:`DATA_DIR`). Missing vectors are not something this script can fix, so those cells are
@@ -25,14 +64,28 @@ Run it::
     python experiments/run_all_experiments.py --dry-run   # what would run, and what would not
     python experiments/run_all_experiments.py             # run the missing cells, cheapest first
     python experiments/run_all_experiments.py --force     # re-run every cell that has data
-    # one slice, e.g. to shard the expensive attack across jobs:
+    # one family, or one slice of one:
+    python experiments/run_all_experiments.py --families clustering
     python experiments/run_all_experiments.py --attacks xgboost --defenses openanonymity
-    # anything after `--` is appended to every run_experiment.py command line:
-    python experiments/run_all_experiments.py -- --no-tune
+    # anything after `--` is appended to every runner command line:
+    python experiments/run_all_experiments.py --families attribution -- --no-tune
 
-Cells run **cheapest attack first** (:data:`ATTACKS` is in increasing cost order), so a batch
-that is interrupted has completed the runs that were quick to redo. A failing cell does not stop
-the rest unless ``--stop-on-error`` is given; the exit status is non-zero if any cell failed.
+Cells run **cheapest first**: the families in :data:`FAMILIES` order whatever order
+``--families`` names them in, attribution sorted by attack (:data:`ATTACKS` is in increasing cost
+order) and clustering by corpus (:data:`CLUSTERING_SOURCE_ORDER` is), so a batch that is
+interrupted has completed the runs that were quick to redo. A failing cell does not stop the rest unless ``--stop-on-error`` is given; the exit status
+is non-zero if any cell failed.
+
+**Flags that change the output directory name must not go through ``--``.** ``output_tag`` and
+``run_clustering.main`` both append any non-default scope choice to the directory name --
+``--language-aware``, ``--ood reject``, ``--known-windows`` on one side, ``--known-defense``,
+``--standardize``, ``--projection``, ``--rescoring``, ``--time-weight`` on
+the other -- which deliberately takes the run out of the comparable set. Passing one here would
+leave this script checking, naming and job-guarding a directory the runner never writes. Those
+are variant runs; submit them by hand (``scripts/run_clustering_slurm.sh``, or the GPU script for
+``--projection contrastive``). In particular this launcher always leaves ``--known-defense`` at
+its default: an undefended known side is the deployment threat model and the only condition whose
+name stays in the comparable set.
 
 Submitting to SLURM
 -------------------
@@ -44,10 +97,11 @@ belongs on a login node and returns in seconds::
     python experiments/run_all_experiments.py --slurm --dry-run   # print the sbatch lines, submit nothing
     python experiments/run_all_experiments.py --slurm             # submit the missing cells
 
-**The split of knowledge is the point.** This file decides *what* runs and which resource
-*class* each cell needs -- :func:`resource_profile`, which knows that xgboost wants an
-accelerator and WildChat wants memory, and nothing about any cluster. Two files outside it hold
-everything site-specific, and they are the only ones another user edits:
+**The split of knowledge is the point.** This file decides *what* runs and which resource *class*
+each cell needs -- :func:`resource_profile`, which knows that xgboost wants an accelerator, that
+WildChat wants memory, and that a clustering cell is large in a different place from an
+attribution one; and nothing about any cluster. Two files outside it hold everything
+site-specific, and they are the only ones another user edits:
 
 * ``scripts/slurm.toml`` -- profile name to ``sbatch`` flags (partitions, limits, accounting).
   Overridable with ``--slurm-config`` / ``$PROMPT_ANONYMITY_SLURM_CONFIG``; one-off flags go on
@@ -60,11 +114,13 @@ an array shares one allocation, so the nearest-neighbour tasks would each hold a
 jobs also fail independently, which is what ``--stop-on-error`` buys in the local path and what
 is lost the moment the work is asynchronous (so the two flags are rejected together).
 
-**A queued cell is skipped.** "Already done" is read off ``rolling_results.csv``, which does not
-exist while a job is still pending, so re-running the launcher would otherwise submit the whole
-grid a second time. Each job is named after its cell, and :func:`queued_job_names` asks ``squeue``
-what is already in flight. That guard is *not* lifted by ``--force``: two jobs writing one results
-directory corrupt it, so resubmitting means cancelling the job first.
+**A queued cell is skipped.** "Already done" is read off a results file that does not exist while
+a job is still pending, so re-running the launcher would otherwise submit the whole grid a second
+time. Each job is named after its cell, and :func:`queued_job_names` asks ``squeue`` what is
+already in flight. That guard is *not* lifted by ``--force``: two jobs writing one directory
+corrupt it, so resubmitting means cancelling the job first. Note the by-hand
+``scripts/run_clustering_slurm.sh`` names its jobs ``clustering`` rather than after the cell, so
+this guard cannot see a clustering run submitted that way.
 """
 
 from __future__ import annotations
@@ -83,8 +139,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+#: Where each family's runner and results live. ``clustering`` is a separate root rather than a
+#: subdirectory of ``results/`` because both directory *names* are contracts other scripts parse,
+#: and a three-part name sitting among four-part ones would be read by the wrong parser.
 RUNNER = REPO_ROOT / "experiments" / "run_experiment.py"
 RESULTS_DIR = REPO_ROOT / "experiments" / "results"
+CLUSTERING_RUNNER = REPO_ROOT / "experiments" / "run_clustering.py"
+CLUSTERING_DIR = REPO_ROOT / "experiments" / "clustering"
 
 #: Batch wrapper every SLURM job runs: it builds the environment and execs the runner command.
 SLURM_WRAPPER = REPO_ROOT / "scripts" / "slurm_job.sh"
@@ -152,8 +213,10 @@ FRAME_SHIFT = ("frame_shift",)
 #: ablation could be run; only the main arm is in the default grid to keep the featurize bill down.
 FRAME_PAD = ("frame_pad",)
 
+EMBAD = ("embad", "embad_summary", "embad_gemini")
+
 DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
-            + COLLISION_SEEDING + FRAME_SHIFT + FRAME_PAD)
+            + COLLISION_SEEDING + FRAME_SHIFT + FRAME_PAD + EMBAD)
 
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
@@ -183,7 +246,7 @@ ATTACKS = ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd", "l
 #: not an optional extra: it roughly **doubles** WildChat's StyloMetrix top-1 over
 #: ``nearest_neighbor`` (0.0655 -> 0.1387 at ``known0075``, 1.7-2.1x on every configuration), so a
 #: grid without it reports a corpus limit where there was only a solver limit.
-SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd")}
+SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "rlsc", "logistic_sgd")}
 
 #: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
 #: ``DEFAULT_KNOWN_WINDOWS``. Used only to decide whether a directory is complete; this script
@@ -191,6 +254,84 @@ SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "plda", "lda", "rlsc"
 #: corpus is too small for one of them) would look permanently incomplete -- which has not
 #: happened on either corpus, and would be visible as a cell that re-runs every time.
 KNOWN_CONFIGS = ("known0025", "known2550", "known5075", "known0050", "known2575", "known0075")
+
+#: The two families, in the order a batch runs them. Names are what ``--families`` takes.
+FAMILIES = ("attribution", "clustering")
+
+#: :data:`SOURCES` in clustering's cost order -- cheapest corpus first, so an interrupted batch
+#: has finished the quick cells. The attribution grid orders by attack instead and takes the
+#: corpora in :data:`SOURCES` order within each; there the corpus is not the dominant cost.
+CLUSTERING_SOURCE_ORDER = ("swe_chat", "wildchat")
+
+#: Features the clustering grid uses when ``--features`` is not given. Every clustering result on
+#: disk is on this one: the graph is built from cosine distances, where the 3,072-d semantic
+#: vectors carry the same-author signal that makes the attack work at all. ``--features`` still
+#: accepts the whole of :data:`FEATURES` and applies to both families at once.
+CLUSTERING_DEFAULT_FEATURES = ("gemini_embedding_2",)
+
+#: Algorithms every clustering cell runs, in the order ``run_clustering.py`` sorts them into.
+#: Passed explicitly rather than left to the runner's default, so the plan shows what was asked
+#: for and a later change to that default cannot silently re-shape a batch.
+CLUSTERING_ALGORITHMS = ("average_linkage", "componentwise_agglomerative", "connected",
+                         "hdbscan", "leiden")
+
+#: Author scopes every clustering cell attacks the collection under, likewise passed explicitly.
+#: Each is a complete run with its own search and baselines, filed in the same directory under a
+#: ``scope`` column; their BCubed scores are **not** comparable with each other.
+CLUSTERING_SCOPES = ("all", "unseen")
+
+#: Where a clustering algorithm cannot run, so that its absence is not read as an unfinished
+#: cell. Mirrors the runner's own guard rather than importing it, for the same reason the grid
+#: above is literal: ``average_linkage`` needs a dense ``n_documents^2`` float64 distance matrix,
+#: which is 14.9 GB at WildChat's 43,127-document test quarter and over the 20,000-document
+#: ``MAX_DENSE_DOCUMENTS`` limit, so the runner skips it there with a printed note.
+#: ``componentwise_agglomerative`` is the method that gets average linkage back at that scale by
+#: agglomerating inside one connected component at a time, and has no such limit.
+CLUSTERING_SCALE_LIMITED = {"average_linkage": ("wildchat",)}
+
+#: The clustering configurations every cell is run under: name -> (``--projection``, whether the
+#: elapsed-time weight is searched). The name is the fourth part of the directory,
+#: ``<dataset>_<defense>_<feature>_<variant>``, and must be one ``run_clustering.variant_name``
+#: can produce and ``plot_results.CLUSTERING_VARIANT_LABELS`` registers.
+#:
+#: Both are in the default grid, and they are different experiments rather than one superseding
+#: the other:
+#:
+#: * ``plain`` is the pure-text run, the comparable set every ``by_defense`` and
+#:   ``precision_recall`` figure draws. Dropping it would empty those figures.
+#: * ``time`` fuses elapsed time into the edge score and reads no learned projection. It is the
+#:   control that makes the row below readable -- timestamps alone re-link users nearly as well
+#:   as a tuned style attack (WildChat test BCubed F 0.463 for timing only against 0.510 for the
+#:   baseline), so a fused number has to be shown against it to claim the gain is joint. CPU only,
+#:   since there is no projection to fit.
+#: * ``contrastive_time`` fits a contrastive projection on the first half of the timeline and
+#:   fuses elapsed time into the edge score, which is the strongest configuration measured: on
+#:   WildChat's test slice, BCubed F 0.510 baseline -> 0.537 contrastive -> **0.562** with timing.
+#:   It goes to the variants family instead, where the strategy is the axis.
+#:
+#: **Every variant searches its distance thresholds as quantiles of the graph's own edge weights**
+#: -- ``run_clustering.py`` has no absolute-radius mode any more (see ``search_spaces``). So the
+#: three differ only in what is fused into the edge score, and ``time`` at a searched weight of 0
+#: really is ``plain``. What that buys is that one threshold means one thing across a projection,
+#: a fusion, and the undefended-tuning-slice/defended-test-collection gap; what it costs is that a
+#: defense's effect on the distance *scale* no longer registers, only its effect on ranking.
+#:
+#: ``lda``, ``wccn`` and the rescorings are **registered variants, just not gridded here**:
+#: ``run_clustering.py`` produces them (``--projection lda``, ``--projection wccn --rescoring
+#: csls``), ``plot_results.CLUSTERING_VARIANT_LABELS`` names them, and their directories parse.
+#: They are out of the default grid because the contrastive projection beat every algorithm and
+#: hubness fix in the development sweep, so the default runs the pure-text baseline and the
+#: winner. Adding one back is a single line here, e.g. ``"lda": ("lda", False)``.
+CLUSTERING_VARIANTS = {
+    "plain": ("none", False),
+    "time": ("none", True),
+    "contrastive_time": ("contrastive", True),
+}
+
+#: Prefix of the reference partitions ``run_clustering.py`` scores beside the algorithms
+#: (``baseline_singleton`` and friends). They are rows in ``clustering_results.csv`` but not
+#: attacks, have no ``clusters_*.csv``, and are not what makes a cell finished.
+BASELINE_PREFIX = "baseline_"
 
 
 # --- resource classes --------------------------------------------------------
@@ -211,26 +352,68 @@ GPU_ATTACKS = ("xgboost", "logistic_sgd")
 #: float32 = 4.72 GB at ``known0050`` alone; runs have been OOM-killed at 16 GB.
 LARGE_MEMORY_SOURCES = ("wildchat",)
 
+#: Sources whose *collection* does not fit the small clustering profile -- a different resource
+#: story from the one above, which is why the clustering classes are their own. WildChat clusters
+#: 43,127 documents: two neighbour graphs, HDBSCAN's minimum spanning tree over ~1.5M edges, and
+#: componentwise agglomeration's dense per-component matrix, on top of the 172,509 x 3,072 feature
+#: matrix held while loading (2.1 GB). See the notes in ``scripts/slurm.toml``.
+LARGE_COLLECTION_SOURCES = ("wildchat",)
+
+#: Projections worth allocating a GPU for. The contrastive fit is 30,000 steps of a 3,072 x 1,024
+#: matmul over a 2,048-document batch -- ~6 minutes on one A100 against hours on eight cores. The
+#: closed-form projections (``wccn``, ``lda``) and every clustering algorithm are CPU work, so a
+#: variant that does not fit a contrastive map stays on the CPU classes.
+GPU_PROJECTIONS = ("contrastive",)
+
 
 @dataclass(frozen=True)
 class Cell:
-    """One point of the grid: one runner invocation, one results directory."""
+    """One point of the grid: one runner invocation, one results directory.
 
+    Both families share this shape; ``attack`` and ``variant`` are what tell them apart, each
+    ``None`` for the family that has no such axis. The alternative -- two dataclasses -- would
+    have forked ``Plan``, ``print_plan``, the whole SLURM path and ``main`` along with it, to
+    express two absent fields.
+    """
+
+    family: str
     source: str
     defense: str
     feature: str
-    attack: str
+    attack: str | None = None
+    variant: str | None = None
 
     @property
     def tag(self) -> str:
-        """The results directory name -- ``run_experiment.output_tag`` for a default run.
+        """The results directory name, for a default run of this cell's family.
 
-        Four parts, positional, ``base`` for no defense. The dataset part is the source name
+        ``run_experiment.output_tag`` (four parts) or ``run_clustering.main``'s tag (three), both
+        positional and both spelling no defense ``base``. The dataset part is the source name
         verbatim, which is also its parquet's base name -- one spelling per corpus. Every flag
-        this script passes is a default as far as ``output_tag`` is concerned, so the name stays
-        in the comparable set that ``plot_results.py`` draws.
+        this script passes is a default as far as those two are concerned, so the name stays in
+        the comparable set that ``plot_results.py`` draws.
         """
-        return f"{self.source}_{self.defense}_{self.feature}_{self.attack}"
+        name = f"{self.source}_{self.defense}_{self.feature}"
+        return f"{name}_{self.attack if self.attack is not None else self.variant}"
+
+    @property
+    def variant_flags(self) -> list[str]:
+        """The ``run_clustering.py`` flags this cell's variant adds; empty for ``plain``.
+
+        The *name* is the contract, not these flags: ``run_clustering.variant_name`` derives the
+        fourth part of the directory from exactly this combination, and this script names the job,
+        checks whether the cell is finished and reports it under that string.
+        """
+        if self.variant is None:
+            return []
+        projection, tune_weight = CLUSTERING_VARIANTS[self.variant]
+        return (([] if projection == "none" else ["--projection", projection])
+                + (["--tune-time-weight"] if tune_weight else []))
+
+    @property
+    def results_root(self) -> Path:
+        """The root this cell's directory lives under -- one per family."""
+        return RESULTS_DIR if self.family == "attribution" else CLUSTERING_DIR
 
     def feature_parquet(self, data_dir: Path) -> Path:
         """The vectors this cell attacks: ``<split>[_<defense>]_<feature>.parquet``."""
@@ -249,21 +432,40 @@ class Cell:
         return data_dir / f"{self.source}_{self.defense}.parquet"
 
 
-def build_grid() -> list[Cell]:
-    """Every cell of the grid, in execution order: cheapest attack first.
+def build_grid(families: tuple[str, ...], sources: tuple[str, ...], defenses: tuple[str, ...],
+               features: tuple[str, ...], clustering_features: tuple[str, ...],
+               attacks: tuple[str, ...], variants: tuple[str, ...]) -> list[Cell]:
+    """Every selected cell, in execution order: families in :data:`FAMILIES` order, cheapest first.
 
-    Sorting by attack rather than by source means an interrupted batch has finished all the
-    nearest-neighbour runs -- the ones that are cheap to redo -- rather than a random prefix.
-    Within an attack the order is source, defense, feature, so the plan reads in blocks.
+    Attribution sorts by attack rather than by source, so an interrupted batch has finished all
+    the nearest-neighbour runs -- the ones that are cheap to redo -- rather than a random prefix;
+    within an attack the order is source, defense, feature, so the plan reads in blocks.
+    Clustering has no attack axis but two others: its cost order is the variant (the plain run
+    before the one that has to fit a projection first) and then the corpus, since swe-chat's test
+    quarter is ~1,000 documents against WildChat's 43,127 and every stage of it is superlinear in
+    that.
     """
-    return [
-        Cell(source=source, defense=defense, feature=feature, attack=attack)
-        for attack in ATTACKS
-        for source in SOURCES
-        for defense in DEFENSES
-        for feature in FEATURES
-        if attack in SOURCE_ATTACKS.get(source, ATTACKS)
-    ]
+    cells: list[Cell] = []
+    for family in families:
+        if family == "attribution":
+            cells += [
+                Cell("attribution", source, defense, feature, attack)
+                for attack in attacks
+                for source in SOURCES
+                for defense in defenses
+                for feature in features
+                if source in sources and attack in SOURCE_ATTACKS.get(source, ATTACKS)
+            ]
+        else:
+            cells += [
+                Cell("clustering", source, defense, feature, variant=variant)
+                for variant in variants
+                for source in CLUSTERING_SOURCE_ORDER
+                for defense in defenses
+                for feature in clustering_features
+                if source in sources
+            ]
+    return cells
 
 
 def resource_profile(cell: Cell) -> str:
@@ -280,7 +482,21 @@ def resource_profile(cell: Cell) -> str:
     once, and folding it into plain ``gpu`` -- sized for xgboost on swe-chat at 24 GB and a
     four-hour ``short`` QOS -- would hand a 3.4 GB score matrix and a multi-hour Gemini fit an
     allocation that fits neither.
+
+    Clustering has its own two classes over one axis, the corpus, and does not borrow ``cpu`` /
+    ``cpu_large``. There is no attack to want an accelerator -- the neighbour graph is a BLAS
+    matmul through the project's blocked kernel and Leiden, HDBSCAN and connected components are
+    CPU graph algorithms, so a card would sit idle for the whole job -- and what is large about a
+    clustering cell is its graphs and its dense per-component matrices, not an
+    ``[n_unknown x n_authors]`` score matrix. The two families want different amounts of the same
+    resource, and each should be tunable in the TOML without moving the other.
     """
+    if cell.family == "clustering":
+        projection = CLUSTERING_VARIANTS[cell.variant][0] if cell.variant else "none"
+        if projection in GPU_PROJECTIONS:
+            return "clustering_gpu"
+        return ("clustering_cpu_large" if cell.source in LARGE_COLLECTION_SOURCES
+                else "clustering_cpu")
     if cell.attack in GPU_ATTACKS:
         return "gpu_large" if cell.source in LARGE_MEMORY_SOURCES else "gpu"
     if cell.source in LARGE_MEMORY_SOURCES:
@@ -316,6 +532,70 @@ def completed_configs(run_dir: Path, attack: str) -> set[str]:
             if (run_dir / f"predictions_{attack}_{config}.csv").exists()}
 
 
+def scope_suffix(scope: str) -> str:
+    """Filename suffix for one clustering author scope; empty for ``all``.
+
+    Mirrors ``run_clustering.scope_suffix`` (and ``plot_results.clustering_scope_suffix``, which
+    mirrors it for the same reason): the ``all`` scope is spelled by *absence*, so its files keep
+    the names they had before ``--scopes`` existed. Restated rather than imported because
+    importing the runner would pull in numpy, pandas, scipy and the attack package just to print
+    a plan -- the same reason the grid vocabulary above is literal.
+    """
+    return "" if scope == "all" else f"_{scope}"
+
+
+def expected_results(cell: Cell, scopes: tuple[str, ...],
+                     algorithms: tuple[str, ...]) -> set[tuple[str, str]]:
+    """The ``(scope, algorithm)`` pairs a finished clustering ``cell`` should hold.
+
+    The batch's whole request, minus the pairs :data:`CLUSTERING_SCALE_LIMITED` says this corpus
+    cannot produce. Without that subtraction every WildChat cell would be one result short
+    forever and would be re-run by every launch -- the failure mode :data:`KNOWN_CONFIGS`
+    warns about above, except that here it would actually happen.
+    """
+    return {(scope, algorithm)
+            for scope in scopes
+            for algorithm in algorithms
+            if cell.source not in CLUSTERING_SCALE_LIMITED.get(algorithm, ())}
+
+
+def completed_results(run_dir: Path) -> set[tuple[str, str]]:
+    """The ``(scope, algorithm)`` pairs a clustering ``run_dir`` holds a finished result for.
+
+    The clustering half of :func:`completed_configs`, and it counts a pair only on the same
+    two-halves rule: a row in ``clustering_results.csv`` and its own
+    ``clusters_<algorithm>[_unseen].csv``. Checking one alone would call a half-written directory
+    done -- and the per-document file is what a downstream re-score and every clustering figure
+    read, so a missing one is a cell that cannot be used however complete its summary looks.
+
+    A ``clustering_results.csv`` written before the ``scope`` column existed (2026-08-16) is
+    entirely the ``all`` scope, which is what the ``or "all"`` below records -- correctly leaving
+    such a directory partial, since it really does hold nothing for ``unseen``.
+    """
+    results = run_dir / "clustering_results.csv"
+    if not results.exists():
+        return set()
+    try:
+        with results.open(newline="", encoding="utf-8") as handle:
+            scored = {((row.get("scope") or "all"), row["algorithm"])
+                      for row in csv.DictReader(handle)}
+    except (OSError, KeyError):        # unreadable or written by an older, different schema
+        return set()
+    return {(scope, algorithm) for scope, algorithm in scored
+            if not algorithm.startswith(BASELINE_PREFIX)
+            and (run_dir / f"clusters_{algorithm}{scope_suffix(scope)}.csv").exists()}
+
+
+def describe_missing(missing: set[tuple[str, str]]) -> str:
+    """The missing ``(scope, algorithm)`` pairs of a clustering cell, as one line for the plan."""
+    return ", ".join(f"{algorithm}[{scope}]" for scope, algorithm in sorted(missing))
+
+
+def describe_missing_configs(missing: set[str]) -> str:
+    """The missing known configurations of an attribution cell, in :data:`KNOWN_CONFIGS` order."""
+    return ", ".join(config for config in KNOWN_CONFIGS if config in missing)
+
+
 def queued_job_names() -> frozenset[str]:
     """Job names this user already has pending or running, as reported by ``squeue``.
 
@@ -342,7 +622,11 @@ def queued_job_names() -> frozenset[str]:
 
 @dataclass
 class Plan:
-    """What this script decided to do about one cell, and why."""
+    """What this script decided to do about one cell, and why.
+
+    Family-agnostic: nothing here or in :func:`print_plan` reads anything off the cell but its
+    ``tag``, which is what lets one plan hold both families' cells at once.
+    """
 
     cell: Cell
     action: str                        # "run", "done", "queued", or "no-data"
@@ -353,15 +637,18 @@ class Plan:
         return self.action == "run"
 
 
-def plan_cell(cell: Cell, data_dir: Path, results_dir: Path, force: bool,
+def plan_cell(cell: Cell, args: argparse.Namespace,
               queued: frozenset[str] = frozenset()) -> Plan:
     """Decide whether ``cell`` runs, and record the reason it does not.
 
     Data availability is checked first and is not overridable: ``--force`` re-runs work, it
     cannot conjure vectors that were never computed. The queue check comes next and is *also* not
     overridable -- two jobs writing one results directory interleave their ``predictions_*.csv``
-    and leave it neither run's output, so a resubmission means cancelling the job first.
+    (or their ``clusters_*.csv``) and leave it neither run's output, so a resubmission means
+    cancelling the job first. Only the last step, "is it already finished", differs between the
+    families, because only there do they write different files.
     """
+    data_dir = args.data_dir
     documents = data_dir / f"{cell.source}.parquet"
     if not documents.exists():
         return Plan(cell, "no-data", f"{documents.name} missing -- build the dataset first")
@@ -382,31 +669,61 @@ def plan_cell(cell: Cell, data_dir: Path, results_dir: Path, force: bool,
                       + (f" --defense {cell.defense}" if defended is not None else "") + "`")
         return Plan(cell, "no-data", reason)
 
-    run_dir = results_dir / cell.tag
-    done = completed_configs(run_dir, cell.attack)
-    if force:
+    if cell.family == "attribution":
+        run_dir = args.results_dir / cell.tag
+        expected: set = set(KNOWN_CONFIGS)
+        done: set = completed_configs(run_dir, cell.attack)
+        describe = describe_missing_configs
+        unit = "known configs"
+    else:
+        run_dir = args.clustering_dir / cell.tag
+        expected = expected_results(cell, tuple(args.scopes), tuple(args.algorithms))
+        done = completed_results(run_dir) & expected
+        describe = describe_missing
+        unit = "(scope, algorithm) results"
+
+    if args.force:
         return Plan(cell, "run", "forced" if done else "")
-    if set(KNOWN_CONFIGS) <= done:
-        return Plan(cell, "done", f"{len(KNOWN_CONFIGS)} known configs in {run_dir.name}")
+    if expected <= done:
+        return Plan(cell, "done", f"{len(expected)} {unit} in {run_dir.name}")
     if done:
-        missing = [config for config in KNOWN_CONFIGS if config not in done]
-        return Plan(cell, "run", f"partial: {len(done)}/{len(KNOWN_CONFIGS)} present, "
-                                 f"missing {', '.join(missing)}")
+        return Plan(cell, "run", f"partial: {len(done)}/{len(expected)} present, "
+                                 f"missing {describe(expected - done)}")
     return Plan(cell, "run", "")
 
 
 # --- running -----------------------------------------------------------------
 
 def runner_command(cell: Cell, args: argparse.Namespace) -> list[str]:
-    """The ``run_experiment.py`` command line for one cell.
+    """The runner command line for one cell -- which runner depends on the family.
 
-    Only the four grid axes and the settings that decide *where* the work happens are passed;
-    everything else is left at the runner's default, which is what keeps the output directory
-    name to its four parts and the run inside the comparable set. ``--xgboost-device`` is the one
-    value this script sets away from that default (to ``auto``, see :func:`parse_args`); it is
-    not part of ``output_tag``, so it changes where the trees are fitted and nothing else about
-    how the run is filed. ``--extra`` is appended last so it can override anything here.
+    Only the grid axes, the settings that decide *where* the work happens, and (for clustering)
+    the batch-wide experiment configuration are passed; everything else is left at the runner's
+    default, which is what keeps the output directory name to its three or four parts and the run
+    inside the comparable set. ``--extra`` is appended last so it can override anything here,
+    with the caveat in the module docstring about flags that change the directory name.
+
+    ``--xgboost-device`` is the one value this script sets away from a runner default (to
+    ``auto``, see :func:`parse_args`); it is not part of ``output_tag``, so it changes where the
+    trees are fitted and nothing else about how the run is filed.
+
+    The two runners spell an undefended cell differently and each is given what it expects:
+    ``run_experiment.py`` takes ``--defense none`` and is simply not passed the flag, while
+    ``run_clustering.py`` takes the directory spelling ``base`` as the value of ``--defense``.
     """
+    if cell.family == "clustering":
+        command = [sys.executable, str(CLUSTERING_RUNNER),
+                   "--source", cell.source,
+                   "--defense", cell.defense,
+                   "--feature", cell.feature,
+                   "--data-dir", str(args.data_dir),
+                   "--algorithms", *args.algorithms,
+                   "--scopes", *args.scopes,
+                   *cell.variant_flags]
+        if args.oracle_sweep:
+            command.append("--oracle-sweep")
+        return command + args.extra
+
     command = [sys.executable, str(RUNNER),
                "--source", cell.source,
                "--feature", cell.feature,
@@ -450,9 +767,15 @@ class SlurmConfig:
     """``scripts/slurm.toml``, parsed: the site's spelling of each resource class.
 
     Three tables, all optional and all holding nothing but ``sbatch`` flags -- ``defaults``
-    applied to every job, ``profiles`` keyed by :func:`resource_profile`'s return value, and
-    ``overrides`` keyed by a cell tag. There is no schema of our own beyond that, on purpose: a
-    flag this launcher has never heard of still works, because it is passed straight through.
+    applied to every job, ``profiles`` keyed by a resource-class name (this launcher's are
+    :func:`resource_profile`'s return values), and ``overrides`` keyed by a cell tag. There is no
+    schema of our own beyond that, on purpose: a flag this launcher has never heard of still
+    works, because it is passed straight through.
+
+    The two methods take a profile name and a tag rather than a :class:`Cell`, because a cell's
+    resource class is a property of its family and this table is not: keeping the lookup here and
+    the rule in :func:`resource_profile` is what lets the clustering classes be added without
+    touching either.
     """
 
     path: Path
@@ -460,19 +783,18 @@ class SlurmConfig:
     profiles: dict[str, tuple[str, ...]]
     overrides: dict[str, tuple[str, ...]]
 
-    def flags_for(self, cell: Cell) -> list[str]:
+    def flags_for(self, profile: str, tag: str) -> list[str]:
         """The ``sbatch`` flags for one cell, in precedence order (later wins)."""
         return [*self.defaults,
-                *self.profiles[resource_profile(cell)],
-                *self.overrides.get(cell.tag, ())]
+                *self.profiles[profile],
+                *self.overrides.get(tag, ())]
 
-    def check(self, cells: list[Cell]) -> None:
-        """Fail before anything is submitted if a cell's profile is not in the file.
+    def check(self, wanted: set[str]) -> None:
+        """Fail before anything is submitted if a resource class is not in the file.
 
         Checked for the whole batch up front rather than at each submission, so a missing profile
         is a message instead of half a grid queued and the rest abandoned.
         """
-        wanted = {resource_profile(cell) for cell in cells}
         missing = sorted(wanted - set(self.profiles))
         if missing:
             raise SystemExit(
@@ -587,7 +909,7 @@ def sbatch_command(cell: Cell, args: argparse.Namespace, config: SlurmConfig) ->
             f"--job-name={cell.tag}",
             f"--chdir={REPO_ROOT}",
             f"--output={log_dir}/{cell.tag}-%j.out",
-            *config.flags_for(cell),
+            *config.flags_for(resource_profile(cell), cell.tag),
             *args.slurm_arg,
             str(SLURM_WRAPPER),
             *runner_command(cell, args)]
@@ -685,22 +1007,70 @@ def parse_args() -> argparse.Namespace:
                         help="Re-run every cell that has data, including finished ones. Cells "
                              "whose feature parquet is missing are still skipped; this forces "
                              "work to be redone, it cannot create missing vectors.")
+    parser.add_argument("--families", nargs="+", metavar="NAME",
+                        help=f"Attack families to run (default: all of {', '.join(FAMILIES)}). "
+                             "'attribution' drives run_experiment.py over the four-part grid, "
+                             "'clustering' drives run_clustering.py over the three-part one; the "
+                             "--sources/--defenses/--features filters apply to both, --attacks "
+                             "only to the first.")
     parser.add_argument("--sources", nargs="+", metavar="NAME",
                         help=f"Restrict to these datasets (default: all of {', '.join(SOURCES)}).")
     parser.add_argument("--defenses", nargs="+", metavar="NAME",
                         help=f"Restrict to these defenses, '{NO_DEFENSE}' for undefended "
                              f"(default: all of {', '.join(DEFENSES)}).")
     parser.add_argument("--features", nargs="+", metavar="NAME",
-                        help=f"Restrict to these features (default: all of {', '.join(FEATURES)}).")
+                        help=f"Restrict to these features (default: all of "
+                             f"{', '.join(FEATURES)} for attribution, but only "
+                             f"{', '.join(CLUSTERING_DEFAULT_FEATURES)} for clustering, which is "
+                             "the one every clustering result on disk uses). Given explicitly, "
+                             "it applies to both families.")
     parser.add_argument("--attacks", nargs="+", metavar="NAME",
                         help=f"Restrict to these attacks (default: all of {', '.join(ATTACKS)}, "
                              f"subject to the per-source restrictions).")
+    parser.add_argument("--clustering-variants", nargs="+", metavar="NAME",
+                        help="Clustering only: which configurations each cell is run under "
+                             f"(default: all of {', '.join(CLUSTERING_VARIANTS)}). 'plain' is the "
+                             "pure-text run that keeps the three-part directory name every "
+                             "by_defense figure draws; 'contrastive_time' fits a contrastive "
+                             "projection on the first half of the timeline and fuses elapsed "
+                             "time into the edge score, which is the strongest configuration "
+                             "measured (WildChat test BCubed F 0.510 -> 0.562) and lands in the "
+                             "variants family rather than the comparable set. Its time weight is "
+                             "SEARCHED, not set: run_clustering.py tunes it per algorithm on the "
+                             "tuning slice, which is why the directory says `time` and carries no "
+                             "number.")
+    parser.add_argument("--algorithms", nargs="+", metavar="NAME",
+                        default=list(CLUSTERING_ALGORITHMS),
+                        help="Clustering only: algorithms every cell runs (default: "
+                             f"{', '.join(CLUSTERING_ALGORITHMS)}). One list for the whole batch, "
+                             "so the corpora stay comparable; average_linkage is skipped by the "
+                             "runner above 20,000 documents, which is expected on WildChat and is "
+                             "accounted for when deciding whether a cell is finished.")
+    parser.add_argument("--scopes", nargs="+", metavar="NAME",
+                        default=list(CLUSTERING_SCOPES), choices=list(CLUSTERING_SCOPES),
+                        help="Clustering only: author scopes every cell attacks (default: "
+                             f"{', '.join(CLUSTERING_SCOPES)}). 'all' is the test quarter whole, "
+                             "'unseen' only the authors absent from the known side; each is a "
+                             "complete run into the same directory, and their scores are not "
+                             "comparable with each other.")
+    parser.add_argument("--oracle-sweep", action=argparse.BooleanOptionalAction, default=False,
+                        help="Clustering only: also score the whole hyper-parameter grid on the "
+                             "test collection, to bound what tuning could have achieved (writes "
+                             "oracle_sweep.csv). It is an ORACLE -- never select on it. Off by "
+                             "default, matching the runner: it roughly doubles the search cost, "
+                             "and the swe-chat runs on disk were produced without it while the "
+                             "WildChat ones had it, which is one of the inconsistencies this "
+                             "launcher exists to end.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR,
                         help="Directory holding the parquets, passed straight to the runner "
                              "(default: data/hf, NOT data/dist -- see the module docstring).")
     parser.add_argument("--results-dir", type=Path, default=RESULTS_DIR,
-                        help="Where results directories live; what is scanned to decide whether "
+                        help="Where attribution results live; what is scanned to decide whether "
                              "a cell is already done (default: experiments/results).")
+    parser.add_argument("--clustering-dir", type=Path, default=CLUSTERING_DIR,
+                        help="The same for clustering results (default: experiments/clustering). "
+                             "A separate root because both directory names are contracts "
+                             "plot_results.py parses with different functions.")
     parser.add_argument("--log-dir", type=Path, default=None,
                         help="Where each cell's output goes. Locally: <log-dir>/<tag>.log instead "
                              "of the terminal, echoing only the tail of a failing run. Under "
@@ -737,23 +1107,37 @@ def parse_args() -> argparse.Namespace:
                              "report the failures at the end).")
     parser.add_argument("extra", nargs="*", metavar="-- RUNNER ARGS",
                         help="Everything after a bare `--` is appended to every runner command "
-                             "line, e.g. `-- --no-tune`.")
+                             "line, e.g. `-- --no-tune`. It reaches BOTH families, so narrow with "
+                             "--families when a flag only one of them takes. Do NOT pass a flag "
+                             "that changes the output directory name; see the module docstring.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    families = resolve_choices(args.families, FAMILIES, "--families")
     sources = resolve_choices(args.sources, SOURCES, "--sources")
     defenses = resolve_choices(args.defenses, DEFENSES, "--defenses")
     features = resolve_choices(args.features, FEATURES, "--features")
     attacks = resolve_choices(args.attacks, ATTACKS, "--attacks")
+    # An explicit --features applies to both families; left out, clustering takes only the one
+    # feature its results are all on rather than the whole attribution default.
+    clustering_features = (features if args.features
+                           else resolve_choices(list(CLUSTERING_DEFAULT_FEATURES), FEATURES,
+                                                "--features"))
+    # Canonical order rather than the order they were typed, so the plan and the command lines
+    # read the same whatever the caller wrote.
+    args.algorithms = list(resolve_choices(args.algorithms, CLUSTERING_ALGORITHMS, "--algorithms"))
+    args.scopes = [scope for scope in CLUSTERING_SCOPES if scope in args.scopes]
+    variants = resolve_choices(args.clustering_variants, tuple(CLUSTERING_VARIANTS),
+                               "--clustering-variants")
 
-    grid = [cell for cell in build_grid()
-            if cell.source in sources and cell.defense in defenses
-            and cell.feature in features and cell.attack in attacks]
+    grid = build_grid(families, sources, defenses, features, clustering_features, attacks,
+                      variants)
     if not grid:
-        raise SystemExit("no cells selected: the --sources/--defenses/--features/--attacks "
-                         "filters do not intersect (remember WildChat is nearest_neighbor only).")
+        raise SystemExit("no cells selected: the --families/--sources/--defenses/--features/"
+                         "--attacks/--clustering-variants filters do not intersect (remember "
+                         "WildChat is nearest_neighbor and logistic_sgd only).")
 
     if args.stop_on_error and args.slurm:
         raise SystemExit("--stop-on-error is meaningless with --slurm: submission returns before "
@@ -763,23 +1147,31 @@ def main() -> int:
     # a message rather than a partly-submitted grid.
     config = load_slurm_config(args.slurm_config) if args.slurm else None
     if config is not None:
-        config.check(grid)
+        config.check({resource_profile(cell) for cell in grid})
         if not SLURM_WRAPPER.exists():
             raise SystemExit(f"{SLURM_WRAPPER} not found: --slurm submits every job through it.")
 
     queued = queued_job_names() if args.slurm else frozenset()
-    plans = [plan_cell(cell, args.data_dir, args.results_dir, args.force, queued)
-             for cell in grid]
-    print_plan(plans, f"grid: {len(grid)} cells, data from {args.data_dir}"
-                      + (f", resources from {config.path}" if config is not None else ""))
+    plans = [plan_cell(cell, args, queued) for cell in grid]
+    header = (f"grid: {len(grid)} cells over {', '.join(families)}, data from {args.data_dir}"
+              + (f", resources from {config.path}" if config is not None else ""))
+    if "clustering" in families:
+        header += (f"\nclustering configuration: {', '.join(variants)}"
+                   f" | --algorithms {' '.join(args.algorithms)}"
+                   f" --scopes {' '.join(args.scopes)}"
+                   + (" --oracle-sweep" if args.oracle_sweep else ""))
+    print_plan(plans, header)
 
     queue = [plan.cell for plan in plans if plan.will_run]
 
     if args.dry_run:
-        if config is not None:
-            for cell in queue:
+        for cell in queue:
+            if config is not None:
                 print(f"\n{cell.tag}  [{resource_profile(cell)}]")
                 print("  " + shlex.join(sbatch_command(cell, args, config)))
+            else:
+                print(f"\n{cell.tag}")
+                print("  " + shlex.join(runner_command(cell, args)))
         print("\n--dry-run: nothing was submitted." if config is not None
               else "\n--dry-run: nothing was executed.")
         return 0

@@ -171,7 +171,9 @@ from prompt_anonymity.attacks.clustering.projection import (  # noqa: E402
 from prompt_anonymity.attacks.clustering.rescoring import (  # noqa: E402
     GRAPH_RESCORINGS,
     rescore_graph,
+    balanced_time_weight,
     temporal_fusion,
+    winsor_bounds,
 )
 from prompt_anonymity.attacks.similarity.kernel import blocked_distances  # noqa: E402
 from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
@@ -246,6 +248,36 @@ TEST_AUTHOR_SCOPES = ("all", "unseen")
 #: documents from 22 authors.
 MIN_SCOPE_DOCUMENTS = 10
 
+#: Multipliers laid around the *balanced* weight to make ``--tune-time-weight``'s grid.
+#:
+#: The grid is derived per run rather than fixed, because the weight where the two terms of
+#: ``temporal_fusion`` contribute equally is a property of the corpus, not a constant:
+#: :func:`~prompt_anonymity.attacks.clustering.rescoring.balanced_time_weight` reads it off the
+#: tuning graph, and this brackets it geometrically. A fixed linear grid cannot do that -- on
+#: swe-chat the balance sits near 0.1, so a grid starting at 0.2 would have had every candidate
+#: past the point where timing already dominates the text.
+#:
+#: **0.0 is always in the grid** -- the pure-text control, so an algorithm that gains nothing from
+#: session structure can decline the fusion rather than being forced into it. The top is clipped
+#: below 1.0 because a weight of exactly 1 is timing *only*: it reads no text at all, and a search
+#: allowed to select it could report a text attack that is not one.
+TIME_WEIGHT_MULTIPLIERS = (0.25, 0.5, 1.0, 2.0, 4.0)
+
+#: Largest weight the derived grid may contain; see above for why it is not 1.0.
+MAX_TIME_WEIGHT = 0.8
+
+
+def time_weight_grid(balance: float) -> tuple[float, ...]:
+    """The candidate weights for one run: 0, then :data:`TIME_WEIGHT_MULTIPLIERS` around ``balance``."""
+    weights = {0.0} | {min(round(balance * m, 4), MAX_TIME_WEIGHT)
+                       for m in TIME_WEIGHT_MULTIPLIERS}
+    return tuple(sorted(weights))
+
+
+def describe_bounds(bounds: tuple[float, float]) -> str:
+    """One term's winsorising bracket, for the run log and the results row."""
+    return f"[{bounds[0]:.4g}, {bounds[1]:.4g}]"
+
 
 def slice_bounds(n_documents: int) -> tuple[slice, slice]:
     """``(tuning, test)`` -- the simulation slice and the collection under attack.
@@ -265,6 +297,36 @@ def scope_suffix(scope: str) -> str:
     written before ``--scopes`` existed stays readable by exactly the code that read it before.
     """
     return "" if scope == "all" else f"_{scope}"
+
+
+def variant_name(args) -> str:
+    """The fourth part of the output directory name: which *representation* was clustered.
+
+    Four positional parts, ``<dataset>_<defense>_<feature>_<variant>``, deliberately the shape
+    ``experiments/results/`` has used all along -- the variant occupies the slot an attribution
+    run spells with its attack, because it is the same kind of thing: the method, as opposed to
+    the data it was pointed at.
+
+    The variant is the composition of the three axes that change what an edge score *means* --
+    ``--projection``, ``--rescoring`` and the elapsed-time fusion -- in pipeline order, or
+    ``plain`` when none of them is set. ``--standardize`` and ``--known-defense`` are **not** part
+    of it and stay trailing suffixes: they qualify a run rather than name a method, and a name
+    whose fourth part could be any of a dozen combinations is not a positional slot.
+
+    A tuned weight spells itself ``time``, with no number: under ``--tune-time-weight`` the value
+    is an *outcome* recorded per row of ``clustering_results.csv``, and each algorithm may have
+    chosen a different one, so there is no single number the directory could honestly carry.
+    """
+    parts = []
+    if args.projection != "none":
+        parts.append(args.projection)
+    if args.rescoring != "none":
+        parts.append(args.rescoring)
+    if args.tune_time_weight:
+        parts.append("time")
+    elif args.time_weight > 0:
+        parts.append(f"time{args.time_weight:g}")
+    return "_".join(parts) or "plain"
 
 
 def scope_positions(authors: np.ndarray, scope: str) -> tuple[np.ndarray, np.ndarray]:
@@ -644,6 +706,15 @@ class Collection:
     positions: np.ndarray           #: row indices into the whole ordered corpus
     frame: pd.DataFrame             #: the documents themselves, re-indexed from 0
     graph: object = None            #: the neighbour graph over them, once built
+    seconds: np.ndarray | None = None   #: ``ended_at`` for these documents, when the weight is
+    #: being tuned -- the graph is then left UNFUSED and :func:`run_algorithm` fuses a copy of it
+    #: per candidate weight, which is the only way a weight can be searched over.
+    fusion_scales: tuple[float, float] | None = None   #: ``(d0, tau)``, read off the TUNING graph
+    #: and shared by both collections: the weight is selected against one scoring function and has
+    #: to be deployed with the same one, so these are fixed on the known side rather than
+    #: recomputed per graph (see ``rescoring.fusion_scales``).
+    weight_grid: tuple[float, ...] = ()   #: candidate weights, derived from the tuning graph's
+    #: balance point by :func:`time_weight_grid`.
 
     @property
     def authors(self) -> np.ndarray:
@@ -656,7 +727,9 @@ class Collection:
 
 
 def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
-                  seconds: np.ndarray | None, args) -> tuple[Collection, Collection] | None:
+                  seconds: np.ndarray | None, args,
+                  known_embeddings: np.ndarray | None = None
+                  ) -> tuple[Collection, Collection] | None:
     """Both collections for one scope, graphs built, time-fused and rescored -- or ``None``.
 
     ``None`` means the scope is too small to attack (:data:`MIN_SCOPE_DOCUMENTS`), which is a note
@@ -692,17 +765,63 @@ def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
 
     k = min(args.max_neighbors, len(test_positions) - 1, len(tuning_positions) - 1)
     started = time.perf_counter()
+    # Each collection is built from ITS OWN matrix: the tuning slice is the attacker's history
+    # (undefended by default) and the test slice is the collection under attack. The two are the
+    # same array unless --known-defense differs, so this is a no-op in the matched condition.
+    sources = {"test": embeddings,
+               "tuning": embeddings if known_embeddings is None else known_embeddings}
     for collection in collections:
         collection.graph = build_neighbor_graph(
-            take_rows(embeddings, collection.positions), k, metric=args.metric)
+            take_rows(sources[collection.role], collection.positions), k, metric=args.metric)
     print(f"  {'':<{len(label)}}  built two k={k} graphs in {time.perf_counter() - started:.0f}s")
 
+    # The edge score is `temporal_fusion` at EVERY weight, including zero -- a run with no timing
+    # is the same formula with the time term multiplied by nothing, not a different scoring
+    # function. So the scales are derived and the transform applied unconditionally, and a `plain`
+    # run differs from a `time` one only in `w`.
     if seconds is not None:
         for collection in collections:
-            collection.graph = temporal_fusion(collection.graph, seconds[collection.positions],
-                                               args.time_weight)
-        print(f"  {'':<{len(label)}}  fused elapsed time at weight {args.time_weight:g} into both "
-              f"graphs")
+            collection.seconds = seconds[collection.positions]
+    # Both scales come from the TUNING collection and are then applied to both graphs. That
+    # asymmetry is the point: the weight is chosen on the tuning slice, so the transform it
+    # was chosen under has to be the transform the test collection is scored with.
+    tuning = next(c for c in collections if c.role == "tuning")
+    # Per graph, deliberately: each collection is bracketed by its OWN quantiles rather than
+    # inheriting the tuning slice's, for the reasons `winsor_bounds` documents (a fixed bracket
+    # pinned 14.4% of the test collection's time gaps to the clip, and the selected weight is
+    # unaffected either way because the search only ever sees the tuning graph).
+    for collection in collections:
+        collection.fusion_scales = winsor_bounds(collection.graph, collection.seconds)
+    if seconds is None:
+        # tau is NaN here and is never read: the time term is skipped outright at w=0.
+        for collection in collections:
+            collection.graph = temporal_fusion(collection.graph, None, 0.0,
+                                               collection.fusion_scales)
+        shown = next(c for c in collections if c.role == "test").fusion_scales
+        print(f"  {'':<{len(label)}}  text-only edge scores, winsorised to "
+              f"{describe_bounds(shown[0])} (fusion at weight 0)")
+    else:
+        balance = balanced_time_weight(tuning.graph, tuning.seconds, tuning.fusion_scales)
+        for collection in collections:
+            collection.weight_grid = time_weight_grid(balance)
+        for collection in collections:
+            print(f"  {'':<{len(label)}}  {collection.role} winsorised to text "
+                  f"{describe_bounds(collection.fusion_scales[0])}, time "
+                  f"{describe_bounds(collection.fusion_scales[1])} h"
+                  + (f" (balanced weight {balance:.3f})" if collection.role == "tuning" else ""))
+        if args.tune_time_weight:
+            # Left unfused on purpose: the weight is a hyper-parameter here, so fusing once now
+            # would fix the very thing the search is about. `run_algorithm` fuses a copy of each
+            # graph per candidate weight instead -- w=0 included, so the pure-text candidate is
+            # scored in the same space as every other one.
+            print(f"  {'':<{len(label)}}  elapsed time will be fused per candidate weight "
+                  f"({', '.join(f'{w:g}' for w in collections[0].weight_grid)})")
+        else:
+            for collection in collections:
+                collection.graph = temporal_fusion(collection.graph, collection.seconds,
+                                                   args.time_weight, collection.fusion_scales)
+            print(f"  {'':<{len(label)}}  fused elapsed time at weight {args.time_weight:g} into "
+                  f"both graphs")
 
     if args.rescoring != "none":
         # Applied to BOTH graphs, so the tuning slice simulates exactly what the test collection
@@ -720,17 +839,68 @@ def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
 def elapsed_seconds(frame: pd.DataFrame) -> np.ndarray:
     """``ended_at`` as POSIX seconds, NaN where the document carries no timestamp."""
     stamps = pd.to_datetime(frame["ended_at"], errors="coerce", utc=True)
-    seconds = stamps.astype("int64").to_numpy() / 1e9
-    seconds[stamps.isna().to_numpy()] = np.nan
-    return seconds
+    # Subtracting the epoch and asking the timedelta for seconds, rather than `.astype("int64")`
+    # over a hardcoded 1e9. That divisor assumes the parsed dtype is nanoseconds, and pandas 3
+    # parses an ISO string to `datetime64[us]` -- which silently made every gap 1000x too small
+    # and, because `fusion_scales` derives tau from the same array, invisible in `t / tau`.
+    # `total_seconds()` already yields NaN for NaT, so there is no second pass to write the
+    # missing entries -- and pandas hands back a read-only view, so `.copy()` keeps the array
+    # writable for callers that fill or mask it in place.
+    return (stamps - pd.Timestamp(0, tz="UTC")).dt.total_seconds().to_numpy().copy()
 
 
-def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
-                  tuning_graph, tuning_authors: np.ndarray, args) -> tuple[dict, np.ndarray, pd.DataFrame]:
-    """Tune on the simulation slice, then attack the test collection once with the winner."""
+def tune_over_time_weights(algorithm: str, tuning: Collection, tuning_authors: np.ndarray,
+                           args) -> tuple[dict, float, pd.DataFrame]:
+    """Search the elapsed-time weight jointly with ``algorithm``'s own hyper-parameters.
+
+    ``(settings, weight, trials)``. One :func:`tune` pass per candidate in
+    the run's derived weight grid, over a copy of the tuning graph fused at that weight (with the
+    scales the tuning graph fixed), and the winner
+    is the best cell of the whole product -- so the weight is chosen exactly as every other
+    hyper-parameter is, **on the labelled tuning slice [0.50, 0.75) and never on the collection
+    under attack**.
+
+    Per algorithm rather than once per run, for the same reason ``neighbors`` is: what the fusion
+    is worth depends on how the method reads the graph, and connected components at a tight radius
+    is not asking the same question of an edge that Leiden's modularity is. The cost is one
+    existing search per candidate weight, and the trials table keeps every cell so a flat or
+    bimodal optimum in the weight is visible rather than inferred from the winner.
+    """
+    best_settings, best_weight, best_score, tables = None, 0.0, -np.inf, []
+    for weight in tuning.weight_grid:
+        graph = temporal_fusion(tuning.graph, tuning.seconds, weight, tuning.fusion_scales)
+        settings, trials = tune(algorithm, graph, tuning_authors, args.tune_limit,
+                                search_spaces(args, algorithm))
+        trials.insert(0, "time_weight", weight)
+        tables.append(trials)
+        score = float(trials.iloc[0]["bcubed_f"])
+        if score > best_score:
+            best_settings, best_weight, best_score = settings, weight, score
+    combined = pd.concat(tables, ignore_index=True).sort_values(
+        "bcubed_f", ascending=False, kind="mergesort")
+    return best_settings, best_weight, combined
+
+
+def run_algorithm(algorithm: str, test: Collection, test_authors: np.ndarray,
+                  tuning: Collection, tuning_authors: np.ndarray, args) -> tuple[dict, np.ndarray, pd.DataFrame]:
+    """Tune on the simulation slice, then attack the test collection once with the winner.
+
+    Takes the two :class:`Collection` objects rather than their graphs because
+    ``--tune-time-weight`` makes the graph itself part of what is searched: the weight decides the
+    edge scores, so the tuning graph has to be re-fused per candidate and the test graph fused
+    once, at the end, with whatever won.
+    """
     started = time.perf_counter()
-    settings, trials = tune(algorithm, tuning_graph, tuning_authors, args.tune_limit,
-                            search_spaces(args, algorithm))
+    test_graph, time_weight = test.graph, args.time_weight
+    if args.tune_time_weight:
+        settings, time_weight, trials = tune_over_time_weights(
+            algorithm, tuning, tuning_authors, args)
+        # The collection under attack is fused ONCE, with the weight the tuning slice chose. It is
+        # never scored at any other weight, which is what keeps the choice honest.
+        test_graph = temporal_fusion(test.graph, test.seconds, time_weight, test.fusion_scales)
+    else:
+        settings, trials = tune(algorithm, tuning.graph, tuning_authors, args.tune_limit,
+                                search_spaces(args, algorithm))
     tuning_seconds = time.perf_counter() - started
     tuned_score = float(trials.iloc[0]["bcubed_f"])
     # Named before the attack, not after: the failure path below returns this same table, and a
@@ -755,6 +925,17 @@ def run_algorithm(algorithm: str, test_graph, test_authors: np.ndarray,
             f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}"
             for key, value in sorted(settings.items())),
         **score_partition(labels, test_authors),
+        # Per row, because --tune-time-weight lets each algorithm choose its own; it repeats the
+        # run-level `time_weight` column when the weight is fixed instead.
+        "time_weight": time_weight,
+        # Without these the run cannot be reconstructed from its own outputs: a weight only means
+        # something alongside the brackets the two terms were winsorised to. These are the TEST
+        # collection's own (see `winsor_bounds` on why they are per-graph); the tuning slice's are
+        # in the run log.
+        "fusion_text_bounds": ("" if test.fusion_scales is None
+                               else describe_bounds(test.fusion_scales[0])),
+        "fusion_time_bounds_hours": ("" if test.fusion_scales is None
+                                     else describe_bounds(test.fusion_scales[1])),
         "tuning_bcubed_f": tuned_score,
         # Named for its sign, because the old name (`tuning_transfer_gap`) did not carry one and
         # was misread: POSITIVE means the tuning slice scored HIGHER than the test collection, i.e.
@@ -850,6 +1031,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default="wildchat")
     parser.add_argument("--feature", default="gemini_embedding_2")
     parser.add_argument("--defense", default="base")
+    parser.add_argument("--known-defense", default="base",
+                        help="Defense applied to the KNOWN side -- the labelled history the "
+                             "attacker holds, which here is never enrolled but IS what "
+                             "hyper-parameters are tuned on and what --projection and "
+                             "--standardize are fitted on (default: base, i.e. undefended). The "
+                             "default is the deployment threat model: a user adopts a defense "
+                             "today, so whatever leaked earlier is original text. Set it equal to "
+                             "--defense for the matched condition, where the defense has always "
+                             "been on. A non-default value is appended to the output directory.")
     parser.add_argument("--algorithms", nargs="*", default=sorted(CLUSTERING_ATTACKS),
                         help="Methods to run. Pass none (`--algorithms`) with --diagnostics to "
                              "measure the corpus without attacking it.")
@@ -899,15 +1089,21 @@ def parse_args() -> argparse.Namespace:
                              "rescoring.temporal_fusion). 0 is the pure-text attack. A non-zero "
                              "value is appended to the output directory name, because it changes "
                              "what the result claims: style AND session structure, not style.")
+    parser.add_argument("--tune-time-weight", action="store_true",
+                        help="Choose --time-weight by search instead of fixing it: each algorithm "
+                             "is tuned over a grid laid around the balanced weight (see "
+                             "time_weight_grid, which derives it from the tuning graph rather "
+                             "than fixing it, because where the two terms balance is a property "
+                             "of the corpus) jointly with its own hyper-parameters, on the "
+                             "tuning slice [0.50, 0.75) and never on the collection "
+                             "under attack. The winner "
+                             "goes in clustering_results.csv's per-row `time_weight` and the "
+                             "whole product is in tuning_trials.csv. Costs one existing search "
+                             "per candidate weight. Tags the directory `time` rather than "
+                             "`time<w>`, since the value is a result of the run and not a setting "
+                             "of it, and cannot be combined with a non-zero --time-weight.")
     parser.add_argument("--rescoring-locality", type=int, default=10,
                         help="Neighbours each rescoring summarises a point's neighbourhood over.")
-    parser.add_argument("--threshold-mode", default=None, choices=["absolute", "quantile"],
-                        help="Whether distance thresholds are searched as absolute radii or as "
-                             "quantiles of the graph's own edges. Defaults to 'quantile' whenever "
-                             "--projection or --rescoring is set, because an absolute radius does "
-                             "not survive a change of space (see edge_quantile), and to "
-                             "'absolute' otherwise so base runs keep the grid their results on "
-                             "disk were produced with.")
     parser.add_argument("--projection-hard-negatives", type=int, default=0,
                         help="Refresh interval in steps for hard-negative batches in "
                              "'contrastive'; 0 keeps random batches.")
@@ -925,15 +1121,37 @@ def parse_args() -> argparse.Namespace:
 
 
 def search_spaces(args, algorithm: str) -> dict:
-    """The hyper-parameter grid for one algorithm, absolute or quantile as the run requires.
+    """The hyper-parameter grid for one algorithm.
 
-    Quantile grids exist only for the two threshold-based methods; everything else falls back to
-    :data:`CLUSTERING_SPACES`, whose parameters (Leiden's ``resolution``, HDBSCAN's
-    ``min_cluster_size``) are not distances and so carry across spaces unchanged.
+    **Every distance threshold is searched as a quantile of the graph's own edge weights**, and
+    there is no absolute-radius mode any more. An absolute radius is only meaningful in the space
+    it was tuned in, and this run has at least two spaces in it whatever the flags say:
+
+    * ``--projection``, ``--rescoring`` and the elapsed-time fusion each rewrite the edge scores.
+      The fusion is the easiest to miss because it is not a projection --
+      ``rescoring.temporal_fusion`` returns ``(1-w)*z(distance) + w*z(log-hours)``, standardised
+      over the graph's own edges, so its scores centre near zero and go negative.
+    * **The tuning slice and the collection under attack are not one space either.**
+      ``--known-defense`` defaults to ``base``, so on a defended cell the threshold is chosen on a
+      graph built from *undefended* vectors and applied to one built from defended vectors, whose
+      distances sit at a different scale. Nothing in the flags marks that, which is why the mode
+      cannot be inferred from them and had to stop being a choice.
+
+    A quantile asks the same question of every one of those ("keep the closest 28% of candidate
+    edges") and lands in the right place in each. It is also not an oracle: :func:`edge_quantile`
+    reads the *unlabelled* edge weights of the collection being clustered, which is data the
+    attacker holds.
+
+    What this costs is that a defense's effect on the distance *scale* becomes invisible -- a
+    quantile keeps the same share of edges however far apart the rewrite pushed the documents, so
+    a defense can only register through changes in edge ranking. That is a real limitation of
+    every number produced here and belongs in any caption comparing defenses.
+
+    Only the three threshold-based methods have quantile grids; ``leiden``'s ``resolution`` and
+    ``hdbscan``'s ``min_cluster_size`` are not distances, so they fall back to
+    :data:`CLUSTERING_SPACES` and carry across spaces unchanged.
     """
-    mode = args.threshold_mode or (
-        "quantile" if (args.projection != "none" or args.rescoring != "none") else "absolute")
-    if mode == "quantile" and algorithm in CLUSTERING_SPACES_QUANTILE:
+    if algorithm in CLUSTERING_SPACES_QUANTILE:
         return CLUSTERING_SPACES_QUANTILE
     return CLUSTERING_SPACES
 
@@ -989,8 +1207,8 @@ def attack_scope(test: Collection, tuning: Collection, known_authors: np.ndarray
                   f"({len(test_authors) ** 2 * 8 / 1e9:.1f} GB), over the "
                   f"{MAX_DENSE_DOCUMENTS:,}-document limit.")
             continue
-        row, labels, trials = run_algorithm(algorithm, test.graph, test_authors,
-                                            tuning.graph, tuning_authors, args)
+        row, labels, trials = run_algorithm(algorithm, test, test_authors,
+                                            tuning, tuning_authors, args)
         trials.insert(0, "scope", test.scope)
         trials_tables.append(trials)
         if row is None:
@@ -1036,24 +1254,23 @@ def attack_scope(test: Collection, tuning: Collection, known_authors: np.ndarray
 
 def main() -> None:
     args = parse_args()
-    tag = f"{args.source}_{args.defense}_{args.feature}"
-    # Before --projection rather than after it, unlike every other axis, because the name then
-    # reads in pipeline order: this rewrites the feature space the projection is then fitted on.
+    if args.tune_time_weight and args.time_weight > 0:
+        raise SystemExit("--tune-time-weight searches the weight; --time-weight fixes it. Pass "
+                         "one or the other, not both (the directory name can only say which "
+                         "happened, not both).")
+    tag = f"{args.source}_{args.defense}_{args.feature}_{variant_name(args)}"
+    # A defended known side is a different experiment: the tuning slice and any fitted projection
+    # then carry the same appended text as the collection under attack. Suffixed so it cannot
+    # overwrite the deployment-model run, and so `plot_results.py` reads it as its own directory.
+    if args.known_defense != "base":
+        tag = f"{tag}_knowndef-{args.known_defense}"
+    # After the variant rather than before --projection, which is where it used to sit. The
+    # positional slot wins over pipeline order: `--standardize` rewrites the space the projection
+    # is fitted on, so reading it first was truer to what happens, but the fourth part of the name
+    # has to be the variant and nothing else for `plot_results.parse_clustering_run_name` to find
+    # it there.
     if args.standardize:
         tag = f"{tag}_zscore"
-    if args.projection != "none":
-        tag = f"{tag}_{args.projection}"
-    if args.rescoring != "none":
-        tag = f"{tag}_{args.rescoring}"
-    if args.time_weight > 0:
-        tag = f"{tag}_time{args.time_weight:g}"
-    # --threshold-mode belongs in the tag for exactly the reason --projection and --rescoring do:
-    # it changes WHAT WAS SEARCHED, so two runs that differ only in it are not the same experiment
-    # and must not share a directory. Leaving it out overwrote this project's existing base
-    # results once; the default is None (absolute unless a projection/rescoring implies quantile),
-    # so an explicit choice is what gets tagged.
-    if args.threshold_mode is not None:
-        tag = f"{tag}_{args.threshold_mode}"
     output_dir = args.output_dir or (OUTPUT_ROOT / tag)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1061,6 +1278,24 @@ def main() -> None:
         args.data_dir, args.source, args.feature,
         defense="none" if args.defense == "base" else args.defense)
     embeddings = np.nan_to_num(embeddings)
+
+    # The attacker's own history, which by default is UNDEFENDED text. Nothing here enrols an
+    # author, but the known side still decides hyper-parameters and fits --projection, so it has
+    # to come from the matrix the attacker would really hold. Row-aligned to `frame` through the
+    # same loader and the same `doc_id` join, so one position means the same document in both.
+    known_embeddings = embeddings
+    if args.known_defense != args.defense:
+        known_frame, known_embeddings = load_documents_and_features(
+            args.data_dir, args.source, args.feature,
+            defense="none" if args.known_defense == "base" else args.known_defense)
+        if not known_frame["doc_id"].equals(frame["doc_id"]):
+            raise SystemExit(
+                f"the known-side and test-side feature files do not cover the same documents in "
+                f"the same order ({len(known_frame):,} vs {len(frame):,} rows) -- one of them is "
+                f"stale; rebuild it with `compute_features --source {args.source} --defense ...`.")
+        known_embeddings = np.nan_to_num(known_embeddings)
+        print(f"  known side: {args.known_defense} ({known_embeddings.shape[0]:,} documents); "
+              f"collection under attack: {args.defense}")
 
     if args.standardize:
         # Known-side statistics, `[0, KNOWN_FRACTION)`, and NOT PROJECTION_FIT_FRACTION's first
@@ -1074,29 +1309,41 @@ def main() -> None:
         # than the arithmetic inlined precisely because "what this project means by standardising"
         # is the thing under test.
         known_side = slice(0, int(round(KNOWN_FRACTION * len(frame))))
-        embeddings = standardize(embeddings[known_side], embeddings)[1]
+        # Fitted on the KNOWN matrix (undefended by default) and applied to both, so the tuning
+        # slice and the collection under attack end up in one space -- statistics differing
+        # between them would make the two graphs incomparable before any algorithm ran.
+        statistics_source = known_embeddings[known_side]
+        if known_embeddings is not embeddings:
+            known_embeddings = standardize(statistics_source, known_embeddings)[1]
+        embeddings = standardize(statistics_source, embeddings)[1]
         print(f"  standardized on {known_side.stop:,} known-side documents "
               f"({embeddings.shape[1]} columns)")
 
     if args.projection != "none":
         fit_window = slice(0, int(round(PROJECTION_FIT_FRACTION * len(frame))))
         started = time.perf_counter()
-        projection = fit_projection(args.projection, embeddings[fit_window],
+        # Fitted on the known matrix: a projection learned from defended history is not what an
+        # attacker holding original text would have.
+        projection = fit_projection(args.projection, known_embeddings[fit_window],
                                     frame["author_id"].to_numpy()[fit_window],
                                     **projection_kwargs(args))
         # Whole-corpus transform, not per-window: the projection is fitted blind to which slice a
         # document falls in, and applying it once keeps the two graphs in the same space.
+        if known_embeddings is not embeddings:
+            known_embeddings = projection.transform(known_embeddings)
         embeddings = projection.transform(embeddings)
         print(f"  projection {projection.name}: fitted on {fit_window.stop:,} documents "
               f"({frame['author_id'].iloc[fit_window].nunique():,} authors), "
               f"{embeddings.shape[1]} dimensions, {time.perf_counter() - started:.0f}s")
 
     print(tag)
-    seconds = elapsed_seconds(frame) if args.time_weight > 0 else None
+    seconds = (elapsed_seconds(frame)
+               if args.time_weight > 0 or args.tune_time_weight else None)
     # Deduplicated, order preserved: a repeated --scopes value would otherwise attack the same
     # collection twice and write two identical rows for it under one scope name.
     scopes = list(dict.fromkeys(args.scopes))
-    prepared = {scope: prepare_scope(scope, frame, embeddings, seconds, args) for scope in scopes}
+    prepared = {scope: prepare_scope(scope, frame, embeddings, seconds, args, known_embeddings)
+                for scope in scopes}
     prepared = {scope: pair for scope, pair in prepared.items() if pair is not None}
     if not prepared:
         raise SystemExit("no scope has enough documents to attack; nothing to do.")
@@ -1139,11 +1386,16 @@ def main() -> None:
         print()
 
     results = pd.DataFrame(rows)
-    for column, value in (("time_weight", args.time_weight), ("rescoring", args.rescoring),
+    # `time_weight` is written per row by `run_algorithm` -- under --tune-time-weight each
+    # algorithm chose its own, so there is no single run-level value to state. The baseline rows
+    # have no such column, which is correct: a reference partition reads no graph.
+    for column, value in (("rescoring", args.rescoring),
                           ("projection", args.projection),
                           ("feature", args.feature),
                           ("defense", args.defense), ("dataset", args.source)):
         results.insert(0, column, value)
+    if "time_weight" not in results:
+        results.insert(0, "time_weight", args.time_weight)
     results.to_csv(output_dir / "clustering_results.csv", index=False)
     if all_trials:
         pd.concat(all_trials, ignore_index=True).to_csv(output_dir / "tuning_trials.csv",
