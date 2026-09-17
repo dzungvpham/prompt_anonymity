@@ -17,9 +17,10 @@
 #
 # Nothing here is hardcoded to one checkout. The launcher passes --chdir=<project root>, so a job
 # it submits already starts there; $SLURM_SUBMIT_DIR and then $PWD are the fallbacks for running
-# this file by hand. The env is an `env/` beside the project unless $PROMPT_ANONYMITY_CONDA_ENV
-# says otherwise; sbatch exports the submitting environment by default, so that variable (and
-# $PROMPT_ANONYMITY_PROJECT) can just be set in your shell before launching.
+# this file by hand. Environment resolution, in order: an explicit $PROMPT_ANONYMITY_CONDA_ENV
+# wins outright; otherwise a `.venv` beside the project is activated if one exists; otherwise the
+# job runs with whatever environment it inherited. $PROMPT_ANONYMITY_PROJECT can be set in your
+# shell before launching, same as the Conda variables.
 #
 # Do not switch the project root to this script's own path: sbatch copies the batch script to a
 # spool directory on the node, so $BASH_SOURCE at run time is not where this file lives.
@@ -27,7 +28,7 @@
 set -euo pipefail
 
 PROJECT="${PROMPT_ANONYMITY_PROJECT:-${SLURM_SUBMIT_DIR:-$PWD}}"
-CONDA_ENV="${PROMPT_ANONYMITY_CONDA_ENV:-$PROJECT/env}"
+CONDA_ENV="${PROMPT_ANONYMITY_CONDA_ENV:-}"
 CONDA_MODULE="${PROMPT_ANONYMITY_CONDA_MODULE:-conda/latest}"
 
 cd "$PROJECT"
@@ -39,29 +40,49 @@ cd "$PROJECT"
 # Unbuffering costs nothing at this volume (a few hundred lines per run).
 export PYTHONUNBUFFERED=1
 
-# Each step is conditional because how conda arrives differs per cluster, and an unconditional
-# `module load` is a hard failure on a site that has no Lmod at all. sbatch exports the submitting
-# environment by default, so on Unity `module` is usually already here; ~/.bashrc is the fallback
-# that defines it, and is sourced with -u off because other people's rc files are not -u clean.
-if ! command -v module >/dev/null 2>&1 && [[ -f ~/.bashrc ]]; then
-    set +u
-    # shellcheck disable=SC1090
-    source ~/.bashrc
-    set -u
+# Three cases, in priority order. Absolute-path callers (`run_all_experiments.py` passes
+# `.venv/bin/python` explicitly) are unaffected by any of them -- `exec "$@"` below runs that exact
+# binary regardless of what is or is not on $PATH. This branch exists for the other convention some
+# scripts use: a bare `python`/`pip` that has to resolve through $PATH, which needs something here
+# to have actually put the right interpreter on it first.
+if [[ -n "$CONDA_ENV" ]]; then
+    # Case 1: a Conda user asked for a specific environment by name. Each step below is
+    # conditional because how conda arrives differs per cluster, and an unconditional `module
+    # load` is a hard failure on a site that has no Lmod at all. sbatch exports the submitting
+    # environment by default, so on Unity `module` is usually already here; ~/.bashrc is the
+    # fallback that defines it, and is sourced with -u off because other people's rc files are not
+    # -u clean.
+    if ! command -v module >/dev/null 2>&1 && [[ -f ~/.bashrc ]]; then
+        set +u
+        # shellcheck disable=SC1090
+        source ~/.bashrc
+        set -u
+    fi
+    if ! command -v conda >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
+        module load "$CONDA_MODULE"
+    fi
+    if ! command -v conda >/dev/null 2>&1; then
+        echo "no conda on PATH: set PROMPT_ANONYMITY_CONDA_MODULE, or edit this file for your site" >&2
+        exit 1
+    fi
+    # The hook rather than a bare `conda activate`: activation is a shell function, and whether it
+    # is defined in a batch shell depends on whether conda's init block ran in a file this shell
+    # read.
+    eval "$(conda shell.bash hook)"
+    echo "Activating conda env $CONDA_ENV"
+    conda activate "$CONDA_ENV"
+elif [[ -f "$PROJECT/.venv/bin/activate" ]]; then
+    # Case 2: no Conda env requested, but the project has its own virtualenv -- the Unity setup.
+    # Sourcing it (rather than nothing) is what makes a bare `python` in the forwarded command
+    # resolve to this project's interpreter instead of whatever the node's default is.
+    echo "Activating venv $PROJECT/.venv"
+    # shellcheck disable=SC1091
+    source "$PROJECT/.venv/bin/activate"
+else
+    # Case 3: neither. Not a hard failure -- a caller passing an absolute interpreter path doesn't
+    # need either of the above, so refusing to run here would break that convention for no reason.
+    echo "no \$PROMPT_ANONYMITY_CONDA_ENV and no $PROJECT/.venv; running with the inherited environment as-is" >&2
 fi
-if ! command -v conda >/dev/null 2>&1 && command -v module >/dev/null 2>&1; then
-    module load "$CONDA_MODULE"
-fi
-if ! command -v conda >/dev/null 2>&1; then
-    echo "no conda on PATH: set PROMPT_ANONYMITY_CONDA_MODULE, or edit this file for your site" >&2
-    exit 1
-fi
-
-# The hook rather than a bare `conda activate`: activation is a shell function, and whether it is
-# defined in a batch shell depends on whether conda's init block ran in a file this shell read.
-eval "$(conda shell.bash hook)"
-echo "Activating $CONDA_ENV"
-conda activate "$CONDA_ENV"
 
 # Only when this job actually asked for one, so the CPU cells' logs are not a page of error text.
 if [[ -n "${SLURM_JOB_GPUS:-${SLURM_GPUS_ON_NODE:-}}" ]]; then
