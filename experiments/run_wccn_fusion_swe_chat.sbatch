@@ -42,6 +42,7 @@ bash scripts/slurm_job.sh python experiments/run_wccn_fusion.py \
                   gemini_embedding_2+char_ngram \
                   gemini_embedding_2+stylometrix \
                   gemini_embedding_2+pos_ngram \
+                  gemini_embedding_2+char_ngram+stylometrix+pos_ngram \
                   char_ngram stylometrix pos_ngram \
     --attacks wccn \
     --pos-cache "pos_tags_cache_swe_chat.jsonl" \
