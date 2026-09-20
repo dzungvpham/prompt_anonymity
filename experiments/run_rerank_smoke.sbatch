@@ -142,8 +142,27 @@ print("[env] torch", torch.__version__, "| cuda visible:", torch.cuda.is_availab
       "(not needed here -- this is the CPU smoke test)")
 import transformers
 print("[env] transformers", transformers.__version__)
+
+# The whole attacks package, not just the top-level one. attacks/__init__.py builds its registries
+# by importing every attack family, so ANY of their dependencies missing breaks ANY entry point --
+# a reranker included, and none of them touch xgboost or the trees. Importing it here is what
+# makes that a named failure in a 30-second CPU job instead of a traceback four hours into a paid
+# one. (The imports inside that chain should be lazy for anything optional; this is the canary for
+# when one is not.)
 import prompt_anonymity
 print("[env] prompt_anonymity imports from", prompt_anonymity.__file__)
+try:
+    import prompt_anonymity.attacks
+    import prompt_anonymity.attacks.llm
+except ModuleNotFoundError as err:
+    print("[env] the attacks package does not import:", err)
+    print("[env] this breaks EVERY entry point, the rerankers included, even when the missing")
+    print("[env] package is for an attack they never run. Sync this interpreter with pyproject:")
+    print("[env]   python -m pip install -e \".[rerank]\"")
+    print("[env] and if the import is for something optional, it belongs inside the function")
+    print("[env] that uses it -- see multiclass/boosted_trees.py.")
+    sys.exit(1)
+print("[env] the attacks registries import clean")
 '
 
 # --- 2. offline invariants -------------------------------------------------

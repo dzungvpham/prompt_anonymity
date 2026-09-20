@@ -196,6 +196,10 @@ echo "=================================================================="
 # payload OpenRouter would reject should fail here, not 24 hours after you paid for it.
 echo ""
 echo "[0a/4] self-tests ($(date))"
+# Which interpreter, before anything is asked of it. A job that fails on an import is nearly
+# always running in a different environment from the one you tested in, and without this line
+# the log cannot tell you that -- compare it against the smoke test's own [env] interpreter.
+run python -c 'import sys; print("  interpreter:", sys.executable)'
 run python -m prompt_anonymity.attacks.llm.listwise --selftest
 # The batch client's self-test is about the batch payload, the :batch slug and the ticket logic --
 # none of which the synchronous channel has.

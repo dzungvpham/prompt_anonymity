@@ -125,6 +125,10 @@ echo "=================================================================="
 # rather than after loading a checkpoint.
 echo ""
 echo "[0a/3] attack self-test ($(date))"
+# Which interpreter, before anything is asked of it. A job that fails on an import is nearly
+# always running in a different environment from the one you tested in, and without this line
+# the log cannot tell you that -- compare it against the smoke test's own [env] interpreter.
+run python -c 'import sys; print("  interpreter:", sys.executable)'
 run python -m prompt_anonymity.attacks.llm.listwise --selftest
 
 # --- 0b. inputs ------------------------------------------------------------

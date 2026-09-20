@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from xgboost import XGBClassifier
 
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401
 from sklearn.model_selection import HalvingRandomSearchCV, GroupKFold
@@ -133,6 +132,14 @@ def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
     }
 
     cv = GroupKFold(n_splits=5)
+
+    # Lazy, exactly as multiclass/boosted_trees.py imports it, and for a reason that is not about
+    # this function: `attacks/__init__.py` imports this package eagerly to build the registry, so
+    # a top-level xgboost import here made xgboost a hard requirement of `import
+    # prompt_anonymity.attacks` -- and therefore of every entry point in the project, including
+    # the two rerankers, which never touch it. An environment missing one optional wheel should
+    # cost you this attack, not all of them.
+    from xgboost import XGBClassifier
 
     search = HalvingRandomSearchCV(
     estimator=XGBClassifier(
