@@ -67,6 +67,7 @@ from prompt_anonymity.attacks.llm.euclidean_llm_judge import (  # noqa: E402
     DEFAULT_SNIPPET_CHARS, JUDGE_SYSTEM_PROMPT_TEMPLATE, _judge_prompt, _parse_choice,
 )
 from prompt_anonymity.attacks.llm._openrouter import OpenRouterChat  # noqa: E402
+from prompt_anonymity.attacks.llm._anthropic_foundry import AnthropicFoundryChat  # noqa: E402
 from prompt_anonymity.caching import TransformCache, logic_hash, params_hash  # noqa: E402
 from prompt_anonymity.evaluation.metrics.ranking import (  # noqa: E402
     macro_top_k_accuracy, ranking_summary, true_author_ranks,
@@ -196,7 +197,8 @@ def _batch_with_retry(fn, max_attempts: int = 8, wait_seconds: float = 150.0):
 def run_judge_once(prompt_fn, system_prompt_template: str, known_texts: list[str],
                    query_texts: list[str], col_index: np.ndarray, document_index: np.ndarray,
                    judge_model: str, cache_dir, cache_namespace: str, seed: int,
-                   snippet_chars: int, max_tokens: int = 8) -> tuple[np.ndarray, int]:
+                   snippet_chars: int, max_tokens: int = 8,
+                   judge_provider: str = "openrouter") -> tuple[np.ndarray, int]:
     """One judge pass over an already-built shortlist: shuffle presentation order (cancels
     position bias), build prompts, call the model (cached), parse each pick back to a column
     index in the real WCCN score matrix. A refusal / invalid digit falls back to WCCN's own #1
@@ -217,13 +219,19 @@ def run_judge_once(prompt_fn, system_prompt_template: str, known_texts: list[str
         for i in range(n)
     ]
     system_prompt = system_prompt_template.format(n=k)
-    client = OpenRouterChat(judge_model, system_prompt, max_tokens=max_tokens)
+    if judge_provider == "foundry":
+        client = AnthropicFoundryChat(judge_model, system_prompt, max_tokens=max_tokens)
+        client_cls = AnthropicFoundryChat
+    else:
+        client = OpenRouterChat(judge_model, system_prompt, max_tokens=max_tokens)
+        client_cls = OpenRouterChat
     if cache_dir is not None:
         cache = TransformCache(
             Path(cache_dir) / "attacks", cache_namespace,
-            logic_hash([OpenRouterChat, prompt_fn], version="2"),
-            params_hash({"judge_model": judge_model, "system_prompt": system_prompt,
-                        "top_k": k, "snippet_chars": snippet_chars, "seed": seed}),
+            logic_hash([client_cls, prompt_fn], version="2"),
+            params_hash({"judge_provider": judge_provider, "judge_model": judge_model,
+                        "system_prompt": system_prompt, "top_k": k,
+                        "snippet_chars": snippet_chars, "seed": seed}),
         )
         raw_choices = _batch_with_retry(lambda: cache.apply_batch(prompts, client.complete_batch))
     else:
@@ -302,6 +310,9 @@ def main():
                         help="documents judged per window (= API calls per window, per "
                              "majority-vote run)")
     parser.add_argument("--judge-model", default="anthropic/claude-sonnet-5")
+    parser.add_argument("--judge-provider", default="openrouter", choices=["openrouter", "foundry"],
+                        help="'foundry' uses ANTHROPIC_FOUNDRY_API_KEY/_BASE_URL -- pass "
+                             "--judge-model claude-sonnet-5-2 together with this.")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--majority-vote-runs", type=int, default=1,
                         help="judge each ambiguous row this many times (different candidate "
@@ -405,7 +416,8 @@ def main():
                 picks, refused = run_judge_once(
                     prompt_fn, system_prompt_template, known_texts, query_texts_subset,
                     col_index, document_index, args.judge_model, args.cache_dir,
-                    f"{cache_namespace}_run{r}", args.seed + r, DEFAULT_SNIPPET_CHARS)
+                    f"{cache_namespace}_run{r}", args.seed + r, DEFAULT_SNIPPET_CHARS,
+                    judge_provider=args.judge_provider)
                 all_picks.append(picks)
                 total_refused += refused
             all_picks = np.array(all_picks)
@@ -426,7 +438,8 @@ def main():
             final_picks, refused = run_judge_once(
                 prompt_fn, system_prompt_template, known_texts, query_texts_subset,
                 col_index, document_index, args.judge_model, args.cache_dir,
-                cache_namespace, args.seed, DEFAULT_SNIPPET_CHARS)
+                cache_namespace, args.seed, DEFAULT_SNIPPET_CHARS,
+                judge_provider=args.judge_provider)
             print(f"  judge: {refused}/{n_ambiguous} refusals forced to WCCN's own #1")
             n_calls = n_ambiguous
 
