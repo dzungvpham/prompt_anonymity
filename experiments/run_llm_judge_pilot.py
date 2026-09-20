@@ -24,6 +24,7 @@ margin_quantile alone would do if run over the whole window.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -43,13 +44,130 @@ from run_wccn_fusion import (  # noqa: E402
 )
 from prompt_anonymity.attacks.similarity.whitened_centroid import WhitenedCentroid  # noqa: E402
 from prompt_anonymity.attacks.llm.candidates import author_candidates  # noqa: E402
-from prompt_anonymity.attacks.llm.euclidean_llm_judge import EuclideanLLMJudgeAttack  # noqa: E402
+from prompt_anonymity.attacks.llm.euclidean_llm_judge import (  # noqa: E402
+    DEFAULT_SNIPPET_CHARS, EuclideanLLMJudgeAttack, _parse_choice,
+)
+from prompt_anonymity.attacks.llm._openrouter import OpenRouterChat  # noqa: E402
+from prompt_anonymity.caching import TransformCache, logic_hash, params_hash  # noqa: E402
 from prompt_anonymity.core import AttackData  # noqa: E402
 from prompt_anonymity.evaluation.metrics.ranking import (  # noqa: E402
     macro_top_k_accuracy, ranking_summary, true_author_ranks,
 )
 
 TURN_SEPARATOR = "\n\n"
+
+FEATURE_GROUNDED_SYSTEM_PROMPT = (
+    "You are an authorship-attribution judge. You will be shown one QUERY text and "
+    "{n} CANDIDATE texts, labeled 1 through {n}, each annotated with computed writing-style "
+    "statistics (average word length, sentence length, vocabulary variety, punctuation "
+    "density, capitalization rate). Use these statistics to ground your judgment in addition "
+    "to reading the text itself -- they are the same signal a stylometrist would compute by "
+    "hand, not a substitute for reading.\n"
+    "Task:\n"
+    "Choose the ONE candidate most likely written by the SAME author as the QUERY, weighting "
+    "writing style over topic or subject matter.\n"
+    "Rules:\n"
+    "- This is a forced choice: you MUST pick exactly one candidate, the single closest "
+    "stylistic match. Even if none is an obvious match, pick the best of the {n}. Do NOT "
+    "refuse and do NOT answer 0.\n"
+    "- Output ONLY the single digit (1-{n}) of your choice and nothing else -- no words, no "
+    "punctuation, no explanation."
+)
+
+
+def quick_style_stats(text: str) -> dict[str, float]:
+    """A handful of cheap, human-interpretable style statistics -- the SALA-style grounding.
+
+    Deliberately not StyloMetrix (197 opaque-coded dims meant for a classifier, not for
+    reading in a prompt): these five are simple enough that a judge can sanity-check them
+    against the text it's also shown, which is the point of grounding rather than just
+    supplying more numbers.
+    """
+    words = text.split() or [""]
+    n_words = len(words)
+    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()] or [text]
+    n_chars = len(text) or 1
+    return {
+        "avg_word_length": round(sum(len(w) for w in words) / n_words, 2),
+        "type_token_ratio": round(len(set(w.lower() for w in words)) / n_words, 3),
+        "avg_sentence_length_words": round(n_words / len(sentences), 1),
+        "punctuation_density": round(sum(c in ".,;:!?-()[]{}\"'" for c in text) / n_chars, 3),
+        "uppercase_ratio": round(sum(c.isupper() for c in text) / n_chars, 3),
+    }
+
+
+def _format_stats(stats: dict[str, float]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in stats.items())
+
+
+def _feature_grounded_prompt(query_text: str, query_stats: dict,
+                             candidate_texts: list[str], candidate_stats: list[dict]) -> str:
+    lines = [f"QUERY (stats: {_format_stats(query_stats)}):\n{query_text}"]
+    for i, (cand, stats) in enumerate(zip(candidate_texts, candidate_stats), 1):
+        lines.append(f"\nCANDIDATE {i} (stats: {_format_stats(stats)}):\n{cand}")
+    n = len(candidate_texts)
+    lines.append(f"\nWhich candidate is the closest stylistic match to the QUERY? "
+                f"You MUST pick one. Answer with a single digit 1-{n}.")
+    return "\n".join(lines)
+
+
+def feature_grounded_rerank(data, base_scores, judge_model, top_k, snippet_chars, cache_dir,
+                            seed):
+    """SALA-style variant of EuclideanLLMJudgeAttack: same shortlist/shuffle/cache machinery,
+    but the prompt embeds computed style statistics alongside each text (arXiv:2602.23079's
+    "feature-grounded prompting" -- numeric stats ground the LLM's reasoning rather than being
+    fed to a separate classifier). Reimplemented rather than subclassed because the prompt
+    builder and system-prompt template are the only things that differ, and threading a
+    prompt-builder callback through the shared class would be a bigger change than duplicating
+    ~20 lines for an experimental variant.
+    """
+    known_texts = [str(t) for t in np.asarray(data.known_texts)]
+    unknown_texts = [str(t) for t in np.asarray(data.unknown_texts)]
+    candidates = author_candidates(data.known_embeddings, data.known_labels,
+                                   data.unknown_embeddings, top_k=top_k, metric=data.metric)
+    authors = candidates.authors
+    n, k = candidates.author_index.shape
+
+    rng = np.random.default_rng(seed)
+    perms = [rng.permutation(k) for _ in range(n)]
+    present_docs = [candidates.document_index[i][perms[i]] for i in range(n)]
+    present_authors = [candidates.author_index[i][perms[i]] for i in range(n)]
+
+    query_stats = [quick_style_stats(t[:snippet_chars]) for t in unknown_texts]
+    cand_stats = [[quick_style_stats(known_texts[j][:snippet_chars]) for j in present_docs[i]]
+                 for i in range(n)]
+    prompts = [
+        _feature_grounded_prompt(unknown_texts[i][:snippet_chars], query_stats[i],
+                                 [known_texts[j][:snippet_chars] for j in present_docs[i]],
+                                 cand_stats[i])
+        for i in range(n)
+    ]
+
+    system_prompt = FEATURE_GROUNDED_SYSTEM_PROMPT.format(n=k)
+    client = OpenRouterChat(judge_model, system_prompt, max_tokens=8)
+    if cache_dir is not None:
+        cache = TransformCache(
+            Path(cache_dir) / "attacks", "feature_grounded_llm_judge",
+            logic_hash([OpenRouterChat, quick_style_stats, _feature_grounded_prompt], version="1"),
+            params_hash({"judge_model": judge_model, "system_prompt": system_prompt,
+                        "top_k": top_k, "snippet_chars": snippet_chars, "seed": seed}),
+        )
+        raw_choices = cache.apply_batch(prompts, client.complete_batch)
+    else:
+        raw_choices = client.complete_batch(prompts)
+    choices = [_parse_choice(r) for r in raw_choices]
+
+    final = base_scores.copy()
+    row_max = base_scores.max(axis=1)
+    refused = 0
+    for i, choice in enumerate(choices):
+        if 1 <= choice <= k:
+            final[i, present_authors[i][choice - 1]] = row_max[i] + 1.0
+        else:
+            final[i, candidates.author_index[i, 0]] = row_max[i] + 1.0
+            refused += 1
+    print(f"  feature-grounded judge: {refused}/{n} refusals forced to nearest")
+    return final, authors
 
 
 def load_texts_by_doc_id(data_dir: str, source: str) -> dict[str, str]:
@@ -113,6 +231,11 @@ def main():
                         help="judge each ambiguous row this many times (different candidate "
                              "shuffles) and promote the mode pick, instead of trusting one "
                              "call. 1 = single run (default).")
+    parser.add_argument("--judge-variant", default="plain", choices=["plain", "feature_grounded"],
+                        help="'plain': raw text only (EuclideanLLMJudgeAttack). "
+                             "'feature_grounded': SALA-style prompt with computed style stats "
+                             "alongside each text. Mutually exclusive with --majority-vote-runs "
+                             "> 1 (not implemented together).")
     parser.add_argument("--cache-dir", default="llm_judge_cache")
     parser.add_argument("--seed", type=int, default=47)
     args = parser.parse_args()
@@ -185,7 +308,11 @@ def main():
 
         before_subset = window_metrics(candidates.scores[ambiguous_idx], candidates.authors,
                                        unknown_labels_in[ambiguous_idx])
-        if args.majority_vote_runs > 1:
+        if args.judge_variant == "feature_grounded":
+            boosted, judge_authors = feature_grounded_rerank(
+                data, candidates.scores[ambiguous_idx], args.judge_model, args.top_k,
+                DEFAULT_SNIPPET_CHARS, args.cache_dir, args.seed)
+        elif args.majority_vote_runs > 1:
             boosted, judge_authors = majority_vote_rerank(
                 data, candidates.scores[ambiguous_idx], args.judge_model, args.top_k,
                 args.cache_dir, args.majority_vote_runs, args.seed)
