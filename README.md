@@ -174,6 +174,29 @@ Point `--slurm-config` (or `$PROMPT_ANONYMITY_SLURM_CONFIG`) at a file of your o
 settings uncommitted. Jobs are named after their results directory, so a cell already pending or
 running is skipped rather than submitted twice; `scancel` it first to resubmit.
 
+### Listwise reranking on a cluster
+
+The rerankers are not part of that grid — they read text rather than vectors — so they have their
+own jobs, submitted from the repo root:
+
+```bash
+sbatch experiments/run_rerank_smoke.sbatch          # CPU, ~10 min, ~$0.05: run this FIRST
+bash   experiments/submit_rerank_swe_chat.sh        # both arms at once on SWE-chat
+```
+
+The launcher queues three jobs: `run_rerank_jina.sbatch` on a GPU (free, the control),
+`run_rerank_sonnet.sbatch` on a CPU node with `BATCH=0` (Claude Sonnet 5 over OpenRouter, reasoning
+on, **no Batch API** — one allocation instead of a submit/collect pair, at full real-time price),
+and `finish_rerank.sbatch` with `afterany` on both, which merges their tables into one
+`rerank_summary.csv` and validates it. Each arm writes into its own subdirectory first, because
+`run_rerank.py` merges that summary read-modify-write and two concurrent jobs would race on it.
+
+The Sonnet arm's key is `SONNET_API_KEY` in a `.env` **at the repo root**; the batch path
+(`BATCH=1`, the default when that script is submitted directly) uses `SONNET_OR_KEY` instead.
+`LISTWISE_RERANK_MAX_WORKERS` — `WORKERS=` on the job — sets how many requests are in flight.
+Verdicts are cached by prompt text, so an interrupted arm resumes cheaply and a re-run judges only
+what is new.
+
 ## Defenses
 
 A defense rewrites the prompt text a user would release, **one user turn at a time**, so turn count

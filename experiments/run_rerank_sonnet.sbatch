@@ -1,13 +1,28 @@
 #!/bin/bash
 #
 # run_rerank_sonnet.sbatch -- rerank a nearest-neighbor shortlist with Claude Sonnet 5, reasoning
-# on, through OpenRouter's BATCH api, then check that the output is actually usable.
+# on, through OpenRouter, then check that the output is actually usable.
 #
-# TWO PHASES, TWO SUBMISSIONS. A batch has a 24-hour completion window and the longest wall clock in
-# this repo is 16h, so the job that submits is not the job that collects:
+# TWO DELIVERY CHANNELS, and the choice is money against wall clock. Same model, same rubric, same
+# effort, same cache either way -- only how the requests are delivered differs.
+#
+# BATCH=1 (the default): OpenRouter's Batch API at ~half price, in TWO PHASES, TWO SUBMISSIONS. A
+# batch has a 24-hour completion window and the longest wall clock in this repo is 16h, so the job
+# that submits is not the job that collects:
 #
 #     sbatch experiments/run_rerank_sonnet.sbatch                 # PHASE=submit: queues, exits
 #     PHASE=collect sbatch experiments/run_rerank_sonnet.sbatch   # later: polls, writes, validates
+#
+# BATCH=0: the synchronous client, one job, no phases, answers in this allocation. FULL PRICE --
+# $2/$10 per MTok against the batch tier's $1/$5, so roughly double the figures quoted below. Worth
+# it when you want the result today rather than tomorrow. Its key is SONNET_API_KEY (not
+# SONNET_OR_KEY), and WORKERS sets how many requests are in flight:
+#
+#     BATCH=0 sbatch experiments/run_rerank_sonnet.sbatch
+#     BATCH=0 WORKERS=24 SOURCE=swe_chat sbatch experiments/run_rerank_sonnet.sbatch
+#
+# For the full swe_chat pairing of this job with the free jina control, both started at once, use
+# the launcher rather than this file directly:  bash experiments/submit_rerank_swe_chat.sh
 #
 # SUBMIT FROM THE REPO ROOT (--output is relative and SLURM resolves it against the submit dir).
 # One-time: mkdir -p scripts/logs
@@ -43,17 +58,25 @@
 #
 #     sbatch --time=0-01:00:00 experiments/run_rerank_sonnet.sbatch
 #
-# NEEDS SONNET_OR_KEY in the environment or in a .env AT THE REPO ROOT (load_dotenv walks UP from
-# the working directory, so DS_env/.env is not found). Deliberately not OPENROUTER_API_KEY: this
-# attack's spend is meant to be separable from the defenses' and the other judges'.
+# BATCH=0 needs the whole wall clock, though: all of SWE-chat's unknown side at both shortlist
+# sizes is ~2,200 requests, which is roughly 3-4h at WORKERS=16. Preemption is survivable -- the
+# job requeues and the cache means it resumes rather than re-buying what it already judged.
 #
-# Overrides (sbatch exports your submitting environment -- KEEP THEM IDENTICAL ACROSS BOTH PHASES):
+# NEEDS A KEY in the environment or in a .env AT THE REPO ROOT (load_dotenv walks UP from the
+# working directory, so DS_env/.env is not found). Which one depends on the channel --
+# SONNET_OR_KEY for BATCH=1, SONNET_API_KEY for BATCH=0. Deliberately not OPENROUTER_API_KEY in
+# either case: this attack's spend is meant to be separable from the defenses' and the other
+# judges'.
+#
+# Overrides (sbatch exports your submitting environment; under BATCH=1, KEEP THEM IDENTICAL ACROSS
+# BOTH PHASES -- see above for why drift there bills you twice):
 #   SOURCE=wildchat_small sbatch ...
 #   FEATURE=luar sbatch ...
 #   TOP_KS="5" sbatch ...
 #   LIMIT=50 sbatch ...                    # a seeded sample of the unknown side; bounds the bill
 #   EFFORT=medium sbatch ...               # thinking depth: low/medium/high/xhigh/max
 #   MODEL=anthropic/claude-opus-5 sbatch ...
+#   WORKERS=24 sbatch ...                  # BATCH=0 only: concurrent requests (default 16)
 #
 #SBATCH --job-name=rrk-sonnet
 #SBATCH --output=scripts/logs/%x-%j.out
@@ -88,10 +111,30 @@ if [ -z "$PROJECT" ]; then
 fi
 cd "$PROJECT"
 
-PHASE="${PHASE:-submit}"
-if [ "$PHASE" != "submit" ] && [ "$PHASE" != "collect" ]; then
-    echo "ERROR: PHASE must be 'submit' or 'collect' (got '$PHASE')." >&2
+BATCH="${BATCH:-1}"
+if [ "$BATCH" != "0" ] && [ "$BATCH" != "1" ]; then
+    echo "ERROR: BATCH must be 1 (the Batch API, two phases) or 0 (synchronous, one job)," \
+         "got '$BATCH'." >&2
     exit 1
+fi
+
+if [ "$BATCH" = "0" ]; then
+    # Not defaulted-and-ignored: a PHASE left over in the submitting environment would otherwise
+    # read as "this is the collect half of something", and there is no other half.
+    if [ -n "${PHASE:-}" ]; then
+        echo "ERROR: PHASE=$PHASE was set, but BATCH=0 has no phases -- it submits nothing to" \
+             "collect later. Drop PHASE, or use BATCH=1." >&2
+        exit 1
+    fi
+    PHASE="none"
+    KEY_ENV="SONNET_API_KEY"
+else
+    PHASE="${PHASE:-submit}"
+    if [ "$PHASE" != "submit" ] && [ "$PHASE" != "collect" ]; then
+        echo "ERROR: PHASE must be 'submit' or 'collect' (got '$PHASE')." >&2
+        exit 1
+    fi
+    KEY_ENV="SONNET_OR_KEY"
 fi
 
 SOURCE="${SOURCE:-wildchat_tiny}"
@@ -124,11 +167,20 @@ fi
 run() { if [ "${#RUN[@]}" -eq 0 ]; then "$@"; else "${RUN[@]}" "$@"; fi; }
 
 echo "=================================================================="
-echo "listwise rerank (sonnet, batched) -- PHASE=$PHASE"
+if [ "$BATCH" = "0" ]; then
+    echo "listwise rerank (sonnet, UNBATCHED -- full real-time price)"
+else
+    echo "listwise rerank (sonnet, batched) -- PHASE=$PHASE"
+fi
 echo "  $SOURCE / $FEATURE / known$WINDOW"
 echo "  shortlist sizes: ${TOP_K_LIST[*]}"
 echo "  output:          $OUT_DIR"
-echo "  tickets:         $CACHE_DIR/attacks/_batches"
+if [ "$BATCH" = "0" ]; then
+    echo "  concurrency:     ${WORKERS:-16} requests in flight"
+else
+    echo "  tickets:         $CACHE_DIR/attacks/_batches"
+fi
+echo "  key:             \$$KEY_ENV"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname), $(date)"
 echo "=================================================================="
 
@@ -139,7 +191,11 @@ echo "=================================================================="
 echo ""
 echo "[0a/4] self-tests ($(date))"
 run python -m prompt_anonymity.attacks.llm.listwise --selftest
-run python -m prompt_anonymity.attacks.llm._openrouter_batch --selftest
+# The batch client's self-test is about the batch payload, the :batch slug and the ticket logic --
+# none of which the synchronous channel has.
+if [ "$BATCH" = "1" ]; then
+    run python -m prompt_anonymity.attacks.llm._openrouter_batch --selftest
+fi
 
 # --- 0b. inputs ------------------------------------------------------------
 echo ""
@@ -166,17 +222,18 @@ echo "  features: $DIST_DIR/${STEM}_${FEATURE}.parquet"
 # queue slot instead of a half-submitted sweep.
 echo ""
 echo "[0c/4] credentials ($(date))"
-if [ -z "${SONNET_OR_KEY:-}" ] && [ ! -f "$PROJECT/.env" ]; then
-    echo "ERROR: SONNET_OR_KEY is not set and there is no $PROJECT/.env for load_dotenv to read." >&2
+# Indirect expansion: which variable holds the key depends on the channel (see the KEY_ENV block).
+if [ -z "${!KEY_ENV:-}" ] && [ ! -f "$PROJECT/.env" ]; then
+    echo "ERROR: $KEY_ENV is not set and there is no $PROJECT/.env for load_dotenv to read." >&2
     echo "  Add it at the REPO ROOT (load_dotenv walks UP from the working directory, so a .env in" >&2
     echo "  a subdirectory -- DS_env/.env -- is never found):" >&2
-    echo "    echo 'SONNET_OR_KEY=sk-or-...' >> $PROJECT/.env" >&2
+    echo "    echo '$KEY_ENV=sk-or-...' >> $PROJECT/.env" >&2
     exit 1
 fi
-if [ -n "${SONNET_OR_KEY:-}" ]; then
-    echo "  SONNET_OR_KEY: set in the environment"
+if [ -n "${!KEY_ENV:-}" ]; then
+    echo "  $KEY_ENV: set in the environment"
 else
-    echo "  SONNET_OR_KEY: expected in $PROJECT/.env (not read here, so it stays out of this log)"
+    echo "  $KEY_ENV: expected in $PROJECT/.env (not read here, so it stays out of this log)"
 fi
 
 if [ "$CHECK_ONLY" = "1" ]; then
@@ -185,10 +242,13 @@ if [ "$CHECK_ONLY" = "1" ]; then
     exit 0
 fi
 
-# --- 1. submit or collect --------------------------------------------------
-# One invocation per shortlist size, in BOTH phases, so the two phases differ by exactly one flag
-# (--no-wait) and the prompts they build are identical. --no-wait stops at the first configuration
-# with uncached rows, which is why submit cannot pass both sizes in one call.
+# --- 1. rerank (unbatched), or submit, or collect ---------------------------
+# COMMON is built once and shared by all three, which is the point: the batch phases differ by
+# exactly one flag (--no-wait) and so build byte-identical prompts, and the unbatched channel
+# builds the same ones again, so its verdicts and theirs are the same cache entries.
+#
+# The batch phases pass ONE shortlist size per invocation because --no-wait stops at the first
+# configuration with uncached rows. The unbatched channel has no such stop and passes all of them.
 COMMON=(--source "$SOURCE" --feature "$FEATURE" --defense "$DEFENSE"
         --data-dir "$DIST_DIR" --known-window "$WINDOW" --seed "$SEED"
         --cache-dir "$CACHE_DIR" --output-dir "$OUT_DIR" --variant llm)
@@ -202,7 +262,23 @@ if [ -n "${MODEL:-}" ]; then
     COMMON+=(--judge-model "$MODEL")
 fi
 
-if [ "$PHASE" = "submit" ]; then
+if [ "$BATCH" = "0" ]; then
+    # ONE invocation with every shortlist size. The batch path splits them up only because
+    # --no-wait stops at the first configuration with uncached rows; with nothing queued that
+    # constraint is gone, and one call means one read-modify-write of rerank_summary.csv.
+    export LISTWISE_RERANK_MAX_WORKERS="${WORKERS:-16}"
+    TOP_K_ARGS=()
+    for k in "${TOP_K_LIST[@]}"; do
+        TOP_K_ARGS+=(--top-k "$k")
+    done
+
+    echo ""
+    echo "[1/4] reranking, unbatched ($(date))"
+    echo "  $LISTWISE_RERANK_MAX_WORKERS concurrent requests; 429s are retried with backoff, so a"
+    echo "  value above the account's rate limit costs latency rather than failures."
+    run python experiments/run_rerank.py "${COMMON[@]}" --no-batch "${TOP_K_ARGS[@]}"
+
+elif [ "$PHASE" = "submit" ]; then
     echo ""
     echo "[1/4] submitting batches ($(date))"
     QUEUED=0
@@ -238,17 +314,18 @@ if [ "$PHASE" = "submit" ]; then
     echo ""
     echo "Collecting early is safe -- it just polls until the batch is done."
     exit 0
-fi
 
-echo ""
-echo "[1/4] collecting batches ($(date))"
-echo "  (the same prompts as the submit phase, so each ticket resumes its batch rather than"
-echo "   submitting a second copy of it -- watch for 'resuming existing batch' below)"
-for k in "${TOP_K_LIST[@]}"; do
+else
     echo ""
-    echo "--- top-k $k ---"
-    run python experiments/run_rerank.py "${COMMON[@]}" --top-k "$k"
-done
+    echo "[1/4] collecting batches ($(date))"
+    echo "  (the same prompts as the submit phase, so each ticket resumes its batch rather than"
+    echo "   submitting a second copy of it -- watch for 'resuming existing batch' below)"
+    for k in "${TOP_K_LIST[@]}"; do
+        echo ""
+        echo "--- top-k $k ---"
+        run python experiments/run_rerank.py "${COMMON[@]}" --top-k "$k"
+    done
+fi
 
 # --- 2. is the output usable? ----------------------------------------------
 # The run finishing is not the same as the run being good. A judge that refused every row degrades
@@ -272,4 +349,9 @@ echo "READ THE SAMPLED DOCUMENTS ABOVE. The accuracies cannot tell you whether t
 echo "about writing style or about subject matter, and a judge that read topic is measuring the"
 echo "wrong thing however good its top-1 looks. Three printed rows can tell you; a CSV cannot."
 echo ""
+if [ "$BATCH" = "0" ]; then
+    echo "judge_cost_usd is what OpenRouter reported on the replies themselves, and it is a FLOOR:"
+    echo "a reply that arrives without a usage block contributes nothing to it."
+    echo ""
+fi
 echo "Compare against the free control on the same rows:  experiments/run_rerank_jina.sbatch"

@@ -25,8 +25,16 @@ is rejected with a 400 on Sonnet 5, which uses adaptive thinking steered by effo
 Requests go through the **Batch API** by default
 (:class:`~prompt_anonymity.attacks.llm._openrouter_batch.OpenRouterBatch`), at roughly half the
 real-time price with a 24-hour window, resuming rather than resubmitting if the job is interrupted.
-``batch=False`` falls back to the synchronous thread-pool client for smoke tests. The key is
-``SONNET_OR_KEY``, read from a ``.env`` at the repo root.
+Its key is ``SONNET_OR_KEY``, read from a ``.env`` at the repo root.
+
+``batch=False`` takes the synchronous thread-pool client
+(:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`) instead, under
+:data:`SYNC_API_KEY_ENV` (``SONNET_API_KEY``). **It is a full run, not a lesser one**: same model,
+same rubric, same ``reasoning.effort``, and the verdicts land in the same cache namespace. What it
+trades is money for time -- full real-time price, ~$2/$10 per MTok against the batch tier's
+~$1/$5 -- and what it buys is a result in one sitting instead of a submit job, a 24-hour window
+and a collect job. Throughput is then just how many requests are in flight, which
+``LISTWISE_RERANK_MAX_WORKERS`` sets.
 
 **The discount is carried by the model slug, not by the endpoint.** OpenRouter lists
 ``anthropic/claude-sonnet-5`` and ``anthropic/claude-sonnet-5:batch`` as two separate models, at
@@ -54,6 +62,7 @@ needs no new API calls.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -109,6 +118,18 @@ DEFAULT_SEED = 47
 MAX_TOKENS_BASE = 2000
 #: Additional budget per candidate, covering that position's justification.
 MAX_TOKENS_PER_CANDIDATE = 200
+
+#: Environment variable holding the key for the **unbatched** path. Deliberately not the batch
+#: client's ``SONNET_OR_KEY`` (:mod:`._openrouter_batch`) and not the shared ``OPENROUTER_API_KEY``:
+#: this arm's spend is meant to be separable from the defenses' and the other judges'.
+SYNC_API_KEY_ENV = "SONNET_API_KEY"
+
+#: Thread-pool width for the unbatched path, where throughput is entirely a function of how many
+#: requests are in flight. Read once at import, mirroring
+#: :data:`prompt_anonymity.defenses.frame_shift.FRAME_SHIFT_MAX_WORKERS`, so a job script can raise
+#: it without a code change. The client retries 429s with jittered backoff, so a value that
+#: outruns the account's rate limit costs latency rather than failures.
+SYNC_MAX_WORKERS = int(os.environ.get("LISTWISE_RERANK_MAX_WORKERS", "8"))
 
 #: Manual logic version for the judge cache; bump to force a full recompute (see caching.py).
 RERANK_VERSION = "1"
@@ -209,10 +230,11 @@ class ListwiseLLMRerankAttack:
         no reasoning field at all.
     batch : bool
         ``True`` (default) submits through OpenRouter's Batch API at ~50% of the real-time price,
-        with a 24-hour window. ``False`` uses the synchronous thread-pool client -- for smoke tests,
-        where waiting beats saving. It is **not** part of the cache key: it changes the delivery
-        channel, not the prompts, so a ``--no-batch`` trial run and the full batched run share one
-        cache namespace and the trial's verdicts are reused.
+        with a 24-hour window, under ``SONNET_OR_KEY``. ``False`` uses the synchronous thread-pool
+        client under :data:`SYNC_API_KEY_ENV`, at full price and with
+        :data:`SYNC_MAX_WORKERS` requests in flight -- for when waiting beats saving. It is **not**
+        part of the cache key: it changes the delivery channel, not the prompts, so the two share
+        one cache namespace and either one's verdicts are reused by the other.
     wait : bool
         Batch mode only. ``False`` submits, records resume tickets and exits, so the run can be
         collected by re-running the same command later.
@@ -238,8 +260,9 @@ class ListwiseLLMRerankAttack:
         :meth:`attack`. See :func:`~prompt_anonymity.attacks.llm.listwise.detail_table`.
     cost_usd : float
         What OpenRouter billed for the requests this run actually made, or ``nan`` when nothing was
-        billed through a channel that reports it (a fully-cached run, or the synchronous client,
-        which discards the usage block). Following
+        billed through a channel that reports it (a fully-cached run). Both clients report it; the
+        synchronous one's figure is a floor, since a reply that arrives without a usage block
+        contributes nothing to it. Following
         :mod:`prompt_anonymity.evaluation.utility._deepseek`: a cached row contributes nothing and
         never overwrites what was really paid.
     """
@@ -278,13 +301,15 @@ class ListwiseLLMRerankAttack:
                     reasoning_effort=self.reasoning_effort, wait=self.wait, ticket_dir=ticket_dir,
                 )
             else:
-                # The synchronous client has no reasoning knob of its own; extended thinking is a
-                # batch-path feature here, and a --no-batch run is a cheap shape check rather than a
-                # measurement to report. It also always sends temperature/top_p, which Sonnet 5 no
-                # longer accepts -- if OpenRouter passes them through rather than dropping them, this
-                # path fails immediately with the response body, which is the cheap place to find out.
+                # Same model, same rubric, same effort as the batch path -- only the delivery
+                # channel differs, which is what makes an unbatched run a measurement rather than
+                # a shape check. temperature/top_p are passed as None so the client omits them
+                # entirely: Sonnet 5 rejects both with a 400, and a default sent anyway is
+                # indistinguishable from this attack asking for them.
                 self._client = OpenRouterChat(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
+                    temperature=None, top_p=None, reasoning_effort=self.reasoning_effort,
+                    max_workers=SYNC_MAX_WORKERS, api_key_env=SYNC_API_KEY_ENV,
                 )
         return self._client.complete_batch(prompts)
 

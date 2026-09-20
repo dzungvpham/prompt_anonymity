@@ -3,8 +3,16 @@
 :mod:`.euclidean_llm_judge` and :mod:`.bt_tournament` ask a remote model to decide which candidate
 author wrote an unknown conversation. This module holds the one client they share:
 :class:`OpenRouterChat`, a thin wrapper over the chat-completions endpoint -- a lazily read
-``OPENROUTER_API_KEY`` (from a ``.env``), jittered exponential backoff on transient failures,
-fail-fast on non-retryable 4xx, and a thread pool to fan a batch of requests out.
+``OPENROUTER_API_KEY`` (from a ``.env``; the key's variable is a constructor argument, and the
+listwise reranker overrides it), jittered exponential backoff on transient failures, fail-fast on
+non-retryable 4xx, and a thread pool to fan a batch of requests out.
+
+**Reasoning models are first-class here, not only in the batch client.** ``reasoning_effort`` sends
+``reasoning.effort``, and ``temperature=None``/``top_p=None`` omit those fields rather than sending
+a default -- both are needed by Claude Sonnet 5, which rejects the sampling controls with a 400 and
+does its thinking under an effort level. That is what makes an unbatched run of
+:mod:`.listwise_llm_rerank` comparable to the batched one rather than a cheaper, thinking-free
+imitation of it.
 
 **It lived in** :mod:`prompt_anonymity.evaluation.utility` **until the utility judge moved off OpenRouter**
 (first to a Microsoft Foundry Claude deployment, then to DeepSeek --
@@ -35,6 +43,7 @@ from __future__ import annotations
 
 import os
 import random
+import threading
 import time
 
 #: OpenRouter chat-completions endpoint.
@@ -56,16 +65,33 @@ class OpenRouterChat:
         OpenRouter chat model id (e.g. ``"openai/gpt-4o"``).
     system_prompt : str
         System message prepended to every request (the response-model persona or the judge rubric).
-    temperature, top_p, max_tokens : float / float / int
-        Standard sampling controls; ``temperature=0`` keeps decoding deterministic.
+    temperature, top_p, max_tokens : float or None / float or None / int
+        Standard sampling controls; ``temperature=0`` keeps decoding deterministic. **``None``
+        omits the field from the payload entirely**, which is what a reasoning model needs: Claude
+        Sonnet 5 rejects ``temperature`` and ``top_p`` outright, and a default of 0.0 sent anyway
+        is a 400 rather than a suggestion the provider is free to ignore.
+    reasoning_effort : str or None
+        ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, sent as ``reasoning.effort`` --
+        which OpenRouter maps onto Anthropic's ``output_config.effort`` for Claude 4.6 and newer.
+        ``None`` (default) sends no reasoning field, so every existing caller is unaffected. The
+        older fixed thinking budget must NOT be sent: ``budget_tokens`` is a 400 on Sonnet 5.
     max_workers : int
         Thread-pool width for :meth:`complete_batch` (requests are network I/O-bound).
     max_retries, backoff_cap, timeout : int / float / float
         Retry budget for transient failures, backoff ceiling (seconds), and per-request timeout.
+
+    Attributes
+    ----------
+    total_cost : float
+        What OpenRouter reported billing for the requests this client actually made, in USD,
+        accumulated across threads. Best effort: the endpoint is asked for a usage block and any
+        reply that arrives without one contributes nothing, so this is a floor on the spend rather
+        than an invoice. Callers read it through ``getattr(client, "total_cost", nan)``.
     """
 
-    def __init__(self, model: str, system_prompt: str = "", *, temperature: float = 0.0,
-                 top_p: float = 1.0, max_tokens: int = 1024, max_workers: int = 8,
+    def __init__(self, model: str, system_prompt: str = "", *, temperature: float | None = 0.0,
+                 top_p: float | None = 1.0, max_tokens: int = 1024,
+                 reasoning_effort: str | None = None, max_workers: int = 8,
                  max_retries: int = 8, backoff_cap: float = 30.0, timeout: float = 120.0,
                  base_url: str = OPENROUTER_BASE_URL, api_key_env: str = OPENROUTER_API_KEY_ENV):
         import requests
@@ -77,11 +103,14 @@ class OpenRouterChat:
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
+        self.reasoning_effort = reasoning_effort
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.backoff_cap = backoff_cap
         self.timeout = timeout
         self.base_url = base_url
+        self.total_cost = 0.0
+        self._cost_lock = threading.Lock()
 
         # Walks UP from the working directory: a .env at the repo root (or above it) is found, one
         # in a SUBdirectory is not -- `DS_env/.env` does not work when the job runs from the root.
@@ -97,6 +126,26 @@ class OpenRouterChat:
     def _backoff(self, attempt: int) -> None:
         delay = min(self.backoff_cap, 2 ** attempt)
         time.sleep(random.uniform(0, delay))  # full jitter de-synchronizes concurrent workers
+
+    def _record_cost(self, reply) -> None:
+        """Add one reply's billed cost to :attr:`total_cost`, ignoring a reply that carries none.
+
+        Deliberately total: a provider that omits the usage block, or reports it under a shape this
+        does not recognise, must not turn a completed run into a crash over a bookkeeping field.
+        The worst case is an under-count, which the caller reports as a floor.
+        """
+        try:
+            cost = (reply.get("usage") or {}).get("cost")
+        except AttributeError:
+            return
+        if cost is None:
+            return
+        try:
+            cost = float(cost)
+        except (TypeError, ValueError):
+            return
+        with self._cost_lock:
+            self.total_cost += cost
 
     def complete(self, text: str, max_tokens: int | None = None) -> str:
         """Return the model's reply to ``text`` under the fixed system prompt.
@@ -119,9 +168,19 @@ class OpenRouterChat:
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": text},
             ],
-            "temperature": self.temperature, "top_p": self.top_p,
             "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
+            # Asks for the billed amount on the reply itself, which is the only way this client can
+            # report what a run cost -- there is no batch object to read it off afterwards.
+            "usage": {"include": True},
         }
+        # Sampling controls are sent only when set. See the class docstring: a reasoning model
+        # rejects them, and sending a default is indistinguishable from the caller asking for it.
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.top_p is not None:
+            payload["top_p"] = self.top_p
+        if self.reasoning_effort:
+            payload["reasoning"] = {"effort": self.reasoning_effort}
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
         last_err = None
@@ -130,7 +189,9 @@ class OpenRouterChat:
                 resp = self._requests.post(self.base_url, headers=headers, json=payload,
                                            timeout=self.timeout)
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                reply = resp.json()
+                self._record_cost(reply)
+                return reply["choices"][0]["message"]["content"]
             except self._requests.exceptions.HTTPError as err:
                 status = err.response.status_code
                 body = err.response.text
