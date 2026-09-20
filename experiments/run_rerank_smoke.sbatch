@@ -240,12 +240,20 @@ if [ "$LLM" = "1" ]; then
         echo "    echo 'SONNET_API_KEY=sk-or-...' >> $PROJECT/.env" >&2
         exit 1
     fi
-    if [ -n "${SONNET_API_KEY:-}" ]; then
-        echo "  key:      SONNET_API_KEY set in the environment"
-    else
-        echo "  key:      SONNET_API_KEY expected in $PROJECT/.env (not read here, so it stays"
-        echo "            out of this log)"
-    fi
+    # Not just "is it set" -- does the provider accept it. Generates no tokens, takes a second,
+    # and is the difference between finding out here and finding out in stage 6 after the free
+    # stage has run. The key itself never reaches the log.
+    "${RUN[@]}" python -c '
+import sys
+from prompt_anonymity.attacks.llm._openrouter import check_credentials
+from prompt_anonymity.attacks.llm.listwise_llm_rerank import SYNC_API_KEY_ENV
+
+ok, message = check_credentials(SYNC_API_KEY_ENV)
+print("  key:", message)
+if not ok:
+    print("  (or pass LLM=0 to skip the paid stage entirely)")
+    sys.exit(1)
+'
 fi
 
 # --- 5. free end to end ----------------------------------------------------

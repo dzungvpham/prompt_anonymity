@@ -8,7 +8,7 @@
 #
 # Produces, with the defaults below:
 #
-#   data/dist/shards/wildchat_dp_mlm_eps100.NNNN-of-0048.parquet   one per worker
+#   data/dist/shards/wildchat_dp_mlm_eps100.NNNN-of-0024.parquet   one per worker
 #   data/dist/wildchat_dp_mlm_eps100.parquet                       merged defended split
 #   data/dist/wildchat_dp_mlm_eps100_stylometrix.parquet           features
 #   experiments/results/wildchat_dp_mlm_eps100_stylometrix_*/      the attack
@@ -32,7 +32,7 @@
 #   # worker dies on `import torch`. sbatch exports your submitting environment, so:
 #   export PROMPT_ANONYMITY_CONDA_ENV=$HOME/prompt_anonymity/env     # adjust to your env
 #
-#   # Then, IN THAT ENVIRONMENT, warm the caches on the login node. 48 workers starting at once
+#   # Then, IN THAT ENVIRONMENT, warm the caches on the login node. 24 workers starting at once
 #   # would otherwise all reach for roberta-base and the NLTK data (punkt/punkt_tab/stopwords/
 #   # wordnet) simultaneously -- a download storm on nodes that may have no network at all:
 #   python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
@@ -59,8 +59,8 @@
 # and a defend cache layout too wide to ever re-use. So this job goes the other way:
 #
 #   * 8 array tasks, one GPU each -- few enough to schedule together, even on gpu-preempt.
-#   * 6 WORKER PROCESSES per GPU, each defending its own shard, sharing the card.
-#   * 48 shards in total (TASKS x WORKERS), which is the number that defines the cache layout.
+#   * 3 WORKER PROCESSES per GPU, each defending its own shard, sharing the card.
+#   * 24 shards in total (TASKS x WORKERS), which is the number that defines the cache layout.
 #
 # WHY WORKERS PER CARD, AND NOT JUST A BIGGER BATCH. One DP-MLM process alternates between a
 # single-threaded CPU phase and a GPU phase, and cannot overlap them: `_process_chunk` builds every
@@ -70,20 +70,34 @@
 # DPMLM_BATCH_SIZE does nothing about it -- it makes the GPU phase shorter, not the CPU phase.
 # Concurrent processes fix exactly that: one worker's CPU phase overlaps another's GPU phase.
 #
-# HOW MANY FIT. Per worker, on the card: ~0.25 GB of bf16 weights, ~0.8 GB for the chunk logits
-# buffer (DPMLM_FLUSH_POSITIONS=8192 x 50,265 vocab x fp16), ~1-1.5 GB of activations at
-# DPMLM_BATCH_SIZE=128, plus ~0.5 GB of CUDA context -- about 3 GB, so an 80 GB A100 has room for
-# 20+ and even a 40 GB card for a dozen. MEMORY IS NOT THE LIMIT. What binds first is CPU cores
-# (~2-3 per worker for that Python phase) and then the card's own throughput, which is why the
-# default is 6 workers on 16 CPUs rather than the 20 that would fit. Raise WORKERS if the smoke
-# test below shows the GPU still idling; the failure mode is mild (time-slicing, not OOM).
+# HOW MANY FIT -- AND WHY THE ANSWER IS SMALL. The steady-state cost of a worker is modest: ~0.25
+# GB of bf16 weights, ~0.8 GB for the chunk logits buffer (DPMLM_FLUSH_POSITIONS=8192 x 50,265
+# vocab x fp16), ~1-1.5 GB of activations at DPMLM_BATCH_SIZE=128, ~0.5 GB of CUDA context. About
+# 3 GB. That number is a trap, and this job was first written around it.
+#
+# THE PEAK IS SET BY THE LONGEST TURN IN THE CORPUS, not by the average or by any knob here.
+# `_process_chunk`'s phase 3 samples ONE CONVERSATION at a time, and for that conversation it
+# materializes `chunk_logits[rows].float()` -- [live_jobs x 50,265] in FLOAT32 -- and then a
+# softmax of the same shape. That is 400 KB per masked position, twice over. And it is not bounded
+# by DPMLM_FLUSH_POSITIONS: the chunker accumulates WHOLE turns, so a chunk always holds at least
+# one turn however big it is.
+#
+# WildChat has single turns of 100k+ characters (someone pasting a document), which is ~23,000
+# eligible words, which is ~9 GB for that one turn on top of its 2.3 GB logits block. Measured:
+# six workers on a 44 GB L40S died with `Tried to allocate 4.32 GiB` while a sibling held 27.5 GB
+# (job 64621446). Hence the two changes below -- 80 GB-class cards ONLY, and 3 workers, giving each
+# ~26 GB of headroom for a tail turn.
+#
+# So: CPU cores bound how many workers are USEFUL (~2-3 each for the Python phase), and the corpus
+# tail bounds how many are SAFE. Raise WORKERS only with DPMLM_BATCH_SIZE lowered to match, and
+# only after watching `nvidia-smi` through a smoke test that includes some long documents.
 #
 # No CUDA MPS. Processes time-slicing one device is fine here because each worker submits large
 # kernels (a 128 x ~450-token batch), so the scheduler has plenty to interleave.
 #
 # MEASURE BEFORE COMMITTING TO A LAYOUT:
 #
-#   LIMIT=2000 WORKERS=6 sbatch --array=0 experiments/run_dpmlm_wildchat.sbatch
+#   LIMIT=2000 sbatch --array=0 experiments/run_dpmlm_wildchat.sbatch
 #   # then, per worker log, words/s from the tqdm line, and:
 #   nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv -l 10
 #
@@ -120,7 +134,7 @@
 #              separately (see the note at the bottom of this header).
 #
 # STAGES 2-5 RUN ONCE, in whichever task holds the last worker to finish: that worker's
-# `apply_defenses` merges the 48 shards, and the task that finds the merged parquet claims the
+# `apply_defenses` merges the 24 shards, and the task that finds the merged parquet claims the
 # downstream stages under a lock.
 #
 # EPSILON IS THE READABILITY KNOB. The default is dp_mlm_eps100: at the paper's eps=25 the sampled
@@ -132,7 +146,7 @@
 #
 # Overrides (sbatch exports your submitting environment, so these are read at run time):
 #
-#   WORKERS=10 sbatch --cpus-per-task=24 ...   # more shards per card (see MEASURE above)
+#   WORKERS=4 DPMLM_BATCH_SIZE=64 sbatch ...   # more shards per card -- read "HOW MANY FIT" first
 #   DEFENSE=dp_mlm_eps250 sbatch ...       # a different budget
 #   DEFENSE=dp_mlm_var_a10 sbatch ...      # adaptive length (the paper's Algorithm 3)
 #   FEATURE=gemini_embedding_2 sbatch ...  # the paid encoder -- read the memory note below first
@@ -154,7 +168,7 @@
 #   sbatch experiments/run_dpmlm_wildchat.sbatch --attacks nearest_neighbor logistic
 #
 # MEMORY, AND WHEN TO RUN THE ATTACK SEPARATELY. --mem below is one number for all 8 tasks, so it
-# is sized for 6 workers plus the merge, not for a WildChat attack on 3,072-d embeddings:
+# is sized for 3 workers plus the merge, not for a WildChat attack on 3,072-d embeddings:
 # scripts/slurm.toml asks 96g for wildchat+gemini_embedding_2 and 24g for stylometrix. The default
 # FEATURE=stylometrix fits here (measured 14.6 GB peak for nearest_neighbor). With
 # FEATURE=gemini_embedding_2, submit ATTACK=0 and run the attack as its own job afterwards:
@@ -169,20 +183,21 @@
 #SBATCH --nodes=1
 #SBATCH --partition=gpu-preempt
 #SBATCH --gpus=1
-# Any card with ~24 GB will hold six 3 GB workers; the list is the repo's usual set minus the small
-# ones. Pre-Ampere would land on fp16 rather than bf16 (see `gpu_dtype`), which an MLM forward pass
-# is fine with -- widen this if the queue for these is long and you would rather have more cards.
-#SBATCH --constraint=a100|l40s|h100|h200
-# ~2.7 cores per worker. This, not VRAM, is what caps WORKERS: each worker has a single-threaded
-# Python phase (NLTK detokenize + tokenizer encode per masked word) that runs flat out.
-#SBATCH --cpus-per-task=16
-# 6 workers x ~3 GB of host memory, plus headroom for the merge that one task also runs:
-# `merge_shards` reads all 48 shards into pandas and concatenates them, and WildChat's text is
+# 80 GB-class cards ONLY. This was `a100|l40s|h100|h200` on the first version, to get more cards
+# scheduled, and six workers on a 44 GB L40S OOM'd -- see "HOW MANY FIT" above: the peak is one
+# long turn's [23,000 x 50,265] float32 softmax, not the steady state. An L40S or a 40 GB A100 can
+# run this job, but at 1-2 workers, which wastes more in parallelism than the wider queue wins.
+#SBATCH --constraint=a100-80g|h100|h200
+# ~2.7 cores per worker, for the single-threaded Python phase (NLTK detokenize + tokenizer encode
+# per masked word) that each one runs flat out.
+#SBATCH --cpus-per-task=8
+# 3 workers x ~3 GB of host memory, plus headroom for the merge that one task also runs:
+# `merge_shards` reads all 24 shards into pandas and concatenates them, and WildChat's text is
 # ~3.8 GiB as Python strings, so that step alone peaks near 8 GiB -- and the attack stage after it
 # measured 14.6 GB on this corpus. If the merge still OOMs, submit MERGE=0 and finish on a fat CPU
 # node (the commands are printed at the end of every log).
 #SBATCH --mem=48g
-# Expected 1-4 hours at 8 cards x 6 workers on a ~90M-position corpus; this is the margin for being
+# Expected 2-8 hours at 8 cards x 3 workers on a ~90M-position corpus; this is the margin for being
 # wrong about the rate, and --requeue means a preemption costs queue time rather than work.
 #SBATCH --time=0-12:00:00
 #SBATCH --requeue
@@ -221,16 +236,24 @@ STAGGER="${STAGGER:-10}"
 #
 TASK="${SLURM_ARRAY_TASK_ID:-0}"
 TASKS="${TASKS:-${SLURM_ARRAY_TASK_COUNT:-1}}"
-WORKERS="${WORKERS:-6}"
+WORKERS="${WORKERS:-3}"
 NSHARDS=$((TASKS * WORKERS))
 
 CPUS="${SLURM_CPUS_PER_TASK:-16}"
 # Split the allocation's cores between the workers instead of letting every process think it owns
-# the node: six torch runtimes each spawning $(nproc) OpenMP threads is pure contention, and the
+# the node: several torch runtimes each spawning $(nproc) OpenMP threads is pure contention, and the
 # tokenizer's own pool is worse than useless here (one short pair-encode per call).
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(( CPUS / WORKERS > 0 ? CPUS / WORKERS : 1 ))}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+# Workers share one card, and each one's allocation pattern swings between a steady ~3 GB and a
+# multi-GB spike on a long turn (see "HOW MANY FIT"). That is exactly the pattern that fragments
+# the caching allocator: the spike needs one contiguous block, and a heap full of freed small
+# blocks cannot give it one. Expandable segments let the allocator grow a segment instead of
+# failing -- torch's own OOM message recommends it, and the AFR job already runs this way. Must be
+# set before anything initializes CUDA, which is why it is here rather than inside the worker.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # HOW MUCH A PREEMPTION COSTS, in one number. The defense flushes its cache table every this many
 # DISTINCT TURNS -- turns, not conversations, because `apply_defenses` hands the cache one row per
@@ -239,7 +262,7 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 #
 # Why not leave it at the module default of 200: each flush rewrites the WHOLE table for the shard
 # (`_write_checkpoint`), which grows toward ~80 MB here, and 200 turns is ~20 seconds of work --
-# that is a rewrite every 20 seconds, on a shared filesystem, times 48 workers, to protect against
+# that is a rewrite every 20 seconds, on a shared filesystem, times 24 workers, to protect against
 # losing 20 seconds. 1,000 turns puts a flush every few minutes and cuts the write volume ~5x.
 # Read at import time, and NOT part of the defense's params(), so changing it never invalidates a
 # cached turn. Lower it if preemptions on this partition are frequent enough to matter.
@@ -301,9 +324,9 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-# 0b. Resolve the environment BEFORE launching six workers, and say which interpreter this job
+# 0b. Resolve the environment BEFORE launching the workers, and say which interpreter this job
 #     actually got. Two traps this catches in five seconds rather than at the first uncached turn,
-#     multiplied across 6 worker logs:
+#     multiplied across every worker log:
 #
 #       * The wrong environment. scripts/slurm_job.sh takes $PROMPT_ANONYMITY_CONDA_ENV if set and
 #         otherwise activates $PROJECT/.venv -- so a stub .venv beside a real conda env silently
@@ -341,7 +364,7 @@ if not torch.cuda.is_available():
     sys.exit(1)
 
 # Resolve the NLTK data too: the backend downloads it lazily, which fails on an offline node --
-# better to say so here than to have six workers each discover it separately.
+# better to say so here than to have every worker discover it separately.
 import nltk
 for package, path in (("punkt_tab", "tokenizers/punkt_tab"), ("stopwords", "corpora/stopwords")):
     try:
@@ -362,7 +385,7 @@ print("[preflight] ok:", sys.argv[1], "resolved, checkpointing every",
 #
 #    Each worker is handed its shard EXPLICITLY (--num-shards/--shard-index), which
 #    `resolve_sharding` prefers over the SLURM array variables: those describe the array, and the
-#    array is now only half of the layout. Each also gets its own log, because six tqdm progress
+#    array is now only half of the layout. Each also gets its own log, because concurrent tqdm
 #    bars multiplexed into one file are unreadable -- follow one with
 #    `tail -f scripts/logs/dpmlm-wc-<jobid>_<task>.shard0000.log`.
 echo ""
@@ -389,7 +412,7 @@ for worker in $(seq 0 $((WORKERS - 1))); do
     pids+=($!)
     worker_shards+=("$shard")
     worker_logs+=("$log")
-    # Stagger the starts: six processes importing torch and initializing CUDA on the same second
+    # Stagger the starts: several processes importing torch and initializing CUDA on one second
     # is a thundering herd on a shared filesystem, and buys nothing. Seconds, so it is noise next
     # to the run; STAGGER=0 turns it off.
     [ "$STAGGER" = "0" ] || sleep "$STAGGER"

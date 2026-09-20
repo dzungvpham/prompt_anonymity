@@ -246,6 +246,23 @@ else
     echo "  $KEY_ENV: expected in $PROJECT/.env (not read here, so it stays out of this log)"
 fi
 
+# Then actually USE it. The check above only proves a variable or a file exists, and a .env that
+# exists but defines a different variable passes it happily -- which is how a run reached the
+# thread pool and took 401 on every request. This asks OpenRouter, generates no tokens, and
+# prints the key's length and last four characters rather than the key.
+if [ "$BATCH" = "0" ]; then
+    run python -c '
+import sys
+from prompt_anonymity.attacks.llm._openrouter import check_credentials
+from prompt_anonymity.attacks.llm.listwise_llm_rerank import SYNC_API_KEY_ENV
+
+ok, message = check_credentials(SYNC_API_KEY_ENV)
+print("  " + message)
+if not ok:
+    sys.exit(1)
+'
+fi
+
 if [ "$CHECK_ONLY" = "1" ]; then
     echo ""
     echo "(CHECK_ONLY=1 -- preflight only, nothing submitted)"

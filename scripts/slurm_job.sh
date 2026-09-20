@@ -45,13 +45,12 @@ export PYTHONUNBUFFERED=1
 # binary regardless of what is or is not on $PATH. This branch exists for the other convention some
 # scripts use: a bare `python`/`pip` that has to resolve through $PATH, which needs something here
 # to have actually put the right interpreter on it first.
-if [[ -n "$CONDA_ENV" ]]; then
-    # Case 1: a Conda user asked for a specific environment by name. Each step below is
-    # conditional because how conda arrives differs per cluster, and an unconditional `module
-    # load` is a hard failure on a site that has no Lmod at all. sbatch exports the submitting
-    # environment by default, so on Unity `module` is usually already here; ~/.bashrc is the
-    # fallback that defines it, and is sourced with -u off because other people's rc files are not
-    # -u clean.
+activate_conda() {
+    # Each step is conditional because how conda arrives differs per cluster, and an
+    # unconditional `module load` is a hard failure on a site that has no Lmod at all. sbatch
+    # exports the submitting environment by default, so on Unity `module` is usually already
+    # here; ~/.bashrc is the fallback that defines it, and is sourced with -u off because other
+    # people's rc files are not -u clean.
     if ! command -v module >/dev/null 2>&1 && [[ -f ~/.bashrc ]]; then
         set +u
         # shellcheck disable=SC1090
@@ -69,8 +68,13 @@ if [[ -n "$CONDA_ENV" ]]; then
     # is defined in a batch shell depends on whether conda's init block ran in a file this shell
     # read.
     eval "$(conda shell.bash hook)"
-    echo "Activating conda env $CONDA_ENV"
-    conda activate "$CONDA_ENV"
+    echo "Activating conda env $1"
+    conda activate "$1"
+}
+
+if [[ -n "$CONDA_ENV" ]]; then
+    # Case 1: a Conda user asked for a specific environment by name or prefix.
+    activate_conda "$CONDA_ENV"
 elif [[ -f "$PROJECT/.venv/bin/activate" ]]; then
     # Case 2: no Conda env requested, but the project has its own virtualenv -- the Unity setup.
     # Sourcing it (rather than nothing) is what makes a bare `python` in the forwarded command
@@ -78,10 +82,24 @@ elif [[ -f "$PROJECT/.venv/bin/activate" ]]; then
     echo "Activating venv $PROJECT/.venv"
     # shellcheck disable=SC1091
     source "$PROJECT/.venv/bin/activate"
+elif [[ -d "$PROJECT/env/conda-meta" ]]; then
+    # Case 3: the layout the README actually tells you to build -- `conda create -p ./env`. Found
+    # by conda-meta/, which exists in a conda prefix and nowhere else, so this cannot mistake a
+    # directory that merely happens to be called `env` for an environment.
+    #
+    # This case is here because its absence was silent and expensive: without it a batch job fell
+    # through to Case 4 and ran whatever `python` the node's PATH offered -- on this cluster a
+    # uv-managed 3.13 with none of the project's dependencies -- while the same commands run by
+    # hand on the login node used ./env and worked. Every symptom was a missing module, which
+    # reads as a broken install rather than as the wrong interpreter.
+    activate_conda "$PROJECT/env"
 else
-    # Case 3: neither. Not a hard failure -- a caller passing an absolute interpreter path doesn't
-    # need either of the above, so refusing to run here would break that convention for no reason.
-    echo "no \$PROMPT_ANONYMITY_CONDA_ENV and no $PROJECT/.venv; running with the inherited environment as-is" >&2
+    # Case 4: none of the above. Not a hard failure -- a caller passing an absolute interpreter
+    # path doesn't need any of them, so refusing to run here would break that convention for no
+    # reason. It is loud, though, because the failure it leads to is not obviously about the
+    # environment when you read it hours later.
+    echo "no \$PROMPT_ANONYMITY_CONDA_ENV, no $PROJECT/.venv and no $PROJECT/env conda prefix;" >&2
+    echo "  running with the inherited environment as-is -- \`python\` resolves to $(command -v python 2>/dev/null || echo 'nothing on PATH')" >&2
 fi
 
 # Only when this job actually asked for one, so the CPU cells' logs are not a page of error text.

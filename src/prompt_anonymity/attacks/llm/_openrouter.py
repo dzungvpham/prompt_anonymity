@@ -52,6 +52,61 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_KEY_ENV = "OPENROUTER_API_KEY"
 
 
+#: Key-introspection endpoint. A GET here authenticates without generating a single token, which
+#: is what makes it usable as a preflight.
+OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+
+
+def check_credentials(api_key_env: str = OPENROUTER_API_KEY_ENV, *, timeout: float = 30.0):
+    """``(ok, message)`` for the key in ``$api_key_env`` -- resolved, then actually used.
+
+    Checking that a ``.env`` *file exists* is not checking that it holds the key you need, and the
+    difference is expensive: a job whose preflight passed on the file's existence goes on to build
+    a corpus of prompts, open a thread pool and get 401 on the first one, hours after you walked
+    away. This asks the provider, costs nothing (no completion is generated) and takes a second.
+
+    Never returns or logs the key itself, only its length and last four characters -- enough to
+    tell "the variable is set to the wrong thing" from "the variable is not set", which is the
+    distinction you need at 2am, without putting a credential in a log file that outlives the job.
+    """
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    key = os.environ.get(api_key_env)
+    if not key:
+        return False, (f"{api_key_env} is not set, and no .env on the way up from {os.getcwd()} "
+                       f"defines it. Note that load_dotenv walks UP from the working directory, "
+                       f"so a .env in a subdirectory is never found.")
+    if key != key.strip():
+        return False, (f"{api_key_env} has leading or trailing whitespace ({len(key)} chars). A "
+                       f"quoted value or a trailing newline in .env does this, and the provider "
+                       f"sees a malformed Authorization header.")
+
+    import requests
+
+    shape = f"{len(key)} chars, ending {key[-4:]!r}"
+    try:
+        response = requests.get(OPENROUTER_KEY_URL, timeout=timeout,
+                                headers={"Authorization": f"Bearer {key}"})
+    except Exception as err:  # noqa: BLE001 - a preflight must not raise
+        return False, f"could not reach OpenRouter to check {api_key_env} ({shape}): {err}"
+
+    if response.status_code == 200:
+        body = response.json().get("data", {})
+        limit, usage = body.get("limit"), body.get("usage")
+        headroom = "no spend limit set" if limit is None else f"limit {limit}, used {usage}"
+        return True, f"{api_key_env} authenticates ({shape}); {headroom}"
+    if response.status_code == 401:
+        return False, (f"{api_key_env} is set ({shape}) but OpenRouter rejects it: 401 "
+                       f"{response.text.strip()[:200]}. The variable holds something, just not a "
+                       f"valid key -- check you did not put the batch key, another provider's "
+                       f"key, or a placeholder in it.")
+    return False, (f"{api_key_env} ({shape}) got HTTP {response.status_code} from OpenRouter: "
+                   f"{response.text.strip()[:200]}")
+
+
 class OpenRouterChat:
     """Minimal OpenRouter chat client: one fixed system prompt, one user message per call.
 
