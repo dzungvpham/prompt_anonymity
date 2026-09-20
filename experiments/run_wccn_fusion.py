@@ -116,36 +116,78 @@ def load_pos_tags(cache_glob: str, doc_ids: list[str]) -> dict[str, str]:
     return by_id
 
 
+def build_component(name: str, known_slice: slice, unknown_slice: slice,
+                    precomputed: dict[str, np.ndarray], doc_ids: list[str],
+                    turns_by_id: dict[str, str] | None, pos_by_id: dict[str, str] | None
+                    ) -> tuple[np.ndarray, np.ndarray]:
+    """One feature block's standardized (known, unknown) matrices for this window.
+
+    A fresh featurizer instance per call for the per-split kind: ``featurize()`` fits on its
+    first call, so calling known first (fit) then unknown second (transform-only) on this
+    instance is what keeps the fit known-side-only. Never reuse an instance across windows.
+    """
+    if name in PER_SPLIT_FEATURIZERS:
+        featurizer_cls, text_key = PER_SPLIT_FEATURIZERS[name]
+        by_id = turns_by_id if text_key == "turns" else pos_by_id
+        featurizer = featurizer_cls()
+        k = featurizer.featurize([by_id[d] for d in doc_ids[known_slice]])
+        u = featurizer.featurize([by_id[d] for d in doc_ids[unknown_slice]])
+    else:
+        k, u = precomputed[name][known_slice], precomputed[name][unknown_slice]
+    return standardize(k, u)
+
+
 def build_matrices(components: list[str], known_slice: slice, unknown_slice: slice,
                     precomputed: dict[str, np.ndarray], doc_ids: list[str],
                     turns_by_id: dict[str, str] | None, pos_by_id: dict[str, str] | None
                     ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
-    known_blocks, unknown_blocks, dims = [], [], {}
-    known_ids = doc_ids[known_slice]
-    unknown_ids = doc_ids[unknown_slice]
+    """Early (concatenation) fusion: standardize each component, hstack, standardize again."""
+    blocks = [build_component(name, known_slice, unknown_slice, precomputed, doc_ids,
+                              turns_by_id, pos_by_id) for name in components]
+    dims = {name: k.shape[1] for name, (k, u) in zip(components, blocks)}
 
-    for name in components:
-        if name in PER_SPLIT_FEATURIZERS:
-            featurizer_cls, text_key = PER_SPLIT_FEATURIZERS[name]
-            by_id = turns_by_id if text_key == "turns" else pos_by_id
-            # Fresh instance per window per component: featurize() fits on its first call, so
-            # calling known first (fit) then unknown second (transform-only) on this instance is
-            # what keeps the fit known-side-only. Never reuse an instance across windows.
-            featurizer = featurizer_cls()
-            k = featurizer.featurize([by_id[d] for d in known_ids])
-            u = featurizer.featurize([by_id[d] for d in unknown_ids])
-        else:
-            k, u = precomputed[name][known_slice], precomputed[name][unknown_slice]
-        k, u = standardize(k, u)
-        known_blocks.append(k)
-        unknown_blocks.append(u)
-        dims[name] = k.shape[1]
-
-    if len(known_blocks) == 1:
-        return known_blocks[0], unknown_blocks[0], dims
-    fused_known, fused_unknown = np.hstack(known_blocks), np.hstack(unknown_blocks)
+    if len(blocks) == 1:
+        k, u = blocks[0]
+        return k, u, dims
+    fused_known = np.hstack([k for k, u in blocks])
+    fused_unknown = np.hstack([u for k, u in blocks])
     fused_known, fused_unknown = standardize(fused_known, fused_unknown)
     return fused_known, fused_unknown, dims
+
+
+def zscore(matrix: np.ndarray) -> np.ndarray:
+    """Whole-matrix z-score: puts one attack's raw score scale on par with another's."""
+    return (matrix - matrix.mean()) / (matrix.std() + 1e-12)
+
+
+def score_fusion_predict(components: list[str], known_slice: slice, unknown_slice: slice,
+                         known_labels: np.ndarray, attack_name: str, attack_kwargs: dict,
+                         alpha: float, precomputed: dict[str, np.ndarray], doc_ids: list[str],
+                         turns_by_id: dict[str, str] | None, pos_by_id: dict[str, str] | None
+                         ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    """Late fusion: fit one attack per component, then combine z-scored author scores.
+
+    ``combined = z(score_0) + alpha * sum(z(score_i) for i > 0)`` -- the first component anchors
+    the scale, ``alpha`` weights every other component equally against it. Simpler than a
+    per-pair alpha, and enough to test whether score-level combination beats concatenating raw
+    features before the first component gets fit against as one attack (``run_wccn_fusion``'s
+    default mode).
+    """
+    combined, authors, dims = None, None, {}
+    for i, name in enumerate(components):
+        k, u = build_component(name, known_slice, unknown_slice, precomputed, doc_ids,
+                               turns_by_id, pos_by_id)
+        dims[name] = k.shape[1]
+        attack = ATTRIBUTION_ATTACKS[attack_name](**attack_kwargs).fit(k, known_labels)
+        scores = zscore(attack.score(u))
+        if authors is None:
+            authors = attack.authors
+        else:
+            assert list(authors) == list(attack.authors), \
+                "candidate order differs between components fit on the same known_labels"
+        weight = 1.0 if i == 0 else alpha
+        combined = scores * weight if combined is None else combined + scores * weight
+    return combined, authors, dims
 
 
 def parse_args():
@@ -160,6 +202,17 @@ def parse_args():
                         choices=sorted(ATTRIBUTION_ATTACKS))
     parser.add_argument("--shrinkage", type=float, default=0.2,
                         help="passed to wccn/plda only")
+    parser.add_argument("--fusion-mode", default="concat", choices=["concat", "score"],
+                        help="'concat' (default): standardize each component, hstack, fit one "
+                             "attack. 'score': fit one attack PER component, z-score each "
+                             "component's score matrix, combine with --score-alpha. Only "
+                             "meaningful for a --feature-sets entry with 2+ components; a "
+                             "single-component entry is identical under both modes.")
+    parser.add_argument("--score-alpha", type=float, default=1.0,
+                        help="score mode only: weight on every component after the first "
+                             "(the first anchors the scale). Select this on one held-out "
+                             "window, then lock it -- do not pick it from the same windows "
+                             "the final numbers are reported on.")
     parser.add_argument("--known-windows", nargs="+", default=list(DEFAULT_KNOWN_WINDOWS))
     parser.add_argument("--test-fraction", type=float, default=DEFAULT_TEST_FRACTION)
     parser.add_argument("--pos-cache", default=None,
@@ -218,31 +271,40 @@ def main():
         print(f"\n=== {config.tag} ({config.label}) known={known_slice.stop - known_slice.start:,} "
               f"unknown={int(in_set.sum()):,}/{unknown_slice.stop - unknown_slice.start:,} in-set ===")
 
+        use_score_fusion = args.fusion_mode == "score"
         for label, comps in feature_sets:
-            t0 = time.time()
-            k, u, dims = build_matrices(comps, known_slice, unknown_slice, precomputed, doc_ids,
-                                        turns_by_id, pos_by_id)
-            u_in = u[in_set]
-            build_time = time.time() - t0
-
             for attack_name in args.attacks:
-                t1 = time.time()
+                t0 = time.time()
                 kwargs = {"shrinkage": args.shrinkage} if attack_name in SHRINKAGE_ATTACKS else {}
-                attack = ATTRIBUTION_ATTACKS[attack_name](**kwargs).fit(k, known_labels)
-                scores = attack.score(u_in)
-                ranks = true_author_ranks(scores, attack.authors, unknown_labels_in)
-                summary = ranking_summary(ranks, len(attack.authors))
-                acc1 = macro_top_k_accuracy(ranks, unknown_labels_in, k=1)
-                runtime = build_time + (time.time() - t1)
 
+                if use_score_fusion and len(comps) > 1:
+                    scores_all, cand_authors, dims = score_fusion_predict(
+                        comps, known_slice, unknown_slice, known_labels, attack_name, kwargs,
+                        args.score_alpha, precomputed, doc_ids, turns_by_id, pos_by_id)
+                    scores = scores_all[in_set]
+                else:
+                    k, u, dims = build_matrices(comps, known_slice, unknown_slice, precomputed,
+                                                doc_ids, turns_by_id, pos_by_id)
+                    attack = ATTRIBUTION_ATTACKS[attack_name](**kwargs).fit(k, known_labels)
+                    scores = attack.score(u[in_set])
+                    cand_authors = attack.authors
+                runtime = time.time() - t0
+
+                ranks = true_author_ranks(scores, cand_authors, unknown_labels_in)
+                summary = ranking_summary(ranks, len(cand_authors))
+                acc1 = macro_top_k_accuracy(ranks, unknown_labels_in, k=1)
+
+                mode_tag = f"{label}[score,a={args.score_alpha}]" if use_score_fusion and len(comps) > 1 else label
                 m = {"macro_conv_acc1": acc1, "mrr": summary["mrr"]}
-                per_window[(label, attack_name)].append(m)
-                print(f"  {label:<32} {attack_name:<14} "
+                per_window[(mode_tag, attack_name)].append(m)
+                print(f"  {mode_tag:<40} {attack_name:<14} "
                       f"macro_conv_acc1={acc1:.4f}  mrr={summary['mrr']:.4f}")
 
                 csv_rows.append({
                     "source": args.source, "known_config": config.tag,
-                    "feature_set": label, "attack": attack_name,
+                    "feature_set": label, "fusion_mode": args.fusion_mode,
+                    "score_alpha": args.score_alpha if use_score_fusion and len(comps) > 1 else "",
+                    "attack": attack_name,
                     "shrinkage": args.shrinkage if attack_name in SHRINKAGE_ATTACKS else "",
                     "macro_conv_acc1": round(acc1, 6), "mrr": round(summary["mrr"], 6),
                     "n_known": known_slice.stop - known_slice.start,
