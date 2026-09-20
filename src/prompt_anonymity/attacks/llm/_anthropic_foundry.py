@@ -34,6 +34,8 @@ class AnthropicFoundryChat:
     def _ensure_client(self):
         if self._client is not None:
             return self._client
+        from dotenv import load_dotenv
+        load_dotenv()
         api_key = os.environ.get("ANTHROPIC_FOUNDRY_API_KEY")
         base_url = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
         if not api_key or not base_url:
