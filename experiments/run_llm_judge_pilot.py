@@ -45,6 +45,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -169,6 +170,27 @@ def wccn_shortlist(base_scores_subset: np.ndarray, candidate_authors: np.ndarray
     return col_index, document_index
 
 
+def _batch_with_retry(fn, max_attempts: int = 4, wait_seconds: float = 130.0):
+    """Retry ``fn()`` on OpenRouter's HTTP 402 "in-flight budget exhausted" -- a transient
+    per-account concurrency cap (too many requests in flight at once across this whole batch
+    or a recent one), not the ordinary "out of credits" 402 and not retried by
+    :meth:`OpenRouterChat.complete`, which treats every non-429 4xx as permanent. Firing 100
+    prompts through a thread pool for one window, then another 100 for the very next window
+    moments later, is exactly the shape that trips this -- the account-wide budget can still be
+    settling from the first burst. Any other error (including an ordinary 402) is not retried.
+    """
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except RuntimeError as err:
+            msg = str(err)
+            if "402" not in msg or "in_flight_budget" not in msg or attempt == max_attempts - 1:
+                raise
+            print(f"  OpenRouter in-flight budget exhausted (attempt {attempt + 1}/"
+                  f"{max_attempts}); waiting {wait_seconds:.0f}s before retrying...")
+            time.sleep(wait_seconds)
+
+
 def run_judge_once(prompt_fn, system_prompt_template: str, known_texts: list[str],
                    query_texts: list[str], col_index: np.ndarray, document_index: np.ndarray,
                    judge_model: str, cache_dir, cache_namespace: str, seed: int,
@@ -201,9 +223,9 @@ def run_judge_once(prompt_fn, system_prompt_template: str, known_texts: list[str
             params_hash({"judge_model": judge_model, "system_prompt": system_prompt,
                         "top_k": k, "snippet_chars": snippet_chars, "seed": seed}),
         )
-        raw_choices = cache.apply_batch(prompts, client.complete_batch)
+        raw_choices = _batch_with_retry(lambda: cache.apply_batch(prompts, client.complete_batch))
     else:
-        raw_choices = client.complete_batch(prompts)
+        raw_choices = _batch_with_retry(lambda: client.complete_batch(prompts))
     choices = [_parse_choice(r) for r in raw_choices]
 
     picks = np.empty(n, dtype=int)
