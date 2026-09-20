@@ -221,7 +221,34 @@ def parse_args():
                              "'pos_tags_cache_wildchat_shard*of4.jsonl')")
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--output-csv", default=None)
+    parser.add_argument("--feature-dir", action="append", default=[], metavar="FEATURE=DIR",
+                        help="load one precomputed feature's parquet from a different "
+                             "directory than --data-dir (repeatable), e.g. luar=data/dist "
+                             "for a feature whose vectors were computed alongside a "
+                             "different document filtering/build. Re-aligned by doc_id "
+                             "rather than assumed to share row order with --data-dir.")
     return parser.parse_args()
+
+
+def load_feature_by_doc_id(data_dir: str, source: str, feature: str,
+                           doc_ids: list[str]) -> np.ndarray:
+    """One feature's matrix, reordered to ``doc_ids`` -- for a feature computed against a
+    different document build (different filtering/ordering, or no co-located ``<source>.parquet``
+    at all) than the run's anchor feature, so row position cannot be trusted across the two and
+    there may be no documents file in ``data_dir`` to join through in the first place. Reads the
+    feature parquet directly rather than going through :func:`load_documents_and_features`."""
+    path = Path(data_dir) / f"{source}_{feature}.parquet"
+    if not path.exists():
+        raise SystemExit(f"{path} not found.")
+    table = pq.read_table(path)
+    columns = [c for c in table.column_names if c not in ("doc_id", "author_id")]
+    by_id = {d: i for i, d in enumerate(table.column("doc_id").to_pylist())}
+    missing = [d for d in doc_ids if d not in by_id]
+    if missing:
+        raise SystemExit(f"{len(missing):,}/{len(doc_ids):,} documents have no {feature} vector "
+                         f"in {path} (e.g. {missing[0]!r}).")
+    rows = np.array([by_id[d] for d in doc_ids])
+    return np.column_stack([table.column(c).to_numpy()[rows] for c in columns]).astype(np.float32)
 
 
 def main():
@@ -234,13 +261,23 @@ def main():
     if needs_pos and not args.pos_cache:
         raise SystemExit("--pos-cache is required when a feature set uses 'pos_ngram'")
 
+    feature_dirs = {}
+    for spec in args.feature_dir:
+        name, _, path = spec.partition("=")
+        if not path:
+            raise SystemExit(f"--feature-dir {spec!r}: expected FEATURE=DIR")
+        feature_dirs[name] = path
+
     sha = git_sha()
     print(f"git SHA {sha}  source={args.source}  attacks={args.attacks}  shrinkage={args.shrinkage}")
+    if feature_dirs:
+        print(f"feature directory overrides: {feature_dirs}")
 
     frame = None
     precomputed: dict[str, np.ndarray] = {}
-    anchor_feature = precomputed_needed[0] if precomputed_needed else "gemini_embedding_2"
-    for feat in dict.fromkeys([anchor_feature, *precomputed_needed]):
+    anchor_candidates = [f for f in precomputed_needed if f not in feature_dirs]
+    anchor_feature = anchor_candidates[0] if anchor_candidates else "gemini_embedding_2"
+    for feat in dict.fromkeys([anchor_feature, *anchor_candidates]):
         frame_i, mat = load_documents_and_features(args.data_dir, args.source, feat)
         if frame is None:
             frame = frame_i
@@ -253,6 +290,11 @@ def main():
 
     authors = frame["author_id"].to_numpy()
     doc_ids = frame["doc_id"].tolist()
+
+    for feat in [f for f in precomputed_needed if f in feature_dirs]:
+        precomputed[feat] = load_feature_by_doc_id(feature_dirs[feat], args.source, feat, doc_ids)
+        print(f"{feat}: {precomputed[feat].shape[1]} dims, loaded from {feature_dirs[feat]} "
+              f"(re-aligned by doc_id)")
 
     turns_by_id = load_turns_text(args.data_dir, args.source, doc_ids) if needs_char else None
     pos_by_id = load_pos_tags(args.pos_cache, doc_ids) if needs_pos else None
