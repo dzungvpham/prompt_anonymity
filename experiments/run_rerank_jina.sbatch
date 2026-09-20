@@ -24,6 +24,12 @@
 # retrieval reranker asked an authorship question may well score confidently in the wrong direction,
 # which would make it a useful negative control rather than a failure.
 #
+# PREEMPTION IS SURVIVABLE. This asks for gpu-preempt, where a job can be killed at any moment and
+# requeued from the top -- so scores are written to the cache every few shortlists as they are
+# computed (JINA_RERANK_FLUSH_EVERY, default 8). A requeued job re-scores at most that many rows
+# and carries on from where it was, which for a whole corpus is the difference between finishing
+# across several preemptions and never finishing at all.
+#
 # SEE WHAT IS MISSING WITHOUT RUNNING ANYTHING -- a second, on the login node, no GPU:
 #
 #     CHECK_ONLY=1 bash experiments/run_rerank_jina.sbatch

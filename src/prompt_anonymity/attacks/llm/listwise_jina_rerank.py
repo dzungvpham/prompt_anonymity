@@ -41,6 +41,7 @@ repository is, worth knowing before it is reused anywhere else.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -49,7 +50,7 @@ import pandas as pd
 from ...caching import TransformCache, logic_hash, params_hash
 from ...core import AttackData
 from .candidates import author_candidates
-from .listwise import detail_table, fold_listwise, present, report
+from .listwise import detail_table, fold_listwise, present, progress_printer, report
 
 #: The reranker checkpoint. 0.6B, multilingual, listwise -- which matters here: the corpora are not
 #: English-only (swe-chat carries Chinese conversations), and an English-only reranker would score
@@ -68,6 +69,14 @@ DEFAULT_TOP_K = 5
 DEFAULT_SNIPPET_CHARS = 800
 #: Seed for the per-row candidate shuffle.
 DEFAULT_SEED = 47
+
+#: How many scored shortlists to bank at a time. This attack runs on a **preemptible** partition,
+#: and until a score is written to the cache the GPU time that produced it is lost on requeue --
+#: so the number answers "how much work is a preemption allowed to destroy", in shortlists. Small,
+#: because a shortlist is a forward pass and the write is one small file either way; not 1, because
+#: there is no reason to pay a syscall per item when a few seconds of rework is free.
+#: ``JINA_RERANK_FLUSH_EVERY`` overrides it.
+FLUSH_EVERY = int(os.environ.get("JINA_RERANK_FLUSH_EVERY", "8"))
 
 #: Manual logic version for the score cache; bump to force a full recompute (see caching.py).
 RERANK_VERSION = "1"
@@ -158,17 +167,25 @@ class ListwiseJinaRerankAttack:
         scores are scattered back into slot order here -- the caller ranks them itself, and a list
         that is already sorted would lose which slot each number belongs to.
         """
+        return [row for _, row in self._score_stream(items)]
+
+    def _score_stream(self, items: list[tuple[str, list[str]]]):
+        """``(index, scores)`` per item, yielded as each shortlist is scored.
+
+        One forward pass per item either way -- there is no batching knob on this model -- so this
+        costs nothing over :meth:`_score` and lets the caller bank each result. On a preemptible
+        GPU partition that is the difference between a requeued job resuming and one starting over,
+        which for a whole corpus it may never get far enough to finish.
+        """
         import torch
 
         model = self._ensure_model()
-        scores = []
         with torch.inference_mode():
-            for query, documents in items:
+            for index, (query, documents) in enumerate(items):
                 row = [0.0] * len(documents)
                 for result in model.rerank(query, documents):
                     row[int(result["index"])] = float(result["relevance_score"])
-                scores.append(row)
-        return scores
+                yield index, row
 
     def _cache(self, cache_dir) -> TransformCache:
         return TransformCache(
@@ -221,7 +238,10 @@ class ListwiseJinaRerankAttack:
 
         if cache_dir is not None:
             cache = self._cache(cache_dir)
-            relevance = cache.apply_batch(items, self._score, key=_cache_key)
+            relevance = cache.apply_streaming(
+                items, self._score_stream, key=_cache_key, flush_every=FLUSH_EVERY,
+                on_progress=progress_printer("scored") if self.verbose else None,
+            )
             if self.verbose:
                 print(f"  listwise rerank: {cache.hits}/{n} rows served from cache, "
                       f"{cache.misses} scored")

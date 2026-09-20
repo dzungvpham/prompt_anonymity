@@ -194,8 +194,13 @@ and `finish_rerank.sbatch` with `afterany` on both, which merges their tables in
 The Sonnet arm's key is `SONNET_API_KEY` in a `.env` **at the repo root**; the batch path
 (`BATCH=1`, the default when that script is submitted directly) uses `SONNET_OR_KEY` instead.
 `LISTWISE_RERANK_MAX_WORKERS` — `WORKERS=` on the job — sets how many requests are in flight.
-Verdicts are cached by prompt text, so an interrupted arm resumes cheaply and a re-run judges only
-what is new.
+
+**Both arms resume after an interruption.** Results are written to the cache as they are produced
+rather than at the end of the run — every verdict for the paid arm, every few shortlists for the
+GPU arm (`JINA_RERANK_FLUSH_EVERY`) — so a job that is preempted, requeued or killed on wall clock
+keeps what it already computed, and re-running the identical command recomputes only the
+remainder. That is `TransformCache.apply_streaming`; `apply_batch`, which the featurizers and the
+Batch API path use, still writes only once its transform returns.
 
 ## Defenses
 

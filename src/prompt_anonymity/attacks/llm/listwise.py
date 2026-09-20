@@ -225,6 +225,34 @@ def report(orders: Sequence[Sequence[int]], presentation: Presentation, *, n_par
           f"{n_applied}/{n} folded back into the scores")
 
 
+def progress_printer(label: str, *, lines: int = 40, stream=None):
+    """An ``on_progress(done, total)`` for
+    :meth:`~prompt_anonymity.caching.TransformCache.apply_streaming`, throttled to ``lines``.
+
+    A reranking run returns nothing until it ends -- hours, for the paid arm on a whole corpus --
+    so without this a job log is indistinguishable between working and hung. Throttled because the
+    other failure is a log with one line per row: at ``flush_every=1`` over a thousand documents,
+    per-result printing would bury everything else the job says.
+
+    Flushed on every line: SLURM's ``--output`` is a file, so Python would otherwise block-buffer
+    this and deliver the whole progress trace at once, when the job is already over.
+    """
+    import sys
+
+    stream = stream or sys.stdout
+    state = {"last": -1}
+
+    def on_progress(done: int, total: int) -> None:
+        step = max(1, total // max(1, lines))
+        if done != total and done // step == state["last"]:
+            return
+        state["last"] = done // step
+        percent = 100.0 * done / total if total else 100.0
+        print(f"  {label}: {done}/{total} ({percent:.0f}%)", file=stream, flush=True)
+
+    return on_progress
+
+
 # --- self-test ---------------------------------------------------------------
 
 def _synthetic(seed: int = 3, n_authors: int = 12, per_author: int = 5, dim: int = 8):

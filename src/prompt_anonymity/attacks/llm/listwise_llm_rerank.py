@@ -73,7 +73,14 @@ from ...core import AttackData
 from ._openrouter import OpenRouterChat
 from ._openrouter_batch import OpenRouterBatch
 from .candidates import author_candidates
-from .listwise import complete_order, detail_table, fold_listwise, present, report
+from .listwise import (
+    complete_order,
+    detail_table,
+    fold_listwise,
+    present,
+    progress_printer,
+    report,
+)
 
 #: Authorship-attribution rubric for a forced **full ranking**. The candidate count is filled in per
 #: call so the prompt matches ``top_k``. JSON rather than prose because the reply carries two things
@@ -292,7 +299,7 @@ class ListwiseLLMRerankAttack:
     def _max_tokens(self, k: int) -> int:
         return MAX_TOKENS_BASE + MAX_TOKENS_PER_CANDIDATE * k
 
-    def _judge(self, prompts: list[str], k: int, ticket_dir) -> list[str]:
+    def _build_client(self, k: int, ticket_dir) -> None:
         if self._client is None:
             system_prompt = RANK_SYSTEM_PROMPT_TEMPLATE.format(n=k)
             if self.batch:
@@ -311,7 +318,21 @@ class ListwiseLLMRerankAttack:
                     temperature=None, top_p=None, reasoning_effort=self.reasoning_effort,
                     max_workers=SYNC_MAX_WORKERS, api_key_env=SYNC_API_KEY_ENV,
                 )
+
+    def _judge(self, prompts: list[str], k: int, ticket_dir) -> list[str]:
+        """Every reply at once -- the batch channel, where one submission is the unit of work."""
+        self._build_client(k, ticket_dir)
         return self._client.complete_batch(prompts)
+
+    def _judge_stream(self, prompts: list[str], k: int, ticket_dir):
+        """``(index, reply)`` as each one lands -- the unbatched channel.
+
+        Same concurrency as :meth:`_judge`; what differs is that the caller learns about a reply
+        the moment it arrives and can bank it. At real-time prices a full corpus is hours of paid
+        calls, and a job killed at 90% must not have to buy the first 90% again.
+        """
+        self._build_client(k, ticket_dir)
+        yield from self._client.complete_stream(prompts)
 
     def _cache(self, cache_dir, k: int) -> TransformCache:
         # Keyed by prompt text; namespaced by the judge model + rubric + effort + presentation params
@@ -379,7 +400,18 @@ class ListwiseLLMRerankAttack:
         if cache_dir is not None:
             cache = self._cache(cache_dir, k)
             tickets = Path(cache_dir) / "attacks" / "_batches"
-            replies = cache.apply_batch(prompts, lambda batch: self._judge(batch, k, tickets))
+            if self.batch:
+                # One submission is the unit of work, and the batch client keeps its own resume
+                # tickets, so there is nothing finer to bank here.
+                replies = cache.apply_batch(prompts, lambda batch: self._judge(batch, k, tickets))
+            else:
+                # flush_every=1: a verdict is written the moment it arrives. At real-time prices
+                # each one is real money, and a preemption a minute later must not re-buy it.
+                replies = cache.apply_streaming(
+                    prompts, lambda batch: self._judge_stream(batch, k, tickets),
+                    flush_every=1,
+                    on_progress=progress_printer("judged") if self.verbose else None,
+                )
             if self.verbose:
                 print(f"  listwise rerank: {cache.hits}/{n} rows served from cache, "
                       f"{cache.misses} judged")

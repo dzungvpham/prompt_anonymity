@@ -59,8 +59,14 @@
 #     sbatch --time=0-01:00:00 experiments/run_rerank_sonnet.sbatch
 #
 # BATCH=0 needs the whole wall clock, though: all of SWE-chat's unknown side at both shortlist
-# sizes is ~2,200 requests, which is roughly 3-4h at WORKERS=16. Preemption is survivable -- the
-# job requeues and the cache means it resumes rather than re-buying what it already judged.
+# sizes is ~2,200 requests, which is roughly 3-4h at WORKERS=16.
+#
+# INTERRUPTION IS CHEAP, which is not free and is worth knowing exactly. Each verdict is written
+# to the cache the moment it arrives, so a job that dies -- requeued, out of wall clock, node
+# failure, scancel -- loses only the requests that were in flight at that instant (at most
+# WORKERS of them). Everything already answered is banked, and re-running the identical command
+# re-buys nothing. This partition (`cpu`) does not preempt, so the realistic risks here are the
+# wall clock and your own scancel rather than the scheduler.
 #
 # NEEDS A KEY in the environment or in a .env AT THE REPO ROOT (load_dotenv walks UP from the
 # working directory, so DS_env/.env is not found). Which one depends on the channel --

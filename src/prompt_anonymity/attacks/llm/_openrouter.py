@@ -228,13 +228,44 @@ class OpenRouterChat:
         texts = list(texts)
         if not texts:
             return []
-        if max_tokens is None or isinstance(max_tokens, int):
-            budgets = [max_tokens] * len(texts)
-        else:
-            budgets = [int(b) for b in max_tokens]
-            if len(budgets) != len(texts):
-                raise ValueError(f"max_tokens has {len(budgets)} entries but texts has {len(texts)}.")
+        budgets = self._budgets(texts, max_tokens)
         workers = max(1, min(self.max_workers, len(texts)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             # map over both iterables -> preserves order, re-raises the first failure.
             return list(pool.map(self.complete, texts, budgets))
+
+    def _budgets(self, texts: list, max_tokens):
+        """One ``max_tokens`` per prompt: the instance default, one int for all, or a sequence."""
+        if max_tokens is None or isinstance(max_tokens, int):
+            return [max_tokens] * len(texts)
+        budgets = [int(b) for b in max_tokens]
+        if len(budgets) != len(texts):
+            raise ValueError(f"max_tokens has {len(budgets)} entries but texts has {len(texts)}.")
+        return budgets
+
+    def complete_stream(self, texts: list[str], max_tokens=None):
+        """Answer a batch of prompts concurrently, yielding ``(index, reply)`` **as each lands**.
+
+        The same work as :meth:`complete_batch` at the same concurrency, reported differently:
+        results come back in completion order rather than input order, each tagged with its
+        position. That is what lets a caller persist a reply the moment it arrives instead of
+        holding a thousand of them in memory until the last one returns -- so a run that is
+        preempted, requeued or killed on wall clock keeps everything it already paid for. See
+        :meth:`prompt_anonymity.caching.TransformCache.apply_streaming`, the intended consumer.
+
+        A prompt that still fails after its retries raises here, ending the generator and
+        cancelling what has not started. Replies already yielded are unaffected, which is the
+        whole point: a failure costs the run, not the spend.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        texts = list(texts)
+        if not texts:
+            return
+        budgets = self._budgets(texts, max_tokens)
+        workers = max(1, min(self.max_workers, len(texts)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(self.complete, text, budget): index
+                       for index, (text, budget) in enumerate(zip(texts, budgets))}
+            for future in as_completed(futures):
+                yield futures[future], future.result()

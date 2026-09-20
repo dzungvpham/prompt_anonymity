@@ -227,6 +227,11 @@ class TransformCache:
         running spaCy's ``pipe`` over many texts at once -- so only the uncached items hit the
         expensive path. Duplicate missing items within the batch are computed once.
 
+        **Nothing is persisted until the call returns**, so a process killed partway through has
+        bought nothing and the next run starts over. That is the right trade for a transform
+        whose batched call IS the unit of work (submitting to a batch API), and the wrong one for
+        a long run of independently expensive items -- use :meth:`apply_streaming` for those.
+
         Parameters
         ----------
         items : sequence
@@ -272,6 +277,108 @@ class TransformCache:
 
         outputs = [value if value is not None else computed[k] for k, value in zip(keys, cached)]
         self.misses = len(missing_items)  # distinct items computed this call
+        self.hits = len(items) - self.misses
+        return outputs
+
+    def _missing(self, items, key):
+        """``(keys, cached, missing_keys, missing_items)`` -- the shared front half of the batch
+        methods. Missing items are de-duplicated, in order of first appearance, so a repeated
+        input is computed exactly once however it is delivered."""
+        keys = [key(item) for item in items]
+        cached = [self._read(self._entry_path(k)) for k in keys]
+
+        seen: set = set()
+        missing_keys: list = []
+        missing_items: list = []
+        for item, k, value in zip(items, keys, cached):
+            if value is None and k not in seen:
+                seen.add(k)
+                missing_keys.append(k)
+                missing_items.append(item)
+        return keys, cached, missing_keys, missing_items
+
+    def apply_streaming(self, items, stream_transform, *, key=str, flush_every=1,
+                        on_progress=None) -> list:
+        """Like :meth:`apply_batch`, but **persists results as they arrive** rather than at the end.
+
+        This is the method for a long run of independently expensive items: an hour of GPU on a
+        preemptible partition, or a thousand paid API calls. :meth:`apply_batch` writes nothing
+        until its transform returns, so a job killed at 90% -- preempted, requeued, out of wall
+        clock -- has bought nothing and the next run starts from zero. Here, everything already
+        yielded is on disk, so the next run resumes from it.
+
+        ``stream_transform(missing_items)`` yields ``(index, output)`` pairs, where ``index``
+        positions the output in ``missing_items``. **Completion order, not input order**, which is
+        what lets a concurrent transform keep every worker busy and still report each result the
+        moment it lands -- see
+        :meth:`prompt_anonymity.attacks.llm._openrouter.OpenRouterChat.complete_stream`.
+
+        Parameters
+        ----------
+        items : sequence
+            Inputs to transform.
+        stream_transform : callable
+            Maps the list of (de-duplicated) cache-missing items to an iterable of
+            ``(index, output)``. Called once; not called at all when everything is cached. Each
+            output must be JSON-serializable. Raising partway through is fine and is the point:
+            what was yielded first is already persisted.
+        key : callable, default ``str``
+            Maps an item to its content-addressed cache key (see :meth:`apply`).
+        flush_every : int, default ``1``
+            How many results to hold before writing them. ``1`` writes each one as it arrives --
+            the right setting when an item is expensive enough that losing one matters, e.g. a
+            paid API call. A small number above 1 suits a fast local transform, where the work at
+            risk is seconds and the writes may as well be amortized.
+        on_progress : callable or None
+            Called as ``on_progress(done, total)`` after each flush, counting *distinct missing
+            items*. A run of this shape returns nothing until it finishes, so without this there
+            is no way to tell a slow job from a hung one.
+
+        Notes
+        -----
+        ``self.hits`` / ``self.misses`` follow :meth:`apply_batch`. An index out of range, or a
+        transform that ends early, raises rather than returning a hole: a missing output would
+        otherwise surface much later as a confusing ``KeyError`` on the assembled list.
+        """
+        self.hits = 0
+        self.misses = 0
+        keys, cached, missing_keys, missing_items = self._missing(items, key)
+
+        computed: dict = {}
+        if missing_items:
+            pending: list = []
+            done = 0
+
+            def flush():
+                for k, output in pending:
+                    _atomic_write_json(self._entry_path(k), {"key": k, "output": output})
+                pending.clear()
+                if on_progress is not None:
+                    on_progress(done, len(missing_items))
+
+            for index, output in stream_transform(missing_items):
+                if not 0 <= index < len(missing_items):
+                    raise ValueError(
+                        f"stream transform yielded index {index} for {len(missing_items)} inputs."
+                    )
+                k = missing_keys[index]
+                if k in computed:
+                    raise ValueError(f"stream transform yielded index {index} twice.")
+                computed[k] = output
+                pending.append((k, output))
+                done += 1
+                if len(pending) >= max(1, int(flush_every)):
+                    flush()
+            if pending:
+                flush()
+
+            if done != len(missing_items):
+                raise ValueError(
+                    f"stream transform yielded {done} outputs for {len(missing_items)} inputs."
+                )
+
+        outputs = [value if value is not None else computed[k] for k, value in zip(keys, cached)]
+        self.misses = len(missing_items)
         self.hits = len(items) - self.misses
         return outputs
 
