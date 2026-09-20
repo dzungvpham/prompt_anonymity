@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +59,38 @@ def load_texts_by_doc_id(data_dir: str, source: str) -> dict[str, str]:
     return {d: TURN_SEPARATOR.join(t) for d, t in zip(doc_ids, turns)}
 
 
+def majority_vote_rerank(data, base_scores, judge_model, top_k, cache_dir, n_runs, base_seed):
+    """Run the judge ``n_runs`` times (different candidate-shuffle seeds each), promote each
+    document's MODE pick across runs rather than trusting a single call.
+
+    Per "De-Anonymization at Scale via Tournament-Style Attribution" (arXiv:2601.12407), whose
+    tournament rounds combine multiple independent runs by majority vote to cancel single-run
+    noise -- the same idea applied here to one round of top-K reranking rather than a
+    multi-round tournament. Each run's promoted author is recovered as that run's row-wise
+    argmax (EuclideanLLMJudgeAttack boosts its pick to strictly the row max), so this needs no
+    change to that class -- just calling it several times.
+    """
+    picks_per_run, authors = [], None
+    for i in range(n_runs):
+        judge = EuclideanLLMJudgeAttack(judge_model=judge_model, top_k=top_k,
+                                        margin_quantile=1.0, seed=base_seed + i, verbose=True)
+        boosted = judge.attack(data, cache_dir=cache_dir).to_numpy()
+        if authors is None:
+            authors = judge.authors
+        picks_per_run.append(np.argmax(boosted, axis=1))
+    picks = np.array(picks_per_run)  # (n_runs, n_docs)
+
+    final = base_scores.copy()
+    row_max = base_scores.max(axis=1)
+    agreement = 0
+    for j in range(picks.shape[1]):
+        vote, count = Counter(picks[:, j].tolist()).most_common(1)[0]
+        agreement += count == n_runs
+        final[j, vote] = row_max[j] + 1.0
+    print(f"  majority vote over {n_runs} runs: {agreement}/{picks.shape[1]} rows unanimous")
+    return final, authors
+
+
 def window_metrics(scores, candidate_authors, true_authors):
     ranks = true_author_ranks(scores, candidate_authors, true_authors)
     summary = ranking_summary(ranks, len(candidate_authors))
@@ -76,6 +109,10 @@ def main():
                         help="documents judged per window (= API calls per window)")
     parser.add_argument("--judge-model", default="anthropic/claude-sonnet-5")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--majority-vote-runs", type=int, default=1,
+                        help="judge each ambiguous row this many times (different candidate "
+                             "shuffles) and promote the mode pick, instead of trusting one "
+                             "call. 1 = single run (default).")
     parser.add_argument("--cache-dir", default="llm_judge_cache")
     parser.add_argument("--seed", type=int, default=47)
     args = parser.parse_args()
@@ -148,12 +185,17 @@ def main():
 
         before_subset = window_metrics(candidates.scores[ambiguous_idx], candidates.authors,
                                        unknown_labels_in[ambiguous_idx])
-        judge = EuclideanLLMJudgeAttack(judge_model=args.judge_model, top_k=args.top_k,
-                                        margin_quantile=1.0, seed=args.seed, verbose=True)
-        boosted = judge.attack(data, cache_dir=args.cache_dir)
-        after_subset = window_metrics(boosted.to_numpy(), judge.authors,
-                                      unknown_labels_in[ambiguous_idx])
-        total_judged += n_ambiguous
+        if args.majority_vote_runs > 1:
+            boosted, judge_authors = majority_vote_rerank(
+                data, candidates.scores[ambiguous_idx], args.judge_model, args.top_k,
+                args.cache_dir, args.majority_vote_runs, args.seed)
+        else:
+            judge = EuclideanLLMJudgeAttack(judge_model=args.judge_model, top_k=args.top_k,
+                                            margin_quantile=1.0, seed=args.seed, verbose=True)
+            boosted = judge.attack(data, cache_dir=args.cache_dir).to_numpy()
+            judge_authors = judge.authors
+        after_subset = window_metrics(boosted, judge_authors, unknown_labels_in[ambiguous_idx])
+        total_judged += n_ambiguous * args.majority_vote_runs
 
         results["before (embedding-distance NN in whitened space)"].append(before_subset)
         results["after (LLM judge, ambiguous rows only)"].append(after_subset)
