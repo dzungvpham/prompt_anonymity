@@ -28,8 +28,10 @@
 #
 #   # Warm the caches on the login node. 48 worker processes starting at once would otherwise all
 #   # reach for roberta-base and the NLTK data (punkt/punkt_tab/stopwords/wordnet) simultaneously --
-#   # a download storm on nodes that may have no network at all. Under a minute:
-#   python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
+#   # a download storm on nodes that may have no network at all. Under a minute.
+#   # (.venv/bin/python spelled out because scripts/slurm_job.sh activates that venv for the JOB,
+#   # not for your login shell; every other `python` in this file is likewise the project's.)
+#   .venv/bin/python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
 #
 #   # And check the split is there (it is READ from data/hf, the published mirror):
 #   ls -l data/hf/wildchat.parquet   # else: python -m prompt_anonymity.data.download
