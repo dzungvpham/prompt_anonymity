@@ -26,12 +26,22 @@
 # --------------
 #   mkdir -p scripts/logs          # SLURM fails a job whose --output directory does not exist
 #
-#   # Warm the caches on the login node. 48 worker processes starting at once would otherwise all
-#   # reach for roberta-base and the NLTK data (punkt/punkt_tab/stopwords/wordnet) simultaneously --
-#   # a download storm on nodes that may have no network at all. Under a minute.
-#   # (.venv/bin/python spelled out because scripts/slurm_job.sh activates that venv for the JOB,
-#   # not for your login shell; every other `python` in this file is likewise the project's.)
-#   .venv/bin/python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
+#   # SETTLE WHICH ENVIRONMENT THE JOB GETS, FIRST. scripts/slurm_job.sh uses
+#   # $PROMPT_ANONYMITY_CONDA_ENV when it is set, and otherwise activates $PROJECT/.venv if that
+#   # exists -- so a leftover or stub .venv beside the real conda env silently wins, and every
+#   # worker dies on `import torch`. sbatch exports your submitting environment, so:
+#   export PROMPT_ANONYMITY_CONDA_ENV=$HOME/prompt_anonymity/env     # adjust to your env
+#
+#   # Then, IN THAT ENVIRONMENT, warm the caches on the login node. 48 workers starting at once
+#   # would otherwise all reach for roberta-base and the NLTK data (punkt/punkt_tab/stopwords/
+#   # wordnet) simultaneously -- a download storm on nodes that may have no network at all:
+#   python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
+#
+#   # Missing nltk/torch/transformers there means the [dpmlm] extra was never installed into it
+#   # (install.sh skips the GPU extras on a machine it reads as CUDA-less):
+#   #   python -m pip install -e ".[dpmlm]" -c <(python -c "import numpy; print('numpy=='+numpy.__version__)")
+#   #   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet
+#   # Stage 0 below checks all of this in the job itself and stops in seconds if it is wrong.
 #
 #   # And check the split is there (it is READ from data/hf, the published mirror):
 #   ls -l data/hf/wildchat.parquet   # else: python -m prompt_anonymity.data.download
@@ -290,6 +300,63 @@ if [ ! -f "$READ_DIR/${SOURCE}.parquet" ]; then
 fi
 
 mkdir -p "$LOG_DIR"
+
+# 0b. Resolve the environment BEFORE launching six workers, and say which interpreter this job
+#     actually got. Two traps this catches in five seconds rather than at the first uncached turn,
+#     multiplied across 6 worker logs:
+#
+#       * The wrong environment. scripts/slurm_job.sh takes $PROMPT_ANONYMITY_CONDA_ENV if set and
+#         otherwise activates $PROJECT/.venv -- so a stub .venv beside a real conda env silently
+#         wins. Export PROMPT_ANONYMITY_CONDA_ENV=<your env> before sbatch to settle it.
+#       * The [dpmlm] extra missing. `import nltk` is the first line of the DP-MLM backend's
+#         __init__, and torch/transformers come with it; a machine that installed via install.sh's
+#         non-CUDA branch has none of the three.
+#
+#     It also prints whether torch sees the GPU, which is the difference between this job taking
+#     hours and taking weeks on CPU.
+echo ""
+echo "------------------------------------------------------------------"
+echo "[0/5] preflight: environment  ($(date))"
+echo "------------------------------------------------------------------"
+"${RUN[@]}" python -c '
+import importlib.util, sys
+
+print("[preflight] interpreter:", sys.executable)
+
+missing = [m for m in ("torch", "transformers", "nltk") if importlib.util.find_spec(m) is None]
+if missing:
+    print("[preflight] MISSING:", ", ".join(missing))
+    print("[preflight] this environment lacks the [dpmlm] extra. Install it into the interpreter")
+    print("[preflight] printed above -- and if that is not the env you meant, export")
+    print("[preflight] PROMPT_ANONYMITY_CONDA_ENV=<your env> and resubmit:")
+    print("[preflight]   python -m pip install -e \".[dpmlm]\"")
+    print("[preflight]   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet")
+    sys.exit(1)
+
+import torch
+device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO GPU VISIBLE"
+print("[preflight] torch", torch.__version__, "| cuda:", torch.cuda.is_available(), "|", device)
+if not torch.cuda.is_available():
+    print("[preflight] no CUDA device visible; DP-MLM on the CPU would take weeks. Stopping.")
+    sys.exit(1)
+
+# Resolve the NLTK data too: the backend downloads it lazily, which fails on an offline node --
+# better to say so here than to have six workers each discover it separately.
+import nltk
+for package, path in (("punkt_tab", "tokenizers/punkt_tab"), ("stopwords", "corpora/stopwords")):
+    try:
+        nltk.data.find(path)
+    except LookupError:
+        print("[preflight] NLTK", package, "is not in", nltk.data.path)
+        print("[preflight] fetch it on a node with network:")
+        print("[preflight]   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet")
+        sys.exit(1)
+
+from prompt_anonymity.defenses import get_defense
+get_defense(sys.argv[1])
+print("[preflight] ok:", sys.argv[1], "resolved, checkpointing every",
+      __import__("os").environ.get("DPMLM_CHECKPOINT_EVERY"), "turns")
+' "$DEFENSE"
 
 # 1. Defend this task's shards -- WORKERS processes on the one GPU, in parallel.
 #
