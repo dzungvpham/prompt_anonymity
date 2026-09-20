@@ -170,14 +170,16 @@ def wccn_shortlist(base_scores_subset: np.ndarray, candidate_authors: np.ndarray
     return col_index, document_index
 
 
-def _batch_with_retry(fn, max_attempts: int = 4, wait_seconds: float = 130.0):
-    """Retry ``fn()`` on OpenRouter's HTTP 402 "in-flight budget exhausted" -- a transient
-    per-account concurrency cap (too many requests in flight at once across this whole batch
-    or a recent one), not the ordinary "out of credits" 402 and not retried by
-    :meth:`OpenRouterChat.complete`, which treats every non-429 4xx as permanent. Firing 100
-    prompts through a thread pool for one window, then another 100 for the very next window
-    moments later, is exactly the shape that trips this -- the account-wide budget can still be
-    settling from the first burst. Any other error (including an ordinary 402) is not retried.
+def _batch_with_retry(fn, max_attempts: int = 8, wait_seconds: float = 150.0):
+    """Retry ``fn()`` on OpenRouter's HTTP 402 "in-flight budget exhausted" -- a transient,
+    account-wide concurrency cap, not the ordinary "out of credits" 402 and not retried by
+    :meth:`OpenRouterChat.complete`, which treats every non-429 4xx as permanent.
+
+    ``OpenRouterChat.complete_batch`` itself only runs 8 requests at a time
+    (``max_workers``, its default), so a single call here isn't what trips this -- it's the
+    account-wide budget, which on a shared API key can also be consumed by other concurrent
+    usage on the same key (this project has multiple collaborators). One 130s wait was not
+    always enough in practice; this budgets for several.
     """
     for attempt in range(max_attempts):
         try:
