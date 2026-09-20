@@ -253,11 +253,39 @@ def window_metrics(scores, candidate_authors, true_authors):
            "ranks": ranks}
 
 
-def recall_at_k(ranks: np.ndarray, k: int) -> float:
-    """Fraction of rows whose true author is within WCCN's own top-k -- the ceiling any
-    reranker of that top-k shortlist could possibly reach (an oracle that always picks
-    correctly whenever the true author is present scores exactly this many top-1 correct)."""
-    return float((ranks <= k).mean())
+def recall_at_k(ranks: np.ndarray, true_authors: np.ndarray, k: int) -> tuple[float, float]:
+    """``(micro, macro)`` recall@k -- the oracle top-1 ceiling for a reranker restricted to
+    WCCN's own top-k, at document weight and at the project's actual headline weight.
+
+    ``macro_top_k_accuracy`` already averages per-author accuracy before averaging over
+    authors; the earlier version of this reported only the micro (document-weighted) figure
+    next to a macro headline metric (``macro_conv_acc1``), which is the wrong ceiling for that
+    number -- a corpus with a few authors carrying many documents can have a much higher micro
+    than macro recall, so the printed "oracle ceiling" overstated how much headroom the macro
+    metric actually had.
+    """
+    micro = float((ranks <= k).mean())
+    macro = macro_top_k_accuracy(ranks, true_authors, k=k)
+    return micro, macro
+
+
+def rescue_counts(ranks_before: np.ndarray, ranks_after: np.ndarray) -> dict[str, int]:
+    """Per-document correctness transitions on a judged subset: how many rows the judge
+    RESCUED (WCCN wrong at rank 1, judge right) versus DAMAGED (WCCN right, judge wrong).
+
+    ``net = rescued - damaged`` is the number that actually says whether reranking is a net
+    win -- a hard-subset accuracy increase can still hide a judge that overturns a lot of
+    correct WCCN picks along the way, which the aggregate accuracy alone would not show.
+    """
+    before_correct = ranks_before == 1
+    after_correct = ranks_after == 1
+    rescued = int((~before_correct & after_correct).sum())
+    damaged = int((before_correct & ~after_correct).sum())
+    return {
+        "rescued": rescued, "damaged": damaged, "net": rescued - damaged,
+        "unchanged_correct": int((before_correct & after_correct).sum()),
+        "unchanged_wrong": int((~before_correct & ~after_correct).sum()),
+    }
 
 
 def main():
@@ -320,6 +348,7 @@ def main():
     results = {"whole_window_before": [], "whole_window_after": [],
               "ambiguous_before": [], "ambiguous_after": []}
     recall_rows = []
+    rescue_rows = []
     total_judged = 0
 
     for config, known_slice, unknown_slice in configs:
@@ -339,8 +368,8 @@ def main():
         proj_unknown = wccn.project(u_feat_in)
 
         m_before_all = window_metrics(base_scores, candidate_authors, unknown_labels_in)
-        r5 = recall_at_k(m_before_all["ranks"], args.top_k)
-        recall_rows.append(r5)
+        micro_r5, macro_r5 = recall_at_k(m_before_all["ranks"], unknown_labels_in, args.top_k)
+        recall_rows.append((micro_r5, macro_r5))
 
         n_ambiguous = min(args.n_ambiguous, len(unknown_labels_in))
         top1 = base_scores.max(axis=1)
@@ -361,8 +390,9 @@ def main():
               f"unknown={in_set.sum()} in-set, judging {n_ambiguous}/{in_set.sum()} "
               f"({n_ambiguous / in_set.sum():.1%}) most-ambiguous ===")
         print(f"  WCCN whole-window: macro_conv_acc1={m_before_all['macro_conv_acc1']:.3f} "
-              f"mrr={m_before_all['mrr']:.3f}  recall@{args.top_k}={r5:.3f} "
-              f"(= oracle top-1 ceiling on this window)")
+              f"mrr={m_before_all['mrr']:.3f}  "
+              f"micro_recall@{args.top_k}={micro_r5:.3f}  macro_recall@{args.top_k}={macro_r5:.3f} "
+              f"(macro = the oracle top-1 ceiling for the headline macro_conv_acc1 metric)")
 
         before_subset = window_metrics(base_scores_subset, candidate_authors, true_subset)
 
@@ -380,9 +410,13 @@ def main():
             final_picks = np.empty(n_ambiguous, dtype=int)
             unanimous = 0
             for i in range(n_ambiguous):
-                vote, count = Counter(all_picks[:, i].tolist()).most_common(1)[0]
-                unanimous += count == args.majority_vote_runs
-                final_picks[i] = vote
+                counts = Counter(all_picks[:, i].tolist())
+                best_count = max(counts.values())
+                tied = {col for col, c in counts.items() if c == best_count}
+                # A tie (including every run disagreeing) breaks toward WCCN's own ranking
+                # among the tied columns, rather than Counter's arbitrary first-seen order.
+                final_picks[i] = next(col for col in col_index[i] if col in tied)
+                unanimous += best_count == args.majority_vote_runs
             print(f"  majority vote over {args.majority_vote_runs} runs: "
                   f"{unanimous}/{n_ambiguous} rows unanimous, {total_refused} refusals total")
             n_calls = n_ambiguous * args.majority_vote_runs
@@ -402,6 +436,9 @@ def main():
         full_after[ambiguous_idx] = boosted_subset
         m_after_all = window_metrics(full_after, candidate_authors, unknown_labels_in)
 
+        rescue = rescue_counts(before_subset["ranks"], after_subset["ranks"])
+        rescue_rows.append(rescue)
+
         results["whole_window_before"].append(m_before_all)
         results["whole_window_after"].append(m_after_all)
         results["ambiguous_before"].append(before_subset)
@@ -410,13 +447,25 @@ def main():
               f"mrr={before_subset['mrr']:.3f}")
         print(f"  ambiguous subset   after:  macro_conv_acc1={after_subset['macro_conv_acc1']:.3f} "
               f"mrr={after_subset['mrr']:.3f}")
+        print(f"  rescued={rescue['rescued']}  damaged={rescue['damaged']}  "
+              f"net={rescue['net']:+d}  (out of {n_ambiguous} judged; "
+              f"unchanged_correct={rescue['unchanged_correct']} "
+              f"unchanged_wrong={rescue['unchanged_wrong']})")
         print(f"  whole window       after:  macro_conv_acc1={m_after_all['macro_conv_acc1']:.3f} "
               f"mrr={m_after_all['mrr']:.3f}  "
               f"(vs {m_before_all['macro_conv_acc1']:.3f}/{m_before_all['mrr']:.3f} before)")
 
     print("\n" + "=" * 70)
     print(f"total documents judged (== API calls): {total_judged}")
-    print(f"mean recall@{args.top_k} (oracle top-1 ceiling): {np.mean(recall_rows):.3f}")
+    micro_recalls = [r[0] for r in recall_rows]
+    macro_recalls = [r[1] for r in recall_rows]
+    print(f"mean micro_recall@{args.top_k}: {np.mean(micro_recalls):.3f}  "
+          f"mean macro_recall@{args.top_k}: {np.mean(macro_recalls):.3f} "
+          f"(the ceiling for the macro_conv_acc1 headline)")
+    total_rescued = sum(r["rescued"] for r in rescue_rows)
+    total_damaged = sum(r["damaged"] for r in rescue_rows)
+    print(f"total rescued={total_rescued}  damaged={total_damaged}  "
+          f"net={total_rescued - total_damaged:+d}  across {total_judged} judged rows")
     print(f"{'variant':<24} {'macro_conv_acc1':>16} {'mrr':>8}")
     print("-" * 70)
     for name, rows in results.items():
@@ -428,7 +477,11 @@ def main():
     for name, rows in results.items():
         print(f"{name}_acc = {[round(r['macro_conv_acc1'], 4) for r in rows]}")
         print(f"{name}_mrr = {[round(r['mrr'], 4) for r in rows]}")
-    print(f"recall_at_{args.top_k} = {[round(r, 4) for r in recall_rows]}")
+    print(f"micro_recall_at_{args.top_k} = {[round(r, 4) for r in micro_recalls]}")
+    print(f"macro_recall_at_{args.top_k} = {[round(r, 4) for r in macro_recalls]}")
+    print(f"rescued_per_window = {[r['rescued'] for r in rescue_rows]}")
+    print(f"damaged_per_window = {[r['damaged'] for r in rescue_rows]}")
+    print(f"net_per_window = {[r['net'] for r in rescue_rows]}")
 
 
 if __name__ == "__main__":
