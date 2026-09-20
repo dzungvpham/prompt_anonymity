@@ -289,12 +289,14 @@ def rescue_counts(ranks_before: np.ndarray, ranks_after: np.ndarray) -> dict[str
     """
     before_correct = ranks_before == 1
     after_correct = ranks_after == 1
-    rescued = int((~before_correct & after_correct).sum())
-    damaged = int((before_correct & ~after_correct).sum())
+    rescued_mask = ~before_correct & after_correct
+    damaged_mask = before_correct & ~after_correct
     return {
-        "rescued": rescued, "damaged": damaged, "net": rescued - damaged,
+        "rescued": int(rescued_mask.sum()), "damaged": int(damaged_mask.sum()),
+        "net": int(rescued_mask.sum()) - int(damaged_mask.sum()),
         "unchanged_correct": int((before_correct & after_correct).sum()),
         "unchanged_wrong": int((~before_correct & ~after_correct).sum()),
+        "rescued_mask": rescued_mask, "damaged_mask": damaged_mask,
     }
 
 
@@ -362,6 +364,7 @@ def main():
               "ambiguous_before": [], "ambiguous_after": []}
     recall_rows = []
     rescue_rows = []
+    author_net = Counter()   # true_author -> (rescued - damaged), across all windows
     total_judged = 0
 
     for config, known_slice, unknown_slice in configs:
@@ -453,6 +456,8 @@ def main():
 
         rescue = rescue_counts(before_subset["ranks"], after_subset["ranks"])
         rescue_rows.append(rescue)
+        for author, r, d in zip(true_subset, rescue["rescued_mask"], rescue["damaged_mask"]):
+            author_net[author] += int(r) - int(d)
 
         results["whole_window_before"].append(m_before_all)
         results["whole_window_after"].append(m_after_all)
@@ -479,8 +484,17 @@ def main():
           f"(the ceiling for the macro_conv_acc1 headline)")
     total_rescued = sum(r["rescued"] for r in rescue_rows)
     total_damaged = sum(r["damaged"] for r in rescue_rows)
+    net_total = total_rescued - total_damaged
     print(f"total rescued={total_rescued}  damaged={total_damaged}  "
-          f"net={total_rescued - total_damaged:+d}  across {total_judged} judged rows")
+          f"net={net_total:+d}  across {total_judged} judged rows")
+
+    positive_authors = sorted((n for n in author_net.values() if n > 0), reverse=True)
+    if net_total > 0 and positive_authors:
+        for top_n in (1, 5, 10):
+            share = sum(positive_authors[:top_n]) / net_total
+            print(f"  net-positive concentration: top {top_n} author(s) account for "
+                  f"{share:.1%} of the +{net_total} total net corrections "
+                  f"({len(positive_authors)} authors have any net-positive contribution)")
     print(f"{'variant':<24} {'macro_conv_acc1':>16} {'mrr':>8}")
     print("-" * 70)
     for name, rows in results.items():
