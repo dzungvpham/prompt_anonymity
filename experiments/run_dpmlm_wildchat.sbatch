@@ -75,22 +75,25 @@
 # vocab x fp16), ~1-1.5 GB of activations at DPMLM_BATCH_SIZE=128, ~0.5 GB of CUDA context. About
 # 3 GB. That number is a trap, and this job was first written around it.
 #
-# THE PEAK IS SET BY THE LONGEST TURN IN THE CORPUS, not by the average or by any knob here.
-# `_process_chunk`'s phase 3 samples ONE CONVERSATION at a time, and for that conversation it
-# materializes `chunk_logits[rows].float()` -- [live_jobs x 50,265] in FLOAT32 -- and then a
-# softmax of the same shape. That is 400 KB per masked position, twice over. And it is not bounded
-# by DPMLM_FLUSH_POSITIONS: the chunker accumulates WHOLE turns, so a chunk always holds at least
-# one turn however big it is.
+# THE PEAK USED TO BE SET BY THE LONGEST TURN IN THE CORPUS, which is why the first two attempts
+# at this job died. Phase 3 sampled a whole conversation in one block -- [positions x 50,265] in
+# float32, plus its softmax, so 800 KB per position for the pair -- and DPMLM_FLUSH_POSITIONS did
+# not bound it, because the chunker accumulates WHOLE turns. Measured on this corpus: the longest
+# turn is 103,874 words (~47k masked positions, ~19 GB to sample), and six workers on a 44 GB L40S
+# died with `Tried to allocate 4.32 GiB` while a sibling held 27.5 GB (job 64621446).
 #
-# WildChat has single turns of 100k+ characters (someone pasting a document), which is ~23,000
-# eligible words, which is ~9 GB for that one turn on top of its 2.3 GB logits block. Measured:
-# six workers on a 44 GB L40S died with `Tried to allocate 4.32 GiB` while a sibling held 27.5 GB
-# (job 64621446). Hence the two changes below -- 80 GB-class cards ONLY, and 3 workers, giving each
-# ~26 GB of headroom for a tail turn.
+# THAT IS NOW FIXED IN THE DEFENSE ITSELF, not worked around here: `DPMLM_SAMPLE_SLICE` (8192)
+# caps how many positions are sampled per call, and a turn longer than that is streamed in waves
+# by `_DPMLMBackend._process_long_turn` -- build a wave's masked inputs, forward them, sample
+# them, free, repeat. Peak is now a property of the wave, identical for a 10k-word turn and a
+# million-word one: ~3.3 GB for the sampling pair, ~0.8 GB for the wave's logits, ~1.6 GB for a
+# full chunk's logits, plus ~1.5 GB of model and activations. Call it 6-7 GB per worker, flat.
 #
-# So: CPU cores bound how many workers are USEFUL (~2-3 each for the Python phase), and the corpus
-# tail bounds how many are SAFE. Raise WORKERS only with DPMLM_BATCH_SIZE lowered to match, and
-# only after watching `nvidia-smi` through a smoke test that includes some long documents.
+# So WORKERS is now bounded by CPU CORES rather than by VRAM: each worker runs a single-threaded
+# Python phase (NLTK detokenize + a tokenizer pair-encode per masked word) and wants 2-3 cores.
+# Three workers on 8 cores is that ratio; three workers on 80 GB is ~20 GB of card, which is
+# deliberate headroom rather than a tight fit. Keep the 80 GB constraint anyway until a run has
+# actually confirmed the new ceiling on this corpus.
 #
 # No CUDA MPS. Processes time-slicing one device is fine here because each worker submits large
 # kernels (a 128 x ~450-token batch), so the scheduler has plenty to interleave.
@@ -423,7 +426,10 @@ for index in "${!pids[@]}"; do
     if wait "${pids[$index]}"; then
         echo "  shard ${worker_shards[$index]} finished ($(date))"
     else
-        echo "  shard ${worker_shards[$index]} FAILED -- see ${worker_logs[$index]}"
+        # The timestamp matters as much as the failure: a worker that dies in seconds is a setup
+        # problem, one that dies after hours is a corpus/memory problem, and the two have nothing
+        # to do with each other.
+        echo "  shard ${worker_shards[$index]} FAILED ($(date)) -- see ${worker_logs[$index]}"
         failed=1
     fi
 done

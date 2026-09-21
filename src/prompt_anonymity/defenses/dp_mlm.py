@@ -136,6 +136,30 @@ DPMLM_FLUSH_POSITIONS = int(os.environ.get("DPMLM_FLUSH_POSITIONS", "8192"))
 #: safe and resumable (a killed run picks up from the last checkpoint). Output-neutral.
 DPMLM_CHECKPOINT_EVERY = int(os.environ.get("DPMLM_CHECKPOINT_EVERY", "200"))
 
+#: Masked positions per sampling call -- and, with it, the length above which a turn is streamed
+#: rather than chunked. This is what bounds the defense's PEAK memory.
+#:
+#: Two allocations scale with the number of positions worked on at once: the logits store
+#: (``[positions x vocab]`` fp16, ~100 KB per position) and, in sampling, a float32 copy plus its
+#: softmax (~400 KB per position, twice). Neither is bounded by ``DPMLM_FLUSH_POSITIONS``, because
+#: the chunker accumulates WHOLE turns and so always holds at least one turn however long it is.
+#: A conversation here is one TURN, and WildChat's longest measured turn is 103,874 words --
+#: ~47k masked positions, i.e. ~4.7 GB of logits and ~19 GB to sample. That is what OOM'd the
+#: first full run after three hours (job 64621446).
+#:
+#: So a turn with at most this many positions takes the chunked path and is sampled in exactly ONE
+#: call -- byte-identical to the code before slicing existed, so cached outputs stay valid -- while
+#: a longer one is streamed by :meth:`_DPMLMBackend._process_long_turn` in waves of this size. At
+#: 8192 the sampling pair peaks near 3.3 GB and a wave's logits near 0.8 GB, which is the same
+#: whether the turn is 10k words or a million.
+#:
+#: NOT in ``params()`` (like batch size and flush positions): putting it there would invalidate
+#: every cached turn everywhere for a knob that changes nothing at or below the threshold. The
+#: consequence to know: for a turn ABOVE it the draws depend on this value, so keep it fixed if
+#: those turns must reproduce. Set it to 0 to disable both slicing and streaming (the old
+#: behaviour, which cannot process WildChat's longest turns at all).
+DPMLM_SAMPLE_SLICE = int(os.environ.get("DPMLM_SAMPLE_SLICE", "8192"))
+
 
 class _DPMLMBackend:
     """Faithful port of the reference ``DPMLM`` class, trimmed to core + optional PII.
@@ -146,7 +170,8 @@ class _DPMLMBackend:
     """
 
     def __init__(self, *, model, clip_min, clip_max, epsilon, seed, concat, stop, pii, batch_size,
-                 add_prob=0.0, del_prob=0.0, flush_positions=DPMLM_FLUSH_POSITIONS):
+                 add_prob=0.0, del_prob=0.0, flush_positions=DPMLM_FLUSH_POSITIONS,
+                 sample_slice=DPMLM_SAMPLE_SLICE):
         import nltk
         import torch
         from nltk.corpus import stopwords
@@ -169,6 +194,7 @@ class _DPMLMBackend:
         self.stop_flag = bool(stop)  # STOP=True means "also privatize stopwords".
         self.batch_size = int(batch_size)
         self.flush_positions = int(flush_positions)
+        self.sample_slice = int(sample_slice)
 
         self.add_prob = float(add_prob)
         self.del_prob = float(del_prob)
@@ -453,10 +479,11 @@ class _DPMLMBackend:
 
         Phase 1 (CPU): build every masked input in the chunk. Phase 2 (GPU): length-sort and run the
         MLM in full batches, keeping only the masked position's logits (on-device). Phase 3 (GPU):
-        per-conversation seeded exponential-mechanism sampling -- clip/softmax/multinomial run on the
-        A100 in one call per conversation, so the 50k-vocab math never touches the CPU. Output does
-        not depend on batching; each conversation is seeded from its own text so the cache stays
-        consistent.
+        per-conversation seeded exponential-mechanism sampling -- clip/softmax/multinomial run on
+        the GPU in slices of :data:`DPMLM_SAMPLE_SLICE` positions (one call for any conversation
+        that fits, which is nearly all of them), so the 50k-vocab math never touches the CPU and a
+        single very long turn cannot demand a multi-GB allocation. Output does not depend on
+        batching; each conversation is seeded from its own text so the cache stays consistent.
         """
         torch = self._torch
         mask_id = self.tokenizer.mask_token_id
@@ -497,41 +524,131 @@ class _DPMLMBackend:
                 progress.update(len(sel))
 
         # Phase 3: per-conversation seeded sampling on the GPU (exponential mechanism).
-        scale = 2 * self.sensitivity / self.epsilon
         gen = torch.Generator(device=self.device)
         for pos, (ti, sentence, tokens, jobs) in enumerate(chunk):
             repl: dict = {}
             live = [job for job in jobs if (pos, *job) in row_of]  # job order == draw order.
             if live:
-                # Stable per-conversation seed (builtin hash() is per-process randomized).
-                seed = int.from_bytes(
-                    hashlib.sha256(f"{self.seed}:{sentence}".encode("utf-8")).digest()[:8], "big"
-                ) & 0x7FFFFFFFFFFFFFFF
-                gen.manual_seed(seed)
-
+                gen.manual_seed(self._turn_seed(sentence))
                 rows = torch.as_tensor([row_of[(pos, *job)] for job in live], device=self.device)
-                # Pr[v] ∝ exp(ε·u(v) / (2·Δu)): clip, scale, softmax, sample -- all on-device.
-                block = chunk_logits[rows].float().clamp_(self.clip_min, self.clip_max).div_(scale)
-                probs = torch.softmax(block, dim=-1)
-                chosen = torch.multinomial(probs, 1, generator=gen).squeeze(1).tolist()
+                chosen = self._sample_rows(chunk_logits[rows], gen)
+                del rows
                 for job, cid in zip(live, chosen):
                     repl[job] = self.tokenizer.decode(cid).strip()
 
-            out = []
-            for i, tok in enumerate(tokens):  # deleted words are already gone from `tokens`.
-                r = repl.get((i, _JOB_REPLACE))
-                if r is None:  # skipped/kept -> original word, original case.
-                    out.append(tok)
-                else:  # restore the original word's capitalization.
-                    out.append(r.capitalize() if tok[:1].isupper() else r.lower())
-                    self._stats["total"] += 1
-                    if r.lower() != tok.lower():
-                        self._stats["perturbed"] += 1
-                added = repl.get((i, _JOB_INSERT))
-                if added:  # an added word has no original case to inherit; empty decode -> drop it.
-                    out.append(added.lower())
-                    self._stats["added"] += 1
-            outputs[ti] = self.detokenizer.detokenize(out)
+            outputs[ti] = self._assemble(tokens, repl)
+
+    def _turn_seed(self, sentence: str) -> int:
+        """Stable per-conversation RNG seed (builtin ``hash()`` is per-process randomized)."""
+        return int.from_bytes(
+            hashlib.sha256(f"{self.seed}:{sentence}".encode("utf-8")).digest()[:8], "big"
+        ) & 0x7FFFFFFFFFFFFFFF
+
+    def _sample_rows(self, logits, gen) -> list:
+        """Exponential-mechanism draw for a ``[k, vocab]`` logits block, one token id per row.
+
+        ``Pr[v] ∝ exp(ε·u(v) / (2·Δu))``: clip, scale, softmax, sample -- all on-device, in row
+        order, consuming ``gen`` once per row. The float32 copy and its softmax are the two
+        tensors that dominate this defense's peak memory (~800 KB per row for the pair), which is
+        why every caller keeps ``k`` at or below :data:`DPMLM_SAMPLE_SLICE`.
+        """
+        torch = self._torch
+        scale = 2 * self.sensitivity / self.epsilon
+        block = logits.float().clamp_(self.clip_min, self.clip_max).div_(scale)
+        probs = torch.softmax(block, dim=-1)
+        chosen = torch.multinomial(probs, 1, generator=gen).squeeze(1).tolist()
+        del block, probs
+        return chosen
+
+    def _assemble(self, tokens, repl) -> str:
+        """Rebuild a turn from its tokens and the sampled replacements/additions, updating stats.
+
+        ``repl`` maps ``(index, kind)`` to the drawn word; a missing REPLACE leaves the original
+        word untouched (skipped, or its mask was truncated away). Deleted words are already gone
+        from ``tokens``.
+        """
+        out = []
+        for i, tok in enumerate(tokens):
+            r = repl.get((i, _JOB_REPLACE))
+            if r is None:  # skipped/kept -> original word, original case.
+                out.append(tok)
+            else:  # restore the original word's capitalization.
+                out.append(r.capitalize() if tok[:1].isupper() else r.lower())
+                self._stats["total"] += 1
+                if r.lower() != tok.lower():
+                    self._stats["perturbed"] += 1
+            added = repl.get((i, _JOB_INSERT))
+            if added:  # an added word has no original case to inherit; empty decode -> drop it.
+                out.append(added.lower())
+                self._stats["added"] += 1
+        return self.detokenizer.detokenize(out)
+
+    def _process_long_turn(self, ti, sentence, tokens, jobs, outputs, progress=None) -> None:
+        """Rewrite ONE turn whose masked positions exceed :data:`DPMLM_SAMPLE_SLICE`, in waves.
+
+        The chunked path above holds logits for every position it is working on at once
+        (``[positions x vocab]``, 100 KB per position even in fp16) and samples a conversation in
+        one block (400 KB per position, twice). Both are fine when a chunk is a few thousand
+        positions and catastrophic for one turn of 100k words -- WildChat's longest measured turn
+        is 103,874 words, i.e. ~47k positions, i.e. ~19 GB for the sampling tensors alone. That is
+        the allocation that killed the first full run.
+
+        So an oversized turn is taken out of the chunked path and processed here, one wave of
+        ``sample_slice`` positions at a time: build the wave's masked inputs, forward them, sample
+        them, free everything, repeat. Peak memory becomes a property of the WAVE rather than of
+        the turn, so it is the same for a 10k-word turn and a 1M-word one.
+
+        Jobs are processed in their natural (ascending) order, and the per-turn generator is seeded
+        once and consumed across the waves, so the draws are deterministic and reproducible for a
+        given ``sample_slice``. They are NOT the same draws an unsliced pass would have made -- see
+        :data:`DPMLM_SAMPLE_SLICE` -- which costs nothing here: a turn this long could not be
+        rewritten at all before.
+        """
+        torch = self._torch
+        mask_id = self.tokenizer.mask_token_id
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(self._turn_seed(sentence))
+        clean_full = self.detokenizer.detokenize(tokens) if len(tokens) <= self.max_context else None
+        wave_size = max(1, self.sample_slice)
+        repl: dict = {}
+
+        for start in range(0, len(jobs), wave_size):
+            wave = jobs[start:start + wave_size]
+            ids_list, mpos_list, meta = [], [], []
+            for anchor, kind in wave:
+                input_ids = self._build_input(tokens, anchor, clean_full,
+                                              insert=(kind == _JOB_INSERT))
+                try:
+                    m_pos = input_ids.index(mask_id)
+                except ValueError:
+                    continue  # mask truncated away -> keep the original word, draw nothing.
+                ids_list.append(input_ids)
+                mpos_list.append(m_pos)
+                meta.append((anchor, kind))
+
+            if meta:
+                # Same length-sorted batching as the chunked path, but only within this wave, so
+                # `wave_logits` is bounded by it. Row j of that tensor is meta[j], i.e. job order.
+                wave_logits = None
+                order = sorted(range(len(meta)), key=lambda j: len(ids_list[j]))
+                for b in range(0, len(meta), self.batch_size):
+                    sel = order[b:b + self.batch_size]
+                    logits = self._forward_mask_logits([ids_list[j] for j in sel],
+                                                       [mpos_list[j] for j in sel])
+                    if wave_logits is None:
+                        wave_logits = torch.empty((len(meta), logits.shape[-1]),
+                                                  dtype=torch.float16, device=self.device)
+                    for row, j in enumerate(sel):
+                        wave_logits[j] = logits[row].to(torch.float16)
+                    del logits
+                for job, cid in zip(meta, self._sample_rows(wave_logits, gen)):
+                    repl[job] = self.tokenizer.decode(cid).strip()
+                del wave_logits
+
+            if progress is not None:
+                progress.update(len(wave))
+
+        outputs[ti] = self._assemble(tokens, repl)
 
     def rewrite_batch(self, texts):
         from tqdm.auto import tqdm
@@ -550,6 +667,15 @@ class _DPMLMBackend:
         for ti, (sentence, tokens, jobs) in enumerate(plans):
             if not tokens:
                 outputs[ti] = sentence
+                continue
+            # An oversized turn never joins a chunk -- its logits alone would be tens of GB (see
+            # _process_long_turn). Flush what has accumulated first, so the chunk's tensors are
+            # freed before the long turn starts allocating, then stream that turn on its own.
+            if 0 < self.sample_slice < len(jobs):
+                if chunk:
+                    self._process_chunk(chunk, outputs, progress)
+                    chunk, chunk_positions = [], 0
+                self._process_long_turn(ti, sentence, tokens, jobs, outputs, progress)
                 continue
             chunk.append((ti, sentence, tokens, jobs))
             chunk_positions += len(jobs)
