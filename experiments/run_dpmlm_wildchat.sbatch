@@ -1,208 +1,52 @@
 #!/bin/bash
 #
-# run_dpmlm_wildchat.sbatch -- DP-MLM over the whole of WildChat, then the usual pipeline on top:
-# defend -> featurize -> attack. A CSV of every defended text drops out on the side, between the
-# merge and the featurize stage.
+# run_dpmlm_wildchat.sbatch -- DP-MLM over all of WildChat on ONE GPU with WORKERS processes
+# sharing it, then the usual pipeline: defend -> featurize -> attack.
 #
 #   sbatch experiments/run_dpmlm_wildchat.sbatch
 #
-# Produces, with the defaults below:
+# Writes:
+#   data/dist/shards/wildchat_dp_mlm_eps100.000N-of-0005.parquet  one per worker (intermediate)
+#   data/dist/wildchat_dp_mlm_eps100.parquet                      defended split (merged)
+#   data/dist/wildchat_dp_mlm_eps100_stylometrix.parquet          features
+#   experiments/results/wildchat_dp_mlm_eps100_stylometrix_*/     attack results
 #
-#   data/dist/shards/wildchat_dp_mlm_eps100.NNNN-of-0024.parquet   one per worker
-#   data/dist/wildchat_dp_mlm_eps100.parquet                       merged defended split
-#   data/dist/wildchat_dp_mlm_eps100_stylometrix.parquet           features
-#   experiments/results/wildchat_dp_mlm_eps100_stylometrix_*/      the attack
-#   data/dist/csv/wildchat_dp_mlm_eps100.csv                       SIDE OUTPUT: every turn,
-#                                                                  original beside defended
+# To read the defended text as CSV afterwards (login node, minutes):
+#   python experiments/export_defended_csv.py --source wildchat --defense dp_mlm_eps100
 #
-# The CSV is for reading the text, nothing else -- no stage consumes it, and CSV=0 skips it without
-# changing a single number downstream. It exists because DP-MLM's output quality *is* the question
-# at a given epsilon, and a parquet of list-of-strings is not something you can eyeball.
+# SUBMIT FROM THE REPO ROOT, with the environment pinned -- scripts/slurm_job.sh otherwise
+# activates $PROJECT/.venv if one exists, which on this checkout is not the real env:
+#   export PROMPT_ANONYMITY_CONDA_ENV=$HOME/prompt_anonymity/env
+#   mkdir -p scripts/logs
 #
-# SUBMIT FROM THE REPO ROOT. --output below is a relative path and SLURM resolves it against the
-# directory you submit from.
+# WHY SEVERAL WORKERS ON ONE CARD: a DP-MLM process alternates a single-threaded CPU phase (NLTK
+# detokenize + tokenizer encode per masked word) with a GPU phase and cannot overlap them, so one
+# process leaves the GPU idle much of the time. Five processes overlap each other's CPU phases.
+# Each worker defends every 5th document (interleaved), and the last one to finish merges.
 #
-# ONE-TIME SETUP
-# --------------
-#   mkdir -p scripts/logs          # SLURM fails a job whose --output directory does not exist
+# MEMORY: the longest WildChat turns (~100k words) are sampled in slices/streamed in waves
+# (DPMLM_SAMPLE_SLICE in dp_mlm.py), so a worker peaks at a few GB regardless of turn length.
+# The 80 GB constraint is a safety margin on top of that.
 #
-#   # SETTLE WHICH ENVIRONMENT THE JOB GETS, FIRST. scripts/slurm_job.sh uses
-#   # $PROMPT_ANONYMITY_CONDA_ENV when it is set, and otherwise activates $PROJECT/.venv if that
-#   # exists -- so a leftover or stub .venv beside the real conda env silently wins, and every
-#   # worker dies on `import torch`. sbatch exports your submitting environment, so:
-#   export PROMPT_ANONYMITY_CONDA_ENV=$HOME/prompt_anonymity/env     # adjust to your env
+# PREEMPTION / TIMEOUT: each worker checkpoints its cache every DPMLM_CHECKPOINT_EVERY turns, so
+# resubmitting the same command resumes rather than restarts. --requeue covers preemption; a
+# TIMEOUT is not requeued by SLURM, so if it hits the wall clock, just sbatch it again.
+# KEEP WORKERS THE SAME ACROSS RESUBMITS: the shard count is part of the cache path, so changing it
+# starts over from zero.
 #
-#   # Then, IN THAT ENVIRONMENT, warm the caches on the login node. 24 workers starting at once
-#   # would otherwise all reach for roberta-base and the NLTK data (punkt/punkt_tab/stopwords/
-#   # wordnet) simultaneously -- a download storm on nodes that may have no network at all:
-#   python -c "from prompt_anonymity.defenses import get_defense; get_defense('dp_mlm_eps100')._get_backend()"
-#
-#   # Missing nltk/torch/transformers there means the [dpmlm] extra was never installed into it
-#   # (install.sh skips the GPU extras on a machine it reads as CUDA-less):
-#   #   python -m pip install -e ".[dpmlm]" -c <(python -c "import numpy; print('numpy=='+numpy.__version__)")
-#   #   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet
-#   # Stage 0 below checks all of this in the job itself and stops in seconds if it is wrong.
-#
-#   # And check the split is there (it is READ from data/hf, the published mirror):
-#   ls -l data/hf/wildchat.parquet   # else: python -m prompt_anonymity.data.download
-#
-# THE SHAPE OF THIS JOB: MANY WORKERS PER CARD, NOT MANY CARDS
-# ------------------------------------------------------------
-# DP-MLM is the lightest model in the registry -- roberta-base, 125M parameters, one masked forward
-# pass per content word, no generation. The whole corpus is roughly:
-#
-#   172,509 documents x ~1,180 words of user text (mean; the median is ~90, the tail is what
-#   costs) x ~45% non-stopword, non-punctuation  ~=  90M masked positions
-#
-# At a measured-order 1-4k positions/s per card that is 6-25 GPU-HOURS for all of WildChat. Handing
-# that to 64 whole GPUs would mean ~15 minutes of compute per card behind a queue wait of hours,
-# and a defend cache layout too wide to ever re-use. So this job goes the other way:
-#
-#   * 8 array tasks, one GPU each -- few enough to schedule together, even on gpu-preempt.
-#   * 3 WORKER PROCESSES per GPU, each defending its own shard, sharing the card.
-#   * 24 shards in total (TASKS x WORKERS), which is the number that defines the cache layout.
-#
-# WHY WORKERS PER CARD, AND NOT JUST A BIGGER BATCH. One DP-MLM process alternates between a
-# single-threaded CPU phase and a GPU phase, and cannot overlap them: `_process_chunk` builds every
-# masked input in Python first (NLTK detokenize + a tokenizer pair-encode PER WORD -- for a turn
-# longer than the 224-token context window, that work is redone for every word in it), then runs the
-# MLM. So a lone process leaves the card idle for a large fraction of its wall clock, and raising
-# DPMLM_BATCH_SIZE does nothing about it -- it makes the GPU phase shorter, not the CPU phase.
-# Concurrent processes fix exactly that: one worker's CPU phase overlaps another's GPU phase.
-#
-# HOW MANY FIT -- AND WHY THE ANSWER IS SMALL. The steady-state cost of a worker is modest: ~0.25
-# GB of bf16 weights, ~0.8 GB for the chunk logits buffer (DPMLM_FLUSH_POSITIONS=8192 x 50,265
-# vocab x fp16), ~1-1.5 GB of activations at DPMLM_BATCH_SIZE=128, ~0.5 GB of CUDA context. About
-# 3 GB. That number is a trap, and this job was first written around it.
-#
-# THE PEAK USED TO BE SET BY THE LONGEST TURN IN THE CORPUS, which is why the first two attempts
-# at this job died. Phase 3 sampled a whole conversation in one block -- [positions x 50,265] in
-# float32, plus its softmax, so 800 KB per position for the pair -- and DPMLM_FLUSH_POSITIONS did
-# not bound it, because the chunker accumulates WHOLE turns. Measured on this corpus: the longest
-# turn is 103,874 words (~47k masked positions, ~19 GB to sample), and six workers on a 44 GB L40S
-# died with `Tried to allocate 4.32 GiB` while a sibling held 27.5 GB (job 64621446).
-#
-# THAT IS NOW FIXED IN THE DEFENSE ITSELF, not worked around here: `DPMLM_SAMPLE_SLICE` (8192)
-# caps how many positions are sampled per call, and a turn longer than that is streamed in waves
-# by `_DPMLMBackend._process_long_turn` -- build a wave's masked inputs, forward them, sample
-# them, free, repeat. Peak is now a property of the wave, identical for a 10k-word turn and a
-# million-word one: ~3.3 GB for the sampling pair, ~0.8 GB for the wave's logits, ~1.6 GB for a
-# full chunk's logits, plus ~1.5 GB of model and activations. Call it 6-7 GB per worker, flat.
-#
-# So WORKERS is now bounded by CPU CORES rather than by VRAM: each worker runs a single-threaded
-# Python phase (NLTK detokenize + a tokenizer pair-encode per masked word) and wants 2-3 cores.
-# Three workers on 8 cores is that ratio; three workers on 80 GB is ~20 GB of card, which is
-# deliberate headroom rather than a tight fit. Keep the 80 GB constraint anyway until a run has
-# actually confirmed the new ceiling on this corpus.
-#
-# No CUDA MPS. Processes time-slicing one device is fine here because each worker submits large
-# kernels (a 128 x ~450-token batch), so the scheduler has plenty to interleave.
-#
-# MEASURE BEFORE COMMITTING TO A LAYOUT:
-#
-#   LIMIT=2000 sbatch --array=0 experiments/run_dpmlm_wildchat.sbatch
-#   # then, per worker log, words/s from the tqdm line, and:
-#   nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv -l 10
-#
-# Utilization well under ~90% means raise WORKERS (or CPUS); ~100% with the per-worker rate falling
-# proportionally means the card is full and more workers buy nothing. A LIMIT run is a smoke test
-# only: it defends the first N documents, so its attack numbers would be meaningless and ATTACK is
-# forced off.
-#
-# CHANGING THE SHARD LAYOUT THROWS AWAY THE DEFEND CACHE. The layout is TASKS x WORKERS and it is
-# part of the cache path (`defense_cache_dir`: two shards sharing one table would each drop the
-# other's rows), so changing EITHER number recomputes everything. Throttling the array with
-# `sbatch --array=0-7%2` does NOT change the layout and is therefore free. Pick a pair and keep it.
-#
-# WHAT A PREEMPTION COSTS
-# -----------------------
-# gpu-preempt jobs get killed; --requeue puts the task back in the queue, it re-runs this script
-# from the top, and each of its workers picks up where it stopped. Concretely, per stage:
-#
-#   defend     RESUMES, losing at most DPMLM_CHECKPOINT_EVERY distinct turns (1,000 here, a few
-#              minutes). The defense flushes its cache table every that many turns and omits the
-#              unfinished ones, so on resume a finished turn is a hit and an unfinished one simply
-#              recomputes. Writes are temp-file-plus-rename with an fsync, so a kill DURING a flush
-#              leaves the previous table intact rather than a truncated one -- there is no state a
-#              preemption can corrupt, only work it can discard.
-#              The cache is per (split, shard layout, defense params), so a requeued worker reads
-#              back its OWN table; this is also why the layout must not change between attempts.
-#              Note the shard parquet is written only when a shard finishes -- the cache, not the
-#              parquet, is what makes this resumable.
-#   featurize  RESUMES: vectors are cached per document, content-addressed, flushed every 256.
-#   attack     DOES NOT RESUME. run_experiment.py deletes its own predictions_*.csv on entry and
-#              starts over. That is survivable for stylometrix (minutes to an hour) and is the
-#              reason scripts/slurm.toml puts WildChat+gemini attacks on the non-preempt `gpu`
-#              partition instead -- for that feature, prefer ATTACK=0 here and submit the attack
-#              separately (see the note at the bottom of this header).
-#
-# STAGES 2-5 RUN ONCE, in whichever task holds the last worker to finish: that worker's
-# `apply_defenses` merges the 24 shards, and the task that finds the merged parquet claims the
-# downstream stages under a lock.
-#
-# EPSILON IS THE READABILITY KNOB. The default is dp_mlm_eps100: at the paper's eps=25 the sampled
-# words are mostly unrelated to the originals and the output is not usable as prompt text -- the
-# CSV is then perfectly well-formed and full of gibberish, which is the mechanism working as
-# specified, not a bug. Raise it (dp_mlm_eps250, dp_mlm_eps500, dp_mlm_eps1000) for more readable
-# text at weaker privacy. Each epsilon is a separate defense with its own cache, parquet, CSV and
-# results directory, so arms never overwrite each other.
-#
-# Overrides (sbatch exports your submitting environment, so these are read at run time):
-#
-#   WORKERS=4 DPMLM_BATCH_SIZE=64 sbatch ...   # more shards per card -- read "HOW MANY FIT" first
-#   DEFENSE=dp_mlm_eps250 sbatch ...       # a different budget
-#   DEFENSE=dp_mlm_var_a10 sbatch ...      # adaptive length (the paper's Algorithm 3)
-#   FEATURE=gemini_embedding_2 sbatch ...  # the paid encoder -- read the memory note below first
-#   SOURCE=wildchat_small sbatch --array=0-1 ...   # a smaller cut; mind the layout note above
-#   LIMIT=2000 sbatch --array=0 ...        # SMOKE TEST (forces ATTACK=0)
-#   CSV=0 sbatch ...                       # skip the side output entirely
-#   SHARD_CSV=1 sbatch ...                 # also export each shard's CSV as it finishes
-#   CSV_NEWLINES=escape sbatch ...         # one physical line per CSV row, for grep
-#   ATTACK=0 sbatch ...                    # stop after featurizing (see the memory note)
-#   MERGE=0 sbatch ...                     # shards only; merge and run the rest by hand later
-#   DPMLM_BATCH_SIZE=256 sbatch ...        # bigger GPU batches; output-neutral and not in the
-#   DPMLM_FLUSH_POSITIONS=16384 sbatch ... # cache key, so tuning these never invalidates work
-#   DPMLM_CHECKPOINT_EVERY=250 sbatch ...  # flush the cache more often: less work lost to a
-#                                          # preemption, more table rewrites (see below)
-#
-# Anything after the script name is forwarded to run_experiment.py only (not to the build stages),
-# so attack and scoring flags go there:
-#
-#   sbatch experiments/run_dpmlm_wildchat.sbatch --attacks nearest_neighbor logistic
-#
-# MEMORY, AND WHEN TO RUN THE ATTACK SEPARATELY. --mem below is one number for all 8 tasks, so it
-# is sized for 3 workers plus the merge, not for a WildChat attack on 3,072-d embeddings:
-# scripts/slurm.toml asks 96g for wildchat+gemini_embedding_2 and 24g for stylometrix. The default
-# FEATURE=stylometrix fits here (measured 14.6 GB peak for nearest_neighbor). With
-# FEATURE=gemini_embedding_2, submit ATTACK=0 and run the attack as its own job afterwards:
-#
-#   python experiments/run_all_experiments.py --slurm --datasets wildchat \
-#       --defenses dp_mlm_eps100 --features gemini_embedding_2
+# Overrides: WORKERS=2 ... | DEFENSE=dp_mlm_eps250 ... | FEATURE=gemini_embedding_2 ... | ATTACK=0
+# Anything after the script name goes to run_experiment.py, e.g. --attacks nearest_neighbor
 #
 #SBATCH --job-name=dpmlm-wc
-#SBATCH --output=scripts/logs/%x-%A_%a.out
+#SBATCH --output=scripts/logs/%x-%j.out
 #SBATCH --open-mode=append
-#SBATCH --array=0-7
 #SBATCH --nodes=1
 #SBATCH --partition=gpu-preempt
 #SBATCH --gpus=1
-# 80 GB-class cards ONLY. This was `a100|l40s|h100|h200` on the first version, to get more cards
-# scheduled, and six workers on a 44 GB L40S OOM'd -- see "HOW MANY FIT" above: the peak is one
-# long turn's [23,000 x 50,265] float32 softmax, not the steady state. An L40S or a 40 GB A100 can
-# run this job, but at 1-2 workers, which wastes more in parallelism than the wider queue wins.
 #SBATCH --constraint=a100-80g|h100|h200
-# ~2.7 cores per worker, for the single-threaded Python phase (NLTK detokenize + tokenizer encode
-# per masked word) that each one runs flat out.
-#SBATCH --cpus-per-task=8
-# 3 workers x ~3 GB of host memory, plus headroom for the merge that one task also runs:
-# `merge_shards` reads all 24 shards into pandas and concatenates them, and WildChat's text is
-# ~3.8 GiB as Python strings, so that step alone peaks near 8 GiB -- and the attack stage after it
-# measured 14.6 GB on this corpus. If the merge still OOMs, submit MERGE=0 and finish on a fat CPU
-# node (the commands are printed at the end of every log).
-#SBATCH --mem=48g
-# Expected 2-8 hours at 8 cards x 3 workers on a ~90M-position corpus; this is the margin for being
-# wrong about the rate, and --requeue means a preemption costs queue time rather than work.
-#SBATCH --time=0-12:00:00
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=80g
+#SBATCH --time=1-00:00:00
 #SBATCH --requeue
 
 set -euo pipefail
@@ -213,349 +57,108 @@ cd "$PROJECT"
 SOURCE="${SOURCE:-wildchat}"
 DEFENSE="${DEFENSE:-dp_mlm_eps100}"
 FEATURE="${FEATURE:-stylometrix}"
-# Read the split from the published mirror, write everything this job makes to data/dist. Passed
-# explicitly rather than left to the defaults so the pre-flight check below tests the same path the
-# stages will use. OUT_DIR is also what run_experiment.py reads as --data-dir: stages 1-4 write
-# there, while the runner's own default is data/hf, which will not have these files.
+ATTACK="${ATTACK:-1}"
+WORKERS="${WORKERS:-5}"
 READ_DIR="${DIST_DIR:-$PROJECT/data/hf}"
 OUT_DIR="${OUT_DIR:-$PROJECT/data/dist}"
-CSV_DIR="${CSV_DIR:-$OUT_DIR/csv}"
-LOG_DIR="${LOG_DIR:-$PROJECT/scripts/logs}"
-LIMIT="${LIMIT:-}"
-MERGE="${MERGE:-1}"
-CSV="${CSV:-1}"
-SHARD_CSV="${SHARD_CSV:-0}"
-CSV_NEWLINES="${CSV_NEWLINES:-keep}"
-CSV_LEVEL="${CSV_LEVEL:-turn}"
-ATTACK="${ATTACK:-1}"
-STAGGER="${STAGGER:-10}"
-
-# The shard layout. TASKS x WORKERS is the total shard count, and it is baked into both the shard
-# filenames and the defend cache path -- see the header. TASKS defaults to the array's size, but
-# RE-RUNNING ONE FAILED TASK must state it, because `sbatch --array=3` sets
-# SLURM_ARRAY_TASK_COUNT=1 and the run would otherwise recompute the corpus under six wrong names:
-#
-#     TASKS=8 sbatch --array=3 experiments/run_dpmlm_wildchat.sbatch
-#
-TASK="${SLURM_ARRAY_TASK_ID:-0}"
-TASKS="${TASKS:-${SLURM_ARRAY_TASK_COUNT:-1}}"
-WORKERS="${WORKERS:-3}"
-NSHARDS=$((TASKS * WORKERS))
-
-CPUS="${SLURM_CPUS_PER_TASK:-16}"
-# Split the allocation's cores between the workers instead of letting every process think it owns
-# the node: several torch runtimes each spawning $(nproc) OpenMP threads is pure contention, and the
-# tokenizer's own pool is worse than useless here (one short pair-encode per call).
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(( CPUS / WORKERS > 0 ? CPUS / WORKERS : 1 ))}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
-export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
-
-# Workers share one card, and each one's allocation pattern swings between a steady ~3 GB and a
-# multi-GB spike on a long turn (see "HOW MANY FIT"). That is exactly the pattern that fragments
-# the caching allocator: the spike needs one contiguous block, and a heap full of freed small
-# blocks cannot give it one. Expandable segments let the allocator grow a segment instead of
-# failing -- torch's own OOM message recommends it, and the AFR job already runs this way. Must be
-# set before anything initializes CUDA, which is why it is here rather than inside the worker.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-
-# HOW MUCH A PREEMPTION COSTS, in one number. The defense flushes its cache table every this many
-# DISTINCT TURNS -- turns, not conversations, because `apply_defenses` hands the cache one row per
-# turn (`<doc_id>#<n>`) -- and everything already in the table comes back as a hit on resume. So
-# the work at risk at any instant is one batch of this size, and nothing else.
-#
-# Why not leave it at the module default of 200: each flush rewrites the WHOLE table for the shard
-# (`_write_checkpoint`), which grows toward ~80 MB here, and 200 turns is ~20 seconds of work --
-# that is a rewrite every 20 seconds, on a shared filesystem, times 24 workers, to protect against
-# losing 20 seconds. 1,000 turns puts a flush every few minutes and cuts the write volume ~5x.
-# Read at import time, and NOT part of the defense's params(), so changing it never invalidates a
-# cached turn. Lower it if preemptions on this partition are frequent enough to matter.
-export DPMLM_CHECKPOINT_EVERY="${DPMLM_CHECKPOINT_EVERY:-1000}"
-
-# A LIMIT run defends the first N documents only, so stages 4-5 would join a partial defended split
-# against the full one and produce attack numbers that mean nothing. The CSV is unaffected -- it
-# describes exactly the text that was defended -- so a smoke test still ends in something readable.
-if [ -n "$LIMIT" ]; then
-    ATTACK=0
-fi
-
-LIMIT_ARGS=()
-if [ -n "$LIMIT" ]; then
-    LIMIT_ARGS=(--limit "$LIMIT")
-fi
-
-MERGE_ARGS=()
-if [ "$MERGE" = "0" ]; then
-    MERGE_ARGS=(--no-auto-merge)
-fi
-
-CSV_ARGS=(--level "$CSV_LEVEL" --newlines "$CSV_NEWLINES")
-
-# Each stage goes through scripts/slurm_job.sh, the same env bootstrap the experiment launcher
-# uses, so how a batch shell here finds conda stays defined in exactly one file. It ends in
-# `exec "$@"`, so calling it as a command runs the stage and returns here.
-#
-# Deliberately NOT `srun`: since SLURM 22.05 a step does not inherit --cpus-per-task from the batch
-# allocation, so `srun <worker>` would hand each one a single CPU -- which is precisely the resource
-# this job is short of.
-RUN=(bash scripts/slurm_job.sh)
-
+LOG_DIR="$PROJECT/scripts/logs"
 STEM="${SOURCE}_${DEFENSE}"
 MERGED="$OUT_DIR/${STEM}.parquet"
-RUN_ID="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}"
+JOB="${SLURM_JOB_ID:-local}"
 
-echo "=================================================================="
-echo "DP-MLM on WildChat: defend -> featurize -> attack (+ CSV on the side)"
-echo "  source:   $SOURCE"
-echo "  defense:  $DEFENSE"
-echo "  feature:  $FEATURE"
-echo "  layout:   task $TASK of $TASKS x $WORKERS workers = $NSHARDS shards"
-echo "  threads:  $OMP_NUM_THREADS per worker (of $CPUS CPUs)"
-echo "  reads:    $READ_DIR/${SOURCE}.parquet"
-echo "  writes:   $MERGED"
-[ "$CSV" != "0" ] && echo "  csv:      $CSV_DIR/${STEM}.csv  (side output, nothing reads it)"
-[ -n "$LIMIT" ] && echo "  LIMIT:    $LIMIT documents (SMOKE TEST -- attack stage disabled)"
-echo "Job $RUN_ID task $TASK on $(hostname), $(date)"
-echo "=================================================================="
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export DPMLM_CHECKPOINT_EVERY="${DPMLM_CHECKPOINT_EVERY:-1000}"
+# Split the allocation's cores between workers instead of each torch runtime assuming the node.
+CPUS="${SLURM_CPUS_PER_TASK:-12}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(( CPUS / WORKERS > 0 ? CPUS / WORKERS : 1 ))}"
+export TOKENIZERS_PARALLELISM=false
 
-# 0. Fail in the first second, not after the queue wait, if the split is not where this will look.
+RUN=(bash scripts/slurm_job.sh)
+
+echo "DP-MLM on $SOURCE: defense=$DEFENSE feature=$FEATURE workers=$WORKERS  job $JOB on $(hostname), $(date)"
+
 if [ ! -f "$READ_DIR/${SOURCE}.parquet" ]; then
     echo "ERROR: no $READ_DIR/${SOURCE}.parquet"
-    echo "Mirror the published dataset first:  python -m prompt_anonymity.data.download"
-    echo "(or point DIST_DIR at a local build, e.g. DIST_DIR=$PROJECT/data/dist)"
     exit 1
 fi
-
 mkdir -p "$LOG_DIR"
 
-# 0b. Resolve the environment BEFORE launching the workers, and say which interpreter this job
-#     actually got. Two traps this catches in five seconds rather than at the first uncached turn,
-#     multiplied across every worker log:
-#
-#       * The wrong environment. scripts/slurm_job.sh takes $PROMPT_ANONYMITY_CONDA_ENV if set and
-#         otherwise activates $PROJECT/.venv -- so a stub .venv beside a real conda env silently
-#         wins. Export PROMPT_ANONYMITY_CONDA_ENV=<your env> before sbatch to settle it.
-#       * The [dpmlm] extra missing. `import nltk` is the first line of the DP-MLM backend's
-#         __init__, and torch/transformers come with it; a machine that installed via install.sh's
-#         non-CUDA branch has none of the three.
-#
-#     It also prints whether torch sees the GPU, which is the difference between this job taking
-#     hours and taking weeks on CPU.
-echo ""
-echo "------------------------------------------------------------------"
-echo "[0/5] preflight: environment  ($(date))"
-echo "------------------------------------------------------------------"
+# Fail in seconds, not hours, if the job landed in the wrong environment or on no GPU -- or if the
+# long-turn streaming is missing or disabled. Without it, WildChat's longest turns (~100k words)
+# need ~19 GB in a single allocation and OOM the run hours in (job 64621446). The check reads the
+# code that will actually run, so it also catches a cluster checkout that predates the fix.
 "${RUN[@]}" python -c '
-import importlib.util, sys
-
-print("[preflight] interpreter:", sys.executable)
-
-missing = [m for m in ("torch", "transformers", "nltk") if importlib.util.find_spec(m) is None]
-if missing:
-    print("[preflight] MISSING:", ", ".join(missing))
-    print("[preflight] this environment lacks the [dpmlm] extra. Install it into the interpreter")
-    print("[preflight] printed above -- and if that is not the env you meant, export")
-    print("[preflight] PROMPT_ANONYMITY_CONDA_ENV=<your env> and resubmit:")
-    print("[preflight]   python -m pip install -e \".[dpmlm]\"")
-    print("[preflight]   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet")
-    sys.exit(1)
-
-import torch
-device = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO GPU VISIBLE"
-print("[preflight] torch", torch.__version__, "| cuda:", torch.cuda.is_available(), "|", device)
+import sys, torch, transformers, nltk
+from prompt_anonymity.defenses import dp_mlm
+print("[preflight]", sys.executable, "| torch", torch.__version__, "| cuda", torch.cuda.is_available())
 if not torch.cuda.is_available():
-    print("[preflight] no CUDA device visible; DP-MLM on the CPU would take weeks. Stopping.")
-    sys.exit(1)
+    sys.exit("[preflight] no GPU visible")
+slice_ = getattr(dp_mlm, "DPMLM_SAMPLE_SLICE", None)
+if slice_ is None or not hasattr(dp_mlm._DPMLMBackend, "_process_long_turn"):
+    sys.exit("[preflight] this dp_mlm.py has no long-turn streaming -- sync the fixed file to the cluster")
+if slice_ <= 0:
+    sys.exit(f"[preflight] DPMLM_SAMPLE_SLICE={slice_} disables streaming; unset it or set it > 0")
+print(f"[preflight] long-turn streaming ON: turns over {slice_} masked positions are streamed")
+'
 
-# Resolve the NLTK data too: the backend downloads it lazily, which fails on an offline node --
-# better to say so here than to have every worker discover it separately.
-import nltk
-for package, path in (("punkt_tab", "tokenizers/punkt_tab"), ("stopwords", "corpora/stopwords")):
-    try:
-        nltk.data.find(path)
-    except LookupError:
-        print("[preflight] NLTK", package, "is not in", nltk.data.path)
-        print("[preflight] fetch it on a node with network:")
-        print("[preflight]   python -m nltk.downloader -q punkt punkt_tab stopwords wordnet")
-        sys.exit(1)
+# Shard files from earlier attempts with a different worker count must be moved aside: the merge
+# refuses to combine shards of two different counts, so they would fail this job at the very end.
+# (Moved, not deleted. The merge only looks at the top of shards/, not at subdirectories.)
+STALE=$(ls "$OUT_DIR/shards/${STEM}."*-of-*.parquet 2>/dev/null \
+        | grep -v -- "-of-$(printf '%04d' "$WORKERS")\.parquet$" || true)
+if [ -n "$STALE" ]; then
+    mkdir -p "$OUT_DIR/shards/stale"
+    echo "moving $(echo "$STALE" | wc -l) stale shard file(s) to $OUT_DIR/shards/stale/"
+    echo "$STALE" | xargs -I{} mv {} "$OUT_DIR/shards/stale/"
+fi
 
-from prompt_anonymity.defenses import get_defense
-get_defense(sys.argv[1])
-print("[preflight] ok:", sys.argv[1], "resolved, checkpointing every",
-      __import__("os").environ.get("DPMLM_CHECKPOINT_EVERY"), "turns")
-' "$DEFENSE"
-
-# 1. Defend this task's shards -- WORKERS processes on the one GPU, in parallel.
-#
-#    Each worker is handed its shard EXPLICITLY (--num-shards/--shard-index), which
-#    `resolve_sharding` prefers over the SLURM array variables: those describe the array, and the
-#    array is now only half of the layout. Each also gets its own log, because concurrent tqdm
-#    bars multiplexed into one file are unreadable -- follow one with
-#    `tail -f scripts/logs/dpmlm-wc-<jobid>_<task>.shard0000.log`.
-echo ""
-echo "------------------------------------------------------------------"
-echo "[1/5] defend shards $((TASK * WORKERS))-$((TASK * WORKERS + WORKERS - 1)) of $NSHARDS  ($(date))"
-echo "------------------------------------------------------------------"
-
+# 1. Defend: WORKERS processes on the one GPU, each on every WORKERS-th document. Each worker has
+#    its own log (appended, so a requeue keeps the earlier attempt's). The last to finish merges.
+echo "[1/3] defend with $WORKERS workers  ($(date))"
 pids=()
-worker_shards=()
-worker_logs=()
 for worker in $(seq 0 $((WORKERS - 1))); do
-    shard=$((TASK * WORKERS + worker))
-    log="$LOG_DIR/${SLURM_JOB_NAME:-dpmlm-wc}-${RUN_ID}_${TASK}.shard$(printf '%04d' "$shard").log"
-    echo "  worker $worker -> shard $shard/$NSHARDS  ($log)"
-    # APPENDED, never truncated: a requeued task re-runs this loop, and `>` would erase the log of
-    # the attempt that was preempted -- exactly the log you need to see how far it got. Matches
-    # --open-mode=append on the task's own log.
-    echo "=== shard $shard, job $RUN_ID, attempt starting $(date) ===" >> "$log"
+    log="$LOG_DIR/dpmlm-wc-${JOB}.shard${worker}.log"
+    echo "  worker $worker -> $log"
+    echo "=== worker $worker, job $JOB, attempt starting $(date) ===" >> "$log"
     "${RUN[@]}" python -m prompt_anonymity.data.apply_defenses \
-        --source "$SOURCE" --defense "$DEFENSE" \
-        --dist-dir "$READ_DIR" --out-dir "$OUT_DIR" \
-        --num-shards "$NSHARDS" --shard-index "$shard" \
-        "${LIMIT_ARGS[@]}" "${MERGE_ARGS[@]}" >> "$log" 2>&1 &
+        --source "$SOURCE" --defense "$DEFENSE" --dist-dir "$READ_DIR" --out-dir "$OUT_DIR" \
+        --num-shards "$WORKERS" --shard-index "$worker" >> "$log" 2>&1 &
     pids+=($!)
-    worker_shards+=("$shard")
-    worker_logs+=("$log")
-    # Stagger the starts: several processes importing torch and initializing CUDA on one second
-    # is a thundering herd on a shared filesystem, and buys nothing. Seconds, so it is noise next
-    # to the run; STAGGER=0 turns it off.
-    [ "$STAGGER" = "0" ] || sleep "$STAGGER"
+    sleep 10   # stagger model loads
 done
 
 failed=0
-for index in "${!pids[@]}"; do
-    if wait "${pids[$index]}"; then
-        echo "  shard ${worker_shards[$index]} finished ($(date))"
+for worker in "${!pids[@]}"; do
+    if wait "${pids[$worker]}"; then
+        echo "  worker $worker finished ($(date))"
     else
-        # The timestamp matters as much as the failure: a worker that dies in seconds is a setup
-        # problem, one that dies after hours is a corpus/memory problem, and the two have nothing
-        # to do with each other.
-        echo "  shard ${worker_shards[$index]} FAILED ($(date)) -- see ${worker_logs[$index]}"
+        echo "  worker $worker FAILED ($(date)) -- see $LOG_DIR/dpmlm-wc-${JOB}.shard${worker}.log"
         failed=1
     fi
 done
-
 if [ "$failed" != "0" ]; then
-    echo ""
-    echo "At least one worker failed; not merging or running anything downstream from a partial"
-    echo "set of shards. Fix the cause and re-submit this task -- finished shards are cached, so"
-    echo "it resumes rather than restarts:"
-    echo "  TASKS=$TASKS WORKERS=$WORKERS sbatch --array=$TASK experiments/run_dpmlm_wildchat.sbatch"
+    echo "A worker failed. Fix the cause and resubmit with the same WORKERS -- finished turns are cached."
     exit 1
 fi
 
-# 2. Optional side output, per shard: each finished shard's own CSV. Off by default -- the merged
-#    export in stage 3 covers the same text in split order, and on WildChat writing both doubles
-#    the disk. Turn it on to read defended text before the slowest worker has finished, or to
-#    salvage shards whose siblings failed.
-if [ "$CSV" != "0" ] && [ "$SHARD_CSV" = "1" ]; then
-    echo ""
-    echo "------------------------------------------------------------------"
-    echo "[2/5] side output: shard CSVs  ($(date))"
-    echo "------------------------------------------------------------------"
-    for shard in "${worker_shards[@]}"; do
-        file="$OUT_DIR/shards/${STEM}.$(printf '%04d' "$shard")-of-$(printf '%04d' "$NSHARDS").parquet"
-        [ -f "$file" ] || continue
-        "${RUN[@]}" python experiments/export_defended_csv.py \
-            --source "$SOURCE" --defense "$DEFENSE" \
-            --defended "$file" --out "$CSV_DIR/$(basename "${file%.parquet}").csv" \
-            --dist-dir "$READ_DIR" --out-dir "$OUT_DIR" "${CSV_ARGS[@]}"
-    done
-fi
+# Merge explicitly, always. The last worker already auto-merges, but checking "does the merged
+# file exist" is not enough: an older one (e.g. from a smoke test) would pass that check and be
+# featurized instead of this run's output. Re-merging only concatenates the shard files -- a
+# minute, no GPU -- and overwrites whatever was there.
+echo "merging shards  ($(date))"
+"${RUN[@]}" python -m prompt_anonymity.data.apply_defenses \
+    --source "$SOURCE" --defense "$DEFENSE" --dist-dir "$READ_DIR" --out-dir "$OUT_DIR" --merge
 
-# 2b. Stages 3-5 must run EXACTLY ONCE, over the merged split, and only after every shard exists.
-#     The last worker anywhere in the array auto-merges, so "the merged parquet is on disk" is the
-#     signal for the task that holds it. `mkdir` is the claim because it is atomic on POSIX: if two
-#     tasks race here, exactly one creates the directory. The lock is keyed to this array's job id,
-#     so a fresh submission is never blocked by an old lock, and re-entrant for its owner, so a
-#     requeued winner resumes the downstream stages instead of skipping them.
-CLAIMED=0
-if [ "$MERGE" != "0" ] && [ -f "$MERGED" ]; then
-    LOCK="$OUT_DIR/.dpmlm_downstream_${STEM}_${RUN_ID}"
-    if mkdir "$LOCK" 2>/dev/null; then
-        echo "$TASK" > "$LOCK/owner"
-        CLAIMED=1
-    elif [ "$(cat "$LOCK/owner" 2>/dev/null)" = "$TASK" ]; then
-        CLAIMED=1
-    fi
-fi
-
-if [ "$CLAIMED" != "1" ]; then
-    echo ""
-    echo "Task $TASK's $WORKERS shards are defended."
-    echo "  shards so far: $(ls "$OUT_DIR/shards/${STEM}."*.parquet 2>/dev/null | wc -l) of $NSHARDS"
-    if [ "$MERGE" = "0" ]; then
-        echo "MERGE=0: no task will merge. Run the merge, export and downstream stages by hand"
-        echo "(the commands are at the bottom of this log)."
-    else
-        echo "Another task merges, exports the CSV and runs featurize/attack once the last shard lands."
-    fi
-    echo "Done $(date)."
-    exit 0
-fi
-
-echo ""
-echo "This task holds the worker that merged the split, so it runs the remaining stages."
-
-# From here on the SLURM array variables must be OUT of the environment. compute_features resolves
-# its own sharding from exactly those variables, so leaving them set would make stage 4 featurize
-# only 1/8th of the documents and write a shard file nobody merges. Every worker above was given
-# its shard explicitly, so nothing below needs them.
-RUN=(env -u SLURM_ARRAY_TASK_ID -u SLURM_ARRAY_TASK_COUNT -u SLURM_ARRAY_JOB_ID
-     bash scripts/slurm_job.sh)
-
-# 3. THE SIDE OUTPUT: every defended text in one readable CSV, one row per turn, original beside
-#    defended, in split order. Streamed a parquet batch at a time, so it costs minutes and almost
-#    no memory however big the corpus is. Deliberately placed BEFORE the featurize and attack
-#    stages, which are the long ones: if DP-MLM produced gibberish at this epsilon, the CSV says so
-#    now rather than after hours of attacking text nobody looked at.
-if [ "$CSV" != "0" ]; then
-    echo ""
-    echo "------------------------------------------------------------------"
-    echo "[3/5] side output: CSV of every defended text  ($(date))"
-    echo "------------------------------------------------------------------"
-    "${RUN[@]}" python experiments/export_defended_csv.py \
-        --source "$SOURCE" --defense "$DEFENSE" \
-        --dist-dir "$READ_DIR" --out-dir "$OUT_DIR" --out "$CSV_DIR/${STEM}.csv" \
-        "${CSV_ARGS[@]}"
-fi
-
-# 4. Featurize the defended text. --dist-dir is where stage 1 wrote, not the mirror.
-echo ""
-echo "------------------------------------------------------------------"
-echo "[4/5] featurize  ($(date))"
-echo "------------------------------------------------------------------"
+echo "[2/3] featurize  ($(date))"
 "${RUN[@]}" python -m prompt_anonymity.data.compute_features \
     --source "$SOURCE" --defense "$DEFENSE" --feature "$FEATURE" --dist-dir "$OUT_DIR"
 
-# 5. Attack it. "$@" is forwarded straight through, so attack/scoring flags given at submit time
-#    land here and nowhere else.
 if [ "$ATTACK" != "0" ]; then
-    echo ""
-    echo "------------------------------------------------------------------"
-    echo "[5/5] attack  ($(date))"
-    echo "------------------------------------------------------------------"
+    echo "[3/3] attack  ($(date))"
     "${RUN[@]}" python experiments/run_experiment.py \
-        --source "$SOURCE" --defense "$DEFENSE" --feature "$FEATURE" \
-        --data-dir "$OUT_DIR" "$@"
+        --source "$SOURCE" --defense "$DEFENSE" --feature "$FEATURE" --data-dir "$OUT_DIR" "$@"
 fi
 
-echo ""
 echo "Done $(date)."
 echo "  defended: $MERGED"
-echo "  features: $OUT_DIR/${STEM}_${FEATURE}.parquet"
-[ "$ATTACK" != "0" ] && echo "  results:  experiments/results/${STEM}_${FEATURE}_*/"
-[ "$CSV" != "0" ] && echo "  csv:      $CSV_DIR/${STEM}.csv  (side output)"
-echo ""
-echo "Read the text before trusting the numbers -- DP-MLM's output quality is the whole question at"
-echo "a given epsilon:"
-echo "  python -c \"import pandas as pd; d=pd.read_csv('$CSV_DIR/${STEM}.csv', nrows=20); print(d[['original_text','defended_text']].to_string())\""
-echo ""
-echo "Compare against the undefended baseline (${SOURCE}_base_${FEATURE}_*) for how much"
-echo "attribution the defense removed, and against the neighbouring epsilons for the privacy/"
-echo "utility curve. Draw the figures with:  python experiments/plot_results.py --jobs 8"
-echo ""
-echo "If a task died and the merge never happened, finish it by hand (CPU only, no GPU needed):"
-echo "  python -m prompt_anonymity.data.apply_defenses --source $SOURCE --defense $DEFENSE \\"
-echo "      --dist-dir $READ_DIR --out-dir $OUT_DIR --merge"
-echo "  python experiments/export_defended_csv.py --source $SOURCE --defense $DEFENSE \\"
-echo "      --dist-dir $READ_DIR --out-dir $OUT_DIR"
+echo "  results:  experiments/results/${SOURCE}_${DEFENSE}_${FEATURE}_*/"
