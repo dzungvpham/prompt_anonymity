@@ -272,6 +272,11 @@ class ListwiseLLMRerankAttack:
         contributes nothing to it. Following
         :mod:`prompt_anonymity.evaluation.utility._deepseek`: a cached row contributes nothing and
         never overwrites what was really paid.
+    reasoning_stats : dict
+        ``replies``, ``replies_with_reasoning`` and ``reasoning_tokens`` for the replies this run
+        actually received -- proof that thinking happened rather than just that it was requested.
+        Synchronous channel only (the batch client does not count them) and cached rows contribute
+        nothing, so a fully-cached run reports zero replies; set by :meth:`attack`.
     """
 
     def __init__(self, *, judge_model: str = DEFAULT_JUDGE_MODEL, top_k: int = DEFAULT_TOP_K,
@@ -295,6 +300,7 @@ class ListwiseLLMRerankAttack:
         self.authors: np.ndarray | None = None
         self.detail: pd.DataFrame | None = None
         self.cost_usd: float = float("nan")
+        self.reasoning_stats: dict = {}
 
     def _max_tokens(self, k: int) -> int:
         return MAX_TOKENS_BASE + MAX_TOKENS_PER_CANDIDATE * k
@@ -437,6 +443,11 @@ class ListwiseLLMRerankAttack:
         self.detail = detail_table(candidates, layout, orders, data.unknown_labels,
                                    unknown_ids=data.unknown_ids, reasons=reasons, applied=applied)
         self.cost_usd = getattr(self._client, "total_cost", float("nan"))
+        self.reasoning_stats = {
+            "replies": getattr(self._client, "n_replies", 0),
+            "replies_with_reasoning": getattr(self._client, "n_replies_with_reasoning", 0),
+            "reasoning_tokens": getattr(self._client, "total_reasoning_tokens", 0),
+        }
 
         if self.verbose:
             report(orders, layout, n_parsed=n_parsed, n_applied=int(applied.sum()),

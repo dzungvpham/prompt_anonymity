@@ -165,6 +165,12 @@ class OpenRouterChat:
         self.timeout = timeout
         self.base_url = base_url
         self.total_cost = 0.0
+        # Evidence that reasoning actually happened, not just that it was asked for: a request can
+        # carry reasoning.effort and still come back without thinking (a provider that drops the
+        # field, a model that does not support it). See _record_usage.
+        self.n_replies = 0
+        self.n_replies_with_reasoning = 0
+        self.total_reasoning_tokens = 0
         self._cost_lock = threading.Lock()
 
         # Walks UP from the working directory: a .env at the repo root (or above it) is found, one
@@ -201,6 +207,32 @@ class OpenRouterChat:
             return
         with self._cost_lock:
             self.total_cost += cost
+
+    def _record_usage(self, reply) -> None:
+        """Count one reply, and whether it reasoned, toward the ``n_replies*`` counters.
+
+        A reply counts as reasoned if its usage reports ``completion_tokens_details.reasoning_tokens
+        > 0`` or its message carries a non-empty ``reasoning`` / ``reasoning_details``. Either field is
+        accepted because which one a provider fills varies. Total for the same reason as
+        :meth:`_record_cost`: a shape this does not recognise counts as a reply without reasoning,
+        never as a crash.
+        """
+        tokens, reasoned = 0, False
+        try:
+            details = (reply.get("usage") or {}).get("completion_tokens_details") or {}
+            tokens = int(details.get("reasoning_tokens") or 0)
+        except (AttributeError, TypeError, ValueError):
+            tokens = 0
+        try:
+            message = reply["choices"][0]["message"]
+            reasoned = bool(message.get("reasoning") or message.get("reasoning_details"))
+        except (AttributeError, IndexError, KeyError, TypeError):
+            reasoned = False
+        with self._cost_lock:
+            self.n_replies += 1
+            self.total_reasoning_tokens += max(tokens, 0)
+            if tokens > 0 or reasoned:
+                self.n_replies_with_reasoning += 1
 
     def complete(self, text: str, max_tokens: int | None = None) -> str:
         """Return the model's reply to ``text`` under the fixed system prompt.
@@ -246,6 +278,7 @@ class OpenRouterChat:
                 resp.raise_for_status()
                 reply = resp.json()
                 self._record_cost(reply)
+                self._record_usage(reply)
                 return reply["choices"][0]["message"]["content"]
             except self._requests.exceptions.HTTPError as err:
                 status = err.response.status_code

@@ -322,6 +322,10 @@ def main() -> None:
                    "n_changed_top1": int((predictions["best_author"]
                                           != predictions["base_best_author"]).sum()),
                    "judge_cost_usd": getattr(attack, "cost_usd", float("nan")),
+                   # Whether the judge actually thought, counted over the replies this run
+                   # received (cached rows contribute nothing). nan for the jina arm.
+                   **{f"judge_{name}": getattr(attack, "reasoning_stats", {}).get(name, float("nan"))
+                      for name in ("replies", "replies_with_reasoning", "reasoning_tokens")},
                    **accuracies(ranks, ""), **base_accuracy}
             summary.append(row)
             print("  " + ", ".join(f"top-{k} {row[f'top_{k}']:.3f} "
