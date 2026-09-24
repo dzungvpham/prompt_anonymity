@@ -130,20 +130,38 @@ class HDBSCANClustering(ClusteringAttack):
     ``min_cluster_size`` is the smallest group the method will call a cluster, and it is the
     parameter that most needs a *matched* tuning slice -- it is an absolute document count, so its
     optimum moves with how many documents an author writes in the window.
+
+    ``cluster_selection_epsilon`` was, until this was added, never searched: :data:`CLUSTERING_SPACES`
+    only swept ``neighbors``/``min_cluster_size``/``cluster_selection_method``, leaving epsilon
+    pinned at its default 0.0 -- HDBSCAN's own density hierarchy with no additional flat merging,
+    which is the maximum-precision/minimum-recall end of what the method can do. Measured on
+    swe-chat/Gemini/``all`` scope: the tuned point this produced scored BCubed F 0.327 (base
+    defense) to 0.152 (embad_gemini) against 0.469-0.556 for the two threshold methods, which *do*
+    have their merge threshold in the search space -- and sweeping epsilon by hand finds F up to
+    0.558, matching or beating them. So ``cluster_selection_epsilon_quantile`` exists to let the
+    tuner reach that point on its own. It is a **quantile** of the view's own k-truncated edge
+    weights (:func:`edge_quantile`), not an absolute radius, for the reason every other threshold in
+    this package is: an absolute value means something different after a projection or after
+    ``rescoring.temporal_fusion``'s winsorised rescale (applied even at weight 0), while a quantile
+    means the same thing in any of those spaces. ``None`` (the default) keeps
+    ``cluster_selection_epsilon`` as given, so existing configurations are unaffected.
     """
 
     min_cluster_size: int = 2
     min_samples: int | None = None
     cluster_selection_epsilon: float = 0.0
+    cluster_selection_epsilon_quantile: float | None = None
     cluster_selection_method: str = "eom"
 
     def cluster(self, graph: NeighborGraph) -> np.ndarray:
         view = self.prepared(graph)
+        epsilon = (self.cluster_selection_epsilon if self.cluster_selection_epsilon_quantile is None
+                  else edge_quantile(view.edges()[2], self.cluster_selection_epsilon_quantile))
         adjacency = view.to_sparse()
         n_components, component = connected_components(adjacency, directed=False,
                                                        return_labels=True)
         if n_components == 1:
-            return self._fit(adjacency)
+            return self._fit(adjacency, epsilon)
 
         # scikit-learn refuses a disconnected sparse graph outright ("HDBSCAN cannot be performed
         # on a disconnected graph"), which would rule the method out at every k that does not
@@ -157,19 +175,19 @@ class HDBSCANClustering(ClusteringAttack):
             members = np.flatnonzero(component == index)
             if len(members) < max(2, int(self.min_cluster_size)):
                 continue                       # too small to hold a cluster: stays noise
-            block = self._fit(adjacency[members][:, members])
+            block = self._fit(adjacency[members][:, members], epsilon)
             found = block >= 0
             labels[members[found]] = block[found] + next_label
             next_label += int(block.max()) + 1 if found.any() else 0
         return labels
 
-    def _fit(self, adjacency) -> np.ndarray:
+    def _fit(self, adjacency, epsilon: float) -> np.ndarray:
         from sklearn.cluster import HDBSCAN
 
         return HDBSCAN(
             min_cluster_size=max(2, int(self.min_cluster_size)),
             min_samples=self.min_samples,
-            cluster_selection_epsilon=float(self.cluster_selection_epsilon),
+            cluster_selection_epsilon=float(epsilon),
             cluster_selection_method=self.cluster_selection_method,
             metric="precomputed",
             copy=True,
@@ -495,6 +513,12 @@ CLUSTERING_SPACES: dict[str, dict[str, list]] = {
         "neighbors": [5, 10, 25, 50],
         "min_cluster_size": [2, 3, 5],
         "cluster_selection_method": ["eom", "leaf"],
+        # 0.0 resolves to the single closest edge (edge_quantile's index 0), not literally the old
+        # fixed epsilon=0.0 default -- but it is the closest this quantile parameterisation gets to
+        # "almost no merging", so it keeps that regime reachable rather than forcing the tuner away
+        # from it. The rest brackets where a hand sweep found the F optimum on swe-chat/Gemini
+        # (quantile ~0.40-0.46, F up to 0.558 against 0.327 at literal epsilon=0 -- class docstring).
+        "cluster_selection_epsilon_quantile": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     },
     "leiden": {
         "neighbors": [5, 10, 25, 50],
