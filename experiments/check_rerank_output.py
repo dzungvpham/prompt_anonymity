@@ -180,12 +180,22 @@ def _check_summary_row(check, label: str, row: pd.Series, top_k: int) -> None:
           " <= ".join(f"{value:.3f}" for value in values))
 
     # The load-bearing one. The reranker reorders the shortlist and never changes its membership, so
-    # top-K at the shortlist size is the base attack's own recall ceiling, to the last bit.
+    # top-K at the shortlist size is the shortlist's own recall, to the last bit. run_rerank.py
+    # records that as shortlist_ceiling; it differs from base_top_K only on rows whose base scores
+    # tie at the shortlist boundary (n_boundary_ties -- see run_rerank.shortlist_ceiling). Summaries
+    # written before that column existed are compared with the baseline, as they always were.
     if top_k in SUMMARY_KS:
-        reranked, base = row.get(f"top_{top_k}"), row.get(f"base_top_{top_k}")
-        check(f"{label} top-{top_k} still equals the baseline (shortlist ceiling unmoved)",
-              pd.notna(reranked) and pd.notna(base) and float(reranked) == float(base),
-              f"rerank={reranked}, base={base}")
+        reranked = row.get(f"top_{top_k}")
+        ceiling = row.get("shortlist_ceiling")
+        if ceiling is None or pd.isna(ceiling):
+            ceiling, against = row.get(f"base_top_{top_k}"), "base"
+        else:
+            ties = row.get("n_boundary_ties")
+            against = "shortlist" + (f", {int(ties)} boundary tie(s)" if pd.notna(ties) and ties
+                                     else "")
+        check(f"{label} top-{top_k} equals the shortlist ceiling (ceiling unmoved)",
+              pd.notna(reranked) and pd.notna(ceiling) and float(reranked) == float(ceiling),
+              f"rerank={reranked}, {against}={ceiling}")
 
 
 def _check_reasons(check, label: str, detail: pd.DataFrame) -> None:

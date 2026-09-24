@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # run_rerank_sonnet_swe_chat.sbatch -- rerank the top-5 nearest-neighbor author shortlist on SWE-chat
-# (gemini_embedding_2 vectors) with Claude Sonnet 5 over OpenRouter, reasoning ON, candidates
+# (gemini_embedding_2 vectors) with Claude Sonnet 5 on MICROSOFT FOUNDRY, reasoning ON, candidates
 # SCRAMBLED, then prove both of those from the output.
 #
 #   sbatch experiments/run_rerank_sonnet_swe_chat.sbatch
@@ -14,29 +14,42 @@
 # frontier model rather than the idea of reranking. Standalone like that one: it calls run_rerank.py
 # directly, and every stage prints a numbered, timestamped header and fails loudly.
 #
-# KEY: SONNET_API_KEY, in a .env AT THE REPO ROOT (load_dotenv walks UP from the working directory,
-# so DS_env/.env is never found). This job always runs UNBATCHED (--no-batch), which is the channel
-# that reads SONNET_API_KEY; the Batch API path reads SONNET_OR_KEY instead and is not used here.
+# CREDENTIALS, both in a .env AT THE REPO ROOT (or exported):
+#   SONNET_API_KEY=<the Foundry key>
+#   FOUNDRY_ENDPOINT=<the Foundry endpoint URL>
+# BOTH are required: with the key alone the Anthropic SDK would post an Azure key to Anthropic's own
+# API and fail like a bad key. The judge is the Foundry DEPLOYMENT claude-sonnet-5-2 (MODEL=...), via
+# the Anthropic SDK's AnthropicFoundry client (src/prompt_anonymity/attacks/llm/_foundry.py). Needs
+# the `anthropic` package: re-run install.sh, or `pip install anthropic`, if step 1 says it is missing.
+# PROVIDER=openrouter runs the old OpenRouter channel instead (SONNET_API_KEY must then be an
+# OpenRouter key -- the two channels share the variable).
 #
-# COST: full real-time price, roughly $0.012 per unknown document at top-5. Start with LIMIT=20 (~25
-# cents), read the reasons and the audit, then run the lot. Verdicts are cached by prompt text the
-# moment they arrive, so the full run re-pays nothing and a preempted/requeued job resumes.
+# COST: full price, no batch discount -- roughly $0.012 per unknown document at top-5 at Sonnet 5's
+# $2/$10 per MTok (Foundry bills at standard Anthropic rates; the cost column is an estimate from
+# token counts, as Foundry replies carry no price). Start with LIMIT=20 (~25 cents), read the
+# reasons and the audit, then run the lot. Verdicts are cached by prompt text the moment they
+# arrive, so the full run re-pays nothing and a preempted/requeued job resumes.
 #
-# REASONING IS ON AND CANNOT BE SWITCHED OFF HERE. EFFORT defaults to high and must be one of
-# low|medium|high|xhigh|max. It is checked three ways: the attack is built exactly as the run builds
-# it and its effort asserted (step 3); the effort is part of the verdict cache key, so no verdict
-# from a non-reasoning run can be served; and after the run, the replies' own usage/reasoning fields
-# are counted (step 6) -- a request that asked for thinking but came back without any fails the job.
+# REASONING IS ON AND CANNOT BE SWITCHED OFF HERE. Every request carries adaptive thinking at EFFORT
+# (default high; low|medium|high|xhigh|max, nothing else accepted). Checked three ways: the attack is
+# built exactly as the run builds it and its effort asserted (step 3); the preflight probe sends one
+# real request with thinking on and must not be rejected (step 4); and after the run, every fresh
+# reply is inspected for thinking blocks -- a run where none of them thought fails (step 6). Effort
+# is also part of the verdict cache key, so no verdict from a non-reasoning run can be served.
+#
+# THE OUTPUT BUDGET IS 16,000 TOKENS, thinking included. A reply cut off at the budget parses as
+# nothing and silently falls back to the distance order, so step 6 counts truncated replies and
+# fails above 5%. Only tokens produced are billed; the budget is a ceiling, not a spend.
 #
 # SCRAMBLING IS ON AND CHECKED TWICE. Each row's K candidates are shown in a seeded random order
 # (list rerankers favour whichever end they read last, which fed nearest-first rewards the metric's
 # WORST candidate). Step 3 asserts the attack is configured to shuffle and that the permutation is
 # really random; step 6 reads back, row by row, the distance order Sonnet was actually shown.
 #
-# Top-5 at k=5 equals the baseline by construction (run_rerank.py asserts it); top-1/2/3 are the
-# reranker's contribution.
+# Top-5 at k=5 is pinned to the shortlist's own recall (run_rerank.py checks it row by row);
+# top-1/2/3 are the reranker's contribution.
 #
-# Preflight on a login node (no money spent, nothing reranked):
+# Preflight on a login node (nothing reranked; the Foundry probe costs a fraction of a cent):
 #
 #     CHECK_ONLY=1 bash experiments/run_rerank_sonnet_swe_chat.sbatch
 #
@@ -44,8 +57,9 @@
 #   LIMIT=20 sbatch ...                    # a seeded sample of the unknown side; bounds the bill
 #   EFFORT=xhigh sbatch ...                # thinking depth: low/medium/high/xhigh/max (never off)
 #   WORKERS=24 sbatch ...                  # concurrent requests (default 16; 429s back off)
-#   TOP_K=10 sbatch ...                    # a different shortlist size (~2x the cost)
-#   MODEL=anthropic/claude-sonnet-5 ...    # OpenRouter slug for the judge
+#   TOP_K=10 sbatch ...                    # a different shortlist size
+#   MODEL=claude-sonnet-5-2 ...            # Foundry deployment name (or an OpenRouter slug)
+#   PROVIDER=openrouter sbatch ...         # the old OpenRouter channel
 #   FEATURE=luar / WINDOW=5075 / SAMPLE=8 / OUT_DIR=...
 #
 #SBATCH --job-name=rrk-sonnet-swe
@@ -88,6 +102,7 @@ TOP_K="${TOP_K:-5}"
 SEED="${SEED:-47}"
 SAMPLE="${SAMPLE:-3}"
 EFFORT="${EFFORT:-high}"
+PROVIDER="${PROVIDER:-foundry}"
 MODEL="${MODEL:-}"
 DIST_DIR="${DIST_DIR:-$PROJECT/data/dist}"
 CACHE_DIR="${CACHE_DIR:-$PROJECT/data/.cache}"
@@ -101,6 +116,11 @@ case "$EFFORT" in
             "not run Sonnet without reasoning." >&2
        exit 1 ;;
 esac
+case "$PROVIDER" in
+    foundry|openrouter) ;;
+    *) echo "ERROR: PROVIDER='$PROVIDER' -- must be foundry or openrouter." >&2
+       exit 1 ;;
+esac
 
 # `none` is spelled `base` in results/ (run_experiment.NO_DEFENSE_TAG); the split stem is the
 # source alone for `none`, else <source>_<defense>.
@@ -111,7 +131,7 @@ if [ "$DEFENSE" = "none" ]; then TAG=base; STEM="$SOURCE"; else TAG="$DEFENSE"; 
 OUT_DIR="${OUT_DIR:-$PROJECT/experiments/results/rerank/${SOURCE}_${TAG}_${FEATURE}_known${WINDOW}/llm}"
 
 # The Python checks below read their settings from the environment.
-export TOP_K SEED EFFORT MODEL OUT_DIR
+export TOP_K SEED EFFORT PROVIDER MODEL OUT_DIR
 
 # Bare `python` when checking on a login node; the env bootstrap only when running as a job.
 if [ "$CHECK_ONLY" = "1" ]; then
@@ -122,13 +142,13 @@ fi
 run() { if [ "${#RUN[@]}" -eq 0 ]; then "$@"; else "${RUN[@]}" "$@"; fi; }
 
 echo "=================================================================="
-echo "listwise rerank (Sonnet 5, unbatched) -- $SOURCE / $FEATURE / known$WINDOW / top-$TOP_K"
+echo "listwise rerank (Sonnet 5 via $PROVIDER, unbatched) -- $SOURCE / $FEATURE / known$WINDOW / top-$TOP_K"
 echo "  reasoning effort: $EFFORT"
 echo "  concurrency:      $LISTWISE_RERANK_MAX_WORKERS requests in flight"
 if [ -n "${LIMIT:-}" ]; then
     echo "  unknown side:     a seeded sample of $LIMIT documents"
 else
-    echo "  unknown side:     all of it (full real-time price)"
+    echo "  unknown side:     all of it (full price)"
 fi
 echo "  output:           $OUT_DIR"
 echo "Job ${SLURM_JOB_ID:-local} on $(hostname), $(date)"
@@ -138,10 +158,17 @@ echo "=================================================================="
 echo ""
 echo "[1/6] environment ($(date))"
 run python -c '
-import sys
+import os, sys
 print("  interpreter:", sys.executable)
-import requests, dotenv  # the OpenRouter client needs both
-print("  requests", requests.__version__)
+import dotenv, requests
+if os.environ["PROVIDER"] == "foundry":
+    try:
+        import anthropic
+        from anthropic import AnthropicFoundry  # noqa: F401
+    except ImportError as error:
+        sys.exit(f"ERROR: {error}. The Foundry provider needs the anthropic SDK: re-run install.sh "
+                 f"or `pip install anthropic` in this environment.")
+    print("  anthropic", anthropic.__version__)
 '
 
 # --- 2. inputs and self-test -----------------------------------------------
@@ -163,11 +190,11 @@ echo "  features: $DIST_DIR/${STEM}_${FEATURE}.parquet"
 echo "  attack self-test:"
 run python -m prompt_anonymity.attacks.llm.listwise --selftest
 
-# --- 3. configuration: reasoning, scramble, key -----------------------------
+# --- 3. configuration: provider, reasoning, budget, scramble -----------------
 # Builds the attack through run_rerank.build_attack -- the exact call the real run makes -- and
 # asserts on the object, so a default flipped anywhere upstream fails here, before any money.
 echo ""
-echo "[3/6] configuration check: reasoning, scramble, key ($(date))"
+echo "[3/6] configuration check: provider, reasoning, budget, scramble ($(date))"
 PRE_CHECK=$(cat <<'PY'
 import math, os, sys
 from argparse import Namespace
@@ -176,26 +203,37 @@ import numpy as np
 
 sys.path.insert(0, "experiments")
 from run_rerank import build_attack
+from prompt_anonymity.attacks.llm import _foundry
 from prompt_anonymity.attacks.llm.candidates import AuthorCandidates
 from prompt_anonymity.attacks.llm.listwise import present
-from prompt_anonymity.attacks.llm.listwise_llm_rerank import (
-    MAX_TOKENS_BASE, MAX_TOKENS_PER_CANDIDATE, SYNC_API_KEY_ENV)
+from prompt_anonymity.attacks.llm.listwise_llm_rerank import SYNC_API_KEY_ENV
 
 k, seed, effort = int(os.environ["TOP_K"]), int(os.environ["SEED"]), os.environ["EFFORT"]
+provider = os.environ["PROVIDER"]
 attack = build_attack("llm", k, Namespace(
-    margin_quantile=1.0, seed=seed, batch=False, wait=True,
+    margin_quantile=1.0, seed=seed, batch=False, wait=True, provider=provider,
     judge_model=os.environ.get("MODEL") or None, reasoning_effort=effort))
 
 problems = []
 if attack.batch:
-    problems.append("attack.batch is True -- the batch channel reads SONNET_OR_KEY, not SONNET_API_KEY")
+    problems.append("attack.batch is True -- this job only runs the unbatched channel")
+if attack.provider != provider:
+    problems.append(f"attack.provider is {attack.provider!r}, expected {provider!r}")
 if not attack.reasoning_effort or attack.reasoning_effort != effort:
     problems.append(f"reasoning_effort is {attack.reasoning_effort!r}, expected {effort!r}")
 if attack.shuffle_candidates is not True:
     problems.append(f"shuffle_candidates is {attack.shuffle_candidates!r} -- candidates would be "
                     f"shown nearest-first")
-if SYNC_API_KEY_ENV != "SONNET_API_KEY":
-    problems.append(f"the unbatched channel reads {SYNC_API_KEY_ENV}, not SONNET_API_KEY")
+budget = attack._max_tokens(k)
+if provider == "foundry":
+    keys = f"{_foundry.FOUNDRY_API_KEY_ENV} + {_foundry.FOUNDRY_ENDPOINT_ENV}"
+    if (_foundry.FOUNDRY_API_KEY_ENV, _foundry.FOUNDRY_ENDPOINT_ENV) != ("SONNET_API_KEY",
+                                                                        "FOUNDRY_ENDPOINT"):
+        problems.append(f"the Foundry client reads {keys}, not SONNET_API_KEY + FOUNDRY_ENDPOINT")
+    if budget < 16000:
+        problems.append(f"output budget is {budget} tokens; thinking needs >= 16000")
+else:
+    keys = SYNC_API_KEY_ENV
 
 # Scramble, on a synthetic shortlist: exactly the call the attack makes, with its own settings.
 n = 1000
@@ -211,11 +249,11 @@ if identity > 0.05:
 if (first == 0).any():
     problems.append(f"slot 1 never shows distance ranks {np.flatnonzero(first == 0).tolist()}")
 
+print(f"  provider:         {attack.provider} (unbatched), credentials {keys}")
 print(f"  judge model:      {attack.judge_model}")
-print(f"  reasoning effort: {attack.reasoning_effort}")
-print(f"  channel:          unbatched, key {SYNC_API_KEY_ENV}")
-print(f"  output budget:    {MAX_TOKENS_BASE + MAX_TOKENS_PER_CANDIDATE * k} tokens per reply "
-      f"(thinking included)")
+print(f"  reasoning:        adaptive thinking, effort {attack.reasoning_effort}"
+      if provider == "foundry" else f"  reasoning:        reasoning.effort {attack.reasoning_effort}")
+print(f"  output budget:    {budget} tokens per reply (thinking included)")
 print(f"  scramble:         shuffle_candidates={attack.shuffle_candidates}; "
       f"{identity:.1%} of {n} synthetic rows nearest-first; slot-1 distance ranks "
       + ", ".join(f"{rank}:{share:.0%}" for rank, share in enumerate(first)))
@@ -231,14 +269,32 @@ run python -c "$PRE_CHECK"
 # --- 4. credentials --------------------------------------------------------
 echo ""
 echo "[4/6] credentials ($(date))"
-if [ -z "${SONNET_API_KEY:-}" ] && [ ! -f "$PROJECT/.env" ]; then
-    echo "ERROR: SONNET_API_KEY is not set and there is no $PROJECT/.env for load_dotenv to read." >&2
-    echo "  Add it at the REPO ROOT:  echo 'SONNET_API_KEY=sk-or-...' >> $PROJECT/.env" >&2
-    exit 1
-fi
-# Asks OpenRouter about the key without generating tokens; prints its length and last four
-# characters, never the key.
-run python -c '
+if [ "$PROVIDER" = "foundry" ]; then
+    # One real request with the run's own settings: proves the endpoint answers, the deployment name
+    # exists, and adaptive thinking + this effort are accepted rather than 400'd. ~$0.001. The key
+    # itself is never printed.
+    PROBE=$(cat <<'PY'
+import os, sys
+from prompt_anonymity.attacks.llm._foundry import DEFAULT_FOUNDRY_MODEL, probe
+
+model = os.environ.get("MODEL") or DEFAULT_FOUNDRY_MODEL
+try:
+    result = probe(model, os.environ["EFFORT"])
+except Exception as error:
+    sys.exit(f"ERROR: the Foundry probe failed -- {type(error).__name__}: {error}")
+print(f"  deployment {model} answered {result['reply']!r}: "
+      f"{result['input_tokens']}+{result['output_tokens']} tokens, ~${result['cost_usd']:.4f}; "
+      f"thinking block present: {result['reasoned']} (adaptive thinking may skip a trivial "
+      f"question -- the run itself is what must show it)")
+if result["refused"] or result["truncated"]:
+    sys.exit("ERROR: the probe was refused or truncated -- check the deployment before paying for a run")
+PY
+)
+    run python -c "$PROBE"
+else
+    # Asks OpenRouter about the key without generating tokens; prints its length and last four
+    # characters, never the key.
+    run python -c '
 import sys
 from prompt_anonymity.attacks.llm._openrouter import check_credentials
 from prompt_anonymity.attacks.llm.listwise_llm_rerank import SYNC_API_KEY_ENV
@@ -247,10 +303,11 @@ ok, message = check_credentials(SYNC_API_KEY_ENV)
 print("  " + message)
 sys.exit(0 if ok else 1)
 '
+fi
 
 if [ "$CHECK_ONLY" = "1" ]; then
     echo ""
-    echo "(CHECK_ONLY=1 -- preflight only, nothing sent to Sonnet)"
+    echo "(CHECK_ONLY=1 -- preflight only, nothing reranked)"
     exit 0
 fi
 
@@ -258,7 +315,8 @@ fi
 ARGS=(--source "$SOURCE" --feature "$FEATURE" --defense "$DEFENSE"
       --data-dir "$DIST_DIR" --known-window "$WINDOW" --seed "$SEED"
       --cache-dir "$CACHE_DIR" --output-dir "$OUT_DIR"
-      --variant llm --top-k "$TOP_K" --no-batch --reasoning-effort "$EFFORT")
+      --variant llm --top-k "$TOP_K" --no-batch --provider "$PROVIDER"
+      --reasoning-effort "$EFFORT")
 if [ -n "${LIMIT:-}" ]; then
     ARGS+=(--limit "$LIMIT")
 fi
@@ -281,7 +339,14 @@ import pandas as pd
 out, k = os.environ["OUT_DIR"], int(os.environ["TOP_K"])
 detail = pd.read_csv(f"{out}/rerank_detail_llm_k{k}.csv")
 summary = pd.read_csv(f"{out}/rerank_summary.csv")
+row = summary[(summary["variant"] == "llm") & (summary["top_k"] == k)]
 problems = []
+
+
+def stat(name):
+    """One summary number for this configuration, or nan if the column/row is absent."""
+    return float(row[name].iloc[0]) if name in row and len(row) else float("nan")
+
 
 # Scramble, as shown: per row, the distance ranks in presented-slot order ARE the order Sonnet read.
 shown = (detail.sort_values(["row", "presented_slot"]).groupby("row")["distance_rank"]
@@ -299,32 +364,40 @@ if share > 0.05 and nearest_first >= 3:
     problems.append(f"{share:.1%} of rows were shown nearest-first -- the candidates were not scrambled")
 
 # Reasoning, from the replies themselves. Cached rows carry no evidence either way.
-row = summary[(summary["variant"] == "llm") & (summary["top_k"] == k)]
-replies = float(row["judge_replies"].iloc[0]) if "judge_replies" in row and len(row) else float("nan")
+replies = stat("judge_replies")
 if pd.isna(replies) or replies == 0:
     print("  reasoning: every row was served from the cache -- no new evidence this run "
-          "(reasoning_effort is part of the cache key, so these came from a reasoning run)")
+          "(the effort is part of the cache key, so these came from a reasoning run)")
 else:
-    reasoned = float(row["judge_replies_with_reasoning"].iloc[0])
-    tokens = float(row["judge_reasoning_tokens"].iloc[0])
-    print(f"  reasoning: {reasoned:.0f}/{replies:.0f} fresh replies reasoned, "
-          f"{tokens / replies:.0f} reasoning tokens per reply on average")
+    reasoned = stat("judge_replies_with_reasoning")
+    tokens = stat("judge_reasoning_tokens")
+    per_reply = f", {tokens / replies:.0f} reasoning tokens per reply" if tokens > 0 else ""
+    print(f"  reasoning: {reasoned:.0f}/{replies:.0f} fresh replies contained thinking{per_reply}")
     if reasoned == 0:
-        problems.append("reasoning was requested but NO reply reported any -- neither "
-                        "usage.completion_tokens_details.reasoning_tokens nor message.reasoning")
+        problems.append("reasoning was requested but NO reply contained any thinking")
     elif reasoned < 0.9 * replies:
-        print(f"  WARNING: only {reasoned / replies:.0%} of replies reasoned")
+        print(f"  WARNING: only {reasoned / replies:.0%} of replies contained thinking")
+    truncated, refused = stat("judge_truncated"), stat("judge_refused")
+    if pd.notna(truncated):
+        print(f"  budget:    {truncated:.0f} replies hit max_tokens, {refused:.0f} refused")
+        if truncated > 0.05 * replies:
+            problems.append(f"{truncated:.0f}/{replies:.0f} replies were cut off at max_tokens -- "
+                            f"thinking is eating the budget (FOUNDRY_MAX_TOKENS)")
 
-# Truncation: a row with no reasons at all parsed as nothing and fell back to distance order.
+# Rows that parsed as nothing (truncated, refused, or malformed) fell back to distance order.
 blank = detail.groupby("row")["reason"].apply(
     lambda reasons: reasons.fillna("").astype(str).str.strip().eq("").all())
 print(f"  unparsed:  {int(blank.sum())}/{len(blank)} rows carry no reasons (fell back to distance order)")
 if blank.mean() > 0.10:
-    problems.append(f"{blank.mean():.0%} of rows returned nothing usable -- if replies were cut off, "
-                    f"thinking may be eating the output budget (MAX_TOKENS_BASE)")
+    problems.append(f"{blank.mean():.0%} of rows returned nothing usable")
 
-cost = row["judge_cost_usd"].iloc[0] if len(row) else float("nan")
-print(f"  cost:      ${cost:.2f} billed this run" if pd.notna(cost) else "  cost:      nothing billed")
+ties = stat("n_boundary_ties")
+if pd.notna(ties) and ties:
+    print(f"  ceiling:   {ties:.0f} row(s) tie at the shortlist boundary; top-{k} is pinned to "
+          f"shortlist_ceiling rather than base_top_{k} (expected, not a leak)")
+cost = stat("judge_cost_usd")
+print(f"  cost:      ~${cost:.2f} this run (estimated from tokens)" if pd.notna(cost) and cost
+      else "  cost:      nothing billed")
 if problems:
     for problem in problems:
         print("ERROR:", problem, file=sys.stderr)
@@ -341,4 +414,4 @@ echo "Done $(date). Wrote, under $OUT_DIR:"
 ls -l "$OUT_DIR"
 echo ""
 echo "rerank_summary.csv: top_1..3 against base_top_1..3 is Sonnet's gain; top_$TOP_K must equal"
-echo "base_top_$TOP_K. Compare with the jina arm at ${OUT_DIR%/llm}/jina. Read the reasons above."
+echo "shortlist_ceiling. Compare with the jina arm at ${OUT_DIR%/llm}/jina. Read the reasons above."

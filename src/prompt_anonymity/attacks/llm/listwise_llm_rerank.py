@@ -70,6 +70,7 @@ import pandas as pd
 
 from ...caching import TransformCache, logic_hash, params_hash
 from ...core import AttackData
+from ._foundry import DEFAULT_FOUNDRY_MODEL, FoundryChat
 from ._openrouter import OpenRouterChat
 from ._openrouter_batch import OpenRouterBatch
 from .candidates import author_candidates
@@ -125,6 +126,16 @@ DEFAULT_SEED = 47
 MAX_TOKENS_BASE = 2000
 #: Additional budget per candidate, covering that position's justification.
 MAX_TOKENS_PER_CANDIDATE = 200
+#: Output budget on the Foundry provider, thinking included. Far above the OpenRouter figure: with
+#: adaptive thinking at high effort, 3,000 tokens is tight enough that a hard row can be cut off
+#: mid-JSON and silently fall back to the distance order. It is a cap, not a spend -- only tokens
+#: produced are billed. (The OpenRouter budget is left as it was, so that channel's configuration is
+#: unchanged.)
+FOUNDRY_MAX_TOKENS = 16000
+
+#: Where the unbatched judge is reached. ``openrouter`` is the original channel; ``foundry`` is Claude
+#: on Microsoft Foundry through the Anthropic SDK (:mod:`._foundry`), unbatched only.
+PROVIDERS = ("openrouter", "foundry")
 
 #: Environment variable holding the key for the **unbatched** path. Deliberately not the batch
 #: client's ``SONNET_OR_KEY`` (:mod:`._openrouter_batch`) and not the shared ``OPENROUTER_API_KEY``:
@@ -226,8 +237,14 @@ class ListwiseLLMRerankAttack:
 
     Parameters
     ----------
-    judge_model : str
-        OpenRouter model slug for the judge (default ``anthropic/claude-sonnet-5``).
+    judge_model : str or None
+        The judge: an OpenRouter model slug, or a Foundry **deployment name** under
+        ``provider="foundry"``. ``None`` (default) picks the provider's default --
+        ``anthropic/claude-sonnet-5`` or :data:`~._foundry.DEFAULT_FOUNDRY_MODEL`.
+    provider : str
+        ``"openrouter"`` (default) or ``"foundry"`` (:mod:`._foundry`: Claude on Microsoft Foundry,
+        adaptive thinking, a :data:`FOUNDRY_MAX_TOKENS` budget). Foundry is unbatched only, so it
+        requires ``batch=False``. Part of the cache key.
     top_k : int
         How many nearest authors to rerank per unknown row (the headline comparison is 5 vs 10).
     snippet_chars : int
@@ -274,18 +291,27 @@ class ListwiseLLMRerankAttack:
         never overwrites what was really paid.
     reasoning_stats : dict
         ``replies``, ``replies_with_reasoning`` and ``reasoning_tokens`` for the replies this run
-        actually received -- proof that thinking happened rather than just that it was requested.
-        Synchronous channel only (the batch client does not count them) and cached rows contribute
-        nothing, so a fully-cached run reports zero replies; set by :meth:`attack`.
+        actually received -- proof that thinking happened rather than just that it was requested --
+        plus ``truncated`` and ``refused`` (Foundry only; ``0`` on OpenRouter, which does not
+        report them). Synchronous channel only (the batch client does not count them) and cached
+        rows contribute nothing, so a fully-cached run reports zero replies; set by :meth:`attack`.
     """
 
-    def __init__(self, *, judge_model: str = DEFAULT_JUDGE_MODEL, top_k: int = DEFAULT_TOP_K,
-                 snippet_chars: int = DEFAULT_SNIPPET_CHARS,
+    def __init__(self, *, judge_model: str | None = None, provider: str = "openrouter",
+                 top_k: int = DEFAULT_TOP_K, snippet_chars: int = DEFAULT_SNIPPET_CHARS,
                  reasoning_effort: str | None = DEFAULT_REASONING_EFFORT, batch: bool = True,
                  wait: bool = True, margin_quantile: float = 1.0,
                  shuffle_candidates: bool = True, seed: int = DEFAULT_SEED, verbose: bool = True):
         if not 0.0 <= margin_quantile <= 1.0:
             raise ValueError(f"margin_quantile must be in [0, 1] (got {margin_quantile}).")
+        if provider not in PROVIDERS:
+            raise ValueError(f"provider must be one of {PROVIDERS} (got {provider!r}).")
+        if provider == "foundry" and batch:
+            raise ValueError("provider='foundry' is unbatched only; pass batch=False "
+                             "(run_rerank.py: --no-batch).")
+        if judge_model is None:
+            judge_model = DEFAULT_FOUNDRY_MODEL if provider == "foundry" else DEFAULT_JUDGE_MODEL
+        self.provider = provider
         self.judge_model = judge_model
         self.top_k = top_k
         self.snippet_chars = snippet_chars
@@ -303,6 +329,8 @@ class ListwiseLLMRerankAttack:
         self.reasoning_stats: dict = {}
 
     def _max_tokens(self, k: int) -> int:
+        if self.provider == "foundry":
+            return FOUNDRY_MAX_TOKENS
         return MAX_TOKENS_BASE + MAX_TOKENS_PER_CANDIDATE * k
 
     def _build_client(self, k: int, ticket_dir) -> None:
@@ -312,6 +340,13 @@ class ListwiseLLMRerankAttack:
                 self._client = OpenRouterBatch(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
                     reasoning_effort=self.reasoning_effort, wait=self.wait, ticket_dir=ticket_dir,
+                )
+            elif self.provider == "foundry":
+                # Same rubric and effort, different transport: adaptive thinking at this effort,
+                # credentials from FOUNDRY_API_KEY_ENV / FOUNDRY_ENDPOINT_ENV. See _foundry.py.
+                self._client = FoundryChat(
+                    self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
+                    reasoning_effort=self.reasoning_effort, max_workers=SYNC_MAX_WORKERS,
                 )
             else:
                 # Same model, same rubric, same effort as the batch path -- only the delivery
@@ -350,6 +385,7 @@ class ListwiseLLMRerankAttack:
             Path(cache_dir) / "attacks", "listwise_llm_rerank",
             logic_hash([OpenRouterBatch, ListwiseLLMRerankAttack], version=RERANK_VERSION),
             params_hash({
+                "provider": self.provider,
                 "judge_model": self.judge_model,
                 "judge_system_prompt": RANK_SYSTEM_PROMPT_TEMPLATE.format(n=k),
                 "reasoning_effort": self.reasoning_effort,
@@ -447,6 +483,8 @@ class ListwiseLLMRerankAttack:
             "replies": getattr(self._client, "n_replies", 0),
             "replies_with_reasoning": getattr(self._client, "n_replies_with_reasoning", 0),
             "reasoning_tokens": getattr(self._client, "total_reasoning_tokens", 0),
+            "truncated": getattr(self._client, "n_truncated", 0),
+            "refused": getattr(self._client, "n_refused", 0),
         }
 
         if self.verbose:

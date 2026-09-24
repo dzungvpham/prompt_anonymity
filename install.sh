@@ -173,7 +173,9 @@ pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
 #                needed for dp_mlm_pii -- plain dp_mlm does not use it.
 #   [rerank]     transformers (on top of [styleremix]'s torch) for the listwise_jina_rerank attack's
 #                local reranker. Plain wheels; the 0.6B checkpoint is fetched right after. The
-#                listwise_llm_rerank attack beside it needs no extra -- it talks HTTP.
+#                listwise_llm_rerank attack beside it needs no extra -- it talks HTTP (OpenRouter) or
+#                the Anthropic SDK (Foundry), and `anthropic` is a core dependency, so every branch
+#                below installs it with the package itself.
 log "Installing the prompt_anonymity package (editable) and its dependencies ..."
 STYLEREMIX_EXTRA="without"
 QWEN_EXTRA="without"

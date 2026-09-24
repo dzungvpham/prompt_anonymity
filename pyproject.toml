@@ -24,6 +24,9 @@ dependencies = [
     "requests",
     "tiktoken",
     "openai",
+    # Claude on Microsoft Foundry (AnthropicFoundry): the listwise Sonnet reranker's foundry
+    # provider and EmBad's hosted mutator. Imported lazily by both.
+    "anthropic",
     "pyyaml",
 ]
 

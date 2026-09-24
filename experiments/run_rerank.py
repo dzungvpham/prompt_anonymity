@@ -133,8 +133,13 @@ def parse_args() -> argparse.Namespace:
                         help="score at most this many unknown documents, sampled across the whole "
                              "unknown side (not a head slice). None scores all of them")
 
+    parser.add_argument("--provider", choices=("openrouter", "foundry"), default="openrouter",
+                        help="where the LLM judge is reached: OpenRouter, or Claude on Microsoft "
+                             "Foundry (SONNET_API_KEY + FOUNDRY_ENDPOINT; unbatched only, so it "
+                             "needs --no-batch)")
     parser.add_argument("--judge-model", default=None,
-                        help="OpenRouter slug for the LLM judge (default: the attack's own)")
+                        help="the LLM judge: an OpenRouter slug, or a Foundry deployment name "
+                             "under --provider foundry (default: the provider's own)")
     parser.add_argument("--reasoning-effort", default=None,
                         help="thinking depth for the LLM judge: low/medium/high/xhigh/max")
     parser.add_argument("--batch", action=argparse.BooleanOptionalAction, default=True,
@@ -210,12 +215,50 @@ def accuracies(ranks: np.ndarray, prefix: str) -> dict:
             for k in SUMMARY_KS}
 
 
+def shortlist_ceiling(detail: pd.DataFrame, ranks, base_ranks, in_set, top_k: int):
+    """The exact top-K each row must land on after reranking, checked row by row.
+
+    The invariant the fold-back guarantees is **per row and about the shortlist**, not about the
+    baseline: on a reranked row the true author is in the top ``top_k`` *if and only if* it was
+    shortlisted (the shortlist is lifted strictly above every other score), and a row the ambiguity
+    gate skipped keeps its base ranking. That is what this checks.
+
+    The baseline usually agrees with it, but not always, because :func:`true_author_ranks` averages
+    **ties**. A true author tied with two others around position ``top_k`` gets an averaged rank of
+    exactly ``top_k`` and counts as a baseline hit, while ``argpartition`` can only shortlist some of
+    the tied authors -- and if it leaves the true one out, the rerank correctly pushes it below the
+    shortlist. That once failed a whole SWE-chat run on one document (0.719 vs 0.720), with the
+    fold-back doing exactly what it should. Such rows are counted as ``n_boundary_ties`` rather
+    than treated as a leak.
+
+    Returns ``(ceiling, n_boundary_ties, n_violations)``: the top-``top_k`` accuracy the rerank must
+    equal, the rows where ties made the baseline differ from the shortlist, and the rows that
+    actually break the invariant (any is a bug).
+    """
+    n = len(ranks)
+    member = np.zeros(n, dtype=bool)
+    applied = np.zeros(n, dtype=bool)
+    rows = detail.groupby("row")
+    index = np.asarray(rows.size().index, dtype=int)
+    member[index] = rows["is_true_author"].any().to_numpy(dtype=bool)
+    applied[index] = rows["applied"].all().to_numpy(dtype=bool)
+
+    base_hit = np.where(in_set, base_ranks, np.inf) <= top_k
+    expected = np.where(applied, member, base_hit)
+    actual = np.where(in_set, ranks, np.inf) <= top_k
+    violations = int(((expected != actual) & in_set).sum())
+    ties = int(((member != base_hit) & applied & in_set).sum())
+    ceiling = float(expected[in_set].mean()) if in_set.any() else float("nan")
+    return ceiling, ties, violations
+
+
 def build_attack(variant: str, top_k: int, args: argparse.Namespace):
     """Construct one reranker, passing through only the options the user actually set."""
     shared = {"top_k": top_k, "margin_quantile": args.margin_quantile, "seed": args.seed}
     if variant == "jina":
         return ListwiseJinaRerankAttack(**shared)
-    settings = dict(shared, batch=args.batch, wait=args.wait)
+    settings = dict(shared, batch=args.batch, wait=args.wait,
+                    provider=getattr(args, "provider", "openrouter"))
     if args.judge_model:
         settings["judge_model"] = args.judge_model
     if args.reasoning_effort:
@@ -314,6 +357,15 @@ def main() -> None:
                                index=False)
             attack.detail.to_csv(output_dir / f"rerank_detail_{variant}_k{top_k}.csv", index=False)
 
+            # A shortlist of one is returned unreranked and carries no detail; the baseline is
+            # then the ceiling by definition.
+            if attack.detail is not None and len(attack.detail):
+                ceiling, boundary_ties, violations = shortlist_ceiling(
+                    attack.detail, ranks, base_ranks, in_set, top_k)
+            else:
+                ceiling = accuracies(base_ranks, "").get(f"top_{top_k}", float("nan"))
+                boundary_ties, violations = 0, 0
+
             row = {"variant": variant, "top_k": top_k, "known_config": config.tag,
                    "source": args.source, "feature": args.feature, "defense": args.defense,
                    "metric": args.metric, "margin_quantile": args.margin_quantile,
@@ -322,24 +374,36 @@ def main() -> None:
                    "n_changed_top1": int((predictions["best_author"]
                                           != predictions["base_best_author"]).sum()),
                    "judge_cost_usd": getattr(attack, "cost_usd", float("nan")),
-                   # Whether the judge actually thought, counted over the replies this run
-                   # received (cached rows contribute nothing). nan for the jina arm.
+                   # Whether the judge actually thought, and how many replies were cut off or
+                   # declined, counted over the replies this run received (cached rows contribute
+                   # nothing). nan for the jina arm.
                    **{f"judge_{name}": getattr(attack, "reasoning_stats", {}).get(name, float("nan"))
-                      for name in ("replies", "replies_with_reasoning", "reasoning_tokens")},
+                      for name in ("replies", "replies_with_reasoning", "reasoning_tokens",
+                                   "truncated", "refused")},
+                   # What top-K at the shortlist size must equal (see shortlist_ceiling), and the
+                   # rows where tied base scores make that differ from base_top_K.
+                   "shortlist_ceiling": ceiling, "n_boundary_ties": boundary_ties,
                    **accuracies(ranks, ""), **base_accuracy}
             summary.append(row)
             print("  " + ", ".join(f"top-{k} {row[f'top_{k}']:.3f} "
                                    f"({row[f'top_{k}'] - row[f'base_top_{k}']:+.3f})"
                                    for k in SUMMARY_KS))
 
-            # The shortlist is the reranker's recall ceiling and it never moves, so top-K at the
-            # shortlist size must be the baseline's number to the last bit. If it is not, the
+            # The shortlist is the reranker's recall ceiling and it never moves: on every reranked
+            # row the true author is in the top K exactly when it was shortlisted. Checked row by
+            # row against the shortlist -- not against base_top_K, which tied base scores can make
+            # differ by a document or two (shortlist_ceiling explains). A violation means the
             # fold-back wrote outside the shortlist and every accuracy above is meaningless.
-            if top_k in SUMMARY_KS and row[f"top_{top_k}"] != row[f"base_top_{top_k}"]:
+            if boundary_ties:
+                print(f"  note: {boundary_ties} row(s) tie at the shortlist boundary, so top-{top_k} "
+                      f"is pinned to the shortlist ({ceiling:.6f}) rather than to base_top_{top_k}"
+                      f" ({base_accuracy.get(f'base_top_{top_k}', float('nan')):.6f}). Expected, "
+                      f"not a leak.")
+            if violations:
                 raise SystemExit(
-                    f"{variant} top-{top_k} is {row[f'top_{top_k}']:.6f} but the baseline's is "
-                    f"{row[f'base_top_{top_k}']:.6f}. Reranking cannot change top-K at the "
-                    f"shortlist size -- fold_listwise has touched authors outside the shortlist."
+                    f"{variant}: {violations} row(s) put the true author in the top {top_k} "
+                    f"without shortlisting it, or out of it despite shortlisting it. Reranking "
+                    f"cannot do that -- fold_listwise has touched authors outside the shortlist."
                 )
 
     # Merge into the summary rather than replacing it. The Sonnet job runs one shortlist size per

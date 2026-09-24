@@ -13,8 +13,9 @@
 # something breaks the log says which stage it was.
 #
 # WHAT IT MEASURES. The shortlist is the top-5 authors under nearest-neighbor (max linkage, see
-# attacks/llm/candidates.py); the reranker only reorders it. So top-5 is identical to the baseline
-# by construction -- run_rerank.py asserts that -- and top-1/2/3 are the reranker's contribution.
+# attacks/llm/candidates.py); the reranker only reorders it. So top-5 is pinned to the shortlist's
+# own recall -- run_rerank.py checks that row by row; it equals the baseline except where base
+# scores tie at the shortlist boundary -- and top-1/2/3 are the reranker's contribution.
 #
 # PREEMPTION IS SURVIVABLE. gpu-preempt can kill and requeue this at any moment; scores are flushed
 # to the cache every JINA_RERANK_FLUSH_EVERY (default 8) shortlists, so a requeue resumes rather
@@ -183,4 +184,4 @@ echo "Done $(date). Wrote, under $OUT_DIR:"
 ls -l "$OUT_DIR"
 echo ""
 echo "rerank_summary.csv: top_1..3 against base_top_1..3 is the reranker's gain; top_$TOP_K must"
-echo "equal base_top_$TOP_K. Read the sampled documents above, not just the summary."
+echo "equal shortlist_ceiling. Read the sampled documents above, not just the summary."
