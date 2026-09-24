@@ -335,9 +335,10 @@ def main(results_dir, n_sample: int = 3, seed: int = 47) -> int:
             _check_predictions(check, label, predictions, n_unknown)
             if _check_detail(check, label, detail, n_unknown, top_k):
                 _check_cross_table(check, label, predictions, detail)
-                # The two arms answer different questions and are held to different standards: the
-                # LLM owes a readable justification per position, the local reranker owes a score.
-                if variant == "llm":
+                # The arms answer different questions and are held to different standards: an LLM
+                # judge -- the API one (`llm`) or the local one (`qwen`) -- owes a readable
+                # justification per position, the jina reranker owes a score.
+                if variant in ("llm", "qwen"):
                     _check_reasons(check, label, detail)
                 else:
                     _check_relevance(check, label, detail)

@@ -71,6 +71,7 @@ import pandas as pd
 from ...caching import TransformCache, logic_hash, params_hash
 from ...core import AttackData
 from ._foundry import DEFAULT_FOUNDRY_MODEL, FoundryChat
+from ._local_vllm import THINKING_SAMPLING, LocalVLLMChat
 from ._openrouter import OpenRouterChat
 from ._openrouter_batch import OpenRouterBatch
 from .candidates import author_candidates
@@ -133,9 +134,17 @@ MAX_TOKENS_PER_CANDIDATE = 200
 #: unchanged.)
 FOUNDRY_MAX_TOKENS = 16000
 
+#: Output budget on the local provider, thinking included. Qwen's thinking runs long; 16k fits the
+#: 32k served window beside a ~2k-token prompt, and a reply that still hits it is counted.
+LOCAL_MAX_TOKENS = 16384
+
 #: Where the unbatched judge is reached. ``openrouter`` is the original channel; ``foundry`` is Claude
-#: on Microsoft Foundry through the Anthropic SDK (:mod:`._foundry`), unbatched only.
-PROVIDERS = ("openrouter", "foundry")
+#: on Microsoft Foundry through the Anthropic SDK (:mod:`._foundry`); ``local`` is a vLLM model on
+#: this machine's GPU with thinking on (:mod:`._local_vllm`, Qwen3.8-27B by default). All three are
+#: unbatched except ``openrouter``.
+PROVIDERS = ("openrouter", "foundry", "local")
+#: Label for the local judge when none is given; the weights are ``models.toml [rerank_qwen]``'s.
+DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.8-27B"
 
 #: Environment variable holding the key for the **unbatched** path. Deliberately not the batch
 #: client's ``SONNET_OR_KEY`` (:mod:`._openrouter_batch`) and not the shared ``OPENROUTER_API_KEY``:
@@ -242,9 +251,12 @@ class ListwiseLLMRerankAttack:
         ``provider="foundry"``. ``None`` (default) picks the provider's default --
         ``anthropic/claude-sonnet-5`` or :data:`~._foundry.DEFAULT_FOUNDRY_MODEL`.
     provider : str
-        ``"openrouter"`` (default) or ``"foundry"`` (:mod:`._foundry`: Claude on Microsoft Foundry,
-        adaptive thinking, a :data:`FOUNDRY_MAX_TOKENS` budget). Foundry is unbatched only, so it
-        requires ``batch=False``. Part of the cache key.
+        ``"openrouter"`` (default), ``"foundry"`` (:mod:`._foundry`: Claude on Microsoft Foundry,
+        adaptive thinking, a :data:`FOUNDRY_MAX_TOKENS` budget) or ``"local"`` (:mod:`._local_vllm`:
+        a vLLM model on the local GPU with thinking on and Qwen's thinking-mode sampling, a
+        :data:`LOCAL_MAX_TOKENS` budget; ``reasoning_effort`` must not be ``None``, since thinking
+        cannot be switched off there). Both are unbatched only, so they require ``batch=False``.
+        Part of the cache key.
     top_k : int
         How many nearest authors to rerank per unknown row (the headline comparison is 5 vs 10).
     snippet_chars : int
@@ -306,11 +318,14 @@ class ListwiseLLMRerankAttack:
             raise ValueError(f"margin_quantile must be in [0, 1] (got {margin_quantile}).")
         if provider not in PROVIDERS:
             raise ValueError(f"provider must be one of {PROVIDERS} (got {provider!r}).")
-        if provider == "foundry" and batch:
-            raise ValueError("provider='foundry' is unbatched only; pass batch=False "
-                             "(run_rerank.py: --no-batch).")
+        if provider in ("foundry", "local") and batch:
+            raise ValueError(f"provider={provider!r} is unbatched only; pass batch=False "
+                             f"(run_rerank.py: --no-batch).")
+        if provider == "local" and not reasoning_effort:
+            raise ValueError("provider='local' always thinks; reasoning_effort must not be None.")
         if judge_model is None:
-            judge_model = DEFAULT_FOUNDRY_MODEL if provider == "foundry" else DEFAULT_JUDGE_MODEL
+            judge_model = {"foundry": DEFAULT_FOUNDRY_MODEL,
+                           "local": DEFAULT_LOCAL_MODEL}.get(provider, DEFAULT_JUDGE_MODEL)
         self.provider = provider
         self.judge_model = judge_model
         self.top_k = top_k
@@ -331,6 +346,8 @@ class ListwiseLLMRerankAttack:
     def _max_tokens(self, k: int) -> int:
         if self.provider == "foundry":
             return FOUNDRY_MAX_TOKENS
+        if self.provider == "local":
+            return LOCAL_MAX_TOKENS
         return MAX_TOKENS_BASE + MAX_TOKENS_PER_CANDIDATE * k
 
     def _build_client(self, k: int, ticket_dir) -> None:
@@ -340,6 +357,13 @@ class ListwiseLLMRerankAttack:
                 self._client = OpenRouterBatch(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
                     reasoning_effort=self.reasoning_effort, wait=self.wait, ticket_dir=ticket_dir,
+                )
+            elif self.provider == "local":
+                # The rubric is unchanged, so this judge owes the same reason per position as the
+                # API judges. Thinking on; only the text after </think> reaches the parser.
+                self._client = LocalVLLMChat(
+                    self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
+                    seed=self.seed,
                 )
             elif self.provider == "foundry":
                 # Same rubric and effort, different transport: adaptive thinking at this effort,
@@ -386,6 +410,8 @@ class ListwiseLLMRerankAttack:
             logic_hash([OpenRouterBatch, ListwiseLLMRerankAttack], version=RERANK_VERSION),
             params_hash({
                 "provider": self.provider,
+                **({"sampling": {**THINKING_SAMPLING, "thinking": True}}
+                   if self.provider == "local" else {}),
                 "judge_model": self.judge_model,
                 "judge_system_prompt": RANK_SYSTEM_PROMPT_TEMPLATE.format(n=k),
                 "reasoning_effort": self.reasoning_effort,

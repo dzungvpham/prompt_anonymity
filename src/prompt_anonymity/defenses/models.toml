@@ -118,6 +118,15 @@ model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
 #     AFR_ALLOW_DOWNLOAD=1      opt in to fetching a checkpoint that is not already on disk. Without
 #                               it a non-local checkpoint is a hard error, not a 30 GB download.
 
+# The local LLM judge behind the listwise reranker's `provider="local"` channel
+# (prompt_anonymity.attacks.llm._local_vllm; run_rerank.py --variant qwen). The same checkpoint as
+# [afr] above, served the same way (vLLM offline, bf16, max_num_seqs capped for the hybrid Mamba
+# layers), but with thinking ON -- the judge ranks five candidates and writes a reason per rank.
+# $RERANK_QWEN_MODEL overrides it. A path that is not on disk is refused rather than downloaded
+# unless RERANK_QWEN_ALLOW_DOWNLOAD=1, for the same ~54 GB reason as AFR.
+[rerank_qwen]
+model = "/datasets/ai/qwen3/hub/models--Qwen--Qwen3.8-27B"
+
 # The local reranker behind the listwise_jina_rerank attack
 # (prompt_anonymity.attacks.llm.listwise_jina_rerank). UNLIKE the large checkpoints above, this one
 # IS expected to download when it is not already on disk: it is 0.6B, it is public, and the attack

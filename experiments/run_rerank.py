@@ -120,8 +120,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True,
                         help="z-score the features on the known side before ranking")
 
-    parser.add_argument("--variant", choices=("llm", "jina", "both"), default="jina",
-                        help="which reranker(s) to run; 'llm' and 'both' cost money")
+    parser.add_argument("--variant", choices=("llm", "jina", "qwen", "both"), default="jina",
+                        help="which reranker(s) to run; 'llm' and 'both' cost money. 'qwen' is the "
+                             "LLM judge run locally (Qwen3.8-27B via vLLM, thinking on; needs a "
+                             "large GPU). 'both' is llm + jina")
     parser.add_argument("--top-k", type=int, action="append", dest="top_k",
                         help="shortlist size; repeatable (e.g. --top-k 5 --top-k 10). Default: 5")
     parser.add_argument("--margin-quantile", type=float, default=1.0,
@@ -257,8 +259,13 @@ def build_attack(variant: str, top_k: int, args: argparse.Namespace):
     shared = {"top_k": top_k, "margin_quantile": args.margin_quantile, "seed": args.seed}
     if variant == "jina":
         return ListwiseJinaRerankAttack(**shared)
-    settings = dict(shared, batch=args.batch, wait=args.wait,
-                    provider=getattr(args, "provider", "openrouter"))
+    if variant == "qwen":
+        # The local judge: same rubric and shortlist as `llm`, run on this machine's GPU with
+        # thinking on. Always unbatched; --provider and --batch do not apply.
+        settings = dict(shared, batch=False, wait=True, provider="local")
+    else:
+        settings = dict(shared, batch=args.batch, wait=args.wait,
+                        provider=getattr(args, "provider", "openrouter"))
     if args.judge_model:
         settings["judge_model"] = args.judge_model
     if args.reasoning_effort:
