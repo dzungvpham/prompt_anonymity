@@ -105,7 +105,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from prompt_anonymity.features import FEATURIZERS, get_featurizer
+from prompt_anonymity.features import FEATURIZERS, KNOWN_SIDE_FEATURES, get_featurizer
 from prompt_anonymity.resources import describe_budget
 
 from .config import cache_dir, dist_dir, hf_dir
@@ -166,12 +166,6 @@ SHARD_SUBDIR = "shards"
 # Shard filename suffix: ``.<index>-of-<count>.parquet``, zero-padded so `ls` sorts them in order.
 SHARD_SUFFIX = re.compile(r"\.(\d+)-of-(\d+)\.parquet$")
 
-# Featurizers that cannot be sharded, because they *fit* on the documents they are given (a TF-IDF
-# vocabulary and an SVD basis) instead of computing each vector independently. Sharding one would
-# fit a different feature space per shard, and concatenating those would produce a file whose
-# columns mean different things in different rows -- so it is refused rather than approximated.
-# These are the same featurizers that require `--chunk-size 0`.
-UNSHARDABLE_FEATURES = {"char_ngram_tfidf"}
 
 
 # --- input ------------------------------------------------------------------
@@ -459,9 +453,7 @@ def compute_features(featurizer, texts, *, cache_dir, chunk_size: int = CHUNK_SI
     Vectors are cached on disk per document -- content-addressed, namespaced by the featurizer's
     name, source version and parameters (see :mod:`prompt_anonymity.caching`) -- so a re-run
     recomputes nothing and an interrupted run resumes from the last completed chunk. Pass
-    ``chunk_size <= 0`` to featurize everything in a single call, which is required by
-    featurizers that *fit* on the first batch they see (``char_ngram_tfidf``), where chunking
-    would fit on the first chunk alone.
+    ``chunk_size <= 0`` to featurize everything in a single call.
     """
     if not texts:
         raise ValueError("no documents to featurize.")
@@ -684,7 +676,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
                    help="which built split to featurize (default: swe_chat)")
-    p.add_argument("--feature", default="stylometrix", choices=sorted(FEATURIZERS),
+    p.add_argument("--feature", default="stylometrix",
+                   choices=sorted({*FEATURIZERS, *KNOWN_SIDE_FEATURES}),
                    help="registered featurizer to run (default: stylometrix)")
     p.add_argument("--language", default=None,
                    help="optional filter: keep only documents whose language_primary is this "
@@ -745,6 +738,13 @@ def main() -> None:
                    help="a sharded run writes only its shard, leaving the merge to an explicit "
                         "--merge")
     args = p.parse_args()
+    if args.feature in KNOWN_SIDE_FEATURES:
+        # Accepted by argparse only so it can be refused with the reason, rather than as an
+        # unknown name: this feature exists, it just has nothing to precompute.
+        raise SystemExit(f"{args.feature} is fitted per known configuration inside "
+                         f"experiments/run_experiment.py (its vocabulary and IDF must not see the "
+                         f"test documents), so there is no parquet to compute. Run "
+                         f"`python experiments/run_experiment.py --feature {args.feature}`.")
 
     language = None if (args.language or "all").lower() == "all" else args.language
     language_code = args.language_code or LANGUAGE_CODES.get(language, DEFAULT_LANGUAGE_CODE)
@@ -780,10 +780,6 @@ def main() -> None:
         return
 
     shard_index, num_shards = resolve_sharding(args.shard_index, args.num_shards)
-    if num_shards > 1 and args.feature in UNSHARDABLE_FEATURES:
-        raise SystemExit(f"--num-shards cannot be used with {args.feature}: it fits its feature "
-                         f"space (vocabulary, SVD basis) on the documents it is given, so each "
-                         f"shard would produce a different one. Run it unsharded.")
 
     max_len = resolve_max_len(args.source, args.max_len)
     featurizer = build_featurizer(args.feature, language_code=language_code, max_len=max_len,

@@ -436,7 +436,7 @@ FEATURE_LABELS = {
     "gemini_embedding_001": "Gemini Embedding 001",
     "function_words": "Function words",
     "character_statistics": "Character stats",
-    "char_ngram_tfidf": "Char n-gram TF-IDF",
+    "char_ngram_tfidf": "Character n-gram",
     "style_distance": "StyleDistance",
     "harrier": "Harrier 0.6B",
     "harrier_imperative": "Harrier 0.6B (imperative)",
@@ -7189,6 +7189,13 @@ def parse_args() -> argparse.Namespace:
                              f"now that {len(ATTACKS)} attacks are registered. It narrows the "
                              f"figures only -- no result is touched, so widening it again costs "
                              f"a redraw and nothing else.")
+    parser.add_argument("--features", nargs="+", choices=FEATURES, default=None,
+                        metavar="FEATURE",
+                        help="Which features to draw (default: every feature on disk). The "
+                             "feature counterpart of --attacks, on the same terms: a run whose "
+                             "feature is not selected is left out of every figure and legend, and "
+                             "no result is touched. Colours do not move, since a feature's hue is "
+                             "fixed by its FEATURES index rather than by what else is drawn.")
     parser.add_argument("--force", action="store_true",
                         help="Redraw every figure, ignoring the cache. Not needed after editing "
                              "this file (the cache keys on its contents) or after a re-run (they "
@@ -7810,11 +7817,19 @@ def main() -> None:
               f"({', '.join(ATTACK_LABELS[name] for name in ATTACKS if name in attacks)}); "
               f"{len(held_back)} run(s) of other attacks left out -- pass --attacks all for every "
               f"attack on disk")
+    # `--features` narrows on exactly the same terms, and just as early.
+    features = set(args.features or FEATURES)
+    feature_held_back = [run for run in runs if run.feature not in features]
+    runs = [run for run in runs if run.feature in features]
+    if feature_held_back:
+        print(f"{len(feature_held_back)} run(s) of other features left out "
+              f"(drawing {', '.join(FEATURE_LABELS[name] for name in FEATURES if name in features)})")
     # One parser now, and the variant splits the result: the pure-text runs are the comparable set
     # every other clustering family draws, and the rest -- a learned projection, a rescoring, a
     # timing fusion -- get the variants family, where the strategy is the axis rather than a
     # contaminant on a panel keyed by defense.
-    all_clustering = discover_clustering_runs(CLUSTERING_DIR)
+    all_clustering = [run for run in discover_clustering_runs(CLUSTERING_DIR)
+                      if run.feature in features]
     clustering = [run for run in all_clustering if run.variant == PLAIN_VARIANT]
     variants = [run for run in all_clustering if run.variant != PLAIN_VARIANT]
     if not runs and not all_clustering:
@@ -7900,8 +7915,11 @@ def main() -> None:
     # The selected attacks are in the key as well: they decide which series a figure carries,
     # and an unselected run is absent from the run tuple, so without them a narrowed sweep and a
     # full one would disagree about a figure they both call current.
+    # The feature selection joins the key only when one is made, so a sweep without --features
+    # keeps the key every figure already has.
     settings = (f"{source_digest()}|bootstrap={replicates}|png={int(args.png)}"
-                f"|attacks={','.join(sorted(attacks))}")
+                f"|attacks={','.join(sorted(attacks))}"
+                + (f"|features={','.join(sorted(features))}" if args.features else ""))
     cache = PlotCache(PLOTS_DIR / CACHE_FILE, settings, force=args.force)
     # `--families` narrows what is *drawn*, never what is planned: `plan` stays whole, so the
     # manifest written at the end still describes the tree rather than this run's slice of it and

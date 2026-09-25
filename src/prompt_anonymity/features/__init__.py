@@ -25,6 +25,10 @@ ever wanted again.
 
 Add a featurizer by writing a :class:`Featurizer` and registering its class in
 ``FEATURIZERS``.
+
+The one exception to "featurization is a build stage" is :data:`KNOWN_SIDE_FEATURES`: features
+whose vocabulary and weights are *fitted* (``char_ngram_tfidf``). Fitting them offline would fit
+on the test documents too, so the experiment runner fits them itself, per known configuration.
 """
 
 from __future__ import annotations
@@ -34,7 +38,7 @@ from .base import Featurizer
 from .character import CharacterStatisticsFeaturizer
 from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
-from .char_ngram_tfidf import CharNgramTfidfFeaturizer
+from .char_ngram_tfidf import CharNgramTfidf, KnownSideTfidf
 from .gemini_embedding import GeminiEmbedding001Featurizer, GeminiEmbedding2Featurizer
 from .harrier import (HarrierFeaturizer, HarrierImperativeFeaturizer, HarrierPlainFeaturizer)
 from .sentence_transformer import (EmbeddingGemma300mFeaturizer, Harrier270mFeaturizer,
@@ -50,7 +54,6 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "stylometrix": StyloMetrixFeaturizer,
     "character_statistics": CharacterStatisticsFeaturizer,
     "function_words": FunctionWordFeaturizer,
-    "char_ngram_tfidf": CharNgramTfidfFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
     "luar": LuarFeaturizer,
     # Local, offline, instruction-conditioned -- the encoder the leave-one-out defense scores
@@ -62,6 +65,14 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "harrier_270m": Harrier270mFeaturizer,
     "embeddinggemma_300m": EmbeddingGemma300mFeaturizer,
     "jina_v5_nano": JinaV5NanoFeaturizer,
+}
+
+#: Features that are **fitted** rather than computed per document, so they cannot be precomputed
+#: into a parquet without letting the test documents shape the feature space. The experiment
+#: runner builds these itself, fitting one per known configuration on that configuration's known
+#: documents only (see :mod:`.char_ngram_tfidf`). Keep the names disjoint from ``FEATURIZERS``.
+KNOWN_SIDE_FEATURES: dict[str, type] = {
+    "char_ngram_tfidf": CharNgramTfidf,
 }
 
 def get_featurizer(name: str, **options) -> Featurizer:
@@ -84,6 +95,9 @@ __all__ = [
     "GeminiEmbedding2Featurizer",
     "GeminiEmbedding001Featurizer",
     "FEATURIZERS",
+    "KNOWN_SIDE_FEATURES",
+    "CharNgramTfidf",
+    "KnownSideTfidf",
     "get_featurizer",
     "StyleDistanceFeaturizer",
     "LuarFeaturizer",

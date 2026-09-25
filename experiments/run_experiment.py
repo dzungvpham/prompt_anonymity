@@ -274,13 +274,15 @@ import pyarrow.parquet as pq
 from scipy.spatial.distance import cdist
 from scipy.special import logsumexp
 from scipy.stats import loguniform
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401  (unlocks the import below)
 from sklearn.model_selection import HalvingRandomSearchCV
 
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, MULTICLASS_ATTACKS, rejection_score
+from prompt_anonymity.data.compute_features import read_texts, split_path
 from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
+from prompt_anonymity.features import KNOWN_SIDE_FEATURES
 from prompt_anonymity.evaluation.metrics import (
     author_query_metrics,
     c_at_1,
@@ -495,6 +497,19 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
             f"--feature {feature}" + (f" --defense {defense}" if defended else "") + "`."
         )
 
+    merged = order_documents(documents, undated, model_owner, language)
+    return merged, read_feature_matrix(feature_file, feature_columns,
+                                       merged.pop(FEATURE_ROW).to_numpy())
+
+
+def order_documents(documents: pd.DataFrame, undated: str = "drop", model_owner: str = "all",
+                    language: str = "all") -> pd.DataFrame:
+    """Filter ``documents``, place or drop the undated ones, and sort them onto the timeline.
+
+    Shared by both loaders so a parquet-backed feature and a known-side-fitted one see exactly the
+    same documents in exactly the same order -- every window boundary depends on it. See
+    :func:`load_documents_and_features` for what ``undated`` means.
+    """
     merged = filter_documents(documents, model_owner, language)
 
     n_undated = int(merged["ended_at"].isna().sum())
@@ -508,9 +523,55 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
             merged["ended_at"] = merged["ended_at"].fillna("")
             print(f"placing {n_undated:,} undated documents ({authors} authors) at the start of the timeline")
 
-    merged = merged.sort_values(["ended_at", "doc_id"], kind="mergesort").reset_index(drop=True)
-    return merged, read_feature_matrix(feature_file, feature_columns,
-                                       merged.pop(FEATURE_ROW).to_numpy())
+    return merged.sort_values(["ended_at", "doc_id"], kind="mergesort").reset_index(drop=True)
+
+
+def load_documents_and_counts(data_dir, source: str, feature, undated: str = "drop",
+                              model_owner: str = "all", language: str = "all",
+                              defenses: tuple[str, ...] = ("none",)
+                              ) -> tuple[pd.DataFrame, list]:
+    """Documents plus the raw counts a :data:`KNOWN_SIDE_FEATURES` entry is fitted on.
+
+    The counterpart of :func:`load_documents_and_features` for a feature with no parquet: it reads
+    the document **text** instead, one block per entry of ``defenses`` (``"none"`` is the original
+    text, anything else that defense's rewrite), and has ``feature`` count n-grams over all the
+    blocks in one shared column space. Returns ``(frame, counts)`` with ``counts[i]`` the sparse
+    matrix for ``defenses[i]``, row-aligned to ``frame``.
+
+    Nothing here is fitted: counts are per document. The fitted part (vocabulary, IDF) is done per
+    known configuration in :func:`run_window`.
+    """
+    documents_path = Path(data_dir) / f"{source}.parquet"
+    if not documents_path.exists():
+        raise SystemExit(f"{documents_path} not found -- build it first with\n"
+                         f"  python -m prompt_anonymity.data.build_dataset")
+    document_schema = pq.ParquetFile(documents_path).schema_arrow.names
+    wanted = [column for column in DOCUMENT_COLUMNS if column in document_schema]
+    frame = order_documents(pd.read_parquet(documents_path, columns=wanted),
+                            undated, model_owner, language)
+    blocks = [load_document_texts(data_dir, source, defense, frame["doc_id"])
+              for defense in defenses]
+    return frame, feature.count(*blocks)
+
+
+def load_document_texts(data_dir, source: str, defense: str, doc_ids: pd.Series) -> list[str]:
+    """The text of ``doc_ids``, in that order, from the split or one defense's rewrite of it.
+
+    Joined on ``doc_id`` -- a defended file keeps its own row order -- with a missing id a hard
+    error, as for a feature parquet. Turns are joined exactly as ``compute_features`` joins them,
+    so a known-side feature reads the same text every precomputed feature did.
+    """
+    defended = None if defense == "none" else defense
+    path = split_path(source, data_dir, defended)
+    if not path.exists():
+        raise SystemExit(f"{path} not found" + (
+            f" -- run `python -m prompt_anonymity.data.apply_defenses --source {source} "
+            f"--defense {defense}` first" if defended else ""))
+    keys = pd.Index(pd.read_parquet(path, columns=["doc_id"])["doc_id"])
+    positions = keys.get_indexer(doc_ids)
+    if (positions < 0).any():
+        raise SystemExit(f"{int((positions < 0).sum()):,} documents are missing from {path}.")
+    return read_texts(source, data_dir, positions, defense=defended)
 
 
 def load_background(data_dir, source: str, feature: str, size: int,
@@ -686,6 +747,18 @@ def gap_weeks(frame: pd.DataFrame, config: KnownConfig, known: slice) -> float:
     if stamps.isna().any():
         return float("nan")
     return float((stamps.iloc[1] - stamps.iloc[0]).total_seconds() / (7 * 24 * 3600))
+
+
+def zscores(args: argparse.Namespace) -> bool:
+    """Whether this run z-scores its features: ``--standardize``, unless the feature scales itself.
+
+    A :data:`KNOWN_SIDE_FEATURES` entry (``char_ngram_tfidf``) is TF-IDF with unit-L2 rows, and a
+    per-column z-score would divide each column by its own spread -- cancelling the IDF weights
+    outright, since IDF *is* a per-column scale. Its scaling is part of the feature, so the run is
+    still the default configuration and keeps the default directory name.
+    """
+    feature = KNOWN_SIDE_FEATURES.get(args.feature)
+    return args.standardize and not getattr(feature, "already_scaled", False)
 
 
 def standardize(known: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, ...]:
@@ -917,10 +990,11 @@ def build_attack(name: str, args: argparse.Namespace, overrides: dict | None = N
 # the grid, not the data, was setting that answer.
 # Attacks absent from this mapping have nothing worth tuning and are used as configured.
 HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
-    # C stops at 5 for a cost reason, not a modelling one: above it lbfgs needs several times more
-    # iterations to converge and a single fit dominates the whole search, while every window that
-    # has been searched picked a C below 1. Widen it only alongside a higher max_iter.
-    "logistic": {"C": loguniform(0.02, 5.0), "class_weight": [None, "balanced"]},
+    # The ceiling was 5 until 2026-09-25, for a cost reason (above it lbfgs needs more iterations
+    # to converge), and raised to 100 because char_ngram_tfidf picked the largest candidate below 5
+    # on all six swe-chat configurations -- the optimum was outside the range. Expect slower fits
+    # and a ConvergenceWarning at the top of it; raise max_iter if the warning shows.
+    "logistic": {"C": loguniform(0.02, 100.0), "class_weight": [None, "balanced"]},
     # Same two knobs as `logistic`, over a range that reaches two decades lower. The floor is not
     # copied from there because the shape of the problem is not the same: at 19,711 authors over
     # 196 features the model carries 3.9M parameters against 129,382 documents, where swe-chat's
@@ -929,7 +1003,8 @@ HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
     # `learning_rate` are deliberately absent: the first is a compute budget rather than a
     # hyper-parameter, and the second measured insensitive over 0.02-0.1 (same top-1, same final
     # loss to four decimals), so sampling it would spend the budget learning nothing.
-    "logistic_sgd": {"C": loguniform(0.002, 5.0), "class_weight": [None, "balanced"]},
+    # Ceiling raised 5 -> 100 on 2026-09-25, for the reason given under `logistic`.
+    "logistic_sgd": {"C": loguniform(0.002, 100.0), "class_weight": [None, "balanced"]},
     "svm": [
         {"kernel": ["linear"], "C": loguniform(0.1, 30.0)},
         {"kernel": ["rbf"], "C": loguniform(1.0, 300.0), "gamma": ["scale"]},
@@ -994,6 +1069,11 @@ def inner_known_folds(n_known: int, window: float, n_folds: int = 3) -> list[tup
     return folds
 
 
+#: :class:`TunableAttack`'s own constructor arguments, as opposed to the attack's settings. Kept out
+#: of ``tuning_trials.csv`` and of the settings handed on to the real fit.
+WRAPPER_PARAMS = ("attack_name", "standardize", "feature_transform")
+
+
 class TunableAttack(BaseEstimator, ClassifierMixin):
     """scikit-learn estimator wrapping one :data:`ATTRIBUTION_ATTACKS` entry, for the tuner.
 
@@ -1009,22 +1089,29 @@ class TunableAttack(BaseEstimator, ClassifierMixin):
     only. Fitting them on all of the known data would leak the fold's validation documents into
     the fold's own preprocessing -- a mild leak, but the point of this machinery is that there
     are none.
+
+    ``feature_transform`` does the same for a :data:`KNOWN_SIDE_FEATURES` entry: the search is
+    then handed raw n-gram counts, and every fit clones the transform and fits its vocabulary and
+    IDF on that fit's own training rows before the attack sees anything.
     """
 
-    def __init__(self, attack_name: str, standardize: bool = True, **settings):
+    def __init__(self, attack_name: str, standardize: bool = True, feature_transform=None,
+                 **settings):
         self.attack_name = attack_name
         self.standardize = standardize
+        self.feature_transform = feature_transform
         self.settings = settings
 
     def get_params(self, deep: bool = True) -> dict:
         """Flatten the settings dict into the search space's own parameter names."""
-        return {"attack_name": self.attack_name, "standardize": self.standardize, **self.settings}
+        return {"attack_name": self.attack_name, "standardize": self.standardize,
+                "feature_transform": self.feature_transform, **self.settings}
 
     def set_params(self, **params):
         """Accept any hyper-parameter name; unrecognised ones are passed to the attack."""
         settings = dict(self.settings)
         for key, value in params.items():
-            if key in ("attack_name", "standardize"):
+            if key in WRAPPER_PARAMS:
                 setattr(self, key, value)
             else:
                 settings[key] = value
@@ -1032,6 +1119,9 @@ class TunableAttack(BaseEstimator, ClassifierMixin):
         return self
 
     def fit(self, embeddings, labels):
+        if self.feature_transform is not None:
+            self.transform_ = clone(self.feature_transform).fit(embeddings)
+            embeddings = self.transform_.transform(embeddings)
         embeddings = np.asarray(embeddings, dtype=float)
         if self.standardize:
             scale = embeddings.std(axis=0)
@@ -1044,6 +1134,8 @@ class TunableAttack(BaseEstimator, ClassifierMixin):
 
     def predict(self, embeddings):
         """The highest-scoring author per document."""
+        if self.feature_transform is not None:
+            embeddings = self.transform_.transform(embeddings)
         embeddings = np.asarray(embeddings, dtype=float)
         if self.standardize:
             embeddings = (embeddings - self.center_) / self.scale_
@@ -1094,7 +1186,7 @@ def halving_budget(n_known: int, n_authors: int, n_candidates: int, factor: int)
 
 
 def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
-                  args: argparse.Namespace) -> tuple[dict, pd.DataFrame]:
+                  args: argparse.Namespace, feature_transform=None) -> tuple[dict, pd.DataFrame]:
     """Pick ``name``'s hyper-parameters using known documents only, and say what it picked.
 
     Runs :class:`sklearn.model_selection.HalvingRandomSearchCV` over
@@ -1145,25 +1237,27 @@ def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
         # shrinkage estimators say so once per author per fit -- thousands of lines that mean
         # "this rung is small", which is the design. Nothing else is silenced.
         warnings.filterwarnings("ignore", message="Only one sample available")
-        search = _halving_search(name, space, folds, factor, embeddings, labels, args)
+        search = _halving_search(name, space, folds, factor, embeddings, labels, args,
+                                 feature_transform)
 
     # One row per (candidate, rung), so the CSV shows both what was tried and where each
     # candidate was cut. `train_budget` is the rung's resource level as a share of the whole
     # known side; each fold trains on that same share of *its* (shorter) training block.
     trials = pd.DataFrame(search.cv_results_["params"]).drop(
-        columns=["attack_name", "standardize"], errors="ignore")
+        columns=list(WRAPPER_PARAMS), errors="ignore")
     trials["known_cv_top1"] = search.cv_results_["mean_test_score"]
     trials["known_cv_std"] = search.cv_results_["std_test_score"]
     trials["rung"] = search.cv_results_["iter"]
     trials["train_budget"] = search.cv_results_["n_resources"]
     trials["selected"] = np.arange(len(trials)) == search.best_index_
     best = {key: value for key, value in search.best_params_.items()
-            if key not in ("attack_name", "standardize")}
+            if key not in WRAPPER_PARAMS}
     return best, trials
 
 
 def tuned_settings(name: str, tag: str, embeddings: np.ndarray, labels: np.ndarray,
-                   args: argparse.Namespace, cache: dict) -> tuple[dict, pd.DataFrame]:
+                   args: argparse.Namespace, cache: dict,
+                   feature_transform=None) -> tuple[dict, pd.DataFrame]:
     """:func:`tune_on_known`, run at most once per ``(attack, known configuration)``.
 
     ``tag`` is the configuration's :attr:`KnownConfig.tag`, and it is the cache key: two
@@ -1179,17 +1273,68 @@ def tuned_settings(name: str, tag: str, embeddings: np.ndarray, labels: np.ndarr
     key = (name, tag)
     if key in cache:
         return cache[key], pd.DataFrame()
-    settings, trials = tune_on_known(name, embeddings, labels, args)
+    settings, trials = tune_on_known(name, embeddings, labels, args, feature_transform)
     cache[key] = settings
     return settings, trials
 
 
+def base_run_directory(args: argparse.Namespace) -> Path:
+    """The undefended run of this same experiment: :func:`output_tag` with ``--defense none``."""
+    base = argparse.Namespace(**{**vars(args), "defense": "none"})
+    return REPO_ROOT / "experiments" / "results" / output_tag(base)
+
+
+def load_tuned_settings(source: Path, attacks, tags) -> dict[tuple[str, str], dict]:
+    """Every ``(attack, known configuration)``'s selected settings from another run's search.
+
+    Backs ``--tuned-from``. A defended run with the default ``--known-defense none`` tunes on the
+    **undefended** known side -- the same vectors, labels, folds and seeded candidates as the base
+    run -- so its search is a repeat of the base run's and must pick the same settings; this reads
+    them instead of spending the search again (9 h 47 m against 69 min on WildChat
+    ``char_ngram_tfidf``/``logistic_sgd``). The values come from ``tuning_trials.csv``'s selected
+    rows at full precision, not from ``rolling_results.csv``, whose column is rounded to four
+    significant figures.
+
+    The returned dict has the shape of :func:`tuned_settings`' cache, which is what it is loaded
+    into. An attack with no registered space needs nothing and gets ``{}``. An attack **with** one
+    must have a selected row for every configuration, or this refuses -- copying from a run that
+    was never tuned would quietly publish the defaults as if a search had chosen them.
+    """
+    trials_path = source / "tuning_trials.csv"
+    trials = (pd.read_csv(trials_path, keep_default_na=False, na_values=[""])
+              if trials_path.exists() else pd.DataFrame())
+    settings: dict[tuple[str, str], dict] = {}
+    for attack in attacks:
+        space = HYPERPARAMETER_SPACES.get(attack)
+        for tag in tags:
+            if not space:
+                settings[(attack, tag)] = {}
+                continue
+            chosen = (trials[(trials["known_config"] == tag) & (trials["attack"] == attack)
+                             & (trials["selected"].astype(str) == "True")]
+                      if not trials.empty else trials)
+            if len(chosen) != 1:
+                raise SystemExit(
+                    f"--tuned-from {source}: no tuned {attack} settings for {tag} "
+                    f"({len(chosen)} selected rows in {trials_path.name}). That run was not tuned "
+                    f"(or not for this configuration); tune it first, or drop --tuned-from.")
+            keys = space.keys() if isinstance(space, dict) else {k for s in space for k in s}
+            row = chosen.iloc[0]
+            # class_weight=None is written as an empty cell and read back as NaN.
+            settings[(attack, tag)] = {
+                key: (None if pd.isna(row[key]) else
+                      row[key].item() if hasattr(row[key], "item") else row[key])
+                for key in keys if key in row.index}
+    return settings
+
+
 def _halving_search(name: str, space, folds, factor: int, embeddings: np.ndarray,
-                    labels: np.ndarray, args: argparse.Namespace) -> HalvingRandomSearchCV:
+                    labels: np.ndarray, args: argparse.Namespace,
+                    feature_transform=None) -> HalvingRandomSearchCV:
     """The fitted search behind :func:`tune_on_known`; split out only to keep that one readable."""
     return HalvingRandomSearchCV(
-        TunableAttack(attack_name=name, standardize=args.standardize,
-                      **execution_settings(name, args)),
+        TunableAttack(attack_name=name, standardize=zscores(args),
+                      feature_transform=feature_transform, **execution_settings(name, args)),
         space,
         n_candidates=args.tune_candidates,
         factor=factor,
@@ -1413,7 +1558,9 @@ def within_author_mean(embeddings: np.ndarray, labels: np.ndarray, metric: str) 
             continue
         distances = cdist(embeddings[rows], embeddings[rows], metric=metric)
         pairs.append(distances[np.triu_indices(len(rows), k=1)])
-    return float(np.concatenate(pairs).mean()) if pairs else float("nan")
+    # nanmean: cosine is undefined against an all-zero row, which a document containing none of a
+    # fitted vocabulary's n-grams is (char_ngram_tfidf); it has no distance to contribute.
+    return float(np.nanmean(np.concatenate(pairs))) if pairs else float("nan")
 
 
 def between_author_mean(embeddings: np.ndarray, labels: np.ndarray, metric: str,
@@ -1427,7 +1574,7 @@ def between_author_mean(embeddings: np.ndarray, labels: np.ndarray, metric: str,
     rows = rng.choice(len(labels), size=min(sample, len(labels)), replace=False)
     distances = cdist(embeddings[rows], embeddings[rows], metric=metric)
     different = labels[rows][:, None] != labels[rows][None, :]
-    return float(distances[different].mean()) if different.any() else float("nan")
+    return float(np.nanmean(distances[different])) if different.any() else float("nan")
 
 
 # --- attack ------------------------------------------------------------------
@@ -1593,7 +1740,8 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
                tuning_cache: dict, languages: np.ndarray | None = None,
                background: np.ndarray | None = None,
-               known_embeddings_source: np.ndarray | None = None):
+               known_embeddings_source: np.ndarray | None = None,
+               known_side_feature=None):
     """Run one (known configuration, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
@@ -1633,7 +1781,16 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # (joined on `doc_id` at load), so one index means the same document in either.
     known_source = embeddings if known_embeddings_source is None else known_embeddings_source
     known_embeddings, unknown_embeddings = known_source[known], embeddings[unknown]
-    if args.standardize:
+    # A known-side feature arrives as raw n-gram counts. Its vocabulary and IDF are fitted here,
+    # on this configuration's known documents and nothing else, and every other row is only
+    # transformed. The counts are kept for the tuner, which refits the transform per fold.
+    known_counts, feature_transform = None, None
+    if known_side_feature is not None:
+        known_counts, feature_transform = known_embeddings, known_side_feature.transformer()
+        fitted_transform = clone(feature_transform).fit(known_counts)
+        known_embeddings = fitted_transform.transform(known_counts)
+        unknown_embeddings = fitted_transform.transform(unknown_embeddings)
+    if zscores(args):
         blocks = standardize(known_embeddings, unknown_embeddings,
                              *([] if background is None else [background]))
         known_embeddings, unknown_embeddings = blocks[0], blocks[1]
@@ -1654,8 +1811,9 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # unknown_embeddings.
     settings, trials = ({}, pd.DataFrame())
     if args.tune:
-        settings, trials = tuned_settings(attack, config.tag, known_embeddings, known_labels,
-                                          args, tuning_cache)
+        settings, trials = tuned_settings(
+            attack, config.tag, known_embeddings if known_counts is None else known_counts,
+            known_labels, args, tuning_cache, feature_transform)
 
     # Fit the attack on the known side (documents + labels, all of which the attacker holds) and
     # score every unknown document against every known author.
@@ -1733,6 +1891,9 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
         "gap_weeks": gap_weeks(frame, config, known),
         # Rounded because the search now samples continuous ranges: an unrounded C prints 17
         # digits of a number whose third one is noise. tuning_trials.csv keeps the exact value.
+        # Where the settings came from when they were copied rather than searched (--tuned-from);
+        # empty for a run that tuned itself or ran untuned.
+        "tuned_from": getattr(args, "tuned_from_resolved", ""),
         "hyperparameters": ", ".join(
             f"{key}={value:.4g}" if isinstance(value, float) else f"{key}={value}"
             for key, value in settings.items()) or "default",
@@ -1950,7 +2111,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
                         help="Which built split to attack (default: swe_chat).")
     parser.add_argument("--feature", default="stylometrix",
-                        help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: stylometrix).")
+                        help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: "
+                             "stylometrix) -- or a feature fitted per known configuration, which "
+                             "has no parquet and reads the document text instead: "
+                             + ", ".join(sorted(KNOWN_SIDE_FEATURES)) + ".")
+    parser.add_argument("--max-ngrams", type=int, default=None, metavar="N",
+                        help="For a known-side feature (char_ngram_tfidf): how many n-grams each "
+                             "known side keeps, by frequency on that known side (default: the "
+                             "feature's own, 3072). A non-default value is appended to the output "
+                             "directory as _top<N>, so it never overwrites the default run.")
     parser.add_argument("--known-defense", default="none", choices=sorted(DEFENSES),
                         help="Defense applied to the KNOWN side, i.e. the labelled history the "
                              "attacker already holds (default: none). The default is deliberate "
@@ -2061,6 +2230,15 @@ def parse_args() -> argparse.Namespace:
                              "of machine. How much it helps on these windows is unmeasured: they "
                              "have ~10^3 rows, well below where a GPU normally pays off, though "
                              "the wide feature axis works in its favour.")
+    parser.add_argument("--tuned-from", default=None, metavar="base|DIR",
+                        help="Skip the hyper-parameter search and reuse the settings another run "
+                             "selected, per (attack, known configuration), from its "
+                             "tuning_trials.csv. 'base' means this experiment's undefended run "
+                             "(same source, feature, attack and scope flags, --defense none). "
+                             "Sound only with --known-defense none (the default): the search runs "
+                             "on the known side, which is then the same undefended text in both "
+                             "runs, so it would pick the same settings. Refused otherwise, and "
+                             "refused if the source run was never tuned.")
     parser.add_argument("--tune", action=argparse.BooleanOptionalAction, default=True,
                         help="Search each attack's hyper-parameter space (HYPERPARAMETER_SPACES) "
                              "before scoring, by successive halving over randomly sampled "
@@ -2153,6 +2331,28 @@ def parse_args() -> argparse.Namespace:
         raise SystemExit(f"--background {args.background} needs an attack that fits a class per "
                          f"label; {', '.join(unusable)} do not. Available: "
                          f"{', '.join(sorted(MULTICLASS_ATTACKS))}.")
+    if args.tuned_from is not None:
+        if not args.tune:
+            raise SystemExit("--tuned-from replaces the search with another run's result; it "
+                             "cannot be combined with --no-tune.")
+        if args.known_defense != "none":
+            raise SystemExit(f"--tuned-from needs --known-defense none: with --known-defense "
+                             f"{args.known_defense} the search runs on defended text, which no "
+                             f"undefended run has seen, so its choice cannot be copied.")
+        if args.tuned_from == "base" and args.defense == "none":
+            raise SystemExit("--tuned-from base on an undefended run would copy the run from "
+                             "itself; tune it instead.")
+    if args.max_ngrams is not None and args.feature not in KNOWN_SIDE_FEATURES:
+        raise SystemExit(f"--max-ngrams applies only to {', '.join(sorted(KNOWN_SIDE_FEATURES))}.")
+    if args.feature in KNOWN_SIDE_FEATURES:
+        # The background pool is read from a feature parquet, which this feature does not have;
+        # and --no-standardize would change the directory name for a run that computes exactly
+        # what the default one does (see `zscores`).
+        if args.background != "none":
+            raise SystemExit(f"--background is not supported with {args.feature}.")
+        if not args.standardize:
+            raise SystemExit(f"--no-standardize has no effect on {args.feature}, which is never "
+                             f"z-scored (see zscores); drop the flag.")
     return args
 
 
@@ -2205,7 +2405,13 @@ def output_tag(args: argparse.Namespace) -> str:
     known_defense = ("" if args.known_defense == "none"
                      else f"_knowndef-{args.known_defense}")
     attacks = "-".join(args.attacks)
-    return (f"{args.source}_{defense}_{args.feature}_{attacks}{known_defense}"
+    # A different vocabulary size is a different feature space, so it must not overwrite the
+    # default one -- and, like every suffix here, it leaves the comparable set.
+    known_side_feature = KNOWN_SIDE_FEATURES.get(args.feature)
+    vocabulary = ("" if args.max_ngrams is None
+                  or args.max_ngrams == known_side_feature().max_features
+                  else f"_top{args.max_ngrams}")
+    return (f"{args.source}_{defense}_{args.feature}_{attacks}{vocabulary}{known_defense}"
             f"{owner}{language}{language_aware}{background}{fractions}{held_out}{openset}"
             f"{metric}{scaled}")
 
@@ -2299,10 +2505,34 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
 
 def main() -> None:
     args = parse_args()
+    known_side_feature = KNOWN_SIDE_FEATURES.get(args.feature)
+    if known_side_feature is not None:
+        known_side_feature = known_side_feature(**({} if args.max_ngrams is None
+                                                    else {"max_features": args.max_ngrams}))
+        run_experiment_grid(args, *load_counts(args, known_side_feature), known_side_feature)
+        return
     frame, embeddings = load_documents_and_features(
         args.data_dir, args.source, args.feature, args.undated, args.model_owner, args.language,
         args.defense,
     )
+    run_experiment_grid(args, frame, embeddings, load_known_embeddings(args, frame))
+
+
+def load_counts(args: argparse.Namespace, feature) -> tuple[pd.DataFrame, object, object]:
+    """``(frame, counts, known_counts)`` for a known-side feature; ``known_counts`` is ``None``
+    unless ``--known-defense`` differs from ``--defense``, as for :func:`load_known_embeddings`."""
+    defenses = (args.defense,) if args.known_defense == args.defense else (
+        args.defense, args.known_defense)
+    frame, counts = load_documents_and_counts(args.data_dir, args.source, feature, args.undated,
+                                              args.model_owner, args.language, defenses)
+    print(f"[{feature.name}] {feature.params()} | {counts[0].shape[1]:,} distinct n-grams in the "
+          f"split; the {feature.max_features:,} kept are chosen, and weighted, per known "
+          f"configuration from its known documents alone")
+    return frame, counts[0], (counts[1] if len(counts) > 1 else None)
+
+
+def load_known_embeddings(args: argparse.Namespace, frame: pd.DataFrame):
+    """The known side's vectors when ``--known-defense`` differs from ``--defense``, else ``None``."""
     # The known side's vectors, when it is defended differently from the unknown side. Loaded as a
     # second matrix rather than spliced here, because which rows are "known" depends on the known
     # configuration and there are six of them. `load_documents_and_features` applies the same
@@ -2321,10 +2551,18 @@ def main() -> None:
                 f"in the same order ({len(known_frame):,} vs {len(frame):,} rows). Both are "
                 f"joined to {args.source}.parquet on doc_id, so this means one of them is stale "
                 f"-- rebuild it with `compute_features --source {args.source} --defense ...`.")
-    print(f"[{args.source}] {len(frame):,} documents x {embeddings.shape[1]} {args.feature} features | "
+    return known_embeddings_source
+
+
+def run_experiment_grid(args: argparse.Namespace, frame: pd.DataFrame, embeddings, known_embeddings_source,
+             known_side_feature=None) -> None:
+    """Everything after loading: every (known configuration, attack), each written as it finishes."""
+    n_features = (embeddings.shape[1] if known_side_feature is None
+                  else known_side_feature.max_features)
+    print(f"[{args.source}] {len(frame):,} documents x {n_features} {args.feature} features | "
           f"{frame['author_id'].nunique():,} authors | {_period(frame)} | "
           f"defense={args.defense} (known side: {args.known_defense}) | "
-          f"attacks={' '.join(args.attacks)}{' | standardized' if args.standardize else ''}")
+          f"attacks={' '.join(args.attacks)}{' | standardized' if zscores(args) else ''}")
     if not args.standardize:
         print("warning: --no-standardize is set. Every attack measured considerably worse without "
               "it (see --standardize --help); this is a diagnostic mode, not a normal run.")
@@ -2367,6 +2605,15 @@ def main() -> None:
     # run_window so its scope is one experiment.
     tuning_cache: dict[tuple[str, str], dict] = {}
     configurations = known_configurations(len(frame), args.known_windows, args.test_fraction)
+    # --tuned-from: the cache is filled up front, so every `tuned_settings` call is a hit and no
+    # search runs. Nothing else about the run changes.
+    if args.tuned_from is not None:
+        source = (base_run_directory(args) if args.tuned_from == "base"
+                  else Path(args.tuned_from))
+        tuning_cache.update(load_tuned_settings(
+            source, args.attacks, [config.tag for config, _, _ in configurations]))
+        args.tuned_from_resolved = str(source.resolve())
+        print(f"--tuned-from: reusing the settings {source.name} selected; no search will run")
     print(f"held-out test set: final {args.test_fraction:.0%} of the timeline "
           f"({len(frame) - int(round((1 - args.test_fraction) * len(frame))):,} documents), "
           f"shared by all {len(configurations)} known configuration(s): "
@@ -2376,7 +2623,7 @@ def main() -> None:
         for attack in args.attacks:
             outcome = run_window(frame, embeddings, config, attack, known, unknown,
                                  args, tuning_cache, languages, background,
-                                 known_embeddings_source)
+                                 known_embeddings_source, known_side_feature)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             cmcs.append(cmc)

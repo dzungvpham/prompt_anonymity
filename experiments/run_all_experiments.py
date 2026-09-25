@@ -221,8 +221,19 @@ DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
 #: largest, while ``gemini_embedding_2`` is semantic and should barely move. ``stylometrix`` is what
-#: every earlier defense was measured on and is what keeps the numbers comparable to them.
+#: every earlier defense was measured on; it stays selectable by name but is out of the default grid.
 FEATURES = ("stylometrix", "char_ngram_tfidf", "gemini_embedding_2")
+
+#: Features the attribution grid uses when ``--features`` is not given. StyloMetrix was dropped on
+#: 2026-09-25: ``char_ngram_tfidf`` replaced it as the style feature (it beats it on every swe-chat
+#: cell and on WildChat's), and the figures are drawn without it.
+ATTRIBUTION_DEFAULT_FEATURES = ("char_ngram_tfidf", "gemini_embedding_2")
+
+#: Features the attribution runner fits per known configuration from the document **text**
+#: (``prompt_anonymity.features.KNOWN_SIDE_FEATURES``, spelled out here rather than imported to
+#: keep this launcher free of the package's imports). They have no feature parquet, so a cell is
+#: ready once its text is -- and a clustering cell, whose runner reads parquets only, never is.
+KNOWN_SIDE_FEATURES = ("char_ngram_tfidf",)
 
 #: In increasing cost order, which is the order cells are executed in. ``nearest_neighbor`` is a
 #: matmul; the rest fit one decision function per author, so their cost grows with the author
@@ -657,8 +668,15 @@ def plan_cell(cell: Cell, args: argparse.Namespace,
         return Plan(cell, "queued", "a job of this name is already pending or running "
                                     "(scancel it to resubmit)")
 
-    features = cell.feature_parquet(data_dir)
-    if not features.exists():
+    if cell.feature in KNOWN_SIDE_FEATURES:
+        defended = cell.defended_parquet(data_dir)
+        if cell.family != "attribution":
+            return Plan(cell, "no-data", f"{cell.feature} is fitted inside run_experiment.py and "
+                                         f"has no feature parquet for the clustering runner")
+        if defended is not None and not defended.exists():
+            return Plan(cell, "no-data", f"{defended.name} missing -- run `apply_defenses "
+                                         f"--source {cell.source} --defense {cell.defense}` first")
+    elif not (features := cell.feature_parquet(data_dir)).exists():
         defended = cell.defended_parquet(data_dir)
         if defended is not None and not defended.exists():
             reason = (f"{features.name} missing; so is {defended.name} -- run "
@@ -1019,8 +1037,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"Restrict to these defenses, '{NO_DEFENSE}' for undefended "
                              f"(default: all of {', '.join(DEFENSES)}).")
     parser.add_argument("--features", nargs="+", metavar="NAME",
-                        help=f"Restrict to these features (default: all of "
-                             f"{', '.join(FEATURES)} for attribution, but only "
+                        help=f"Restrict to these features, any of {', '.join(FEATURES)} (default: "
+                             f"{', '.join(ATTRIBUTION_DEFAULT_FEATURES)} for attribution, but only "
                              f"{', '.join(CLUSTERING_DEFAULT_FEATURES)} for clustering, which is "
                              "the one every clustering result on disk uses). Given explicitly, "
                              "it applies to both families.")
@@ -1118,7 +1136,8 @@ def main() -> int:
     families = resolve_choices(args.families, FAMILIES, "--families")
     sources = resolve_choices(args.sources, SOURCES, "--sources")
     defenses = resolve_choices(args.defenses, DEFENSES, "--defenses")
-    features = resolve_choices(args.features, FEATURES, "--features")
+    features = resolve_choices(args.features or list(ATTRIBUTION_DEFAULT_FEATURES), FEATURES,
+                               "--features")
     attacks = resolve_choices(args.attacks, ATTACKS, "--attacks")
     # An explicit --features applies to both families; left out, clustering takes only the one
     # feature its results are all on rather than the whole attribution default.
