@@ -27,6 +27,7 @@ attack                  what it compares
 ``cosine``              cosine to the author's mean direction
 ``wccn``                the same, after whitening out within-author scatter
 ``lda``                 the same, inside the LDA discriminant subspace
+``lda_wccn``            whitened, inside the LDA discriminant subspace (LDA then WCCN, chained)
 ``plda``                same-author vs different-author log-likelihood ratio
 ======================  =======================================================================
 
@@ -40,6 +41,7 @@ from __future__ import annotations
 from .centroid import CentroidCosine
 from .kernel import block_row_count, blocked_distances
 from .lda import LDACentroid
+from .lda_wccn import LDAWCCN
 from .nearest_neighbor import NearestNeighbor
 from .plda import PLDA
 from .whitened_centroid import WhitenedCentroid
@@ -49,8 +51,9 @@ SIMILARITY_ATTACKS = {
     "cosine": CentroidCosine,
     "wccn": WhitenedCentroid,
     "lda": LDACentroid,
+    "lda_wccn": LDAWCCN,
     "plda": PLDA,
 }
 
 __all__ = ["SIMILARITY_ATTACKS", "NearestNeighbor", "CentroidCosine", "WhitenedCentroid",
-           "LDACentroid", "PLDA", "blocked_distances", "block_row_count"]
+           "LDACentroid", "LDAWCCN", "PLDA", "blocked_distances", "block_row_count"]
