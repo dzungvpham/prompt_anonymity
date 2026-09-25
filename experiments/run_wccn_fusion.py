@@ -73,7 +73,7 @@ from prompt_anonymity.features.pos_ngram_tfidf import POSNgramTfidfFeaturizer  #
 
 #: Attacks whose ``shrinkage`` this script's ``--shrinkage`` controls; every other attack is
 #: constructed with no arguments, matching the defaults every prior scratch script used.
-SHRINKAGE_ATTACKS = {"wccn", "plda"}
+SHRINKAGE_ATTACKS = {"wccn", "plda", "lda_wccn"}
 
 #: Components fit fresh per window from raw text/cached tags, rather than read from a feature
 #: parquet. Maps the ``--feature-sets`` token to (featurizer class, text source key).
