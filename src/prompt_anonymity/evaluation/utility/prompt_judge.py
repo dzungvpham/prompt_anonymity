@@ -24,8 +24,12 @@ that anything the rewrite *adds* is outside the judgement entirely.
 rows. If the reasons complain that names were removed, that the voice changed, or that the rewrite
 said more than it needed to, the rubric is not holding and the numbers should not be trusted yet.
 
-Judging runs through :class:`~prompt_anonymity.evaluation.utility._deepseek.DeepSeekJudge` -- a concurrent
-fan-out against a DeepSeek deployment over its OpenAI-compatible API.
+Judging runs through one of two :data:`JUDGE_BACKENDS`, both a concurrent fan-out over an
+OpenAI-compatible API: ``deepseek`` (the default --
+:class:`~prompt_anonymity.evaluation.utility._deepseek.DeepSeekJudge`, hosted and billed) or
+``local`` (:class:`~prompt_anonymity.evaluation.utility._vllm_judge.VLLMJudge`, a self-hosted vLLM
+server, free). The backend changes where a request goes and what it costs; the rubric, input format
+and parser are shared.
 Every verdict is cached by the package's content-addressed
 :class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/utility/conversation_judge``,
 and conversations the defense left untouched short-circuit to 5 with no API call, so scoring
@@ -45,6 +49,7 @@ Caveats:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,8 +64,20 @@ from ._deepseek import (
     DEFAULT_TOP_P,
     DeepSeekJudge,
     JudgeUsage,
+    OpenAICompatibleJudge,
+    TokenRates,
+    unpack_reply,
 )
-from ._parsing import json_object, render_turns, strip_code_fence
+from ._vllm_judge import (
+    DEFAULT_LOCAL_REASONING_EFFORT,
+    DEFAULT_LOCAL_TEMPERATURE,
+    DEFAULT_LOCAL_TOP_P,
+    VLLMJudge,
+    local_base_url,
+    served_model_name,
+)
+from ._parsing import json_object, render_turn_pairs, strip_code_fence
+from ...defenses._backends import split_turns
 from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 
 #: The rubric file shipped with the package. Read at import; override per run by passing
@@ -116,6 +133,143 @@ DEFAULT_JUDGE_REASONING_EFFORT = DEFAULT_REASONING_EFFORT
 DEFAULT_JUDGE_TEMPERATURE = DEFAULT_TEMPERATURE
 DEFAULT_JUDGE_TOP_P = DEFAULT_TOP_P
 
+#: Valid scores -- the rubric's 1-5 scale.
+_VALID_SCORES = (1, 2, 3, 4, 5)
+
+#: JSON schema for a verdict, for backends that can constrain decoding to one
+#: (:attr:`JudgeBackend.structured_output`). It mirrors the rubric's own output line, field for
+#: field, **in generation order**:
+#:
+#: * ``Turns`` -- one entry per turn that has an ORIGINAL, each ``{Turn, Chain_of_thought, Score}``:
+#:   the judge rates the conversation **turn by turn** (the ``judge_turn_scores`` column), writing
+#:   its analysis of a turn before that turn's score.
+#: * ``Connections`` -- the cross-turn check (rubric Step 2).
+#: * ``Score`` -- the overall verdict, written last so it is conditioned on everything above.
+#: * ``Reason`` -- one line.
+#:
+#: The per-turn analyses and ``Connections`` together are the chain of thought kept in the
+#: ``judge_reasoning`` column; they replace the model's hidden thinking (the local judge runs with
+#: ``reasoning_effort="none"``).
+#:
+#: **Why a schema, and why thinking is off, measured 2026-09-25 on Qwen3.8-27B** over
+#: swe-chat/openanonymity. Without a schema, 15 of 86 replies were unparseable and some more
+#: "parsed" by accident: the model drifted to prose on a **1-10** scale and a bare-digit fallback
+#: read a stray ``Turn 1`` as a score of 1. With a schema but thinking *on*, 12 of 13 "1" scores had
+#: a hidden trace ending "I'd rate this a 9/10" -- the enum cut ``10`` to its first digit. Written
+#: reasoning next to a restated scale puts the scale where the model is writing.
+#:
+#: **Constrained decoding does not show the schema to the model** -- it only masks tokens -- so a
+#: ``description`` alone is never read. :data:`JUDGE_OUTPUT_INSTRUCTION` appends the schema to the
+#: system prompt for that reason.
+_SCALE_REMINDER = (
+    "An integer on the 1-5 scale, NOT out of 10: 5 = fully faithful (only surface wording or "
+    "incidental specifics changed), 4 = substantially faithful (a minor detail blurred), "
+    "3 = partially faithful (a meaningful requirement or context lost), 2 = largely unfaithful "
+    "(a core request missing or changed), 1 = unusable."
+)
+JUDGE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "utility_verdict",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "Turns": {
+                    "type": "array",
+                    "description": (
+                        "One entry per turn that has an ORIGINAL (a non-empty <original>), in "
+                        "order. ADDED turns (empty <original>) get no entry."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "Turn": {"type": "integer",
+                                     "description": "k, from the <turn_k> tag."},
+                            "Chain_of_thought": {
+                                "type": "string",
+                                "description": (
+                                    "Written BEFORE this turn's score: what the <original> asked "
+                                    "or conveyed, and whether that survives in the <modified>. "
+                                    "Changed wording, tone, incidental specifics and anything "
+                                    "added do not count against it."
+                                ),
+                            },
+                            "Score": {"type": "integer", "enum": list(_VALID_SCORES),
+                                      "description": "This turn alone. " + _SCALE_REMINDER},
+                        },
+                        "required": ["Turn", "Chain_of_thought", "Score"],
+                        "additionalProperties": False,
+                    },
+                },
+                "Connections": {
+                    "type": "string",
+                    "description": (
+                        "Whether references and the user's arc across ORIGINAL turns still hold "
+                        "in the MODIFIED version. ADDED turns do not count, whatever they say."
+                    ),
+                },
+                "Score": {"type": "integer", "enum": list(_VALID_SCORES),
+                          "description": "The whole conversation, from the turn scores and the "
+                                         "connections. " + _SCALE_REMINDER},
+                "Reason": {"type": "string", "description": "One-line explanation of the score."},
+            },
+            "required": ["Turns", "Connections", "Score", "Reason"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+#: Appended to the rubric for a backend with :attr:`JudgeBackend.structured_output`, so the model
+#: actually reads the schema it is constrained to (see :data:`JUDGE_RESPONSE_FORMAT`), scale
+#: reminders included.
+JUDGE_OUTPUT_INSTRUCTION = (
+    "OUTPUT FORMAT. Return one JSON object matching this JSON schema, fields in this order. Every "
+    "Score is on the 1-5 scale defined above, never out of 10:\n"
+    + json.dumps(JUDGE_RESPONSE_FORMAT["json_schema"]["schema"], indent=2)
+)
+
+
+@dataclass(frozen=True)
+class JudgeBackend:
+    """Where judge requests go, and the settings a judge there defaults to.
+
+    ``default_model`` is ``None`` when the model is read off the server instead
+    (:func:`~._vllm_judge.served_model_name`). The sampling defaults are per backend because what
+    an endpoint does with them is: DeepSeek ignores ``temperature``/``top_p`` while reasoning,
+    vLLM honours them. ``structured_output`` sends :data:`JUDGE_RESPONSE_FORMAT` and appends
+    :data:`JUDGE_OUTPUT_INSTRUCTION` to the rubric. ``record_reasoning`` also keeps the model's
+    hidden thinking trace, if it produced one, as the ``judge_reasoning`` column when the reply
+    carries no ``Chain_of_thought`` field; off for DeepSeek only because turning it on would re-key
+    every verdict already paid for.
+    """
+
+    client: type
+    default_model: str | None
+    temperature: float
+    top_p: float
+    reasoning_effort: str | None
+    structured_output: bool = False
+    record_reasoning: bool = False
+    #: Skip conversations whose judge input exceeds the server's context (see
+    #: :meth:`ConversationUtility.score`). Needs a client that can count exact prompt tokens --
+    #: :class:`~._vllm_judge.VLLMJudge` asks its server; DeepSeek has no such endpoint.
+    checks_context: bool = False
+
+
+#: Judge backends, selectable with ``judge_backend=`` / ``eval_utility.py --judge-backend``.
+#: ``deepseek`` is the default and **stays out of the cache key** (see
+#: :meth:`ConversationUtility.params`), so every verdict bought before the second backend existed
+#: is still found.
+JUDGE_BACKENDS: dict[str, JudgeBackend] = {
+    "deepseek": JudgeBackend(DeepSeekJudge, DEEPSEEK_DEFAULT_MODEL, DEFAULT_TEMPERATURE,
+                             DEFAULT_TOP_P, DEFAULT_REASONING_EFFORT),
+    "local": JudgeBackend(VLLMJudge, None, DEFAULT_LOCAL_TEMPERATURE, DEFAULT_LOCAL_TOP_P,
+                          DEFAULT_LOCAL_REASONING_EFFORT, structured_output=True,
+                          record_reasoning=True, checks_context=True),
+}
+DEFAULT_JUDGE_BACKEND = "deepseek"
+
 #: Output budget. Larger than a one-line JSON verdict needs, because a model that reasons before
 #: answering spends it too: an under-budgeted request comes back truncated (and unparseable) rather
 #: than erroring, which would read as "the judge misbehaved" when it was a configuration slip.
@@ -145,55 +299,117 @@ USABLE_SCORE_THRESHOLD = 4
 #: (``"2"`` was the Anthropic Foundry judge, ``"1"`` OpenRouter).
 CONVERSATION_UTILITY_VERSION = "3"
 
-#: Valid scores, and the labeled-field fallback for a reply whose JSON did not parse.
-_VALID_SCORES = (1, 2, 3, 4, 5)
-_SCORE_FIELD_RE = re.compile(r'"?score"?\s*:\s*"?\s*([1-5])', re.IGNORECASE)
+#: The labeled-field fallback for a reply whose JSON did not parse. ``(?!\d)`` so a ``"Score": 10``
+#: is not read as a 1.
+_SCORE_FIELD_RE = re.compile(r'"?score"?\s*:\s*"?\s*([1-5])(?!\d)', re.IGNORECASE)
 _ANY_SCORE_RE = re.compile(r"\b([1-5])\b")
 
 
-def _judge_input(original: str, defended: str) -> str:
-    """The judge's user message: the two tagged conversations.
+def _judge_input(original: str, defended: str, max_chars: int | None = None) -> str:
+    """The judge's user message: the two versions as aligned turn pairs
+    (:func:`~._parsing.render_turn_pairs`), ``<turn_k><original>...</original>
+    <modified>...</modified></turn_k>``.
 
-    Built by direct string join (not ``str.format``) so braces anywhere in the conversation text
-    are never mangled.
+    Paired in code since 2026-09-25; before, the judge got two separate
+    ``<original_conversation>`` / ``<modified_conversation>`` blocks with ``[Turn i]`` labels and
+    had to align them itself. The rubric's turn-by-turn procedure (invariant 4) reads each pair
+    directly.
 
-    **The defended side is tagged ``<modified_conversation>``, not "defended".** Nothing the judge
-    reads names what produced the rewrite -- see the rubric file's first invariant. The parameter
-    keeps the package's own vocabulary because that is what it is; only the wire format is neutral.
+    **The defended side is tagged ``<modified>``, not "defended".** Nothing the judge reads names
+    what produced the rewrite -- see the rubric file's first invariant. The parameter keeps the
+    package's own vocabulary because that is what it is; only the wire format is neutral.
 
-    The original always comes first and the sides are never shuffled. The sibling LLM-judge attacks
-    randomize presentation order to cancel position bias, but that does not apply here: the two
-    sides play asymmetric roles (the original is the referent the other version is measured
-    against), so their order carries meaning and swapping them would change the question.
+    Within a pair the original always comes first and the sides are never shuffled. The sibling
+    LLM-judge attacks randomize presentation order to cancel position bias, but that does not apply
+    here: the two sides play asymmetric roles (the original is the referent the other version is
+    measured against), so their order carries meaning and swapping them would change the question.
     """
-    return (
-        f"<original_conversation>\n{original}\n</original_conversation>\n"
-        f"<modified_conversation>\n{defended}\n</modified_conversation>"
-    )
+    return render_turn_pairs(original, defended, max_chars=max_chars)
 
 
-def _parse_score(raw: str) -> tuple[int | None, str]:
-    """Parse a judge reply into ``(score, reason)``; ``score`` is ``None`` when unparseable.
+def _original_turns_intact(original: str, defended: str) -> bool:
+    """Whether every ORIGINAL turn survives **byte-for-byte**, in order, as the defended version's
+    leading turns -- i.e. the defense changed nothing and at most appended turns after them.
 
-    Layered: strip a code fence, try JSON, then a labeled ``"Score": N`` field, then a bare digit.
+    Such a conversation has lost nothing the original conveyed, so it scores 5 without asking the
+    judge: added turns are outside the judgement (rubric invariant 3), and an added turn cannot
+    reach back and change an earlier one (invariant 4). Decided in code rather than by the rubric
+    because the judge does not hold that line against an adversarial addition -- measured
+    2026-09-25 on swe-chat/embad_summary, where all 50 sampled conversations are exactly this case
+    (every original turn identical, one turn appended claiming the text above is void) and a
+    Qwen3.8-27B judge under the turn-by-turn rubric still scored 25 of them 2, conceding "the
+    original request is technically present" and then calling the context "hijacked".
+    """
+    original_turns = split_turns(original)
+    return split_turns(defended)[:len(original_turns)] == original_turns
 
-    Two decisions worth stating:
+
+@dataclass
+class ParsedVerdict:
+    """One judge reply, parsed. ``score`` is ``None`` when the overall score is unparseable."""
+
+    score: int | None
+    reason: str
+    reasoning: str | None = None
+    turn_scores: list[int | None] | None = None
+
+
+def _turn_reasoning(turns: list, connections) -> str | None:
+    """The per-turn analyses and the connections check as one readable block."""
+    lines = []
+    for entry in turns:
+        if isinstance(entry, dict):
+            entry = {str(k).lower(): v for k, v in entry.items()}
+            lines.append(f"turn_{entry.get('turn', '?')} [score {entry.get('score', '?')}]: "
+                         f"{entry.get('chain_of_thought', '') or ''}")
+    if connections:
+        lines.append(f"connections: {connections}")
+    return "\n".join(lines) or None
+
+
+def _turn_score(entry) -> int | None:
+    """One ``Turns`` entry's score, or ``None`` when absent or outside 1-5."""
+    if not isinstance(entry, dict):
+        return None
+    value = {str(k).lower(): v for k, v in entry.items()}.get("score")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = int(round(value))
+    return value if value in _VALID_SCORES else None
+
+
+def _parse_score(raw: str) -> ParsedVerdict:
+    """Parse a judge reply (the rubric's per-turn JSON) into a :class:`ParsedVerdict`.
+
+    Layered: strip a code fence and read the JSON; failing that, take the **last** labeled
+    ``"Score": N`` in the text. Last, because the overall score follows the per-turn ones in the
+    requested format, so the first match would be turn 1's.
+
+    Decisions worth stating:
 
     * A score outside 1-5 is **discarded, not clamped**. A reply of ``0`` or ``10`` means the judge
       ignored the rubric; clamping it to a valid value would invent a data point that no judge
       actually produced.
-    * The bare-digit fallback takes the **first** ``[1-5]`` in the text, not the last. The rubric
-      puts the score before the reason, and reasons routinely contain digits ("turn 3 lost the
-      constraint"). This is the opposite of ``_parse_choice`` in the LLM-judge attacks, where the
-      answer trails any reasoning -- same tier, different position, because the output shape differs.
+    * **There is no bare-digit fallback any more** (there was until 2026-09-25). With the input
+      structured as ``<turn_k>`` and replies discussing turns by number, a free digit is far more
+      often a turn index than a score -- it once read a stray "Turn 1" as a verdict of 1. An
+      unlabeled reply is reported as unparsed, which is visible, rather than guessed.
     """
     text = strip_code_fence(raw)
 
     score: int | None = None
     reason = ""
+    reasoning: str | None = None
+    turn_scores: list[int | None] | None = None
     obj = json_object(text)
     if obj is not None:
         reason = str(obj.get("reason", "") or "")
+        turns = obj.get("turns")
+        if isinstance(turns, list):
+            turn_scores = [_turn_score(entry) for entry in turns]
+            reasoning = _turn_reasoning(turns, obj.get("connections"))
+        else:  # an older single-verdict reply
+            reasoning = obj.get("chain_of_thought") or None
         value = obj.get("score")
         if isinstance(value, bool):  # bool is an int subclass; a True here is not a score of 1
             value = None
@@ -204,14 +420,14 @@ def _parse_score(raw: str) -> tuple[int | None, str]:
             if match is not None:
                 score = int(match.group(1))
 
-    if score is None:  # JSON missing or garbled -> scan the raw text
-        match = _SCORE_FIELD_RE.search(text) or _ANY_SCORE_RE.search(text)
-        if match is not None:
-            score = int(match.group(1))
+    if score is None:  # JSON missing or garbled -> the last labeled score in the raw text
+        matches = _SCORE_FIELD_RE.findall(text)
+        if matches:
+            score = int(matches[-1])
 
     if score not in _VALID_SCORES:
-        return None, f"UNPARSED: {text[:200]}"
-    return score, reason
+        return ParsedVerdict(None, f"UNPARSED: {text[:200]}", reasoning, turn_scores)
+    return ParsedVerdict(score, reason, reasoning, turn_scores)
 
 
 @dataclass
@@ -231,16 +447,18 @@ class ConversationUtilityResult(UtilityResult):
     n : int
         Conversations scored (blank originals are skipped entirely and not counted).
     n_scored, n_unchanged, n_unparsed : int
-        How many produced a usable score (including short-circuited 5s), how many were left
-        untouched by the defense and short-circuited with no API call, and how many could not be
-        parsed.
+        How many produced a usable score (including short-circuited 5s), how many had every
+        original turn left untouched by the defense -- identical, or with turns only appended after
+        them (:func:`_original_turns_intact`) -- and short-circuited with no API call, and how many
+        could not be parsed.
     score_counts : dict
         ``{1: count, ..., 5: count}``. Worth reading even when the mean looks fine: a bimodal 1/5
         split and a uniform 3 both average to 3 and say completely different things about a defense.
     sampled_from : int or None
         Full split size when ``limit`` was used, else ``None``.
     table : pandas.DataFrame
-        Per-conversation detail (``conv_id, score, reason, cost_usd``).
+        Per-conversation detail (``conv_id, score, reason, reasoning, turn_scores, cost_usd``).
+        ``turn_scores`` is a JSON list of the judge's per-turn 1-5 ratings, one per ORIGINAL turn.
     usage : JudgeUsage
         What this run actually spent at the API, in total. Note it counts **requests made, not
         conversations scored**: a verdict served from the cache and a conversation the defense left
@@ -250,6 +468,13 @@ class ConversationUtilityResult(UtilityResult):
     judge_model : str
         Model the requests were billed against; kept so the token counts can be re-priced later
         without guessing which model produced them.
+    n_skipped : int
+        Conversations not judged because their input exceeded the judge's context (local backend
+        only). Their ``score`` is ``None`` and they are excluded from every aggregate, like an
+        unparsed row -- but counted apart, since a skip is a length fact, not a judge failure.
+    judge_rates : TokenRates or None
+        The per-token prices this run's spend was computed at -- zero for a self-hosted backend,
+        ``None`` when unknown or when no client was built (a fully cached run).
     """
 
     mean_score: float
@@ -263,12 +488,17 @@ class ConversationUtilityResult(UtilityResult):
     sampled_from: int | None = None
     usage: JudgeUsage = field(default_factory=JudgeUsage)
     judge_model: str = ""
+    judge_rates: TokenRates | None = None
+    n_skipped: int = 0
 
-    #: The judge's verdict, and what it cost to get it. Deliberately unannotated, so ``@dataclass``
-    #: leaves it a class attribute rather than making it a constructor argument. ``reason`` stays
-    #: off the score file: it is a paragraph per row, and the file is meant to hold numbers a
-    #: defense can be compared on -- read reasons off ``table`` when calibrating the rubric.
-    score_columns = {"judge_score": "score", "judge_cost_usd": "cost_usd"}
+    #: The judge's verdict, what it cost, and why. Deliberately unannotated, so ``@dataclass``
+    #: leaves it a class attribute rather than making it a constructor argument. The one-line
+    #: ``reason`` and the chain of thought (``reasoning``; empty for a backend that does not record
+    #: it, or for an unchanged conversation that was never judged) ride in the score file so a
+    #: suspicious score can be audited in place.
+    score_columns = {"judge_score": "score", "judge_cost_usd": "cost_usd",
+                     "judge_turn_scores": "turn_scores",
+                     "judge_reason": "reason", "judge_reasoning": "reasoning"}
 
     def summary(self) -> str:
         if not self.n_scored:
@@ -280,7 +510,8 @@ class ConversationUtilityResult(UtilityResult):
         return (
             f"{self.sample_note()}Conversation utility  n={self.n}  "
             f"mean={self.mean_score:.2f}  usable(>={USABLE_SCORE_THRESHOLD})={self.usable_rate:.4f}  "
-            f"dist={dist}  (unchanged={self.n_unchanged}, unparsed={self.n_unparsed})"
+            f"dist={dist}  (unchanged={self.n_unchanged}, unparsed={self.n_unparsed}, "
+            f"skipped as too long={self.n_skipped})"
         )
 
 
@@ -294,16 +525,24 @@ class ConversationUtility(UtilityMetric):
 
     Parameters
     ----------
-    judge_model : str
-        Model / deployment name for the judge.
+    judge_backend : str
+        A key of :data:`JUDGE_BACKENDS`: ``"deepseek"`` (default, hosted, billed) or ``"local"``
+        (a self-hosted vLLM server, free). The settings below that are left ``None`` take this
+        backend's defaults.
+    judge_model : str, optional
+        Model / deployment name for the judge. For ``"local"``, ``None`` asks the server which
+        model it serves -- which needs the server up even for a fully cached run.
+    judge_base_url : str, optional
+        ``"local"`` only: the server's ``/v1`` URL (default :func:`~._vllm_judge.local_base_url`).
+        Not in the cache key -- the model name is what identifies the judge, not its address.
     judge_system_prompt : str
         The rubric. Swap it to recalibrate; the cache follows.
-    judge_temperature, judge_top_p : float
-        Sampling controls; see :data:`DEFAULT_JUDGE_TEMPERATURE` (both are ignored by the API
-        while reasoning is on, and are kept in the cache key rather than dropped).
-    judge_reasoning_effort : str or None
-        How much the judge thinks before answering; see
-        :data:`DEFAULT_JUDGE_REASONING_EFFORT`.
+    judge_temperature, judge_top_p : float, optional
+        Sampling controls; see :data:`DEFAULT_JUDGE_TEMPERATURE` (DeepSeek ignores both while
+        reasoning is on; vLLM honours them). Kept in the cache key either way.
+    judge_reasoning_effort : str or None, optional
+        How much the judge thinks before answering; see :data:`DEFAULT_JUDGE_REASONING_EFFORT`
+        and, for the local server, :mod:`._vllm_judge`.
     judge_max_tokens : int
         Output budget per request, shared between the reasoning and the verdict.
     max_chars : int, optional
@@ -316,23 +555,41 @@ class ConversationUtility(UtilityMetric):
     name = "conversation_judge"
     version = CONVERSATION_UTILITY_VERSION
 
-    def __init__(self, *, judge_model: str = DEFAULT_CONVERSATION_JUDGE_MODEL,
+    def __init__(self, *, judge_backend: str = DEFAULT_JUDGE_BACKEND,
+                 judge_model: str | None = None,
+                 judge_base_url: str | None = None,
                  judge_system_prompt: str = CONVERSATION_JUDGE_SYSTEM_PROMPT,
-                 judge_temperature: float = DEFAULT_JUDGE_TEMPERATURE,
-                 judge_top_p: float = DEFAULT_JUDGE_TOP_P,
-                 judge_reasoning_effort: str | None = DEFAULT_JUDGE_REASONING_EFFORT,
+                 judge_temperature: float | None = None,
+                 judge_top_p: float | None = None,
+                 judge_reasoning_effort: str | None = None,
                  judge_max_tokens: int = DEFAULT_CONVERSATION_JUDGE_MAX_TOKENS,
                  max_chars: int | None = DEFAULT_MAX_CHARS,
                  chunk_size: int = DEFAULT_JUDGE_CHUNK_SIZE):
-        self.judge_model = judge_model
+        if judge_backend not in JUDGE_BACKENDS:
+            raise ValueError(f"unknown judge backend {judge_backend!r}; "
+                             f"available: {sorted(JUDGE_BACKENDS)}")
+        if judge_base_url is not None and judge_backend != "local":
+            raise ValueError("judge_base_url only applies to judge_backend='local'; the DeepSeek "
+                             "endpoint comes from DEEPSEEK_BASE_URL.")
+        backend = JUDGE_BACKENDS[judge_backend]
+        self.judge_backend = judge_backend
+        self.judge_base_url = judge_base_url
+        if judge_backend == "local":
+            self.judge_base_url = judge_base_url or local_base_url()
+        # The model is resolved *now*, not when the client is built, because it is in the cache
+        # key: a local judge must name the model the server really runs before any lookup.
+        self.judge_model = (judge_model or backend.default_model
+                            or served_model_name(self.judge_base_url))
         self.judge_system_prompt = judge_system_prompt
-        self.judge_temperature = judge_temperature
-        self.judge_top_p = judge_top_p
-        self.judge_reasoning_effort = judge_reasoning_effort
+        self.judge_temperature = (backend.temperature if judge_temperature is None
+                                  else judge_temperature)
+        self.judge_top_p = backend.top_p if judge_top_p is None else judge_top_p
+        self.judge_reasoning_effort = (backend.reasoning_effort if judge_reasoning_effort is None
+                                       else judge_reasoning_effort)
         self.judge_max_tokens = judge_max_tokens
         self.max_chars = max_chars
         self.chunk_size = chunk_size
-        self._judge_client: DeepSeekJudge | None = None
+        self._judge_client: OpenAICompatibleJudge | None = None
 
     def params(self) -> dict:
         # Everything here changes what the judge is sent or how it samples. The sampling pair is
@@ -342,21 +599,51 @@ class ConversationUtility(UtilityMetric):
         # (post-processes a cached score, so re-sweeping it should cost nothing) and chunk_size (a
         # checkpoint interval -- it changes how the work is submitted, never what any one request
         # contains).
-        return {"judge_model": self.judge_model,
-                "judge_system_prompt": self.judge_system_prompt,
-                "judge_temperature": self.judge_temperature,
-                "judge_top_p": self.judge_top_p,
-                "judge_reasoning_effort": self.judge_reasoning_effort,
-                "max_chars": self.max_chars}
+        params = {"judge_model": self.judge_model,
+                  "judge_system_prompt": self.judge_system_prompt,
+                  "judge_temperature": self.judge_temperature,
+                  "judge_top_p": self.judge_top_p,
+                  "judge_reasoning_effort": self.judge_reasoning_effort,
+                  "max_chars": self.max_chars}
+        # The backend joins the key only when it is not the default, so the DeepSeek key -- and
+        # with it every verdict already paid for -- is byte-identical to before backends existed.
+        if self.judge_backend != DEFAULT_JUDGE_BACKEND:
+            params["judge_backend"] = self.judge_backend
+        if JUDGE_BACKENDS[self.judge_backend].structured_output:
+            params["response_format"] = JUDGE_RESPONSE_FORMAT
+        # Changes what is cached (an envelope, not the bare reply), so it must key the namespace.
+        if JUDGE_BACKENDS[self.judge_backend].record_reasoning:
+            params["record_reasoning"] = True
+        return params
+
+    def _system_prompt_sent(self) -> str:
+        """The rubric, plus :data:`JUDGE_OUTPUT_INSTRUCTION` for a schema-constrained backend.
+
+        Not a separate cache-key entry: it is a function of the rubric and the schema, which
+        :meth:`params` already carries.
+        """
+        if JUDGE_BACKENDS[self.judge_backend].structured_output:
+            return f"{self.judge_system_prompt}\n\n{JUDGE_OUTPUT_INSTRUCTION}"
+        return self.judge_system_prompt
 
     def _judge(self, inputs: list[str]) -> list[str]:
+        return self._client().complete_batch(inputs)
+
+    def _client(self) -> OpenAICompatibleJudge:
+        """The judge client, built on first use. A fully cached DeepSeek run never builds one; a
+        local run always does, since the context check below asks the server to count tokens."""
         if self._judge_client is None:
-            self._judge_client = DeepSeekJudge(
-                self.judge_model, self.judge_system_prompt,
+            endpoint = {"base_url": self.judge_base_url} if self.judge_backend == "local" else {}
+            backend = JUDGE_BACKENDS[self.judge_backend]
+            if backend.structured_output:
+                endpoint["response_format"] = JUDGE_RESPONSE_FORMAT
+            endpoint["record_reasoning"] = backend.record_reasoning
+            self._judge_client = JUDGE_BACKENDS[self.judge_backend].client(
+                self.judge_model, self._system_prompt_sent(),
                 max_tokens=self.judge_max_tokens, temperature=self.judge_temperature,
-                top_p=self.judge_top_p, reasoning_effort=self.judge_reasoning_effort,
+                top_p=self.judge_top_p, reasoning_effort=self.judge_reasoning_effort, **endpoint,
             )
-        return self._judge_client.complete_batch(inputs)
+        return self._judge_client
 
     def score(self, data, *, cache_dir, reference, side: str = "unknown",
               limit: int | None = None, seed: int = DEFAULT_SEED) -> ConversationUtilityResult:
@@ -380,21 +667,60 @@ class ConversationUtility(UtilityMetric):
             units.append((row, conv_id, original, defended))
         n = len(units)
 
-        # A conversation the defense left untouched trivially preserves everything, so short-circuit
-        # it to 5 without an API call. This is what makes scoring `--defense none` free.
+        # A conversation whose original turns the defense left untouched trivially preserves
+        # everything, so short-circuit it to 5 without an API call -- whether it is identical (which
+        # is what makes scoring `--defense none` free) or only had turns appended after them.
         scores: list[int | None] = [5] * n
-        reasons: list[str] = ["unchanged conversation"] * n
+        reasons: list[str] = [
+            "unchanged conversation" if defended == original
+            else "original turns unchanged; turns only appended"
+            for (_, _, original, defended) in units
+        ]
+        # "" rather than None where there is nothing to record, so a fresh row always replaces the
+        # score file's previous reasoning instead of letting a stale one survive the merge.
+        reasonings: list[str] = [""] * n
+        # One score per ORIGINAL turn, as a JSON list. A short-circuited conversation kept every
+        # original turn, so each of its (non-blank) turns is a 5.
+        turn_scores: list[str] = [
+            json.dumps([5] * sum(1 for turn in split_turns(original) if turn.strip()))
+            for (_, _, original, _) in units
+        ]
         # What each conversation cost *this run*. Unchanged ones cost nothing and never will;
         # judged ones are filled in below from the request they caused.
         costs: list[float] = [0.0] * n
-        changed = [u for u, (_, _, original, defended) in enumerate(units) if defended != original]
+        changed = [u for u, (_, _, original, defended) in enumerate(units)
+                   if not _original_turns_intact(original, defended)]
+
+        # Conversations too long for the judge's context are skipped rather than judged: their
+        # score stays None (reported as n_skipped, never folded into the mean) and nothing is
+        # cached for them, so a server started with a longer context picks them up next run.
+        # Checked before the cache on purpose -- a skip is a fact about today's server, not about
+        # the conversation, and must not be stored as if it were a verdict.
+        n_skipped = 0
+        if changed and JUDGE_BACKENDS[self.judge_backend].checks_context:
+            client = self._client()
+            budget = client.input_budget()
+            candidates = [_judge_input(units[u][2], units[u][3], max_chars=self.max_chars)
+                          for u in changed]
+            counts = client.input_token_counts(candidates)
+            fits = []
+            for u, tokens in zip(changed, counts):
+                if tokens > budget:
+                    scores[u] = None
+                    reasons[u] = (f"SKIPPED: judge input is {tokens:,} tokens, over the "
+                                  f"{budget:,}-token budget (context minus max_tokens)")
+                    turn_scores[u] = ""
+                    n_skipped += 1
+                else:
+                    fits.append(u)
+            if n_skipped:
+                print(f"Utility: skipped {n_skipped:,} of {len(changed):,} changed conversations "
+                      f"as too long for the judge ({budget:,}-token input budget)")
+            changed = fits
 
         if changed:
             judge_inputs = [
-                _judge_input(
-                    render_turns(units[u][2], label=True, drop_blank=True, max_chars=self.max_chars),
-                    render_turns(units[u][3], label=True, drop_blank=True, max_chars=self.max_chars),
-                )
+                _judge_input(units[u][2], units[u][3], max_chars=self.max_chars)
                 for u in changed
             ]
             # Judge in chunks so each chunk's verdicts are cached before the next starts: a run
@@ -412,14 +738,20 @@ class ConversationUtility(UtilityMetric):
                   f"{len(judge_inputs) - cached_count:,} judged)")
 
             for k, u in enumerate(changed):
-                scores[u], reasons[u] = _parse_score(verdicts[k])
+                answer, thinking = unpack_reply(verdicts[k])
+                verdict = _parse_score(answer)
+                scores[u], reasons[u] = verdict.score, verdict.reason
+                # The schema's written-out analysis when there is one, else the hidden thinking.
+                reasonings[u] = verdict.reasoning or thinking or ""
+                turn_scores[u] = ("" if verdict.turn_scores is None
+                                  else json.dumps(verdict.turn_scores))
                 # Zero for a verdict this run read back from the cache: the request that paid for
                 # it belongs to the run that made it, whose figure is already in the score file.
                 if self._judge_client is not None:
                     costs[u] = self._judge_client.request_cost(judge_inputs[k])
 
         parsed = [s for s in scores if s is not None]
-        n_unparsed = n - len(parsed)
+        n_unparsed = n - len(parsed) - n_skipped
         score_counts = {s: parsed.count(s) for s in _VALID_SCORES}
         mean_score = sum(parsed) / len(parsed) if parsed else 0.0
         usable = sum(1 for s in parsed if s >= USABLE_SCORE_THRESHOLD)
@@ -432,6 +764,8 @@ class ConversationUtility(UtilityMetric):
             "conv_id": [u[1] for u in units],
             "score": scores,          # None where the reply could not be parsed
             "reason": reasons,
+            "reasoning": reasonings,  # "" where not recorded
+            "turn_scores": turn_scores,  # JSON list, one per ORIGINAL turn; "" where not given
             "cost_usd": costs,
         })
         # A fully cached run never builds a client, so there is nothing to read -- report the empty
@@ -439,9 +773,10 @@ class ConversationUtility(UtilityMetric):
         usage = self._judge_client.usage if self._judge_client is not None else JudgeUsage()
         return ConversationUtilityResult(
             mean_score=mean_score, usable_rate=usable_rate, n=n, n_scored=len(parsed),
-            n_unchanged=n - len(changed), n_unparsed=n_unparsed, score_counts=score_counts,
+            n_unchanged=n - len(changed) - n_skipped, n_unparsed=n_unparsed, n_skipped=n_skipped, score_counts=score_counts,
             table=table, sampled_from=sides.sampled_from,
             usage=usage, judge_model=self.judge_model,
+            judge_rates=self._judge_client.rates if self._judge_client is not None else None,
         )
 
 
@@ -452,7 +787,8 @@ def conversation_utility(data, *, cache_dir, reference, side: str = "unknown",
     :class:`ConversationUtility`.
 
     Mirrors :func:`prompt_anonymity.defenses.apply_defense`. Any :class:`ConversationUtility`
-    constructor argument (``judge_model``, ``judge_system_prompt``, ``judge_temperature``,
+    constructor argument (``judge_backend``, ``judge_model``, ``judge_base_url``,
+    ``judge_system_prompt``, ``judge_temperature``,
     ``judge_max_tokens``, ``max_chars``, ``chunk_size``) may be passed through ``kwargs``.
     """
     return ConversationUtility(**kwargs).score(

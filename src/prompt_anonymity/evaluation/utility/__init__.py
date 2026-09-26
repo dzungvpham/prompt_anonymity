@@ -26,9 +26,10 @@ score a sample with the judge, and correlate -- which turns the paid judge from 
 into a calibration set for the free ones. :mod:`experiments.eval_utility` supports exactly that,
 merging every metric's per-conversation scores into one file per (source, defense).
 
-Judging runs on **DeepSeek** (:mod:`._deepseek`), reached through the ``openai`` library against
-its OpenAI-compatible endpoint; ``DEEPSEEK_BASE_URL`` and ``DEEPSEEK_API_KEY`` come from the
-``.env``. Every call is cached with the package's content-addressed
+Judging runs on **DeepSeek** (:mod:`._deepseek`) by default, reached through the ``openai``
+library against its OpenAI-compatible endpoint; ``DEEPSEEK_BASE_URL`` and ``DEEPSEEK_API_KEY`` come
+from the ``.env``. ``judge_backend="local"`` sends the same rubric to a self-hosted vLLM server
+instead (:mod:`._vllm_judge`), at no cost. Every call is cached with the package's content-addressed
 :class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/utility``, so re-runs and
 text shared across defenses cost nothing, and conversations a defense left unchanged short-circuit
 with no API call at all. The local metrics deliberately do **not** cache: a miss there is
@@ -55,7 +56,8 @@ Example
 
 from importlib import import_module
 
-from ._deepseek import DeepSeekJudge
+from ._deepseek import DeepSeekJudge, OpenAICompatibleJudge
+from ._vllm_judge import VLLMJudge
 from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 from .prompt_judge import (
     CONVERSATION_UTILITY_VERSION,
@@ -142,6 +144,8 @@ __all__ = [
     "get_utility",
     "eval_utility",
     "DeepSeekJudge",
+    "OpenAICompatibleJudge",
+    "VLLMJudge",
     "CONVERSATION_JUDGE_SYSTEM_PROMPT",
     "DEFAULT_CONVERSATION_JUDGE_MODEL",
     "DEFAULT_JUDGE_REASONING_EFFORT",

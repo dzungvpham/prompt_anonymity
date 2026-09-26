@@ -1560,20 +1560,24 @@ class ConfigCmc:
     n_candidates: int
     max_k: int
     level: str = "document"
-    #: An extra line for the panel note, or ``""``. Empty for ``accuracy/``, which is what keeps
-    #: those panels byte-identical; ``openset/accuracy/`` uses it to name the operating point its
-    #: curve is conditioned on, which is the one thing about that figure the axes cannot say.
+    #: The out-of-set cohort in this level's unit, or ``None``. Set only by ``openset/accuracy/``,
+    #: and its presence is what switches :func:`draw_cmc_panel` from the ``accuracy/`` note
+    #: (docs / users / candidates) to ``openset/identification``'s -- ``X out, Y in`` over
+    #: ``Z cand.`` -- so the two slices of one ``DIR(threshold, k)`` surface are annotated alike
+    #: (2026-09-25, on request). ``None`` is what keeps ``accuracy/`` byte-identical.
     #:
-    #: **It must hold only quantities shared by every series in a panel**, because
-    #: :func:`draw_cmc_panel` prints ``series[0]``'s note for the whole panel -- true of the
-    #: document, user and candidate counts, which are properties of the configuration. The
-    #: achieved FAR qualifies: the budget is ``floor(far * n_ood)`` out-of-set documents and
-    #: ``n_ood`` is the same for every attack scored on one configuration, so they all land on
-    #: the identical achieved rate. **How many in-set documents that threshold keeps does NOT
-    #: qualify** -- it is a property of the attack's own score distribution, and printing one
-    #: series' count over a six-series panel produced a note reading "0 kept" above curves at
-    #: 0.65. It lives in the companion CSV's ``n_accepted`` column instead, one value per series.
-    note_line: str = ""
+    #: The achieved FAR was a fourth note line until then; it is in the companion CSV's
+    #: ``false_accept_rate`` column now. It was panel-wide (every attack is held to one budget
+    #: over one out-of-set cohort), which is the only kind of quantity this note may carry:
+    #: :func:`draw_cmc_panel` prints ``series[0]``'s note for the whole panel, and a per-series
+    #: count (how many in-set documents the threshold keeps) once printed "0 kept" over curves
+    #: at 0.65. That count is the CSV's ``n_accepted``.
+    n_ood: int | None = None
+    #: The known side's pool for the ``cand.`` line, in the level's unit (known documents at
+    #: ``doc/``, known users at ``author/``), read from ``rolling_results.csv`` by
+    #: :func:`run_curves` exactly as :class:`ConfigIdentification`'s is. ``None`` leaves the line
+    #: off rather than guessing.
+    n_known: int | None = None
     #: Where that note sits. ``accuracy/`` keeps the file's bottom-right default, which is free
     #: there because a CMC curve climbs to the top right and leaves the corner it started under
     #: empty. ``openset/accuracy/`` cannot: the filter flattens the curve into a low band, so it
@@ -1583,7 +1587,8 @@ class ConfigCmc:
     #: swe-chat's author panels, where the Gemini curves step straight to 0.45-0.72 at k = 1 and
     #: stay flat across the full width, leaving no corner free at all. Re-run that sweep if a
     #: `PANEL_Y_LIMITS` entry or the note's LINE COUNT changes -- both move the answer, and the
-    #: earlier four-line note measured upper left at 9 rather than 4.
+    #: earlier four-line note measured upper left at 9 rather than 4. That sweep was of the
+    #: three-line note at 5% FAR; the note is two lines at 10% FAR now and was not re-swept.
     note_corner: str = "lower right"
 
     @property
@@ -2789,6 +2794,12 @@ def config_identification_authors(table: pd.DataFrame, people: pd.DataFrame,
 # than they do unfiltered.
 
 
+#: The false-accept budget ``openset/accuracy/`` pins. 10% rather than
+#: :data:`IDENTIFICATION_NOTE_FAR`'s 5% (2026-09-25, on request); the k = 1 point therefore
+#: equals the DIR-FAR curve read at FAR 10%, not at the 5% its note prints.
+OPENSET_ACCURACY_FAR = 0.10
+
+
 def threshold_at_far(scores: np.ndarray, is_ood: np.ndarray, far: float) -> tuple[float, float]:
     """``(threshold, achieved FAR)``: the most permissive accept threshold within a FAR budget.
 
@@ -2832,7 +2843,7 @@ def rejected_rank(ranks: np.ndarray, accepted: np.ndarray, ks: np.ndarray) -> np
 
 def config_identification_cmc(table: pd.DataFrame, weights: PanelWeights,
                               baseline: ProportionalBaseline | None,
-                              far: float = IDENTIFICATION_NOTE_FAR) -> ConfigCmc:
+                              far: float = OPENSET_ACCURACY_FAR) -> ConfigCmc:
     """Document-level CMC over the in-set documents that survive a ``far``-budget threshold.
 
     The denominator is **every** in-set document, not the accepted ones: a document the attacker
@@ -2856,6 +2867,7 @@ def config_identification_cmc(table: pd.DataFrame, weights: PanelWeights,
                  if len(row_weights) else (accuracy, accuracy))
     curve = pd.DataFrame({"k": ks, "accuracy": accuracy,
                           "n_accepted": int(accepted.sum()),
+                          "false_accept_rate": achieved,
                           "random": achieved * chance_cmc(pools, ks),
                           "random_proportional": (achieved * baseline.for_documents(ks)
                                                   if baseline else np.nan),
@@ -2863,13 +2875,13 @@ def config_identification_cmc(table: pd.DataFrame, weights: PanelWeights,
     return ConfigCmc(curve=curve, n_documents=len(in_set),
                      n_users=int(in_set["true_author"].nunique()),
                      n_candidates=int(pools.max()), max_k=int(ks[-1]), level="document",
-                     note_line=f"{achieved:.1%} FAR", note_corner="upper left")
+                     n_ood=int(is_ood.sum()), note_corner="upper left")
 
 
 def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
                                       weights: PanelWeights,
                                       baseline: ProportionalBaseline | None,
-                                      far: float = IDENTIFICATION_NOTE_FAR) -> ConfigCmc:
+                                      far: float = OPENSET_ACCURACY_FAR) -> ConfigCmc:
     """:func:`config_identification_cmc` counted per user, at the **author** level's own threshold.
 
     Two things differ from the document level, and both follow ``openset/identification/author``
@@ -2903,6 +2915,7 @@ def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
     counts = in_set.groupby("true_author").size().reindex(best.index).to_numpy(dtype=float)
     curve = pd.DataFrame({"k": ks, "accuracy": accuracy,
                           "n_accepted": int(accepted.sum()),
+                          "false_accept_rate": achieved,
                           "random": np.mean(
                               1.0 - (1.0 - achieved * np.minimum(ks, n_candidates)[None, :]
                                      / n_candidates) ** counts[:, None], axis=0),
@@ -2912,7 +2925,7 @@ def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
                           "ci_low": low, "ci_high": high})
     return ConfigCmc(curve=curve, n_documents=len(in_set), n_users=len(best),
                      n_candidates=n_candidates, max_k=int(ks[-1]), level="identity",
-                     note_line=f"{achieved:.1%} FAR", note_corner="upper left")
+                     n_ood=int(is_ood_user.sum()), note_corner="upper left")
 
 
 # --- the same operating point, split by how long the target conversation is -------------------
@@ -2925,7 +2938,8 @@ def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
 # Like the ndocs families it is observational: a long conversation is a different conversation,
 # usually by a different kind of user, not a short one given more words.
 
-#: The false-accept budget this family pins. 10% rather than the neighbouring families' 5%
+#: The false-accept budget this family pins. 10% like ``openset/accuracy/``
+#: (:data:`OPENSET_ACCURACY_FAR`) rather than the identification note's 5%
 #: (:data:`IDENTIFICATION_NOTE_FAR`), by request: split eight ways, a bin's DIR at 5% sits
 #: close enough to zero on WildChat/StyloMetrix that the length trend is hard to see.
 WORDS_IDENTIFICATION_FAR = 0.10
@@ -2984,16 +2998,20 @@ def config_identification_by_words(table: pd.DataFrame, weights: PanelWeights, d
     * **Document level** -- the threshold spends the budget on out-of-set documents; a bin's DIR
       is the share of its in-set documents identified.
     * **Author level** -- the threshold spends it on out-of-set *users* (a stranger is falsely
-      accepted when any one of their documents is), as ``openset/accuracy/author`` does. A user
-      is counted in every bin they have an in-set conversation in, and in a bin they count as
-      linked if any of **their conversations of that length** was accepted and ranked first. The
-      bins therefore overlap rather than partition the users -- the question is "does a
-      conversation this long get its author linked", which a user with both a short and a long
-      conversation answers once for each.
+      accepted when any one of their documents is), as ``openset/accuracy/author`` does. **Each
+      user sits in exactly one bin**, chosen by the **mean word count of their in-set (test-side)
+      conversations** -- the ones under attack -- on the same :data:`WORD_BIN_EDGES` as the
+      document level, and counts as linked if **any** of those conversations was accepted and
+      ranked first. That is ``openset/accuracy/author``'s k=1 event, so the bins partition the
+      users and their user-weighted mean reproduces that point at this budget. (Until
+      2026-09-25 a user was counted in every bin they had a conversation in, linked per bin by
+      conversations of that length; the bins overlapped and the bars could not be shares of
+      users.) The axis is then a property of the *person* -- how much a typical conversation of
+      theirs says -- not of one conversation.
 
     The baselines are a chance detector at the same achieved FAR in front of the proportional
-    guesser: ``far * p_a`` per document, and ``1 - (1 - far * p_a) ** m`` per (user, bin) with
-    ``m`` that user's in-set conversations in the bin -- the composition inside the power that
+    guesser: ``far * p_a`` per document, and ``1 - (1 - far * p_a) ** m`` per user with ``m``
+    their in-set conversations -- the composition inside the power that
     :meth:`ProportionalBaseline.identities_at_rate` explains.
 
     ``None`` without the corpus parquet, which is the only source of the word counts.
@@ -3034,26 +3052,33 @@ def config_identification_by_words(table: pd.DataFrame, weights: PanelWeights, d
              else 1.0 / pool)
 
     documents = pd.DataFrame({"author": in_set["true_author"].to_numpy(), "bin": document_bins,
-                              "hit": hit, "prior": prior, "pool": pool})
-    pairs = documents.groupby(["author", "bin"], sort=True).agg(
-        hit=("hit", "any"), prior=("prior", "first"), pool=("pool", "max"),
-        m=("hit", "size")).reset_index()
-    n_authors = np.bincount(pairs["bin"].to_numpy(), minlength=n_bins).astype(float)
-    n_documents = np.bincount(document_bins, minlength=n_bins).astype(float)
+                              "hit": hit, "prior": prior, "pool": pool,
+                              "words": lengths.to_numpy(dtype=float)})
     n_users = int(documents["author"].nunique())
 
     if level == "author":
-        bins = pairs["bin"].to_numpy()
-        unit_hit = pairs["hit"].to_numpy()
-        unit_weights = weights.for_authors(pairs["author"])
-        chances = pairs["m"].to_numpy(dtype=float)
-        proportional = 1.0 - (1.0 - achieved * pairs["prior"].to_numpy(dtype=float)) ** chances
-        uniform = 1.0 - (1.0 - achieved / pairs["pool"].to_numpy(dtype=float)) ** chances
-        # The bins overlap (see the docstring), so the bar is each bin's share of (user, bin)
-        # pairs -- the units its point is a rate over. Share of *users* would not sum to one and
-        # reached 0.7 on swe-chat, straight through the panel note.
+        # One row per user, binned by the mean length of their in-set conversations.
+        people = documents.groupby("author", sort=True).agg(
+            hit=("hit", "any"), prior=("prior", "first"), pool=("pool", "max"),
+            m=("hit", "size"), words=("words", "mean")).reset_index()
+        bins = np.clip(np.searchsorted(WORD_BIN_EDGES, people["words"].to_numpy(dtype=float),
+                                       side="right") - 1, 0, None)
+        chances = people["m"].to_numpy(dtype=float)
+        n_authors = np.bincount(bins, minlength=n_bins).astype(float)
+        # A bin's documents are its users' documents, wherever each one's own length falls.
+        n_documents = np.bincount(bins, weights=chances, minlength=n_bins)
+        unit_hit = people["hit"].to_numpy()
+        unit_weights = weights.for_authors(people["author"])
+        proportional = 1.0 - (1.0 - achieved * people["prior"].to_numpy(dtype=float)) ** chances
+        uniform = 1.0 - (1.0 - achieved / people["pool"].to_numpy(dtype=float)) ** chances
+        # The bins partition the users, so the bar is each bin's share of them.
         share = n_authors / n_authors.sum()
     else:
+        # A bin's user count gates it (MIN_AUTHORS_PER_BIN); here a user is counted in every
+        # bin they have a document in, since the unit is the document.
+        n_authors = (documents.groupby("bin")["author"].nunique()
+                     .reindex(range(n_bins), fill_value=0).to_numpy(dtype=float))
+        n_documents = np.bincount(document_bins, minlength=n_bins).astype(float)
         bins, unit_hit = document_bins, hit
         unit_weights = (weights.documents[:, rows] if len(weights.documents)
                         else weights.documents)
@@ -3440,10 +3465,12 @@ PANEL_Y_LIMITS = {
     ("identification_words", "wildchat"): (0.4, 0.1),
     ("identification_words_authors", "wildchat"): (0.4, 0.1),
     # Same reasoning one family over, and the ceiling is set by the *baseline* at the author
-    # level rather than by the curve: 0.2125 / 0.1475 for the two levels' highest curve against
-    # a chance-detector reference reaching 0.2650, so 0.3 is what holds both.
-    ("identification_cmc", "wildchat"): (0.3, 0.1),
-    ("identification_cmc_authors", "wildchat"): (0.3, 0.1),
+    # level rather than by the curve. At the 10% FAR budget (:data:`OPENSET_ACCURACY_FAR`) the
+    # two levels' highest curve is 0.3075 / 0.2436 against a chance-detector reference reaching
+    # 0.391, so 0.4 is what holds both -- 0.3 did at 5% and clipped at 10%. Tight: check the
+    # widest `ci_high` under `--bands` before trusting it.
+    ("identification_cmc", "wildchat"): (0.4, 0.1),
+    ("identification_cmc_authors", "wildchat"): (0.4, 0.1),
 }
 
 
@@ -3822,11 +3849,18 @@ def draw_cmc_panel(axes, series: list[Series], handles: dict,
     # is 4.0 in against a 3.2 in panel and hung out over the y tick labels. Three lines of at most
     # 1.5 in fit. Every drawer here notes its counts this way for the same reason.
     counts = series[0].curve
-    panel_note(axes, f"{abbreviate_count(counts.n_documents)} docs\n"
-                     f"{abbreviate_count(counts.n_users)} users\n"
-                     f"{abbreviate_count(counts.n_candidates)} candidates"
-                     + (f"\n{counts.note_line}" if counts.note_line else ""),
-               scale=scale, corner=counts.note_corner)
+    if counts.n_ood is None:
+        note = (f"{abbreviate_count(counts.n_documents)} docs\n"
+                f"{abbreviate_count(counts.n_users)} users\n"
+                f"{abbreviate_count(counts.n_candidates)} candidates")
+    else:
+        # `openset/identification`'s note, verbatim: out/in cohorts in the level's unit, then
+        # the known pool. The in-set count is users at the identity level, documents otherwise.
+        n_in_set = counts.n_users if counts.level == "identity" else counts.n_documents
+        note = f"{abbreviate_count(counts.n_ood)} out, {abbreviate_count(n_in_set)} in"
+        if counts.n_known is not None:
+            note += f"\n{abbreviate_count(counts.n_known)} cand."
+    panel_note(axes, note, scale=scale, corner=counts.note_corner)
     return pd.concat(rows, ignore_index=True)
 
 
@@ -4537,19 +4571,21 @@ CURVE_TYPES = {
     "identification_words_authors": (draw_words_identification_panel,
                                      "openset/identification_by_words/author", "Words", "DIR",
                                      "Share of in-set users linked at least once by an accepted, "
-                                     "top-1 conversation of that length, at a threshold leaking "
-                                     "at most 10% of out-of-set USERS (stricter than the document "
-                                     "panel's, so the two levels are not one operating point). A "
-                                     "user is counted in every bin they have a conversation in, "
-                                     "so the bins overlap: bars are each bin's share of "
-                                     "(user, bin) pairs"),
+                                     "top-1 conversation, at a threshold leaking at most 10% of "
+                                     "out-of-set USERS (stricter than the document panel's, so "
+                                     "the two levels are not one operating point). Each user is "
+                                     "in ONE bin, by the mean word count of their in-set "
+                                     "conversations (same bins as the document level), so the "
+                                     "bins partition the users and the user-weighted mean over "
+                                     "bins is openset/accuracy/author's k=1 point. Bars: each "
+                                     "bin's share of in-set users"),
     "identification_cmc": (draw_cmc_panel, "openset/accuracy/doc",
                            "Top k candidates", "DIR",
                            "The accuracy/ CMC curve with the rejection filter applied: the share "
                            "of ALL in-set documents ranked within k by a document the attacker "
-                           "accepted, at the most permissive threshold within a 5% FAR budget. A "
-                           "refused document is a miss at every k. Its k=1 point is the "
-                           "openset/identification panel read at FAR 5%; the two are orthogonal "
+                           "accepted, at the most permissive threshold within a 10% FAR budget. "
+                           "A refused document is a miss at every k. Its k=1 point is the "
+                           "openset/identification panel read at FAR 10%; the two are orthogonal "
                            "slices of DIR(threshold, k). Grey dashes: a chance detector at the "
                            "same achieved FAR in front of the proportional guesser, which "
                            "saturates at the achieved FAR itself -- a guesser allowed every "
@@ -4567,7 +4603,7 @@ CURVE_TYPES = {
                                    "the attack at large k on WildChat and that is a real "
                                    "result**: at k = every candidate both reduce to the share of "
                                    "in-set users with any accepted document, and a chance "
-                                   "detector spreads the same 5% of accepts over more people "
+                                   "detector spreads the same 10% of accepts over more people "
                                    "than a real one, which concentrates them on the confident "
                                    "and prolific. It touches more users while identifying none "
                                    "of them, so read the LOW-k end, where the gap is 100x"),
@@ -7462,8 +7498,10 @@ def run_curves(run: Run, tables: dict[str, pd.DataFrame], bootstrap: AuthorBoots
         curves["identification_authors"][tag].n_candidates = pool_users
         # The other slice of the same surface: threshold pinned, k on the axis.
         curves["identification_cmc"][tag] = config_identification_cmc(table, panel, open_baseline)
+        curves["identification_cmc"][tag].n_known = pool_docs
         curves["identification_cmc_authors"][tag] = config_identification_cmc_authors(
             table, people, people_panel, open_baseline)
+        curves["identification_cmc_authors"][tag].n_known = pool_users
         curves["separation_authors"][tag] = config_separation(people, people_panel,
                                                               level="author")
         # One operating point, split by the target's length. Absent without the corpus parquet,

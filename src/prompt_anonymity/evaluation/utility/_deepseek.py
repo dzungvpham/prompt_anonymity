@@ -35,6 +35,7 @@ rubric constants or the score parser -- never requires the SDK or a key.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from dataclasses import dataclass
@@ -208,8 +209,50 @@ def _reply_text(choice) -> str:
     return content
 
 
-class DeepSeekJudge:
+def _reasoning_text(message) -> str | None:
+    """The chain of thought a reasoning parser split off the answer, or ``None`` when absent.
+
+    vLLM has spelled the field both ``reasoning_content`` (older, and DeepSeek's) and ``reasoning``
+    (newer); the SDK exposes whichever the server sent as an attribute, so both are tried.
+    """
+    if message is None:
+        return None
+    for attribute in ("reasoning_content", "reasoning"):
+        value = getattr(message, attribute, None)
+        if value:
+            return str(value)
+    return None
+
+
+def pack_reply(content: str, reasoning: str | None) -> str:
+    """One cacheable string holding a reply *and* its chain of thought (see :func:`unpack_reply`).
+
+    The response cache stores one string per input, so a judge that records its reasoning stores
+    this envelope instead of the bare answer. Which format a cache namespace holds is fixed by the
+    metric's cache key (``record_reasoning`` is in it), so the two never share a namespace.
+    """
+    return json.dumps({"content": content, "reasoning": reasoning}, ensure_ascii=False)
+
+
+def unpack_reply(raw: str) -> tuple[str, str | None]:
+    """``(answer, reasoning)`` from a :func:`pack_reply` envelope; a bare answer passes through
+    as ``(raw, None)``, so a blank-input ``""`` or a plain reply is still read correctly."""
+    try:
+        envelope = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw, None
+    if isinstance(envelope, dict) and set(envelope) == {"content", "reasoning"}:
+        return str(envelope["content"] or ""), envelope["reasoning"]
+    return raw, None
+
+
+class OpenAICompatibleJudge:
     """Score a list of prompts with one chat model: one reply per input, in input order.
+
+    The endpoint-agnostic part of the judge: any server speaking OpenAI's ``/chat/completions``
+    works, given its base URL and key. Two subclasses supply those --
+    :class:`DeepSeekJudge` (the hosted, billed deployment, credentials from ``.env``) and
+    :class:`~prompt_anonymity.evaluation.utility._vllm_judge.VLLMJudge` (a self-hosted vLLM server).
 
     Built lazily by the metric on first real need, so a fully-cached scoring run constructs no
     client and needs no credentials.
@@ -220,58 +263,54 @@ class DeepSeekJudge:
         Model / deployment name as the configured endpoint serves it.
     system_prompt : str
         System message prepended to every request -- the judge's rubric.
+    base_url, api_key : str
+        The endpoint and its credential. Both explicit: resolving them is the subclass's job.
+    rates : TokenRates or None
+        What a token costs at this endpoint, or ``None`` when unknown -- which is recorded as
+        ``nan``, never as free. A self-hosted server passes zero rates, because it genuinely bills
+        nothing.
     max_tokens : int
         Output budget per request, **shared between the reasoning and the answer**. The verdict
         itself is one line of JSON, but with ``reasoning_effort`` set the chain of thought is spent
         from the same budget; too tight a budget shows up as a truncated (and unparseable) reply
         rather than an error, which is what :func:`_reply_text`'s ``TRUNCATED`` marker names.
-        Measured headroom: the dearest setting (``max``) spent ~460 tokens on this workload, so the
-        8192 default is ample -- it was sized for reasoning that, before 2026-08-11, was not
-        actually happening.
     temperature, top_p : float
-        Sampling controls. Both are ignored by the API while reasoning is on -- see
-        :data:`DEFAULT_TEMPERATURE`.
+        Sampling controls. Whether the endpoint honours them is endpoint-specific -- see
+        :data:`DEFAULT_TEMPERATURE` for DeepSeek, which ignores them while reasoning.
     reasoning_effort : str or None
-        ``"low"`` / ``"high"`` / ``"max"`` to think, ``"none"`` not to, ``None`` to omit the field
-        (which on this deployment also means not thinking). See :data:`DEFAULT_REASONING_EFFORT`
-        for what is actually honoured here, which is not what the vendor guide says.
+        Sent as the OpenAI-compatible ``reasoning_effort`` field; ``None`` omits it. Which values
+        are accepted, and what omitting it means, differs per endpoint (see the subclasses).
+    response_format : dict, optional
+        Sent as the OpenAI ``response_format`` field when set -- a JSON schema the endpoint
+        constrains decoding to. Only for endpoints that honour it (vLLM does); ``None`` omits it.
+    record_reasoning : bool
+        Return each reply as a :func:`pack_reply` envelope carrying the chain of thought too,
+        rather than the bare answer. Off by default: turning it on changes what gets cached.
     max_workers, max_retries, timeout : int / int / float
         Concurrency, SDK retry budget, and per-request timeout.
     """
 
-    def __init__(self, model: str = DEFAULT_JUDGE_MODEL, system_prompt: str = "", *,
-                 max_tokens: int = 8192, temperature: float = DEFAULT_TEMPERATURE,
-                 top_p: float = DEFAULT_TOP_P,
+    def __init__(self, model: str, system_prompt: str = "", *, base_url: str, api_key: str,
+                 rates: TokenRates | None, max_tokens: int = 8192,
+                 temperature: float = DEFAULT_TEMPERATURE, top_p: float = DEFAULT_TOP_P,
                  reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
+                 response_format: dict | None = None,
+                 record_reasoning: bool = False,
                  max_workers: int = DEFAULT_MAX_WORKERS,
                  max_retries: int = DEFAULT_MAX_RETRIES,
-                 timeout: float = DEFAULT_TIMEOUT_SECONDS,
-                 api_key_env: str = DEEPSEEK_API_KEY_ENV,
-                 base_url_env: str = DEEPSEEK_BASE_URL_ENV):
-        from dotenv import load_dotenv
+                 timeout: float = DEFAULT_TIMEOUT_SECONDS):
         from openai import OpenAI
 
         self.model = model
         self.system_prompt = system_prompt
+        self.rates = rates
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.reasoning_effort = reasoning_effort
+        self.response_format = response_format
+        self.record_reasoning = record_reasoning
         self.max_workers = max_workers
-
-        load_dotenv()  # walks up from cwd, so credentials can live in the repo root or a subdir
-        api_key = os.environ.get(api_key_env)
-        base_url = os.environ.get(base_url_env)
-        if not api_key:
-            raise RuntimeError(
-                f"{api_key_env} not set. Add it to a .env file so the utility metric can call the "
-                "judge."
-            )
-        if not base_url:
-            raise RuntimeError(
-                f"{base_url_env} not set. Without it the OpenAI client would send this key to "
-                "OpenAI's own API, where it is not a credential. Set the DeepSeek endpoint in .env."
-            )
         self._client = OpenAI(base_url=base_url, api_key=api_key,
                               max_retries=max_retries, timeout=timeout)
         # Running tally of what this client has actually spent. `complete` runs on a thread pool,
@@ -283,7 +322,7 @@ class DeepSeekJudge:
         # holds, so this costs a dict entry per request and no copy of the text.
         self.request_usage: dict[str, JudgeUsage] = {}
         self._usage_lock = threading.Lock()
-        print(f"Utility: judge using model '{model}' "
+        print(f"Utility: judge using model '{model}' at {base_url} "
               f"(reasoning_effort={reasoning_effort}, temperature={temperature}, top_p={top_p})")
 
     def complete(self, text: str) -> str:
@@ -296,6 +335,8 @@ class DeepSeekJudge:
         # `reasoning_effort` is sent bare and only when set: `extra_body={"thinking": ...}`, which
         # the vendor guide pairs it with, is rejected outright here (see DEFAULT_REASONING_EFFORT).
         extra = {"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}
+        if self.response_format is not None:
+            extra["response_format"] = self.response_format
         completion = self._client.chat.completions.create(
             model=self.model,
             messages=[
@@ -316,8 +357,11 @@ class DeepSeekJudge:
                 per_request.add(completion.usage)
                 self.request_usage[text] = per_request
         if not completion.choices:
-            return "EMPTY: the provider returned no choices for this conversation"
-        return _reply_text(completion.choices[0])
+            reply, reasoning = "EMPTY: the provider returned no choices for this conversation", None
+        else:
+            choice = completion.choices[0]
+            reply, reasoning = _reply_text(choice), _reasoning_text(choice.message)
+        return pack_reply(reply, reasoning) if self.record_reasoning else reply
 
     def complete_batch(self, texts: list[str]) -> list[str]:
         """Judge a batch of prompts concurrently, preserving input order.
@@ -342,12 +386,44 @@ class DeepSeekJudge:
         Three outcomes, deliberately distinguished: a real figure when the request was made here;
         ``0.0`` when it was not (the verdict came from the cache, or the conversation was never
         judged), because that is what this run spent on it; and ``nan`` when the request *was* made
-        but the model carries no price in :data:`MODEL_RATES` -- "unknown", which must not be
+        but the endpoint carries no price (:attr:`rates` is ``None``) -- "unknown", which must not be
         recorded as "free". Cost paid by an *earlier* run is not zero and is not lost: it is
         already in that conversation's row of the score file, which a re-run preserves.
         """
         usage = self.request_usage.get(text)
         if usage is None:
             return 0.0
-        cost = usage.estimated_cost(token_rates(self.model))
+        cost = usage.estimated_cost(self.rates)
         return float("nan") if cost is None else cost
+
+
+class DeepSeekJudge(OpenAICompatibleJudge):
+    """:class:`OpenAICompatibleJudge` against the Azure-hosted DeepSeek deployment.
+
+    Resolves the endpoint and key from ``DEEPSEEK_BASE_URL`` / ``DEEPSEEK_API_KEY`` (process env
+    or ``.env``), both required, and prices requests from :data:`MODEL_RATES`. See
+    :data:`DEFAULT_REASONING_EFFORT` for what this deployment actually does with
+    ``reasoning_effort``, which is not what the vendor guide says: thinking is off unless the field
+    is sent, and the value is not validated.
+    """
+
+    def __init__(self, model: str = DEFAULT_JUDGE_MODEL, system_prompt: str = "", *,
+                 api_key_env: str = DEEPSEEK_API_KEY_ENV,
+                 base_url_env: str = DEEPSEEK_BASE_URL_ENV, **kwargs):
+        from dotenv import load_dotenv
+
+        load_dotenv()  # walks up from cwd, so credentials can live in the repo root or a subdir
+        api_key = os.environ.get(api_key_env)
+        base_url = os.environ.get(base_url_env)
+        if not api_key:
+            raise RuntimeError(
+                f"{api_key_env} not set. Add it to a .env file so the utility metric can call the "
+                "judge."
+            )
+        if not base_url:
+            raise RuntimeError(
+                f"{base_url_env} not set. Without it the OpenAI client would send this key to "
+                "OpenAI's own API, where it is not a credential. Set the DeepSeek endpoint in .env."
+            )
+        super().__init__(model, system_prompt, base_url=base_url, api_key=api_key,
+                         rates=token_rates(model), **kwargs)

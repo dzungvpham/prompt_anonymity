@@ -14,6 +14,8 @@ defending happens here::
     python -m prompt_anonymity.data.apply_defenses --source swe_chat --defense styleremix
     python experiments/eval_utility.py --source swe_chat --defense styleremix   # free, local
     python experiments/eval_utility.py --source swe_chat --defense styleremix --metric conversation --limit 50   # PAID
+    python experiments/eval_utility.py --source swe_chat --defense styleremix --metric conversation \
+        --judge-backend local   # the same judge against a self-hosted vLLM server (scripts/serve_qwen.sh), free
 
 **One file per (source, defense), holding every metric's scores.**
 ``experiments/utility/<source>_<defense>.csv`` is keyed by ``conv_id`` and carries one column per
@@ -26,7 +28,9 @@ Rows the run did not score keep whatever the file already had.
 and nothing else; ``conversation`` calls a hosted judge, one request per conversation, and has to
 be asked for by name. Start it with a small ``--limit``: the rubric is meant to be iterated on, and
 a full corpus judged under one that turns out to be miscalibrated is money spent on a number that
-gets thrown away. Every verdict is cached by conversation content, so raising the limit later
+gets thrown away. ``--judge-backend local`` sends the same rubric to a self-hosted vLLM server
+instead (``$LOCAL_LLM_BASE_URL`` or ``localhost:$LOCAL_LLM_PORT``), which records ``0.0`` cost; its
+verdicts cache separately, since the served model name is in the key. Every verdict is cached by conversation content, so raising the limit later
 re-judges only what is new -- and a re-judged row's ``judge_cost_usd`` stays at what was actually
 paid, since a cached row contributes nothing and does not overwrite the recorded figure.
 
@@ -57,9 +61,8 @@ from prompt_anonymity.data.config import cache_dir as default_cache_dir, hf_dir
 from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.defenses._backends import join_turns
 from prompt_anonymity.evaluation.utility import DEFAULT_SEED, UTILITY_METRICS, eval_utility
-from prompt_anonymity.evaluation.utility._deepseek import token_rates
 from prompt_anonymity.evaluation.utility.prompt_judge import (
-    DEFAULT_JUDGE_REASONING_EFFORT, DEFAULT_JUDGE_TEMPERATURE, load_judge_prompt)
+    DEFAULT_JUDGE_BACKEND, JUDGE_BACKENDS, load_judge_prompt)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 #: Where the per-(source, defense) score tables land. Deliberately not ``experiments/results/``:
@@ -81,6 +84,9 @@ SCORE_COLUMN_ORDER = [
     "conv_id",
     "judge_score",        # conversation: the 1-5 verdict
     "judge_cost_usd",     # conversation: what that verdict actually cost
+    "judge_turn_scores",  # conversation: per-turn 1-5 ratings, a JSON list per ORIGINAL turn
+    "judge_reason",       # conversation: the judge's one-line explanation
+    "judge_reasoning",    # conversation: its per-turn analyses and connections check
     "entailment",         # semantic: P(rewrite entails original)
     "bertscore_recall",   # semantic: token-level recall against the original
     "ppl_ratio",          # fluency: perplexity(rewrite) / perplexity(original)
@@ -106,8 +112,13 @@ def read_doc_ids(path: Path) -> list[str]:
     return [str(value) for value in table.column("doc_id").to_pylist()]
 
 
-def align_positions(original_ids: list[str], defended_ids: list[str]) -> list[int]:
+def align_positions(original_ids: list[str], defended_ids: list[str], *,
+                    allow_missing: bool = False) -> list[int | None]:
     """Row position in the defended split for each original row, or raise.
+
+    With ``allow_missing`` an original row absent from the defended split maps to ``None`` instead
+    of raising -- only for ``--defended-file``, whose file may legitimately cover part of the split
+    (see ``scripts/salvage_turn_lists.py``).
 
     The defended parquet is written in its source split's order, so this is usually the identity
     map -- but a sharded defense run reassembled out of order, or a defended file built from a
@@ -119,6 +130,8 @@ def align_positions(original_ids: list[str], defended_ids: list[str]) -> list[in
         raise ValueError("the defended split has duplicate doc_ids; it cannot be joined one-to-one.")
     position_of = {doc_id: position for position, doc_id in enumerate(defended_ids)}
     missing = [doc_id for doc_id in original_ids if doc_id not in position_of]
+    if allow_missing:
+        return [position_of.get(doc_id) for doc_id in original_ids]
     if missing:
         raise ValueError(
             f"{len(missing):,} of {len(original_ids):,} documents are absent from the defended "
@@ -142,8 +155,17 @@ def sample_positions(total: int, limit: int | None, seed: int) -> list[int]:
     return sorted(int(position) for position in rng.choice(total, size=limit, replace=False))
 
 
-def load_pair(source: str, defense: str, data_dir: Path, limit: int | None, seed: int):
+def load_pair(source: str, defense: str, data_dir: Path, limit: int | None, seed: int,
+              defended_path: Path | None = None):
     """The aligned ``(original, defended)`` bundles for a sample of the split, plus its full size.
+
+    ``defended_path`` reads the rewrites from that parquet instead of the registered defense's
+    ``<split>_<defense>.parquet``. Such a file may cover only part of the split: the sample is still
+    drawn over the **whole** split, with the same seed, so it is the same sample every other
+    defense is scored on, and sampled conversations the file lacks are dropped and counted. That
+    keeps the result paired with the other defenses -- but the dropped rows are not random if the
+    file is not (for the salvaged DP-MLM file they are mostly long conversations), so compare it to
+    other defenses on the shared rows, not against their full-sample means.
 
     Each conversation's turn list is joined with the package's turn delimiter, which is what the
     metrics' renderer splits on -- so a defense that dropped or merged a turn is visible as such
@@ -153,11 +175,13 @@ def load_pair(source: str, defense: str, data_dir: Path, limit: int | None, seed
     all of them, and on a full split it is the expensive part of the run that is not a forward pass.
     """
     original_path = data_dir / f"{source}.parquet"
-    defended_path = data_dir / f"{defended_stem(source, defense)}.parquet"
+    external = defended_path is not None
+    if not external:
+        defended_path = data_dir / f"{defended_stem(source, defense)}.parquet"
 
     original_ids = read_doc_ids(original_path)
     defended_ids = read_doc_ids(defended_path)
-    defended_of = align_positions(original_ids, defended_ids)
+    defended_of = align_positions(original_ids, defended_ids, allow_missing=external)
 
     total = len(original_ids)
     positions = sample_positions(total, limit, seed)
@@ -166,9 +190,16 @@ def load_pair(source: str, defense: str, data_dir: Path, limit: int | None, seed
               f"{total:,} documents (seed={seed})")
     else:
         print(f"[{source}/{defense}] scoring all {total:,} documents")
+    if external:
+        covered = [position for position in positions if defended_of[position] is not None]
+        print(f"[{source}/{defense}] {defended_path.name} covers {len(covered):,} of the "
+              f"{len(positions):,} sampled documents; the other {len(positions) - len(covered):,} "
+              "are dropped")
+        positions = covered
 
     original_turns = read_turns(source, data_dir, positions)
-    defended_turns = read_turns(defended_stem(source, defense), data_dir,
+    # read_turns takes a stem and a directory; a path's own stem and parent say the same thing.
+    defended_turns = read_turns(defended_path.name.removesuffix(".parquet"), defended_path.parent,
                                 [defended_of[position] for position in positions])
 
     doc_ids = [original_ids[position] for position in positions]
@@ -239,6 +270,15 @@ def main() -> None:
                              f"into the one output file. Available: {', '.join(sorted(UTILITY_METRICS))}. "
                              f"'conversation' calls a PAID API, one request per conversation, so it "
                              f"is not in the default ({' '.join(DEFAULT_METRICS)})")
+    parser.add_argument("--defended-file", default=None, type=Path,
+                        help="score the rewrites in this parquet (doc_id, turns) instead of a "
+                             "registered defense's; it may cover part of the split (e.g. the "
+                             "output of scripts/salvage_turn_lists.py). Named in the output by "
+                             "--label")
+    parser.add_argument("--label", default=None,
+                        help="--defended-file only: the name for the output file, "
+                             "<source>_<label>.csv (default: the file's stem without the "
+                             "'<source>_' prefix and a '.salvaged' suffix)")
     parser.add_argument("--data-dir", default=None,
                         help="directory holding <split>.parquet and <split>_<defense>.parquet "
                              "(default: the published-dataset mirror, data/hf)")
@@ -255,17 +295,28 @@ def main() -> None:
                              "editing the packaged one; each distinct rubric caches separately, "
                              "so switching back and forth re-judges nothing "
                              "(default: the packaged conversation_judge.yaml)")
+    parser.add_argument("--judge-backend", default=None, choices=sorted(JUDGE_BACKENDS),
+                        help=f"where the judge runs (default: {DEFAULT_JUDGE_BACKEND}): 'deepseek' "
+                             "is the hosted, billed deployment; 'local' is a self-hosted vLLM "
+                             "server (scripts/serve_qwen.sh), free")
+    parser.add_argument("--judge-base-url", default=None,
+                        help="--judge-backend local only: the server's /v1 URL (default: "
+                             "$LOCAL_LLM_BASE_URL, else http://localhost:$LOCAL_LLM_PORT/v1)")
     parser.add_argument("--judge-model", default=None,
-                        help="override the judge model id")
+                        help="override the judge model id (local default: whatever the server "
+                             "serves, read from its /v1/models)")
     parser.add_argument("--judge-temperature", type=float, default=None,
-                        help="override the judge's sampling temperature (default: "
-                             f"{DEFAULT_JUDGE_TEMPERATURE}; note the API ignores it while "
-                             "reasoning is on)")
+                        help="override the judge's sampling temperature (default per backend: "
+                             + ", ".join(f"{name} {backend.temperature}"
+                                         for name, backend in sorted(JUDGE_BACKENDS.items()))
+                             + "; DeepSeek ignores it while reasoning is on)")
     parser.add_argument("--judge-reasoning-effort", default=None,
-                        help="how much the judge thinks before answering: none, low, high, max "
-                             f"(default: {DEFAULT_JUDGE_REASONING_EFFORT}). 'none' is materially "
-                             "cheaper -- it is ~6x fewer output tokens -- and 'max' is the only "
-                             "level measurably above 'low' on this deployment")
+                        help="how much the judge thinks before answering (default per backend: "
+                             + ", ".join(f"{name} {backend.reasoning_effort}"
+                                         for name, backend in sorted(JUDGE_BACKENDS.items()))
+                             + "). deepseek: none, low, high, max -- 'none' is ~6x fewer output "
+                             "tokens, 'max' the only level measurably above 'low'. local vLLM: "
+                             "none, low, medium, xhigh, validated by the server")
     parser.add_argument("--out", default=None,
                         help="where to write the merged score table "
                              "(default: experiments/utility/<source>_<defense>.csv)")
@@ -275,13 +326,20 @@ def main() -> None:
     # not a rubric -- so passing them to a run that never judges anything is a mistake worth naming
     # rather than silently ignoring.
     judge_flags = {"--judge-prompt": args.judge_prompt, "--judge-model": args.judge_model,
+                   "--judge-backend": args.judge_backend, "--judge-base-url": args.judge_base_url,
                    "--judge-temperature": args.judge_temperature,
                    "--judge-reasoning-effort": args.judge_reasoning_effort}
     misapplied = [flag for flag, value in judge_flags.items() if value is not None]
     if "conversation" not in args.metric and misapplied:
         parser.error(f"{', '.join(misapplied)} only applies to --metric conversation, which this "
                      f"run does not include (--metric {' '.join(args.metric)}).")
+    if args.judge_base_url and args.judge_backend != "local":
+        parser.error("--judge-base-url only applies with --judge-backend local.")
     overrides = {}
+    if args.judge_backend:
+        overrides["judge_backend"] = args.judge_backend
+    if args.judge_base_url:
+        overrides["judge_base_url"] = args.judge_base_url
     if args.judge_prompt:
         overrides["judge_system_prompt"] = load_judge_prompt(args.judge_prompt)
         print(f"judge rubric: {args.judge_prompt}")
@@ -292,10 +350,16 @@ def main() -> None:
     if args.judge_reasoning_effort is not None:
         overrides["judge_reasoning_effort"] = args.judge_reasoning_effort
 
+    if args.label and not args.defended_file:
+        parser.error("--label only applies with --defended-file.")
+    defense_name = args.defense
+    if args.defended_file:
+        stem = args.defended_file.name.removesuffix(".parquet").removesuffix(".salvaged")
+        defense_name = args.label or stem.removeprefix(f"{args.source}_")
     data_dir = Path(args.data_dir) if args.data_dir else hf_dir()
     cache_root = Path(args.cache_dir) if args.cache_dir else default_cache_dir()
-    reference, defended, total = load_pair(args.source, args.defense, data_dir, args.limit,
-                                           args.seed)
+    reference, defended, total = load_pair(args.source, defense_name, data_dir, args.limit,
+                                           args.seed, defended_path=args.defended_file)
 
     frames: list[pd.DataFrame] = []
     spent = 0.0
@@ -309,11 +373,11 @@ def main() -> None:
             result.sampled_from = total
         print(result.summary())
         if metric == "conversation":
-            print(result.usage.summary(token_rates(result.judge_model)))
+            print(result.usage.summary(result.judge_rates))
             spent += float(np.nansum(result.table["cost_usd"]))
         frames.append(result.scores())
 
-    out_path = Path(args.out) if args.out else OUTPUT_DIR / f"{args.source}_{args.defense}.csv"
+    out_path = Path(args.out) if args.out else OUTPUT_DIR / f"{args.source}_{defense_name}.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged = merge_scores(read_existing(out_path), frames)
     # Six significant figures: these are model scores read to two or three decimals, and full
@@ -326,7 +390,7 @@ def main() -> None:
         # The file is the spend record: nothing else logs what the judge cost, and summing this
         # column over every such file is the project's cumulative API bill.
         print(f"judge cost: ${spent:.4f} this run, ${np.nansum(merged['judge_cost_usd']):.4f} "
-              f"cumulative for {args.source}/{args.defense}")
+              f"cumulative for {args.source}/{defense_name}")
 
 
 if __name__ == "__main__":
