@@ -9,21 +9,20 @@ from sklearn.svm import SVC
 class SupportVectorAttribution:
     """Support vector machine over the known authors; the score is the decision function.
 
-    The other classical discriminative answer alongside :class:`LogisticAttribution`, and worth
-    having because it optimises a different thing: logistic regression fits the whole conditional
-    distribution, while an SVM only cares about the documents near each boundary. With ~25
-    documents per author that focus tends to pay, and the RBF kernel additionally buys
-    non-linearity, which no other attack here has.
+    The other classical discriminative answer alongside :class:`LogisticAttribution`: logistic
+    regression fits the whole conditional distribution, while an SVM only cares about documents
+    near each boundary. The RBF kernel additionally buys non-linearity, which no other attack here
+    has.
 
-    Uses ``sklearn.svm.SVC`` rather than ``LinearSVC`` even for ``kernel="linear"``, and the
-    reason is purely practical: ``SVC`` is one-vs-one, so it trains ~7,600 tiny pairwise problems,
-    whereas ``LinearSVC`` is one-vs-rest and trains 124 problems each against the entire corpus.
-    Measured on a 2,992-document known side, that is 1.8 seconds against 299.
+    Uses ``sklearn.svm.SVC`` rather than ``LinearSVC`` even for ``kernel="linear"``: ``SVC`` is
+    one-vs-one (many tiny pairwise problems), whereas ``LinearSVC`` is one-vs-rest (each author
+    trained against the whole corpus), and one-vs-one is cheaper at this author-pool size.
 
     ``decision_function_shape="ovr"`` folds the pairwise votes back into one column per author, so
     the output has the same shape as every other attack's. Those margins are *not* posteriors --
-    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence` will report a near-uniform confidence
-    for them, so read this attack's calibration numbers as meaningless rather than as bad.
+    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence` will report a near-uniform
+    confidence for them, so read this attack's calibration numbers as meaningless rather than as
+    bad.
     """
 
     name = "svm"

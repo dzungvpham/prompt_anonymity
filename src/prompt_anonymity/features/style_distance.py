@@ -15,9 +15,8 @@ class StyleDistanceFeaturizer(Featurizer):
 
     def featurize(self, texts) -> np.ndarray:
         if self._model is None:
-            # Imported lazily (like the model-backed defenses) so importing the features registry
-            # never requires torch / sentence-transformers -- only selecting this featurizer does.
-            # Needs the [features] extra (see pyproject.toml / install.sh).
+            # Imported lazily so importing the features registry never requires torch/
+            # sentence-transformers -- only selecting this featurizer does.
             import torch
             from sentence_transformers import SentenceTransformer
 

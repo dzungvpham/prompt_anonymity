@@ -18,16 +18,14 @@ class GradientBoostedTrees:
     either way, but log-space is what the downstream machinery expects: cohort normalisation
     z-scores across authors (meaningful for log-odds-like quantities, not for probabilities that
     sum to 1), and it makes ``softmax(score)`` recover the model's own posterior exactly, so the
-    calibration metrics in :mod:`prompt_anonymity.evaluation.metrics.detection` measure something real for
-    this attack.
+    calibration metrics in :mod:`prompt_anonymity.evaluation.metrics.detection` measure something
+    real for this attack.
 
     This is also the **most expensive** attack in the package, and the cost is driven by the
-    feature count in a way the others' is not. A tree has to search for a split *per feature, per
-    node*, where a distance-based attack sees the same vectors as one matrix multiply; and the
-    multi-class objective trains one tree per author per boosting round. Measured on swe-chat
-    (997 documents, 81 authors, 10 rounds, 2 threads): 1.23 s on 196-dimensional StyloMetrix
-    against 54.2 s on 3,072-dimensional Gemini embeddings -- 44x for 15.7x the columns. Prefer a
-    linear attack on wide dense embeddings, or set ``device="cuda"``.
+    feature count in a way the others' is not: a tree has to search for a split *per feature, per
+    node*, where a distance-based attack sees the same vectors as one matrix multiply, and the
+    multi-class objective trains one tree per author per boosting round. Prefer a linear attack on
+    wide dense embeddings, or set ``device="cuda"``.
 
     ``xgboost`` is imported lazily so the rest of the package works without it installed.
     """
@@ -51,11 +49,9 @@ class GradientBoostedTrees:
         then only reproducible on the same kind of machine -- a silent dependency on what hardware
         happened to be free. Ask for ``"cuda"`` when you want it, and record it.
 
-        The published speedups come from datasets with 10^5-10^7 rows and these windows have
-        10^3, so per-node launch overhead is a large fraction of the work; the wide feature axis
-        is what pays for it instead. Measured on the shape this attack actually sees on swe-chat
-        with Gemini embeddings (1,000 documents x 3,072 features, 81 authors, 10 rounds, 8 CPU
-        threads against one A100-80GB): 22.1 s on CPU against 1.29 s on CUDA, 17x.
+        GPU speedups on published benchmarks come from much larger row counts than this package's
+        typical known-side size, so per-node launch overhead eats into the win here; the wide
+        feature axis (dense embeddings) is what still makes it worth it.
         """
         if self.device != "auto":
             return self.device

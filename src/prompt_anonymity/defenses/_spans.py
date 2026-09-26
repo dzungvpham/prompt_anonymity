@@ -2,32 +2,25 @@
 
 The leave-one-out defense (:mod:`.loo_unlink`) scores *spans* of a prompt rather than whole turns:
 delete one, re-embed, and see how much same-author similarity moves. That needs a segmenter with
-three properties the repo did not previously have anywhere:
+three properties:
 
 * **Exact offsets.** A span carries ``(turn_index, start, end)`` into its own turn, so an edit can be
-  spliced back in place and audited afterwards against the original text. Every artifact the defense
-  writes quotes spans by offset, which is only meaningful if the offsets are real.
+  spliced back in place and audited against the original text.
 * **A total partition.** The spans of a turn concatenate back to the turn byte-for-byte
-  (:func:`spans_cover`). Deleting a span is then simple string surgery with no ambiguity about which
-  whitespace went with which sentence, and a "delete nothing" run is provably a pass-through.
-* **Protected regions are never cut.** Prompts in these corpora are full of fenced code blocks,
-  inline code, URLs and build-stage placeholders (``<URL>``, ``<PATH>``). A sentence boundary landing
-  inside one would let the defense delete half a code fence, which destroys utility for no privacy
-  gain and produces edit logs nobody can read.
+  (:func:`spans_cover`), so deleting a span is unambiguous string surgery and a "delete nothing" run
+  is provably a pass-through.
+* **Protected regions are never cut.** These corpora are full of fenced code blocks, inline code,
+  URLs and placeholders (``<URL>``, ``<PATH>``); a boundary landing inside one would let the defense
+  delete half a code fence.
 
-The protected-region machinery is **borrowed from** :mod:`.collision_seeding` rather than
-reimplemented: both defenses want the same answer to "which parts of this text are safe to rewrite",
-and two copies of that regex drifting apart is a bug neither would catch. The import direction is
-deliberately the awkward one -- a generic helper reaching into a specific defense -- because
-``collision_seeding`` has committed results and a cache keyed on its own source, so relocating the
-pattern here would mean editing a defense to serve a newer one. If a third caller ever appears, that
-is the moment to promote the pattern into this module and re-export it there.
+The protected-region machinery is borrowed from :mod:`.collision_seeding` rather than reimplemented,
+so the two defenses can't drift apart on "which parts of this text are safe to rewrite". The import
+direction points into that module (rather than the other way) because it already has committed
+results and a cache keyed on its own source.
 
-Sentence boundaries come from NLTK's Punkt (already installed for :mod:`.dp_mlm`, see the ``[dpmlm]``
-extra). Punkt is English-trained; the corpora are not English-only, so a non-Latin or
-Punkt-unavailable turn degrades to :data:`FALLBACK_SPLIT_RE` rather than failing. That degradation is
-reported by :func:`segment_turns` through :attr:`Span.fallback` so a run can tell how much of its
-segmentation was heuristic.
+Sentence boundaries come from NLTK's Punkt (installed for :mod:`.dp_mlm`, the ``[dpmlm]`` extra).
+Punkt is English-trained, so a non-Latin or Punkt-unavailable turn degrades to
+:data:`FALLBACK_SPLIT_RE` instead of failing; :attr:`Span.fallback` records which.
 
 Run ``python -m prompt_anonymity.defenses._spans --selftest`` for the invariant checks.
 """
@@ -45,14 +38,9 @@ from .collision_seeding import _PROTECTED_RE as PROTECTED_RE
 from .collision_seeding import latin_ratio, on_free_text, split_protected
 
 #: Used when Punkt is unavailable or the turn is not Latin-script enough for an English model to be
-#: meaningful. Deliberately crude -- it splits after sentence-final punctuation and after a blank
-#: line, which is what survives translation across the scripts in these corpora.
-#:
-#: The CJK alternative is separate from the Latin one and **zero-width on purpose**: CJK sentence
-#: punctuation is not followed by a space, so requiring ``\s+`` after it (the obvious single-branch
-#: regex) silently returns a whole Chinese or Japanese turn as one span. That failure is invisible in
-#: aggregate -- the turn still gets scored, just never split -- which is why it is called out here
-#: rather than left to the reader of the character class.
+#: meaningful. Deliberately crude: splits after sentence-final punctuation and after a blank line.
+#: The CJK branch is zero-width on purpose -- CJK sentence punctuation isn't followed by a space, so
+#: requiring ``\s+`` after it would silently return a whole Chinese/Japanese turn as one span.
 FALLBACK_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])|\n{2,}")
 
 #: Word boundaries, used when a turn turns out to be a single sentence. Cutting after a whitespace
@@ -153,12 +141,10 @@ def _punkt_starts(text: str, language: str) -> list[int] | None:
     """Sentence start offsets from NLTK Punkt, or ``None`` when it is unavailable.
 
     Offsets are recovered by walking ``sent_tokenize``'s output through the source with ``str.index``
-    rather than by using ``span_tokenize``. That is deliberate: ``sent_tokenize`` is the stable public
-    API across the NLTK versions this project has installed (the Punkt pickle became ``punkt_tab``
-    mid-3.8), whereas reaching a ``PunktSentenceTokenizer`` instance with trained parameters differs
-    between them. ``sent_tokenize`` only ever strips surrounding whitespace, never rewrites
-    characters, so the walk is exact -- and if a sentence somehow cannot be located, the whole turn
-    falls back rather than producing offsets that do not point at their own text.
+    rather than ``span_tokenize``, since ``sent_tokenize`` is the stable public API across NLTK
+    versions. It only ever strips surrounding whitespace, never rewrites characters, so the walk is
+    exact -- and if a sentence can't be located, the whole turn falls back rather than producing
+    offsets that don't point at their own text.
     """
     global _PUNKT_UNAVAILABLE
     if _PUNKT_UNAVAILABLE:
@@ -217,18 +203,10 @@ def _admissible(text: str, starts) -> list[int]:
 def _cut_points(text: str, language: str) -> tuple[list[int], str, bool]:
     """``(sorted cut offsets, granularity, used_fallback)`` for one turn.
 
-    Sentence boundaries first. **If they yield no cut at all -- the turn is a single sentence -- the
-    turn is re-cut by word instead.** That case is common in chat corpora (a one-line question is a
-    whole prompt) and leaving it as one span makes the turn useless to the defense in both
-    directions: leave-one-out on the only span deletes the entire prompt, so its linkage score is
-    just the prompt's total score and carries no information about *which part* identifies the
-    author, and the edit loop's only available move is to rewrite the whole thing.
-
-    This is a departure from the design spec, which fixes v1 at sentence granularity and defers
-    sub-sentence spans. The deferral is sound for long prompts, where sentence spans give the loop
-    plenty to choose between; it just has no answer for a prompt that contains one sentence. Word
-    granularity applies **only** in that case, so long prompts are still segmented exactly as
-    specified and the two regimes are told apart by :attr:`Span.granularity`.
+    Sentence boundaries first. If they yield no cut at all -- the turn is a single sentence -- the
+    turn is re-cut by word instead: leave-one-out on a single span would just delete the entire
+    prompt, carrying no information about *which part* identifies the author. Word granularity
+    applies only in that case; :attr:`Span.granularity` tells the two regimes apart.
     """
     used_fallback = False
     starts = None

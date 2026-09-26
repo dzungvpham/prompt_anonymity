@@ -36,7 +36,7 @@ around:
 ``author/``
     The unit is a **person**, and they count once **any one** of their documents does. This is the
     right reading when being linked at all is the harm, and it runs well above the per-document
-    number -- 0.089 against 0.065 on WildChat/StyloMetrix's largest known side.
+    number.
 
 It is not a re-run: the author level is the same predictions collapsed to one row per person by
 :func:`author_table`, taking the best each of their documents achieved.
@@ -89,7 +89,7 @@ fixed, a line per feature+attack -- *which attack is strongest?*).
     the risk, rather than what it averages to. **Keeps the flat path**: it is a per-user curve by
     construction, so there is no document-level twin to file it against.
 ``clustering/``
-    The **other experiment** (merged in from ``plot_clustering.py`` on 2026-08-13), and the one
+    The **other experiment** (merged in from ``plot_clustering.py``), and the one
     family that reads :data:`CLUSTERING_DIR` instead of :data:`RESULTS_DIR`. It reports a
     *partition* rather than a ranking, so it has no known-side grid and none of the three levels
     above: ``clustering/bcubed/by_defense/<feature>.pdf`` is BCubed F per algorithm with every
@@ -100,8 +100,7 @@ fixed, a line per feature+attack -- *which attack is strongest?*).
     doing so; and ``clustering/exposure/<run>.pdf`` is the privacy reading -- per author, the share
     of their traffic that ended up in one cluster, the same cliff curve as ``author_risk/``.
 
-The whole ``openset/`` family reads the documents every other figure drops -- on WildChat that is
-63-87% of the test quarter, some 6,200 unenrolled authors against ~970 enrolled. It rests on two
+The whole ``openset/`` family reads the documents every other figure drops. It rests on two
 columns those rows do carry: ``author_in_known`` (the ground truth) and ``accept_score`` (the
 cohort-normalised margin, which ``run_experiment.py`` writes for every unknown document whether
 or not ``--ood reject`` was on). **Every operating point it shows is an oracle one**: these runs
@@ -120,13 +119,13 @@ per-dataset tree repeated exactly -- both counting levels, both comparison views
 names, the same 3x3 configuration grid -- so a figure and its single-corpus twin sit at matching
 paths and can be read against each other. The one difference is that a panel carries every corpus
 at once: **colour is the compared entity, dash is the corpus**, which is what lets one method be
-followed from a pool of 124 to a pool of 19,711. Each panel notes its counts per corpus and draws
-a grey chance line per corpus -- they differ by up to 0.136 at the author level, where chance moves
-with documents per user, and coincide at the document level where both are ``1/n``. Those chance
-lines take the *corpus* pattern like everything else on the figure, so the two channels each mean
-exactly one thing: the colour legend names the entities and "Random guessing" among them, the
-``Dataset`` legend names the patterns. A figure is drawn only where at least two corpora have the
-run; with one it would be the per-dataset figure redrawn under a folder claiming otherwise.
+followed across pool sizes. Each panel notes its counts per corpus and draws a grey chance line
+per corpus, since chance moves with documents per user at the author level and coincides at the
+document level where both are ``1/n``. Those chance lines take the *corpus* pattern like
+everything else on the figure, so the two channels each mean exactly one thing: the colour legend
+names the entities and "Random guessing" among them, the ``Dataset`` legend names the patterns. A
+figure is drawn only where at least two corpora have the run; with one it would be the
+per-dataset figure redrawn under a folder claiming otherwise.
 ``openset/reach.pdf`` is the share of
 the test set each known side can attempt at all, in documents and in users -- a property of the
 corpus rather than of any attack, and the denominator every other figure is conditioned on.
@@ -137,8 +136,8 @@ split by counting level like everything else.
 ``per_run/<run>/`` keeps the per-run figures the runners used to write themselves -- the
 per-window CMC curves, the window sweep, and the top-k bars -- so one experiment's own detail is
 still available, now regenerated rather than baked in at run time. It is **drawn only under
-``--per-run``**: those are 160 of the 262 figures a full sweep writes and none of them compares
-runs, so they are diagnostics to reach for rather than output to pay for every time.
+``--per-run``**: none of these figures compares runs, so they are diagnostics to reach for rather
+than output to pay for every time.
 
 Every figure is written as a PDF, and as a PNG beside it under ``--png``. Both halves of the work
 -- building the curves and drawing the figures -- run across ``--jobs`` processes; see
@@ -162,7 +161,7 @@ axes. The shaded band is a 95 % percentile interval from a clustered bootstrap o
 draw shared by every configuration and run of a dataset. Every figure is written alongside a
 ``.csv`` of the exact numbers plotted.
 
-**No figure carries a title, and none has since 2026-09-11** (the subtitle went on 2026-08-12).
+**No figure carries a title, and none has since the subtitle was also removed.**
 Both were caption text, and caption text belongs to the document that publishes the figure rather
 than to the image. What each figure *is*, is its path -- which is why the path scheme above is a
 contract and not a filing convenience -- while its panel headings name the configuration and its
@@ -212,15 +211,13 @@ PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
 # other run's, and a figure does not depend on any other figure -- so both are dispatched through
 # the one helper below.
 #
-# THE JOB TABLE IS A MODULE GLOBAL AND THAT IS THE POINT. `ProcessPoolExecutor` pickles whatever
-# it is handed, and these jobs carry the expensive things: a comparison figure's arguments hold
-# every curve it draws (14 MB for one WildChat CMC panel set), and a curve job holds a whole
-# predictions table. Sending those down a pipe would cost more than the work. Instead the jobs are
-# parked in `_JOBS` *before* the pool forks, the children inherit them copy-on-write, and the only
-# thing crossing the pipe is an integer each way plus the small result. That is also why the start
-# method is pinned to "fork" rather than left to the platform default: under "spawn" the child
-# re-imports this module with an empty `_JOBS` and every argument would have to be pickled after
-# all. Linux-only by construction, which this cluster is.
+# THE JOB TABLE IS A MODULE GLOBAL AND THAT IS THE POINT. These jobs carry expensive things (a
+# comparison figure's arguments hold every curve it draws; a curve job holds a whole predictions
+# table), so pickling them down a pipe would cost more than the work. Instead the jobs are parked
+# in `_JOBS` *before* the pool forks, the children inherit them copy-on-write, and only an integer
+# each way plus the small result crosses the pipe. That is also why the start method is pinned to
+# "fork" rather than left to the platform default: under "spawn" the child re-imports this module
+# with an empty `_JOBS`. Linux-only by construction, which this cluster is.
 
 #: Jobs the current pool is executing, as ``(callable, args, kwargs)``. Set by :func:`run_jobs`
 #: immediately before the pool is created, read by the forked children, meaningless otherwise.
@@ -259,8 +256,8 @@ def default_workers() -> int:
     """Cores to use unless ``--jobs`` says otherwise.
 
     Capped rather than "every core": each worker holds its own ``(replicates x documents)`` weight
-    matrix -- 172 MB on WildChat's open-set tables -- on top of the tables it inherited, and this
-    cluster's jobs run under a 16 GB cap that has killed runs before.
+    matrix on top of the tables it inherited, and this cluster's jobs run under a memory cap that
+    has killed runs before.
     """
     return max(1, min(8, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
                       else (os.cpu_count() or 1)))
@@ -310,8 +307,6 @@ DEFENSES = (
     "frame_shift_single",
     "frame_pad",
     "frame_pad_single",
-    "epi",
-    "epi_single",
     "dp_mlm",
     "dp_mlm_pii",
     "dp_mlm_var_a10",
@@ -401,11 +396,6 @@ DEFENSE_LABELS = {
     # frame_shift splits that defense in two: dilution by added content, versus the rewrite.
     "frame_pad": "Frame pad (50 frames)",
     "frame_pad_single": "Frame pad (single frame)",
-    # EPI appends ten words of assertion where frame_pad appends 180 of prose, so the two
-    # read together as instruction-following versus dilution by volume. The topic count is in
-    # the label for the same reason K is above: it is the collision-group knob.
-    "epi": "EPI (30 topics)",
-    "epi_single": "EPI (single topic)",
     "dp_mlm": "DP-MLM",
     "dp_mlm_pii": "DP-MLM (PII only)",
     "dp_mlm_var_a10": "DP-MLM ± (A=0.1)",
@@ -445,7 +435,7 @@ FEATURE_LABELS = {
 ATTACK_LABELS = {
     "nearest_neighbor": "Nearest neighbor",
     "cosine": "Cosine centroid",
-    # "Nearest centroid" rather than "WCCN centroid" (2026-09-12, on request): what it *is* to a
+    # "Nearest centroid" rather than "WCCN centroid": what it *is* to a
     # reader is the centroid matcher beside "Nearest neighbor", and the whitening is the
     # implementation. The registry name stays `wccn`, so every path and CSV is unchanged.
     "wccn": "Nearest centroid",
@@ -453,9 +443,9 @@ ATTACK_LABELS = {
     "plda": "PLDA",
     # **The two logistic labels are named for their FIT, and `logistic_sgd` is the plain one.**
     # It is the attack that runs at WildChat's author counts and therefore the one on every
-    # figure, so it takes the unqualified name (2026-09-12, on request); the exact lbfgs fit --
-    # which cannot be run on WildChat at all, see CLAUDE.md on its 20.4 GB logit matrix -- carries
-    # the qualifier instead. They must not share a label: `handles.setdefault(item.label, ...)`
+    # figure, so it takes the unqualified name; the exact lbfgs fit -- which cannot be run on
+    # WildChat at all, see CLAUDE.md -- carries the qualifier instead. They must not share a
+    # label: `handles.setdefault(item.label, ...)`
     # keys the legend by it, so two attacks spelled the same would collapse into one entry and
     # write one `series` name onto two different curves in the companion CSV. That only bites
     # under `--attacks all`, where both are drawn.
@@ -468,10 +458,9 @@ ATTACK_LABELS = {
 
 #: Stride between one feature's block of attack slots and the next. **Frozen, and deliberately
 #: not ``len(ATTACKS)``.** Since ``hue = slot % 8``, the stride's residue mod 8 is what decides
-#: the whole assignment: at 9 (the attack count when this was written) it is 1, so
-#: ``hue == (feature_index + attack_index) % 8``. Registering one more attack made it 10, residue
-#: 2 -- which silently recoloured **57 of the 63** feature-attack pairs and every figure already
-#: drawn, breaking the rule that a colour follows the entity rather than its position.
+#: the whole assignment, so changing the stride silently recolours most feature-attack pairs on
+#: every figure already drawn, breaking the rule that a colour follows the entity rather than its
+#: position.
 #:
 #: 17 keeps residue 1, so every existing assignment is preserved exactly, and leaves room for 17
 #: attacks before a block overflows into the next feature's. **Add new attacks to the END of**
@@ -510,20 +499,16 @@ DEFAULT_ATTACKS = ("nearest_neighbor", "logistic_sgd", "wccn")
 # pairs, light surface). Never extend this by generating a ninth hue: past eight series a figure
 # needs fewer lines, not a made-up colour (see `resolve_slots`).
 
-#: The chart surface, and **pure white on request** (2026-09-11) rather than the ``dataviz``
-#: skill's default off-white ``#fcfcfb``. A deliberate override of that parameter, not a value
-#: to "correct" back: these figures are printed into a white page, and an off-white panel on it
-#: reads as a grey box rather than as the paper.
+#: The chart surface, and **pure white on request** rather than the ``dataviz`` skill's default
+#: off-white ``#fcfcfb``. A deliberate override of that parameter, not a value to "correct" back:
+#: these figures are printed into a white page, and an off-white panel on it reads as a grey box
+#: rather than as the paper. It stays safe on the skill's contrast check -- the only one involving
+#: the surface, since the other five (lightness band, chroma floor, CVD separation, normal-vision
+#: floor, adjacent pairs) are properties of the palette alone.
 #:
-#: Safe on the skill's checks, and only one of them involves the surface at all -- contrast. Pure
-#: white is *lighter* than the off-white, so every mark's contrast against it goes **up** by
-#: 2.66%: the categorical hues run 2.17-8.56:1 against 2.11-8.34:1 before, and the chrome moves
-#: with them. The other five checks (lightness band, chroma floor, CVD separation, normal-vision
-#: floor, adjacent pairs) are properties of the palette and do not involve the surface.
-#:
-#: **It is also the marker ring and the bar-gap colour** (the skill's 2 px surface ring / 2 px
-#: spacer, which exist to separate overlapping marks by showing the surface through them), so it
-#: must stay one constant -- a ring in the old off-white on a white panel would draw a halo.
+#: **It is also the marker ring and the bar-gap colour** (the skill's surface ring / spacer, which
+#: exist to separate overlapping marks by showing the surface through them), so it must stay one
+#: constant -- a ring in the old off-white on a white panel would draw a halo.
 SURFACE = "#ffffff"
 TEXT_PRIMARY = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -555,10 +540,9 @@ DATASET_DASHES = {"wildchat": (), "swe_chat": (7, 2, 1.5, 2)}
 #: to be followable from one corpus to the other, and on a ``by_defense`` figure no series dashes
 #: at all (colour is the defense, the feature and attack are in the filename).
 FEATURE_DASHES = {
-    # Dash-dot with **tight** gaps (2026-09-12, on request): the first attempt was a plain long
-    # dash at (7, 3), and a 3 pt hole next to a 2 pt line reads as a broken line rather than as a
-    # pattern. Two marks and two equal 1.5 pt gaps keep the stroke continuous at a glance while
-    # staying obviously not-solid next to Gemini's.
+    # Dash-dot with **tight** gaps: a plain long dash was tried first, and a wide hole next to a
+    # thin line reads as a broken line rather than as a pattern. Two marks and two equal small gaps
+    # keep the stroke continuous at a glance while staying obviously not-solid next to Gemini's.
     "stylometrix": (6, 1.5, 1.5, 1.5),
     "gemini_embedding_2": (),
     "gemini_embedding_001": (1.5, 1.5),
@@ -571,15 +555,14 @@ FEATURE_DASHES = {
     "harrier_plain": (1, 2),
 }
 
-#: Every text size on every figure, in points. They were scattered literals until 2026-09-11,
-#: when "a little too small, increase a bit" had to be applied in fourteen places -- so the sizes
-#: now live here and a future nudge is four numbers.
+#: Every text size on every figure, in points -- named constants rather than scattered literals,
+#: so a global size nudge is four numbers instead of many call sites.
 #:
-#: **An annotation inside a panel is set at the tick size** (on request): a direct label, a panel
-#: note, a value on a bar cap and an iso-F level are all things a reader reads *off the plot*, so
-#: they should not be smaller than the numbers on the axis they are read against. That took the
-#: smallest text on any figure from 7 pt to 10.5 pt. The ranking is otherwise unchanged --
-#: annotations and ticks at the bottom, then the legend, then axis labels, then a panel heading.
+#: **An annotation inside a panel is set at the tick size.** A direct label, a panel note, a value
+#: on a bar cap and an iso-F level are all things a reader reads *off the plot*, so they should not
+#: be smaller than the numbers on the axis they are read against. The ranking is otherwise
+#: unchanged -- annotations and ticks at the bottom, then the legend, then axis labels, then a
+#: panel heading.
 FONT_TICK = 10.5         # axis tick labels
 FONT_ANNOTATION = FONT_TICK   # anything written inside the axes; deliberately the same number
 FONT_LEGEND = 10.0       # legend entries and legend titles
@@ -590,35 +573,32 @@ LINE_WIDTH = 2.0
 MARKER_SIZE = 6.0  # >= 8px on the page once the 2px surface ring is added
 
 #: **Every figure on the 3x3 configuration grid** is drawn at twice the file's base point sizes
-#: and twice its stroke widths -- `accuracy/` alone from 2026-09-16, the whole grid since
-#: 2026-09-17, both on request. These are the figures headed for a paper, two side by side at a
+#: and twice its stroke widths. These are the figures headed for a paper, two side by side at a
 #: fraction of the page width; the families that keep the base sizes (`clustering/`, `temporal/`,
 #: `per_run/`) are read on screen at full size and do not go through the grid.
 #:
 #: It is a scale spent along **one dispatch path** -- :func:`plot_config_comparison`, which every
-#: grid figure goes through -- rather than a change to the shared `FONT_*` constants: those are
-#: measured against by the clustering legend block (1.82 in, set by its longest label) and by the
-#: reach and macro/micro row labels, none of which is enlarged. Every helper that sets a point
-#: size therefore takes a ``scale`` defaulting to 1.0, and the grid is the only caller that
-#: passes anything else.
+#: grid figure goes through -- rather than a change to the shared `FONT_*` constants, which other
+#: unenlarged figures (the clustering legend, the reach and macro/micro row labels) are still
+#: measured against. Every helper that sets a point size therefore takes a ``scale`` defaulting to
+#: 1.0, and the grid is the only caller that passes anything else.
 GRID_SCALE = 2.0
 #: The measured series and the chance line, thickened to match the text. Panel chrome --
 #: gridlines, spines, tick marks -- deliberately is NOT scaled: it is meant to stay recessive
 #: against the ink, which is what doubling only the data lines preserves.
 GRID_LINE_WIDTH = LINE_WIDTH * GRID_SCALE
 GRID_BASELINE_WIDTH = 1.2 * GRID_SCALE
-#: Extra air between the grid's rows, as `tight_layout`'s ``h_pad`` -- a multiple of the base font
-#: size, against its default of 1.08 (2026-09-17, on request). The triangular layout is what makes
-#: it necessary: a column's x title goes on its own lowest *visible* panel, so the 25%-size
-#: column's title for row 0 sits at the same height as the headings of the panels in row 1, and at
-#: the default padding the two read as one row of text. This is the only padding that is not left
-#: to `tight_layout` -- the horizontal one still is, since that is what keeps one panel's y tick
+#: Extra air between the grid's rows, as `tight_layout`'s ``h_pad``. The triangular layout is what
+#: makes it necessary: a column's x title goes on its own lowest *visible* panel, so a shorter
+#: column's title can land at the same height as the headings of the row below it, and at the
+#: default padding the two read as one row of text. This is the only padding that is not left to
+#: `tight_layout` -- the horizontal one still is, since that is what keeps one panel's y tick
 #: labels off its neighbour's frame.
 GRID_ROW_PAD = 3.0
 #: The grid's canvas, **square**. The width is what a page gives a figure, so the height is the
-#: free axis, and squaring it makes each cell taller rather than changing the 3 x 3 shape. It was
-#: 12 x 9 for every family and 12 x 12 for `accuracy/` alone; one shape for all of them is what
-#: lets two families be flipped between, which is the whole argument for the shared path scheme.
+#: free axis, and squaring it makes each cell taller rather than changing the 3 x 3 shape. One
+#: shape for every family is what lets two families be flipped between, which is the whole
+#: argument for the shared path scheme.
 GRID_FIGSIZE = (12.0, 12.0)
 BAND_ALPHA = 0.15  # confidence band: readable under the line, never competing with it
 
@@ -630,12 +610,11 @@ BAND_ALPHA = 0.15  # confidence band: readable under the line, never competing w
 #: mean one thing (the defense, on the clustering precision/recall figure).
 #:
 #: **It is not equal *ink*, and equal ink was tried first.** Scaling by
-#: ``sqrt(circle_area / own_area)`` -- 1.25 for a diamond, 1.67 for a star -- makes a pointed shape
-#: measurably bigger than the circle it is meant to match, because the eye reads a marker by its
-#: *extent* as well as by its area, and a pointed shape spends its extent on the points. Each
-#: factor here is the **geometric mean of the two corrections**, equal area and equal extent
-#: (``sqrt(area_scale)``): half-way between the two things a reader is doing at once. That is what
-#: took the diamond from 1.25 to 1.12, on the report that it still looked too big.
+#: ``sqrt(circle_area / own_area)`` makes a pointed shape measurably bigger than the circle it is
+#: meant to match, because the eye reads a marker by its *extent* as well as by its area, and a
+#: pointed shape spends its extent on the points. Each factor here is the **geometric mean of the
+#: two corrections**, equal area and equal extent (``sqrt(area_scale)``): half-way between the two
+#: things a reader is doing at once.
 MARKER_SIZE_SCALE = {"o": 1.00, "s": 0.94, "^": 1.12, "v": 1.12, "D": 1.12,
                      "*": 1.29, "P": 1.09, "X": 1.09, ">": 1.12, "<": 1.12}
 
@@ -654,14 +633,12 @@ MARKER_SHAPES = ("o", "s", "^", "*", "P", "X", "D", "v")
 
 #: Shape per defense -- what :data:`DEFENSE_SLOTS` is for colour, and for the same reason: a
 #: reader flipping between two figures should see one defense wearing one mark. Before this existed
-#: shapes were handed out by *position among the defenses present*, so EmBad (Gemini) was a plus on
-#: SWE-chat's five and a star on WildChat's four; each legend decoded itself, but nothing carried
-#: across.
+#: shapes were handed out by *position among the defenses present*, so a defense's shape depended
+#: on who else was in the figure; each legend decoded itself, but nothing carried across.
 #:
-#: **It cannot be `DEFENSE_SLOTS` reduced modulo the shapes**, the way a hue is. There are eight
-#: shapes against 25 defenses, and the collisions land exactly where it would hurt: ``embad`` would
-#: share ``styleremix``'s mark and ``embad_summary`` would share ``openanonymity``'s, which are
-#: pairs that appear on one figure together. So the assignment is written down instead.
+#: **It cannot be `DEFENSE_SLOTS` reduced modulo the shapes**, the way a hue is. There are far
+#: fewer shapes than defenses, and the collisions land exactly where it would hurt -- two defenses
+#: that appear on one figure together sharing a mark. So the assignment is written down instead.
 #:
 #: **Register a defense here when it first appears on such a figure.** One that is not registered
 #: still draws -- :func:`defense_markers` gives it a shape no registered defense on that figure
@@ -752,20 +729,17 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str, *,
     Every figure in this file goes through here, which is what makes them look like one set.
 
     ``title`` is a **panel** heading and is the only text of its kind left: a facet panel's known
-    interval, or the defense a clustering panel covers. A figure-level title is not drawn any more
-    (removed 2026-09-11) and neither is the subtitle under it (2026-08-12) -- both were caption
-    text, which belongs in the document that publishes the figure rather than burned into the
-    image. **A single-axes figure therefore passes ``""`` here**, since its axes title would be
-    that figure's title. The sentences themselves are kept -- see :data:`CURVE_TYPES`' fifth
-    field -- and the note above :func:`finish_facets` has the full record.
+    interval, or the defense a clustering panel covers. A figure-level title and subtitle are not
+    drawn any more -- both were caption text, which belongs in the document that publishes the
+    figure rather than burned into the image. **A single-axes figure therefore passes ``""`` here**,
+    since its axes title would be that figure's title. The sentences themselves are kept -- see
+    :data:`CURVE_TYPES`' fifth field -- and the note above :func:`finish_facets` has the full record.
 
-    ``title_size``/``title_weight``/``title_pad`` exist for the facet grid, which asked
-    (2026-09-12) for its headings at the axis-label size and unbolded -- a cell's heading names
-    the same kind of thing its axis titles do, so one of them set larger and heavier claimed a
-    hierarchy the design does not have -- and (2026-09-17) for them closer to the panel they
-    belong to, since the heading is that panel's identity and 10 pt at :data:`GRID_SCALE` is
-    0.28 in of air between the two. The defaults are what a standalone panel heading (a
-    clustering panel's defense) still uses.
+    ``title_size``/``title_weight``/``title_pad`` exist for the facet grid, whose headings sit at
+    the axis-label size and unbolded -- a cell's heading names the same kind of thing its axis
+    titles do, so one of them set larger and heavier claimed a hierarchy the design does not have
+    -- and close to the panel they belong to, since the heading is that panel's identity. The
+    defaults are what a standalone panel heading (a clustering panel's defense) still uses.
 
     ``scale`` multiplies every point size this function sets, for the facet grid
     (:data:`GRID_SCALE`). It is a parameter rather than a change to the constants because
@@ -781,13 +755,12 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str, *,
     for side in ("left", "bottom"):
         axes.spines[side].set_color(AXIS)
         axes.spines[side].set_linewidth(0.8)
-    # **Axis text is primary ink, the tick marks stay recessive** (2026-09-11, on request). The
-    # numbers on an axis and the name of that axis are read, not chrome, so they take the same ink
-    # as a panel heading; they were secondary grey until now. `labelcolor` is separate from
-    # `color` in `tick_params` precisely so the 3 px tick *marks* can stay where they were --
-    # blackening those would thicken the frame the skill wants recessive, and nobody reads a tick
-    # mark. Every axis in the file goes through here, including the ones whose tick labels are set
-    # by hand elsewhere (they inherit this call's `labelcolor`).
+    # **Axis text is primary ink, the tick marks stay recessive.** The numbers on an axis and the
+    # name of that axis are read, not chrome, so they take the same ink as a panel heading.
+    # `labelcolor` is separate from `color` in `tick_params` precisely so the tick *marks* can stay
+    # recessive -- blackening those would thicken the frame the skill wants recessive, and nobody
+    # reads a tick mark. Every axis in the file goes through here, including the ones whose tick
+    # labels are set by hand elsewhere (they inherit this call's `labelcolor`).
     axes.tick_params(color=TEXT_SECONDARY, labelcolor=TEXT_PRIMARY, labelsize=FONT_TICK * scale,
                      length=3, width=0.8)
     axes.set_xlabel(xlabel, color=TEXT_PRIMARY, fontsize=FONT_AXIS_LABEL * scale)
@@ -800,12 +773,11 @@ def style_axes(axes, xlabel: str, ylabel: str, title: str, *,
 def add_legend(axes, **options):
     """A frameless legend in text colours -- identity never rides on colour alone.
 
-    A surface wash and a border were added and then removed again on 2026-09-11, both on request.
-    Worth one line rather than nothing: the argument for them was that a legend inside the plot
-    puts marker keys among the marks, and on the precision/recall figure the keys are the same
-    shapes at the same size as the data. What actually solved that is geometry -- squaring the
-    axes and sizing the figure so the block clears the data entirely -- which is the better fix,
-    because a legend that overlaps nothing needs nothing drawn under it.
+    A surface wash and a border were tried and rejected: a legend inside the plot puts marker keys
+    among the marks, and on the precision/recall figure the keys are the same shapes at the same
+    size as the data. What actually solves that is geometry -- squaring the axes and sizing the
+    figure so the block clears the data entirely -- which is the better fix, because a legend that
+    overlaps nothing needs nothing drawn under it.
     """
     legend = axes.legend(frameon=False, fontsize=FONT_LEGEND, labelcolor=TEXT_PRIMARY, **options)
     if legend.get_title().get_text():
@@ -843,27 +815,24 @@ def stack_below(figure, axes, legend):
 
 #: Whether :func:`save_figure` writes a PNG beside each PDF. **Off by default**, and set from
 #: ``--png``. The PDF is the artefact -- it is what a paper includes -- and the PNG was only ever
-#: for a quick look, but it is the more expensive of the two: measured over a full sweep, the PNGs
-#: cost 79 s against the PDFs' 47 s, because a 200 dpi raster has to be rendered *and* deflated
-#: where the PDF only serialises vectors. Writing both by default meant a quarter of every run went
-#: on the copy nobody publishes.
+#: for a quick look, but it is the more expensive of the two to render (a raster has to be
+#: rendered *and* deflated where the PDF only serialises vectors). Writing both by default meant a
+#: real share of every run went on the copy nobody publishes.
 WRITE_PNG = False
 
 
-#: Blank border left around a saved figure, in inches. **As near zero as prints correctly**
-#: (2026-09-11): ``bbox_inches="tight"`` crops the canvas to the artists' own bounding box and then
-#: pads it, and matplotlib's default pad is 0.1 in on every side -- a 20 px border at 200 dpi on
-#: every figure in the tree. A figure here is placed by the document that includes it, which adds
-#: its own space; burning a tenth of an inch into the file means that space cannot be taken away.
+#: Blank border left around a saved figure, in inches. **As near zero as prints correctly**:
+#: ``bbox_inches="tight"`` crops the canvas to the artists' own bounding box and then pads it, and
+#: matplotlib's default pad is on every side of every figure in the tree. A figure here is placed
+#: by the document that includes it, which adds its own space; burning that into the file means
+#: it cannot be taken away.
 #:
 #: **It is not 0, and the reason is a measurement rather than taste.** The box matplotlib crops to
-#: is built from each text artist's *font metrics*, and a rendered antialiased glyph spills one or
-#: two pixels past that, so at pad 0 the outermost label is shaved: the precision/recall figure's
-#: ``F=0.6`` put 4 ink pixels in the final column. Sweeping the pad over both corpora, ink stops
-#: touching an outer edge at **0.01 in** (2 px at 200 dpi) and still touches at 0.005. This is set
-#: to twice that floor, because the figures that could be rendered to measure it are the clustering
-#: ones, and a glyph with more overhang -- a parenthesis, an italic, a comma below a baseline --
-#: could need the extra pixel. It is still a fifth of matplotlib's default and ~1.4 pt on the page.
+#: is built from each text artist's *font metrics*, and a rendered antialiased glyph spills a
+#: pixel or two past that, so at pad 0 the outermost label is shaved. This value is set above the
+#: floor where ink stops touching an outer edge, because a glyph with more overhang -- a
+#: parenthesis, an italic, a comma below a baseline -- could need the extra pixel. It is still a
+#: fraction of matplotlib's default.
 #:
 #: **This is the OUTER margin only.** The padding *between* facet panels comes from
 #: ``tight_layout``'s own defaults and is deliberately left alone -- it is what keeps one panel's
@@ -1088,9 +1057,8 @@ def config_predictions(run: Run, in_set_only: bool = True) -> dict[str, pd.DataF
 # now shown by the facet grid itself) and how much it would move on another sample of users (a
 # confidence interval, which is what this is).
 
-#: Bootstrap replicates behind every band. 1,000 is enough for a 2.5/97.5 percentile to be stable
-#: to about a third of a percentage point, and the whole cost is a weighted ``bincount`` per
-#: replicate per panel -- seconds, against the minutes an attack takes.
+#: Bootstrap replicates behind every band -- enough for the 2.5/97.5 percentile to be stable, and
+#: the whole cost is a weighted ``bincount`` per replicate per panel, cheap next to the attack run.
 BOOTSTRAP_REPLICATES = 1000
 
 #: Fixed so a figure redrawn tomorrow has the same band as the one in the paper.
@@ -1104,9 +1072,8 @@ class AuthorBootstrap:
 
     * **The unit is the user, not the document.** Documents by one person are strongly
       correlated -- a distinctive, prolific user's documents are all hits -- so resampling
-      documents understates the noise badly. Measured on swe-chat: a document-level interval came
-      out 5.6x narrower than the user-level one, which is the same anti-conservative error as
-      dividing by the square root of a nested window count, in a different disguise.
+      documents understates the noise badly, the same anti-conservative error as dividing by the
+      square root of a nested window count, in a different disguise.
     * **One draw, applied everywhere.** The same replicate's user multiplicities are used for
       every known configuration and every run of the dataset. That is what makes the
       configurations *paired*: a replicate that drops a user drops them from all six panels at
@@ -1149,11 +1116,10 @@ class PanelWeights:
     """One table's bootstrap multiplicities, built once and shared by every curve type.
 
     A dozen curve types are computed from the same predictions table, and each used to ask the
-    bootstrap for its own copy of the same ``(replicates x documents)`` matrix -- 63 MB on
-    WildChat's in-set tables, 172 MB on its open-set ones, rebuilt four and three times over.
-    Building it once and passing this object down instead took a measured 24 s to about 7 s, and
-    -- the reason that matters more here -- stopped several copies of it being live at once under
-    the 16 GB cap.
+    bootstrap for its own copy of the same ``(replicates x documents)`` matrix, rebuilding it
+    several times over. Building it once and passing this object down instead is both faster and
+    -- the reason that matters more here -- stops several copies of it being live at once under
+    this cluster's memory cap.
     """
 
     def __init__(self, bootstrap: AuthorBootstrap, author_labels) -> None:
@@ -1176,11 +1142,10 @@ def band_from_replicates(replicates: np.ndarray) -> tuple[np.ndarray, np.ndarray
     Split out from :func:`bootstrap_band` so the curve types that can compute every replicate in
     one vectorised pass share the same summary step instead of reimplementing it.
 
-    **``np.percentile`` wherever it is safe.** ``nanpercentile`` is a uniform ~3x slower on this
-    numpy whether or not the array actually holds a NaN, and instrumenting a full sweep found all
-    831 bands NaN-free: the curves that *can* emit one (a cohort some replicate emptied) never did
-    on real data. The check costs one pass against the partition it guards, so the NaN path stays
-    rather than being asserted away.
+    **``np.percentile`` wherever it is safe.** ``nanpercentile`` is meaningfully slower whether or
+    not the array actually holds a NaN, and a full sweep found every band NaN-free: the curves that
+    *can* emit one (a cohort some replicate emptied) never do on real data. The check costs one
+    pass against the partition it guards, so the NaN path stays rather than being asserted away.
     """
     percentile = np.nanpercentile if np.isnan(replicates).any() else np.percentile
     low, high = percentile(replicates, [2.5, 97.5], axis=0)
@@ -1213,15 +1178,14 @@ def weighted_cmc(ranks: np.ndarray, pools: np.ndarray, ks: np.ndarray,
     this script free of the package's heavy imports (the same reason its name vocabulary is
     literal). Computed as a weighted histogram over ranks plus a prefix sum, so one replicate
     costs one pass over the documents rather than a ``k x documents`` comparison, which at
-    WildChat's scale would be a 19,711 x 43,127 array.
+    scale would be a prohibitively large array.
 
     **Ranks are rounded up before bucketing**, which is what makes the histogram equivalent to
     ``ranks <= k``. ``true_author_rank`` averages ties (a true author tied with one other for
-    first is rank 1.5), so truncating instead -- as this did until 2026-08-06 -- counted that
-    document as a top-1 hit and made every CMC curve slightly optimistic, and made this figure
-    disagree with :func:`counting_modes` and with ``author_report_*.csv`` about the same number:
-    0.0656 against 0.0651 on WildChat/StyloMetrix `known0075`, 452 of 15,819 documents. The
-    package's ``cmc_curve`` documents ``<=`` as the conservative reading; this now matches it.
+    first is rank 1.5), so truncating instead counted that document as a top-1 hit and made every
+    CMC curve slightly optimistic, disagreeing with :func:`counting_modes` and with
+    ``author_report_*.csv`` about the same number. The package's ``cmc_curve`` documents ``<=`` as
+    the conservative reading; this now matches it.
     """
     weights = np.ones(len(ranks), dtype=np.float64) if weights is None else weights
     total = weights.sum()
@@ -1248,12 +1212,11 @@ def grouped_sums(labels: np.ndarray, weights: np.ndarray
 
     Returns ``(present, sums)`` -- the distinct labels in ascending order and an
     ``(n_replicates, len(present))`` array against them -- rather than a dense histogram over
-    every possible label, because the callers' label spaces are sparse: a WildChat CMC ranges over
-    19,711 possible ranks of which only a few thousand are ever occupied.
+    every possible label, because the callers' label spaces are sparse relative to the pool size.
 
     Replicates are folded in blocks because the accumulation wants float64 (``reduceat`` would
     otherwise carry the weights' float32 through a cumulative sum tens of thousands of terms long)
-    and a float64 copy of a whole weight matrix would be 126 MB per call.
+    and a float64 copy of a whole weight matrix would be sizeable per call.
     """
     order = np.argsort(labels, kind="stable")
     sorted_labels = labels[order]
@@ -1271,8 +1234,7 @@ def cmc_replicates(ranks: np.ndarray, ks: np.ndarray, weights: np.ndarray) -> np
 
     The same quantity as calling it in a loop, computed in one pass over :func:`grouped_sums`.
     The cumulative sum runs over the ranks actually present rather than over every integer up to
-    the pool size, and ``ks`` is then read off it by ``searchsorted``. Measured 2.2x faster than
-    the loop on WildChat's largest cell, agreeing with it to 3e-8.
+    the pool size, and ``ks`` is then read off it by ``searchsorted``.
     """
     if not len(ranks) or not len(weights):
         return np.zeros((len(weights), len(ks)))
@@ -1303,16 +1265,14 @@ def chance_cmc(pools: np.ndarray, ks: np.ndarray) -> np.ndarray:
 # --- the proportional-guessing baseline --------------------------------------
 #
 # Uniform 1/N is the weakest baseline there is, and on a heavy-tailed corpus it is *far* too
-# weak to be the line a reader measures the attack against: on WildChat's `known0025` it is
-# 0.013%, while an attacker who reads no text at all and simply always names the known side's
-# most prolific author gets 2.7% -- 200x more, and still knowing nothing about writing style.
-# So the baseline drawn here is a guesser that knows how many documents each known author wrote
-# and nothing else.
+# weak to be the line a reader measures the attack against: an attacker who reads no text at all
+# and simply always names the known side's most prolific author does far better while still
+# knowing nothing about writing style. So the baseline drawn here is a guesser that knows how many
+# documents each known author wrote and nothing else.
 
 #: Replicates behind :func:`prior_inclusion`. The estimate is a mean over prior-weighted random
-#: rankings, so its error falls as ``1/sqrt(R)``; at 2,000 the k=1 point is within ~3% of its
-#: exact value ``sum_a p_a q_a``, which is well inside the line width and far below the spread
-#: between the curves it sits under.
+#: rankings, so its error falls as ``1/sqrt(R)``; well inside the line width and far below the
+#: spread between the curves it sits under.
 BASELINE_REPLICATES = 2000
 
 #: Fixed, so a figure is reproducible and two runs of this script cannot disagree by a hair. The
@@ -1331,10 +1291,9 @@ def baseline_k_grid(n_candidates: int) -> np.ndarray:
     """The k values :func:`prior_inclusion` evaluates, exhaustive at the head then geometric.
 
     The inclusion probabilities are an ``(authors x k)`` array, so evaluating them at every k
-    would be ``n_candidates`` squared -- 388 million entries on WildChat's largest known side.
-    A log grid costs 120 columns instead and loses nothing: the curve is drawn on a log x axis
-    and is monotone in k, so :func:`interpolate_baseline` recovers the intermediate points to
-    well under a pixel.
+    would be ``n_candidates`` squared. A log grid costs far fewer columns instead and loses
+    nothing: the curve is drawn on a log x axis and is monotone in k, so
+    :func:`interpolate_baseline` recovers the intermediate points to well under a pixel.
     """
     head = np.arange(1, min(BASELINE_K_HEAD, n_candidates) + 1)
     if n_candidates <= BASELINE_K_HEAD:
@@ -1394,7 +1353,7 @@ def chance_identity(counts: np.ndarray, n_candidates: int, ks: np.ndarray) -> np
     the companion CSV's reference column -- what the figure draws is the proportional baseline.
 
     Evaluated on :func:`baseline_k_grid` and interpolated, for the same reason the proportional
-    one is: the exact form is an ``(authors x k)`` array, 30 million entries on WildChat.
+    one is: the exact form is an ``(authors x k)`` array, too large to evaluate at every k.
     """
     grid = baseline_k_grid(n_candidates)
     hit = np.minimum(grid, n_candidates) / n_candidates
@@ -1431,8 +1390,7 @@ class ProportionalBaseline:
     #: guesser with something else -- which the two ``openset/`` identification families need,
     #: because the identity level is not linear in the accept rate (see
     #: :meth:`identities_at_rate`). It is the *scored* authors' rows of an array that already
-    #: exists, on the ~88-point grid rather than every k, so it costs ~134k floats on WildChat's
-    #: largest configuration rather than the 30M an all-k version would.
+    #: exists, on the sparse k grid rather than every k, which is what keeps it affordable.
     inclusion: np.ndarray
     document_counts: np.ndarray
 
@@ -1454,9 +1412,8 @@ class ProportionalBaseline:
         document is named correctly with probability ``rate * pi_a``, and the author escapes only
         if all ``m_a`` of theirs miss, so the composition goes *inside* the power:
         ``mean_a (1 - (1 - rate * pi_a) ** m_a)``. Scaling the composed number instead would be
-        right only for authors with one document -- for swe-chat's 184-document user at
-        ``rate = 0.5`` the two differ by 0.39, because half of 184 chances is still a lot of
-        chances.
+        right only for authors with one document -- for a heavy user, half the chances is still a
+        lot of chances.
 
         The document level needs no such method: ``sum_a q_a * rate * pi_a`` really is
         ``rate * for_documents(1)``, since expectation is linear where "at least once" is not.
@@ -1473,7 +1430,7 @@ class ProportionalBaseline:
 
         Evaluated on :attr:`ks` and interpolated in log k afterwards, exactly as
         :meth:`for_identities` is and for the same reason -- doing it at every k would build a
-        1,525 x 19,711 array on WildChat to answer a question the 88-point grid already answers.
+        far larger array to answer a question the sparse grid already answers.
         """
         composed = np.mean(1.0 - (1.0 - rate * self.inclusion) ** self.document_counts[:, None],
                            axis=0)
@@ -1486,8 +1443,7 @@ def known_inclusion(dataset: str, known_config: str) -> tuple[np.ndarray, np.nda
     The Monte Carlo is a property of the *known side* -- which authors the attack ranks over and
     how much each of them wrote -- so it is the same for every defense, feature and attack run
     against that configuration. Computing it once per (dataset, configuration) is what keeps it
-    off the per-run path: on WildChat's largest known side it is 19,711 authors by 2,000
-    replicates, and there are 21 runs that would otherwise each pay for it.
+    off the per-run path, since many runs share one known side and would otherwise each pay for it.
 
     Warmed in the parent process by :func:`warm_baselines` before the curve workers fork, so the
     children inherit the memo rather than each filling their own copy.
@@ -1563,15 +1519,14 @@ class ConfigCmc:
     #: The out-of-set cohort in this level's unit, or ``None``. Set only by ``openset/accuracy/``,
     #: and its presence is what switches :func:`draw_cmc_panel` from the ``accuracy/`` note
     #: (docs / users / candidates) to ``openset/identification``'s -- ``X out, Y in`` over
-    #: ``Z cand.`` -- so the two slices of one ``DIR(threshold, k)`` surface are annotated alike
-    #: (2026-09-25, on request). ``None`` is what keeps ``accuracy/`` byte-identical.
+    #: ``Z cand.`` -- so the two slices of one ``DIR(threshold, k)`` surface are annotated alike.
+    #: ``None`` is what keeps ``accuracy/`` byte-identical.
     #:
-    #: The achieved FAR was a fourth note line until then; it is in the companion CSV's
-    #: ``false_accept_rate`` column now. It was panel-wide (every attack is held to one budget
-    #: over one out-of-set cohort), which is the only kind of quantity this note may carry:
-    #: :func:`draw_cmc_panel` prints ``series[0]``'s note for the whole panel, and a per-series
-    #: count (how many in-set documents the threshold keeps) once printed "0 kept" over curves
-    #: at 0.65. That count is the CSV's ``n_accepted``.
+    #: The achieved FAR is in the companion CSV's ``false_accept_rate`` column rather than a note
+    #: line, since it is panel-wide (every attack is held to one budget over one out-of-set
+    #: cohort) and :func:`draw_cmc_panel` prints only ``series[0]``'s note for the whole panel --
+    #: a per-series quantity (how many in-set documents the threshold keeps) does not belong here
+    #: and is instead the CSV's ``n_accepted`` column.
     n_ood: int | None = None
     #: The known side's pool for the ``cand.`` line, in the level's unit (known documents at
     #: ``doc/``, known users at ``author/``), read from ``rolling_results.csv`` by
@@ -1581,14 +1536,11 @@ class ConfigCmc:
     #: Where that note sits. ``accuracy/`` keeps the file's bottom-right default, which is free
     #: there because a CMC curve climbs to the top right and leaves the corner it started under
     #: empty. ``openset/accuracy/`` cannot: the filter flattens the curve into a low band, so it
-    #: ends in the bottom right rather than above it. Swept over all 44 of that family's figures
-    #: for ink entering each corner's block -- **upper left 4, upper right 8, lower right 43,
-    #: lower left 44** -- which is why it overrides. The four that still collide are all
-    #: swe-chat's author panels, where the Gemini curves step straight to 0.45-0.72 at k = 1 and
-    #: stay flat across the full width, leaving no corner free at all. Re-run that sweep if a
-    #: `PANEL_Y_LIMITS` entry or the note's LINE COUNT changes -- both move the answer, and the
-    #: earlier four-line note measured upper left at 9 rather than 4. That sweep was of the
-    #: three-line note at 5% FAR; the note is two lines at 10% FAR now and was not re-swept.
+    #: ends in the bottom right rather than above it, and the corner is chosen by measurement
+    #: rather than assumed. A few of swe-chat's author panels still collide, since their curves
+    #: step up immediately and stay flat across the full width, leaving no corner free at all.
+    #: Re-check this if a `PANEL_Y_LIMITS` entry or the note's line count changes -- both can move
+    #: which corner is free.
     note_corner: str = "lower right"
 
     @property
@@ -1738,9 +1690,9 @@ def weighted_selective(confidence: np.ndarray, correct: np.ndarray, order: np.nd
     the sense in which Narayanan et al. reported ">80% precision at 50% recall".
 
     **This one stays a per-replicate loop on purpose.** Folding the replicates into one matrix of
-    cumulative sums, as :func:`cmc_replicates` does, was measured 2.5x *slower* here: the cut-off
-    is a ``searchsorted`` into each replicate's own running total, which has no batched form, and
-    the row-at-a-time search plus the float64 working copy cost more than the prefix sums saved.
+    cumulative sums, as :func:`cmc_replicates` does, is slower here: the cut-off is a
+    ``searchsorted`` into each replicate's own running total, which has no batched form, and the
+    row-at-a-time search plus the float64 working copy cost more than the prefix sums saved.
     """
     weights = np.ones(len(correct)) if weights is None else weights
     ordered_weights = weights[order]
@@ -2154,8 +2106,7 @@ def config_ndocs(table: pd.DataFrame, weights: PanelWeights, dataset: str, known
 TOP_LANGUAGES = 7
 
 #: Where every language outside a corpus's top :data:`TOP_LANGUAGES` is counted. Drawn rather than
-#: dropped: on WildChat it is 12.4% of the traffic, and a figure that silently discarded it would
-#: not account for the documents ``accuracy/`` reports on.
+#: dropped, so a figure never silently discards documents ``accuracy/`` reports on.
 OTHER_LANGUAGE = "Other"
 
 #: Band opacity on this family alone. Eight bands overlap in every panel here, against the two to
@@ -2170,11 +2121,10 @@ LANGUAGE_BAND_ALPHA = 0.07
 #: guard is the same one, and for the same reason, as
 #: :func:`cross_dataset_scaling_panels`'s "at least two corpora have the run".
 #:
-#: **This is what excludes swe-chat**, whose experiments are English: measured 2026-08-12, exactly
-#: one of its eight languages clears :data:`MIN_AUTHORS_PER_BIN` on **every** configuration (the
-#: ~40 non-English documents in a panel are spread over seven languages and a handful of users).
-#: A dataset literal would have said the same thing less honestly and would have silently excluded
-#: the next multilingual corpus; this reads the corpus instead of naming it.
+#: **This is what excludes swe-chat**, whose experiments are English: only one of its languages
+#: clears :data:`MIN_AUTHORS_PER_BIN` on any configuration. A dataset literal would have said the
+#: same thing less honestly and would have silently excluded the next multilingual corpus; this
+#: reads the corpus instead of naming it.
 MIN_LANGUAGES_PER_PANEL = 2
 
 
@@ -2225,14 +2175,14 @@ def config_language_cmc(table: pd.DataFrame, weights: PanelWeights, dataset: str
     language's candidate field is narrower before any authorship signal is used, and its accuracy
     is inflated by that narrowing alone. StyloMetrix makes this worse rather than better -- it
     runs an English spaCy pipeline over every document whatever it is written in, and separates
-    English from Russian at AUROC 0.984 *within* one corpus. The comparison that survives is
-    accuracy against ``random_within_language``; the raw curve is what that ratio is built from.
+    English from Russian well *within* one corpus. The comparison that survives is accuracy
+    against ``random_within_language``; the raw curve is what that ratio is built from.
 
-    Evaluated on :func:`baseline_k_grid` rather than at every k. Eight languages by six
-    configurations by two levels is 96 curves per run where ``accuracy/`` has 6, and at WildChat's
-    19,711 candidates an exhaustive grid would make this family alone about 2 GB of the sweep. The
-    grid is exhaustive to k=32 and geometric after, the curve is monotone, and the x axis is
-    logarithmic -- the same argument that already justifies it for the proportional baseline.
+    Evaluated on :func:`baseline_k_grid` rather than at every k: this family draws far more curves
+    per run than ``accuracy/`` does, and at scale an exhaustive grid would make it a large share of
+    the sweep by itself. The grid is exhaustive to k=32 and geometric after, the curve is
+    monotone, and the x axis is logarithmic -- the same argument that already justifies it for the
+    proportional baseline.
 
     At the author level a user is assigned their **modal** language over this panel's documents,
     and their whole cluster -- documents included, for the baseline -- goes into that one series.
@@ -2327,9 +2277,8 @@ def config_language_cmc(table: pd.DataFrame, weights: PanelWeights, dataset: str
 # --- the open world: the documents nobody the attacker knows wrote -----------
 #
 # Every figure above answers "which known author wrote this?" on the documents where that
-# question has an answer. In this corpus that is the minority: 41% of swe-chat's test quarter and
-# 63-87% of WildChat's was written by somebody absent from the known side, and WildChat's test
-# quarter holds roughly 6,200 such strangers against ~970 enrolled users. The figures in this
+# question has an answer. In this corpus that is the minority: much of both test quarters was
+# written by somebody absent from the known side. The figures in this
 # section put them back, using the two columns their rows do carry -- `author_in_known`, which is
 # the ground-truth label, and `accept_score`, the attack's cohort-normalised margin, which
 # `run_experiment.py` writes for *every* unknown document whether or not `--ood reject` was on.
@@ -2361,8 +2310,8 @@ class ConfigOpenSetCoverage:
 
     ``n_ood`` counts whatever the panel's unit is -- stranger documents at the document level,
     stranger *people* at the author level -- so ``ood_rate`` divides by the matching total. The
-    two are far apart: strangers are 63-87% of WildChat's test documents but a larger share of
-    its people, because the enrolled users are the prolific ones.
+    two are far apart: strangers are a large share of the test documents but a larger share of
+    the people, because the enrolled users are the prolific ones.
     """
 
     curve: pd.DataFrame
@@ -2475,10 +2424,9 @@ def weighted_roc(is_ood: np.ndarray, order: np.ndarray, weights: np.ndarray | No
     The area is computed from the same two cumulative sums rather than by integrating the
     interpolated curve -- for each enrolled document, the stranger weight ranked above it, summed
     and divided by the weight of all cross pairs. That is the Mann-Whitney identity, so it is
-    exact where a trapezoid over 101 grid points would not be. Its one approximation is that a
-    tied pair is credited to whichever side the sort put first rather than half each: verified
-    against ``sklearn.metrics.roc_auc_score``, that is an exact match on WildChat and a 2e-6
-    disagreement on swe-chat, where a couple of documents share a margin.
+    exact where a trapezoid over the grid would not be. Its one approximation is that a tied pair
+    is credited to whichever side the sort put first rather than half each; verified against
+    ``sklearn.metrics.roc_auc_score`` to agree except where documents share a margin exactly.
     """
     weights = np.ones(len(is_ood)) if weights is None else weights
     ordered_weights = weights[order]
@@ -2509,10 +2457,10 @@ def config_detection(table: pd.DataFrame, weights: PanelWeights,
     threshold on ``accept_score`` can beat "accept everything" or "reject everything", so a reject
     option would buy nothing.
 
-    Measured, this is where the feature axis separates hardest: Gemini embeddings reach 0.65-0.84
-    on swe-chat while StyloMetrix sits at 0.49-0.60 on both corpora, i.e. at chance. The same
-    margin that carries no information about *correctness* on the risk-coverage figure carries
-    none about *membership* either -- one statistic failing two different ways.
+    This is where the feature axis separates hardest: semantic embeddings detect strangers well
+    above chance while StyloMetrix sits near chance on both corpora. The same margin that carries
+    no information about *correctness* on the risk-coverage figure carries none about *membership*
+    either -- one statistic failing two different ways.
     """
     is_ood = ~table["author_in_known"].to_numpy(dtype=bool)
     score = table["accept_score"].to_numpy(dtype=float)
@@ -2535,31 +2483,23 @@ def config_detection(table: pd.DataFrame, weights: PanelWeights,
 # only if it clears *both* bars.
 #
 # Why this shape and not an "overall accuracy" or a balanced one. Scoring correct rejections as
-# successes makes the metric a readout of the out-of-set rate, which is 63-87% of WildChat's test
-# quarter: measured on `wildchat_base_stylometrix_nearest_neighbor` at `known0075`, plain
-# (N+1)-class accuracy is maximised at 0.6332 by rejecting *everything* -- exactly the out-of-set
-# rate -- and the whole threshold sweep moves it by 0.0003. Balanced accuracy fails the same way
-# for a subtler reason: its two arms have incomparable ceilings, since the true-reject rate spans
-# [0, 1] while the identification arm cannot exceed closed-set top-1 (0.065 on that run), so it is
-# 0.5 * TRR plus a rounding error and its argmax is again the attacker that gives up (0.5000 at
-# reject-everything on StyloMetrix, 0.5023 on Gemini). Both were measured before this was written.
-# DIR-FAR avoids it by never crediting a rejection: the only thing on the y axis is a
-# re-identification that survived the filter.
+# successes makes the metric a readout of the out-of-set rate, which is high enough that plain
+# (N+1)-class accuracy is maximised by rejecting *everything* -- and the whole threshold sweep
+# barely moves it. Balanced accuracy fails the same way for a subtler reason: its two arms have
+# incomparable ceilings, since the true-reject rate spans [0, 1] while the identification arm
+# cannot exceed closed-set top-1, so it is essentially half the true-reject rate and its argmax is
+# again the attacker that gives up. DIR-FAR avoids it by never crediting a rejection: the only
+# thing on the y axis is a re-identification that survived the filter.
 
 #: The false-accept rate the panel note quotes. 5% is the conventional operating point for a
-#: watchlist, low enough that most of an attack's identification power has already been spent
-#: (of its closed-set top-1, `known0075` undefended, a nearest-neighbor attack keeps 7% on
-#: WildChat/StyloMetrix and 21% on WildChat/Gemini, while `logistic_sgd` keeps 47% there and 77%
-#: on swe-chat/Gemini) and not so low that a handful of out-of-set documents decide it.
+#: watchlist, low enough that most of an attack's identification power has already been spent and
+#: not so low that a handful of out-of-set documents decide it.
 #:
-#: **The last clause is a real constraint on swe-chat**, which has 178 out-of-set documents in
-#: its largest configuration, so one of them is 0.56% of the axis and the curve between two
-#: operating points is interpolation rather than measurement. At 5% that is ~9 documents and the
-#: curve agrees with a percentile threshold to 0.001; at 1% it is under two, and the two readings
-#: differ by 0.05 (0.360 against 0.409) purely in how they interpolate -- this family between
-#: attained operating points, as a ROC does, and
-#: :func:`prompt_anonymity.evaluation.metrics.detection.detection_identification_rate` between
-#: adjacent out-of-set *scores*. Neither is wrong; do not quote a low-FAR number on a small
+#: **The last clause is a real constraint on a corpus with few out-of-set documents in its largest
+#: configuration**, where the curve between two operating points is interpolation rather than
+#: measurement -- this family interpolates between attained operating points, as a ROC does, while
+#: :func:`prompt_anonymity.evaluation.metrics.detection.detection_identification_rate` interpolates
+#: between adjacent out-of-set *scores*. Neither is wrong; do not quote a low-FAR number on a small
 #: cohort without saying which.
 IDENTIFICATION_NOTE_FAR = 0.05
 
@@ -2582,10 +2522,9 @@ class ConfigIdentification:
 
     Two edges make it a join rather than a third opinion. At ``FAR = 1`` nothing is rejected, so
     ``top1`` is exactly the ``accuracy/`` family's top-1 on the same run and configuration
-    (verified to the digit: 0.0651 on WildChat/StyloMetrix ``known0075``, 0.2610 on its Gemini
-    twin, 0.5958 on swe-chat/Gemini/logistic). At ``FAR = 0`` it is what the attacker retains
-    when it is not allowed a single false accept. Everything between is the cost of the open
-    world, measured in the currency the rest of the project reports.
+    (verified to the digit on every cell). At ``FAR = 0`` it is what the attacker retains when it
+    is not allowed a single false accept. Everything between is the cost of the open world,
+    measured in the currency the rest of the project reports.
 
     ``k = 1`` only. DIR is defined at any rank and the surface ``DIR(tau, k)`` has the CMC curve
     as its ``FAR = 1`` slice, but a second k would need a second visual channel in a panel where
@@ -2706,9 +2645,8 @@ def identification_baseline(chance: float) -> np.ndarray:
     least once" is not linear in the accept rate, so the composition happens inside the power.
     See :meth:`ProportionalBaseline.identities_at_rate`.
 
-    It is tiny (WildChat's proportional top-1 at ``known0075`` is ~0.0009), which is the point:
-    the same near-flat grey line under every curve is what says this y axis has no floor to speak
-    of, unlike the detection figure's diagonal.
+    It is tiny, which is the point: the same near-flat grey line under every curve is what says
+    this y axis has no floor to speak of, unlike the detection figure's diagonal.
     """
     return DETECTION_GRID * chance
 
@@ -2789,14 +2727,14 @@ def config_identification_authors(table: pd.DataFrame, people: pd.DataFrame,
 #
 # What it answers that neither neighbour can: a CMC curve says how much an attacker gains from
 # being allowed more guesses, and an attacker in the open world does not get to make those
-# guesses on documents it has already refused. Measured, the gain shrinks -- rejection keeps the
-# documents the attack was already confident *and* right about, so extra candidate slots buy less
-# than they do unfiltered.
+# guesses on documents it has already refused. The gain shrinks under rejection -- rejection keeps
+# the documents the attack was already confident *and* right about, so extra candidate slots buy
+# less than they do unfiltered.
 
 
-#: The false-accept budget ``openset/accuracy/`` pins. 10% rather than
-#: :data:`IDENTIFICATION_NOTE_FAR`'s 5% (2026-09-25, on request); the k = 1 point therefore
-#: equals the DIR-FAR curve read at FAR 10%, not at the 5% its note prints.
+#: The false-accept budget ``openset/accuracy/`` pins, deliberately different from
+#: :data:`IDENTIFICATION_NOTE_FAR`; the k = 1 point equals the DIR-FAR curve read at this FAR, not
+#: at the FAR its note prints.
 OPENSET_ACCURACY_FAR = 0.10
 
 
@@ -2811,9 +2749,9 @@ def threshold_at_far(scores: np.ndarray, is_ood: np.ndarray, far: float) -> tupl
     **Exact rather than interpolated, and that is the difference from the curve family.**
     :func:`weighted_identification` interpolates between attained operating points to land on
     :data:`DETECTION_GRID`; here the operating point is a real one the attacker could choose, so
-    the achieved FAR is returned alongside and is what the baseline is composed with. On WildChat
-    (27k out-of-set documents) the two agree to ~1e-4; on swe-chat, where the budget is 8
-    documents of 178, they can differ -- see :data:`IDENTIFICATION_NOTE_FAR`.
+    the achieved FAR is returned alongside and is what the baseline is composed with. The two
+    agree closely on a corpus with plenty of out-of-set documents and can differ where the budget
+    is only a handful -- see :data:`IDENTIFICATION_NOTE_FAR`.
 
     ``-inf`` when the budget does not stretch to a single document, i.e. the most enrolled-looking
     document in the whole test set is a stranger's and nothing can be accepted.
@@ -2888,11 +2826,11 @@ def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
     rather than being choices made here.
 
     * **The budget is spent on out-of-set *users*.** A stranger is falsely accepted the moment any
-      one of their documents is, so a threshold leaking 5% of stranger documents leaks far more
-      than 5% of stranger people -- 9.4% on WildChat and 31.8% on swe-chat, whose out-of-set users
-      write 8.09 documents each. Pinning the *author* FAR at ``far`` therefore picks a stricter
-      threshold than the document panel's, which is why the two levels are not the same operating
-      point and must not be read against each other at a fixed k.
+      one of their documents is, so a threshold leaking a fixed share of stranger documents leaks
+      a far larger share of stranger people, the more documents each writes. Pinning the *author*
+      FAR at ``far`` therefore picks a stricter threshold than the document panel's, which is why
+      the two levels are not the same operating point and must not be read against each other at
+      a fixed k.
     * **A user's rank is the best one among their *accepted* documents**, so the curve asks "was
       this person linked within k by something that survived the filter". Their best rank overall
       is not enough: it may belong to a document the attacker refused.
@@ -2938,19 +2876,17 @@ def config_identification_cmc_authors(table: pd.DataFrame, people: pd.DataFrame,
 # Like the ndocs families it is observational: a long conversation is a different conversation,
 # usually by a different kind of user, not a short one given more words.
 
-#: The false-accept budget this family pins. 10% like ``openset/accuracy/``
-#: (:data:`OPENSET_ACCURACY_FAR`) rather than the identification note's 5%
-#: (:data:`IDENTIFICATION_NOTE_FAR`), by request: split eight ways, a bin's DIR at 5% sits
-#: close enough to zero on WildChat/StyloMetrix that the length trend is hard to see.
+#: The false-accept budget this family pins -- the same as ``openset/accuracy/``
+#: (:data:`OPENSET_ACCURACY_FAR`) rather than the identification note's tighter
+#: (:data:`IDENTIFICATION_NOTE_FAR`), because split across bins a tighter budget pushes a bin's
+#: DIR close enough to zero that the length trend is hard to see.
 WORDS_IDENTIFICATION_FAR = 0.10
 
-#: Left edge of each word-count bin. Five, on request, at round numbers chosen off both corpora's
-#: distributions so no bin is starved: the median conversation is 45 words on WildChat and 54 on
-#: swe-chat (quartiles 16/207 and 20/171), and the open `1000+` bin keeps WildChat's 10% of
-#: pasted-document conversations (its 99th percentile is 12,124 words) in one place.
-#: StyloMetrix reads only the first 2,048 characters (~350 words) and Gemini the first 20,000, so
-#: the top bins are longer than either feature sees -- a flat tail there is truncation, not a
-#: ceiling on what length can buy.
+#: Left edge of each word-count bin, at round numbers chosen off both corpora's distributions so
+#: no bin is starved, with the open `1000+` bin catching the long pasted-document tail.
+#: StyloMetrix reads only a prefix of characters and Gemini a longer one, so the top bins are
+#: longer than either feature sees -- a flat tail there is truncation, not a ceiling on what
+#: length can buy.
 WORD_BIN_EDGES = (1, 20, 50, 200, 1000)
 
 WORD_BIN_LABELS = ndocs_bin_labels(WORD_BIN_EDGES)
@@ -3003,11 +2939,9 @@ def config_identification_by_words(table: pd.DataFrame, weights: PanelWeights, d
       conversations** -- the ones under attack -- on the same :data:`WORD_BIN_EDGES` as the
       document level, and counts as linked if **any** of those conversations was accepted and
       ranked first. That is ``openset/accuracy/author``'s k=1 event, so the bins partition the
-      users and their user-weighted mean reproduces that point at this budget. (Until
-      2026-09-25 a user was counted in every bin they had a conversation in, linked per bin by
-      conversations of that length; the bins overlapped and the bars could not be shares of
-      users.) The axis is then a property of the *person* -- how much a typical conversation of
-      theirs says -- not of one conversation.
+      users and their user-weighted mean reproduces that point at this budget. The axis is then a
+      property of the *person* -- how much a typical conversation of theirs says -- not of one
+      conversation.
 
     The baselines are a chance detector at the same achieved FAR in front of the proportional
     guesser: ``far * p_a`` per document, and ``1 - (1 - far * p_a) ** m`` per user with ``m``
@@ -3136,8 +3070,8 @@ def config_separation(table: pd.DataFrame, weights: PanelWeights,
     """The two score distributions the detection curve summarises.
 
     Each cohort is normalised to its own density rather than plotted as counts: strangers
-    outnumber enrolled documents three to one on WildChat, so raw counts would draw one visible
-    curve and one flat line along the axis, and the question here is about *shape*, not size.
+    outnumber enrolled documents by a wide margin, so raw counts would draw one visible curve and
+    one flat line along the axis, and the question here is about *shape*, not size.
     """
     score = table["accept_score"].to_numpy(dtype=float)
     is_ood = ~table["author_in_known"].to_numpy(dtype=bool)
@@ -3322,7 +3256,7 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str, scale: float = 
     """Head every panel with its known interval, and put the axis titles on the grid's outer edge.
 
     **Each cell is headed ``[50%, 75%] known``** -- the slice of the corpus's timeline the
-    attacker was given, left-aligned above the panel (2026-09-17, on request). It replaces the
+    attacker was given, left-aligned above the panel. It replaces the
     pair of coordinates the grid used to carry: a ``2 quarters stale`` column header over the top
     row, and a ``known 50%`` row label in the slot the y title now occupies. Between them those
     two did name a cell, but only in combination and only for a reader who had found both edges
@@ -3337,17 +3271,17 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str, scale: float = 
     six copies of it inside the grid would be six lines of repeated caption text. The y title is
     the first column's alone for the same reason, in the slot the row label has left free.
 
-    **Every panel carries its own x tick labels** (2026-09-12, on request), which is not what
-    ``sharex`` does on its own -- it labels the bottom row and leaves the rest bare. The axis is
-    shared, so the numbers are the same in every cell, but a reader comparing the top-right panel
-    against the bottom-left one should not have to trace a column down two cells to find out what
-    the x position under a curve is.
+    **Every panel carries its own x tick labels**, which is not what ``sharex`` does on its own --
+    it labels the bottom row and leaves the rest bare. The axis is shared, so the numbers are the
+    same in every cell, but a reader comparing the top-right panel against the bottom-left one
+    should not have to trace a column down two cells to find out what the x position under a
+    curve is.
 
     **Y tick labels are the first column's**, which is what ``sharey`` does by default and the
     opposite of the x rule above. The asymmetry is a space argument, not a reading one: a y tick
-    label sits *outside* its panel and pushes the next column along, so three sets of them at
-    :data:`GRID_SCALE` cost ~1.4 in of the figure's width, for numbers the shared axis makes
-    identical across the row. An x tick label costs height the row below has already reserved.
+    label sits *outside* its panel and pushes the next column along, so repeating it in every
+    column would cost real width for numbers the shared axis already makes identical across the
+    row. An x tick label costs height the row below has already reserved.
     """
     for column, gap in enumerate(GRID_GAPS):
         rows = [row for row, size in enumerate(GRID_SIZES) if grid_config(size, gap) is not None]
@@ -3387,18 +3321,14 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str, scale: float = 
                 label.set_ha("center")
             if column == 0:
                 # Set at 45 degrees. Upright (90) was tried first and packed the numbers too
-                # tightly: rotating a label puts its *width* on the y axis, and at double size
-                # "0.00" is 0.70 in against a 0.85 in gap between quarter ticks -- 0.15 in of
-                # air, which reads as a single run of digits. At 45 the vertical extent is that
-                # width over root two, 0.49 in, so the gap trebles while the label still costs a
-                # fraction of what a horizontal one would.
+                # tightly: rotating a label puts its *width* on the y axis instead of its height,
+                # which is what buys the gap between quarter ticks back.
                 #
-                # `va="center"` (2026-09-16, on request) centres each label's box on the
-                # gridline it names. It was `top`, which hangs the box *below* the tick -- a
-                # rotated label is as tall as the string is long, so at this size that dropped
-                # every number about a quarter of an inch under the line it belongs to and the
-                # bottom one under the axis. Vertical centring is what matplotlib does for an
-                # unrotated y label, so this keeps the rotation a change of angle only.
+                # `va="center"` centres each label's box on the gridline it names. It was `top`,
+                # which hangs the box *below* the tick -- a rotated label is as tall as the string
+                # is long, so that dropped every number visibly under the line it belongs to.
+                # Vertical centring is what matplotlib does for an unrotated y label, so this
+                # keeps the rotation a change of angle only.
                 axes.tick_params(axis="y", labelrotation=45)
                 for label in axes.get_yticklabels():
                     label.set_va("center")
@@ -3407,19 +3337,16 @@ def label_facets(grid, axes_for: dict, xlabel: str, ylabel: str, scale: float = 
 def quarter_ticks(axis, full: float = 1.0) -> None:
     """Tick one axis of a 0-to-``full`` share at **every quarter**: 0, 25%, 50%, 75%, 100%.
 
-    **Every axis in this file that carries a share goes through here** (2026-09-17, on request) --
-    both axes of a coverage or ROC panel, the percentile axes, the clustering figures' precision
-    and recall, the bar charts' accuracy. It was the y axes alone, so a panel whose x was also a
-    share ticked 0.0 / 0.5 / 1.0 across and 0.00 / 0.25 / 0.50 / 0.75 / 1.00 up, which is two
-    different griddings of the same unit on one panel.
+    **Every axis in this file that carries a share goes through here** -- both axes of a coverage
+    or ROC panel, the percentile axes, the clustering figures' precision and recall, the bar
+    charts' accuracy. Without it a panel whose x is also a share can tick differently on each axis,
+    which is two different griddings of the same unit on one panel.
 
-    The positions are pinned rather than left to matplotlib (2026-09-12, on request). Its
-    automatic locator picks a tick count from the axes' *size*, so the same family ticks
-    differently on a tall figure and a short one -- on a shortened facet grid it settled on
-    0.0 / 0.5 / 1.0, three gridlines to read a curve against, where a quarter is the unit these
-    numbers are actually discussed in ("half the documents", "a quarter of the users"). Pinning it
-    makes every panel of every family tick identically whatever the figure height, which is what
-    lets two figures be flipped between.
+    The positions are pinned rather than left to matplotlib. Its automatic locator picks a tick
+    count from the axes' *size*, so the same family ticks differently on a tall figure and a short
+    one, where a quarter is the unit these numbers are actually discussed in ("half the
+    documents", "a quarter of the users"). Pinning it makes every panel of every family tick
+    identically whatever the figure height, which is what lets two figures be flipped between.
 
     ``full`` is 1.0 for a fraction and 100 for a share written as a percentage (the two percentile
     axes), so both spellings land on the same five gridlines. An axis that does not span the whole
@@ -3442,15 +3369,14 @@ def unit_y_axis(axes) -> None:
 
 #: Panels that do **not** take the unit square, as ``(curve type, dataset) -> (top, tick step)``.
 #:
-#: **The second deliberate exception to :func:`quarter_ticks`** (2026-09-17, on request; the
-#: first is the clustering variants dumbbell, whose x is a ~0.08-wide zoom). The rule everywhere
-#: else is that an axis which does not span the unit still gets the quarters below its top, so
-#: one gridline means one thing across the project. It is given up here because
-#: ``openset/identification`` is the one family whose y ceiling is *the attack's own top-1*: on
-#: WildChat that is at most 0.33 and the curves spend the panel's bottom third, with three of the
-#: five gridlines over empty space. The zoom keeps the spirit -- **five evenly spaced gridlines,
-#: still starting at 0** -- and changes only what one of them is worth, which the axis labels
-#: say. swe-chat is deliberately absent: its curves reach 0.84 and the unit square fits them.
+#: **The second deliberate exception to :func:`quarter_ticks`** (the first is the clustering
+#: variants dumbbell, whose x is a narrow zoom). The rule everywhere else is that an axis which
+#: does not span the unit still gets the quarters below its top, so one gridline means one thing
+#: across the project. It is given up here because ``openset/identification`` is the one family
+#: whose y ceiling is *the attack's own top-1*, which on WildChat leaves most of the panel over
+#: empty space. The zoom keeps the spirit -- **five evenly spaced gridlines, still starting at
+#: 0** -- and changes only what one of them is worth, which the axis labels say. swe-chat is
+#: deliberately absent: its curves reach high enough that the unit square fits them.
 #:
 #: **Read the two corpora's panels as different scales.** This is the only place in the file
 #: where the same family's y axis differs between datasets, so a WildChat panel and a swe-chat
@@ -3459,16 +3385,13 @@ def unit_y_axis(axes) -> None:
 PANEL_Y_LIMITS = {
     ("identification", "wildchat"): (0.4, 0.1),
     ("identification_authors", "wildchat"): (0.4, 0.1),
-    # The same zoom as `openset/identification`, whose layout this family adopts. Highest
-    # WildChat curve 0.363 (doc) / 0.165 (author) at eight bins -- check `ci_high` under
-    # `--bands` before trusting the 0.4 ceiling not to clip a band.
+    # The same zoom as `openset/identification`, whose layout this family adopts. Check `ci_high`
+    # under `--bands` before trusting the ceiling not to clip a band.
     ("identification_words", "wildchat"): (0.4, 0.1),
     ("identification_words_authors", "wildchat"): (0.4, 0.1),
     # Same reasoning one family over, and the ceiling is set by the *baseline* at the author
-    # level rather than by the curve. At the 10% FAR budget (:data:`OPENSET_ACCURACY_FAR`) the
-    # two levels' highest curve is 0.3075 / 0.2436 against a chance-detector reference reaching
-    # 0.391, so 0.4 is what holds both -- 0.3 did at 5% and clipped at 10%. Tight: check the
-    # widest `ci_high` under `--bands` before trusting it.
+    # level rather than by the curve -- tight enough that it is worth checking the widest
+    # `ci_high` under `--bands` before trusting it.
     ("identification_cmc", "wildchat"): (0.4, 0.1),
     ("identification_cmc_authors", "wildchat"): (0.4, 0.1),
 }
@@ -3498,12 +3421,10 @@ def unit_x_axis(axes, top: float = 1.0) -> None:
     running along it, so there is nothing to keep off the frame and the extra 2% would read as an
     axis that goes past where the measurement stops.
 
-    **The labels are rotated -45 degrees, the mirror of the y axis's +45** (2026-09-17, on
-    request). Both axes of these panels carry the same five-quarter share, and at
-    :data:`GRID_SCALE` five of ``0.00``..``1.00`` are 2.8 in of labels on a 3.2 in panel -- so
-    they are angled for the same reason the y labels are, and angled the *other* way so the two
-    axes stay distinguishable at a glance rather than reading as one set of text sheared in one
-    direction.
+    **The labels are rotated -45 degrees, the mirror of the y axis's +45.** Both axes of these
+    panels carry the same five-quarter share, so they are angled for the same space reason the y
+    labels are, and angled the *other* way so the two axes stay distinguishable at a glance rather
+    than reading as one set of text sheared in one direction.
 
     **Only the rotation is set here.** The labels stay *centred* on their ticks, which
     :func:`label_facets` applies after this -- its own ``tick_params`` call resets alignment, and
@@ -3518,23 +3439,19 @@ def unit_x_axis(axes, top: float = 1.0) -> None:
 def log_x_axis(axes, decades_per_tick: int = 1) -> None:
     """A log x axis whose ticks read ``1, 10, 100`` rather than ``10^0, 10^1, 10^2``.
 
-    Every log axis in the file goes through here (2026-09-12, on request). Matplotlib's default
-    ``LogFormatterSciNotation`` is right for an axis spanning many orders of magnitude; these span
-    four at most and count **candidate authors**, which a reader compares against the pool size in
-    the panel note -- and "7,867 candidates" does not compare against "10^3" without doing
-    arithmetic first.
+    Every log axis in the file goes through here. Matplotlib's default ``LogFormatterSciNotation``
+    is right for an axis spanning many orders of magnitude; these span few and count **candidate
+    authors**, which a reader compares against the pool size in the panel note, and a count does
+    not compare against a power of ten without doing arithmetic first.
 
-    Thousands are separated for the same reason: the widest label these axes reach is WildChat's
-    ``10,000``, and at four digits a grouped number is read at a glance where a bare one is
-    counted. Minor ticks stay unlabelled, as matplotlib leaves them.
+    Thousands are separated for the same reason: a grouped number is read at a glance where a bare
+    one is counted. Minor ticks stay unlabelled, as matplotlib leaves them.
 
     ``decades_per_tick`` thins the labels to every second (or n-th) power of ten, which every
-    log axis on the grid needs at :data:`GRID_SCALE`: ``10,000`` is 1.10 in wide there against
-    decades 0.80 in apart on a 3.2 in panel, so ``100``, ``1,000`` and ``10,000`` ran into one
-    another.
-    At every second decade the spacing is 1.60 in and the labels clear. It is the *labels* that
-    are thinned and not the axis -- the minor ticks and the gridlines behind them are untouched,
-    so a curve is still read against every decade.
+    log axis on the grid needs at :data:`GRID_SCALE`: labelling every decade there runs the
+    adjacent numbers into one another. It is the *labels* that are thinned and not the axis --
+    the minor ticks and the gridlines behind them are untouched, so a curve is still read against
+    every decade.
     """
     axes.set_xscale("log")
     if decades_per_tick != 1:
@@ -3542,19 +3459,16 @@ def log_x_axis(axes, decades_per_tick: int = 1) -> None:
     axes.xaxis.set_major_formatter(FuncFormatter(lambda value, _: f"{value:,.10g}"))
 
 
-#: Smallest FAR :func:`log_far_axis` shows. It is exactly ``DETECTION_GRID``'s own step (0.01),
-#: not an arbitrary floor: a smaller one would put empty decades under the axis (the grid has no
-#: sample there), which drew as a straight line dressed up as measured curve. FAR=0 -- the
-#: strictest threshold, reject every stranger -- has no image on a log axis and is dropped rather
-#: than clipped onto this floor (2026-09-22, on request): clipping put its value on top of the
-#: real FAR=0.01 sample's x position, and the two almost never agree, which drew a near-vertical
-#: jump right at the left edge that read as a rendering bug.
+#: Smallest FAR :func:`log_far_axis` shows. It is exactly ``DETECTION_GRID``'s own step, not an
+#: arbitrary floor: a smaller one would put empty decades under the axis, which drew as a straight
+#: line dressed up as a measured curve. FAR=0 -- the strictest threshold, reject every stranger --
+#: has no image on a log axis and is dropped rather than clipped onto this floor: clipping put its
+#: value on top of the real floor sample's x position and the two almost never agree, which drew a
+#: near-vertical jump at the left edge that read as a rendering bug.
 FAR_LOG_FLOOR = 0.01
-#: Five ticks spanning [FAR_LOG_FLOOR, 1.0] -- swe-chat's request (2026-09-22) over the plain
-#: decades 0.01/0.001/... below, which it found too compressed at the low end. Not quite even
-#: half-decade spacing (0.01/0.03/0.1/**0.33**/1.0, not .0316/.316) -- that was a second,
-#: explicit correction the same day. The log-scale analogue of :func:`unit_x_axis`'s five linear
-#: quarter-ticks.
+#: Five ticks spanning [FAR_LOG_FLOOR, 1.0], chosen less compressed at the low end than plain
+#: decades and not quite even half-decade spacing either. The log-scale analogue of
+#: :func:`unit_x_axis`'s five linear quarter-ticks.
 FAR_LOG_TICKS = (0.01, 0.03, 0.1, 0.33, 1.0)
 
 
@@ -3574,11 +3488,9 @@ def log_far_axis(axes) -> None:
     axes.tick_params(axis="x", labelrotation=-45)
 
 
-#: Where a panel note can sit, as corner -> (anchor, inset direction, horizontal, vertical).
-#: The inset is **1.5 pt horizontally, 3 pt vertically** (tightened from 4/6 on request): the
-#: block is aligned against the panel's vertical edge, where a 6 pt lift left a two-line note
-#: sitting a visible distance up into the panel. Small but not zero -- at 0 the glyphs touch the
-#: frame and the tight crop shaves their antialiasing (see :data:`FIGURE_PAD_INCHES`).
+#: Where a panel note can sit, as corner -> (anchor, inset direction, horizontal, vertical). The
+#: inset is small but not zero -- at 0 the glyphs touch the frame and the tight crop shaves their
+#: antialiasing (see :data:`FIGURE_PAD_INCHES`).
 NOTE_CORNERS = {
     "lower right": ((1, 0), (-1.5, 3), "right", "bottom"),
     "lower left": ((0, 0), (1.5, 3), "left", "bottom"),
@@ -3595,17 +3507,16 @@ def panel_note(axes, text: str, scale: float = 1.0, corner: str = "lower right")
     panels are not directly comparable at face value -- it belongs on the figure, not in a note
     someone has to look up.
 
-    **Bottom right by default** (2026-09-12, on request; it was top left). Most curve families
-    here rise to the right or start high on the left, so the upper-left corner is where a line
-    actually goes and the note was sitting on the data. Aligned per line as well as as a block,
-    so a multi-line note reads as one object against the panel's corner.
+    **Bottom right by default**, since most curve families here rise to the right or start high on
+    the left, so the upper-left corner is where a line actually goes and the note would sit on the
+    data there. Aligned per line as well as as a block, so a multi-line note reads as one object
+    against the panel's corner.
 
-    ``corner`` is for the three families whose ink is somewhere else, which the doubling to
-    :data:`GRID_SCALE` made unignorable (2026-09-17): a per-user risk curve falls from the top
-    left to the bottom right, so its free corner is the lower *left*; the ndocs panels stand a
-    population histogram along the bottom; and a separation panel's two densities peak on the
-    right, which is what the bottom-right corner had to be given up for. Each of those corners is
-    free by the family's construction rather than by how one run came out -- see the drawers.
+    ``corner`` is for the families whose ink is somewhere else: a per-user risk curve falls from
+    the top left to the bottom right, so its free corner is the lower *left*; the ndocs panels
+    stand a population histogram along the bottom; and a separation panel's two densities peak on
+    the right, which is what the bottom-right corner had to be given up for. Each of those corners
+    is free by the family's construction rather than by how one run came out -- see the drawers.
     """
     (anchor, (dx, dy), ha, va) = NOTE_CORNERS[corner]
     axes.annotate(text, xy=anchor, xytext=(dx * scale, dy * scale), xycoords="axes fraction",
@@ -3616,8 +3527,8 @@ def panel_note(axes, text: str, scale: float = 1.0, corner: str = "lower right")
 # --- NO FIGURE CARRIES A TITLE -----------------------------------------------
 #
 # `figure_heading` drew a left-aligned bold line across the top of every figure and reserved a
-# band in inches for it. It was removed 2026-09-11, on request, and with it the last piece of
-# prose burned into an image: first the subtitle (2026-08-12), now the title.
+# band in inches for it. It was removed, and with it the last piece of prose burned into an image:
+# first the subtitle, now the title.
 #
 # The reasoning is the subtitle's, and it applies harder to a title: what a figure *is* belongs
 # to the document that publishes it, where it can be edited, translated, footnoted and set in the
@@ -3731,12 +3642,9 @@ def finish_facets(figure, handles: dict, legend_title: str,
             list(extra_handles.values()), list(extra_handles), title=extra_title,
             loc="upper center", bbox_to_anchor=tuple(stack_below(figure, legend_cell, legend)),
             borderaxespad=0.0,  # honour the measured anchor instead of re-padding off it
-            # **The default handle length, matching the colour legend above it** (2026-09-12, on
-            # request): these were 4.0 -- double -- from when the dash patterns were long enough
-            # that a default sample clipped them mid-period. `FEATURE_DASHES`' tightened
-            # dash-dot fits nearly twice over in a default 2-em sample, so the only thing the
-            # extra width bought was two legend blocks whose keys were visibly different
-            # lengths, which reads as a difference in kind.
+            # The default handle length, matching the colour legend above it: a longer sample
+            # was needed only for a dash pattern that has since been tightened to fit a default
+            # sample, so keeping the two legend blocks' keys the same length now reads as intended.
             **shared))
     stem.parent.mkdir(parents=True, exist_ok=True)
     table.to_csv(stem.parent / f"{stem.name}.csv", index=False)
@@ -3746,11 +3654,9 @@ def finish_facets(figure, handles: dict, legend_title: str,
 def abbreviate_count(value: int) -> str:
     """``427`` -> ``427``; ``14322`` -> ``14.3k``; ``10000`` -> ``10k``.
 
-    Used by every panel note on the configuration grid (`accuracy/` from 2026-09-16, the rest
-    from 2026-09-17, both on request), where the counts are drawn at :data:`GRID_SCALE` and a
-    grouped five-digit number is 1.5 in of a 3.2 in panel. Thousands
-    are the only magnitude these counts reach -- WildChat's largest is 19,711 candidates -- so
-    there is one suffix and no ladder.
+    Used by every panel note on the configuration grid, where the counts are drawn at
+    :data:`GRID_SCALE` and a grouped five-digit number costs real panel width. Thousands are the
+    only magnitude these counts reach, so there is one suffix and no ladder.
 
     Below 1,000 the number is left exactly as it is, separators and all: that is where the small
     user counts live (427, 744), they are short already, and rounding them would throw away a
@@ -3771,9 +3677,8 @@ def short_unit(unit: str) -> str:
 
     The open-set notes name their own unit, because the document and author levels of those
     figures differ about fivefold and a count with no unit beside it would be read as the other
-    one. At :data:`GRID_SCALE` the long spelling is what pushes "623 in-set documents" to 3.2 in,
-    the full width of a panel, so the note spanned the cell it was anchored to the corner of.
-    ``users`` is short already and stays as it is.
+    one. At :data:`GRID_SCALE` the long spelling costs enough panel width to run the note across
+    the whole cell. ``users`` is short already and stays as it is.
     """
     return "docs" if unit == "documents" else unit
 
@@ -3781,10 +3686,10 @@ def short_unit(unit: str) -> str:
 def cohort_counts(n_ood: int, n_in_set: int, unit: str) -> str:
     """The two open-set populations, one per line: ``374 out-docs`` / ``623 in-docs``.
 
-    **The cohort is a prefix on the unit rather than a phrase of its own** (2026-09-17, on
-    request): the notes read "374 out-of-set" over "623 in-set docs", which spends a third of a
-    :data:`GRID_SCALE` panel's width on saying "-of-set" twice and leaves the two lines different
-    lengths for no reason -- they are two counts of the same kind of thing. The full vocabulary
+    **The cohort is a prefix on the unit rather than a phrase of its own**: spelling it "374
+    out-of-set" over "623 in-set docs" spends real :data:`GRID_SCALE` panel width on saying
+    "-of-set" twice and leaves the two lines different lengths for no reason -- they are two
+    counts of the same kind of thing. The full vocabulary
     ("out-of-set" / "in-set") is unchanged everywhere it is *read* rather than counted: the
     separation figure's cohort legend, the axis descriptions in :data:`CURVE_TYPES`, and the
     companion CSVs.
@@ -3837,17 +3742,14 @@ def draw_cmc_panel(axes, series: list[Series], handles: dict,
              else "random")
     axes.plot(baseline["k"], baseline[drawn], color=TEXT_MUTED, linewidth=1.2 * scale,
               linestyle=BASELINE_DASH, zorder=2)
-    # Every second decade on WildChat, every decade on swe-chat. The two corpora differ by two
-    # orders of magnitude in pool size -- WildChat's k axis runs to ~19,700 and swe-chat's to
-    # ~124 -- so a fixed stride either crowds one or leaves the other with two labels on the
-    # whole axis. Thinning is what the wide axis needs at `GRID_SCALE` (a 1.10 in "10,000"
-    # against decades 0.80 in apart); the narrow one has room for 1, 10, 100 and reads better
-    # with them.
+    # Every second decade on a wide-pool corpus, every decade on a narrow one. The two corpora
+    # differ by two orders of magnitude in pool size, so a fixed stride either crowds one or
+    # leaves the other with two labels on the whole axis.
     log_x_axis(axes, decades_per_tick=1 if shared_k < 1000 else 2)
     unit_y_axis(axes)
     # One count per line rather than the usual "N docs · M users" pair: at `GRID_SCALE` that pair
-    # is 4.0 in against a 3.2 in panel and hung out over the y tick labels. Three lines of at most
-    # 1.5 in fit. Every drawer here notes its counts this way for the same reason.
+    # runs wider than a panel and hangs out over the y tick labels. Every drawer here notes its
+    # counts this way for the same reason.
     counts = series[0].curve
     if counts.n_ood is None:
         note = (f"{abbreviate_count(counts.n_documents)} docs\n"
@@ -4001,8 +3903,8 @@ def draw_words_identification_panel(axes, series: list[Series], handles: dict,
     printed, and every series' own is in the companion CSV's ``false_accept_rate``).
 
     The note is ``openset/identification``'s -- out/in cohorts and the known pool as ``cand.`` --
-    without the FAR, which the path and caption already state (2026-09-24, on request). Lines
-    carry no markers, also on request; five bins are few enough to read without them.
+    without the FAR, which the path and caption already state. Lines carry no markers; five bins
+    are few enough to read without them.
     """
     first = series[0].curve
     n_in_set = first.n_users if first.level == "author" else first.n_documents
@@ -4063,10 +3965,11 @@ def draw_binned_panel(axes, series: list[Series], handles: dict, scale: float,
     labels = list(population["bin_label"])
     axes.set_xticks(np.arange(len(labels)), labels=labels)
     axes.set_xlim(-0.6, len(labels) - 0.4)
-    # The bins are the only categorical x axes in the file, and at `GRID_SCALE` "17-32" is
-    # 0.55 in against a 0.45 in bin pitch, so the labels ran into one another. Rotated rather than
-    # thinned: every bin is a drawn point and a reader needs to know which one they are looking
-    # at. The alignment that pairs with the angle is `label_facets`' -- see the note there.
+    # The bins are the only categorical x axes in the file, and at `GRID_SCALE` a label like
+    # "17-32" is wider than its bin pitch, so unrotated labels run into one another. Rotated
+    # rather than thinned: every bin is a drawn point and a reader needs to know which one they
+    # are looking at. The alignment that pairs with the angle is `label_facets`' -- see the note
+    # there.
     if scale != 1.0:
         axes.tick_params(axis="x", labelrotation=45)
     unit_y_axis(axes)
@@ -4116,9 +4019,8 @@ def scaling_baselines(series: list[Series]) -> list[tuple[str | None, pd.Series]
     A cross-dataset panel needs one *each*, and averaging them would be wrong rather than merely
     imprecise. At the document level chance is uniform ``1/n`` and the two corpora agree to the
     bit, so the lines coincide and look like one. At the author level it is
-    ``1 - (1 - 1/n)^m_a`` averaged over users, which moves with a corpus's documents per user:
-    measured on ``known0075``, WildChat and SWE-chat differ by up to **0.136**, and a mean of the
-    two would be neither corpus's chance.
+    ``1 - (1 - 1/n)^m_a`` averaged over users, which moves with a corpus's documents per user and
+    can differ meaningfully between corpora, so a mean of the two would be neither corpus's chance.
     """
     by_dataset: dict[str | None, pd.Series] = {}
     for item in series:
@@ -4145,9 +4047,9 @@ def scaling_panel_note(series: list[Series]) -> str:
         return counts(series[0]).replace(" · ", "\n")
     labelled: dict[str, str] = {}
     for item in series:
-        # The corpus gets a line of its own: its label plus both counts is 32 characters, which at
-        # `GRID_SCALE` is 4.2 in against a 3.2 in panel, and the note is anchored to the panel's
-        # right edge -- so an over-wide line runs out over the cell to its left.
+        # The corpus gets a line of its own: its label plus both counts runs wider than a panel at
+        # `GRID_SCALE`, and the note is anchored to the panel's right edge -- so an over-wide line
+        # runs out over the cell to its left.
         labelled.setdefault(item.dataset, f"{DATASET_LABELS[item.dataset]}\n{counts(item)}")
     return "\n".join(labelled[name] for name in DATASETS if name in labelled)
 
@@ -4198,14 +4100,14 @@ def draw_scaling_panel(axes, series: list[Series], handles: dict,
             handles.setdefault("Random guessing",
                                Line2D([], [], color=TEXT_MUTED, linewidth=1.2 * scale))
     # Thinned on the wide corpus for the reason `draw_cmc_panel` documents: this axis counts the
-    # same candidates and reaches the same ~19,700 on WildChat.
+    # same candidates and reaches the same scale.
     widest = max(item.curve.curve["n_candidates"].max() for item in series)
     log_x_axis(axes, decades_per_tick=1 if widest < 1000 else 2)
     unit_y_axis(axes)
     # Upper right, and free by construction: every curve here is non-increasing in the pool size,
     # so the corner at the largest pool and the highest accuracy is the one no line reaches. The
-    # bottom-right default is where they all END, which at `GRID_SCALE` put a four-line
-    # cross-dataset note straight through them.
+    # bottom-right default is where they all END, which is where a cross-dataset note would run
+    # straight through them.
     panel_note(axes, scaling_panel_note(series), scale=scale, corner="upper right")
     return pd.concat(rows, ignore_index=True)
 
@@ -4295,14 +4197,14 @@ def draw_identification_panel(axes, series: list[Series], handles: dict,
     still there once the attacker has to decide who is even enrolled.
 
     The dashed line is :func:`identification_baseline`, and unlike the detection figure's
-    diagonal it lies almost on the axis: chance identification is a property of the pool, which
-    has 19,711 candidates in it. A curve indistinguishable from that dash is an attack that
-    identifies nobody at any threshold, which is a different (and stronger) statement than the
-    detection figure's "hugging the diagonal".
+    diagonal it lies almost on the axis: chance identification is a property of a large candidate
+    pool. A curve indistinguishable from that dash is an attack that identifies nobody at any
+    threshold, which is a different (and stronger) statement than the detection figure's "hugging
+    the diagonal".
 
-    **The x axis is log, not the file's usual linear unit square** (2026-09-22, on request): most
-    of a curve's rise happens below FAR=0.1, which a linear axis spends three-quarters of its
-    width not showing. See :func:`log_far_axis`.
+    **The x axis is log, not the file's usual linear unit square**: most of a curve's rise happens
+    below FAR=0.1, which a linear axis spends most of its width not showing. See
+    :func:`log_far_axis`.
     """
     rows = []
     slots = resolve_slots([item.slot for item in series], [item.dash for item in series])
@@ -4330,21 +4232,14 @@ def draw_identification_panel(axes, series: list[Series], handles: dict,
     # **Upper left, and the corner was chosen by measurement rather than by eye.** A monotone
     # curve from (0, 0) to (1, top-1) splits the panel, so which corner it leaves free depends on
     # top-1 *as a fraction of the axis* -- and with `PANEL_Y_LIMITS` that fraction now differs by
-    # corpus, which makes a single representative figure worthless for deciding it. Sweeping all
-    # 44 figures of the family for curves entering each corner's block: **upper left 6, upper
-    # right 19, lower right 26, lower left 43**. The default bottom right is the worst but one,
-    # because the low-feature figures (every StyloMetrix panel, on both corpora) run along the
-    # bottom exactly where it sits.
+    # corpus, which makes a single representative figure worthless for deciding it. Swept across
+    # the whole family, this corner collides least often; the default bottom right is where the
+    # low-feature figures (StyloMetrix, on both corpora) run along the bottom exactly where it
+    # sits. Re-run the sweep before changing this or a `PANEL_Y_LIMITS` entry if it starts to bite.
     #
-    # The 6 that do collide all graze rather than cross -- their peak inside the block is 0.80 to
-    # 0.88 of the panel, against a two-line note occupying roughly the top 0.22 -- and they are
-    # the highest-scoring cells: WildChat `openanonymity`/Gemini `logistic_sgd` at the document
-    # level, and four of swe-chat's author panels. Re-run the sweep above before changing this or
-    # a `PANEL_Y_LIMITS` entry; a one-line note would clear most of the six if it matters.
-    #
-    # The note is "X out, Y in" on one line and the known pool as "Z cand." beneath it
-    # (2026-09-24, on request) -- the unit is left to the path (`doc/` or `author/`), so the
-    # out/in pair and the pool are all counted in whatever that level counts.
+    # The note is "X out, Y in" on one line and the known pool as "Z cand." beneath it -- the unit
+    # is left to the path (`doc/` or `author/`), so the out/in pair and the pool are all counted
+    # in whatever that level counts.
     first = series[0].curve
     rate = f"\nDIR@{IDENTIFICATION_NOTE_FAR:.0%} {first.dir_at(IDENTIFICATION_NOTE_FAR):.3f}"
     n_in_set = (first.n_users if first.level == "author" else first.n_documents) - first.n_ood
@@ -4393,20 +4288,19 @@ def draw_separation_panel(axes, series: list[Series], handles: dict,
 #: The curve types, each as (panel drawer, subdirectory, x label, y label, description).
 #:
 #: **Both axis titles are the quantity's short name** -- `Accuracy`, `Precision`, `Coverage`,
-#: `Candidate users` (2026-09-17, on request). They are drawn at :data:`GRID_SCALE` on a panel a
-#: third of the figure wide, where a sentence does not fit; the sentence each one used to be is
-#: in the description below it, which is the field captions are copied from.
+#: `Candidate users`. They are drawn at :data:`GRID_SCALE` on a panel a third of the figure wide,
+#: where a sentence does not fit; the sentence each one used to be is in the description below it,
+#: which is the field captions are copied from.
 #:
-#: **The counting level is not in the y title**, so both levels of a family read `Accuracy` --
-#: `Users linked` was tried for the author level and dropped the same day, on request. The level
-#: is in the path (`/doc` against `/author`) and in the panel note's own unit, which is where the
-#: rest of the scheme keeps it, and the description says what a unit of each one is.
+#: **The counting level is not in the y title**, so both levels of a family read `Accuracy`. The
+#: level is in the path (`/doc` against `/author`) and in the panel note's own unit, which is where
+#: the rest of the scheme keeps it, and the description says what a unit of each one is.
 #:
-#: **The description is no longer drawn.** It was the subtitle under each figure's title until
-#: 2026-08-12, and the title itself went the same way on 2026-09-11; that is caption text and
-#: belongs in whatever publishes the figure. It is kept here
-#: because it is the one place each family's caveats are written down in a sentence -- copy it
-#: into the caption rather than re-deriving it, and keep it current when a family changes.
+#: **The description is no longer drawn.** It was the subtitle under each figure's title, and the
+#: title itself went the same way; that is caption text and belongs in whatever publishes the
+#: figure. It is kept here because it is the one place each family's caveats are written down in a
+#: sentence -- copy it into the caption rather than re-deriving it, and keep it current when a
+#: family changes.
 #:
 #: **The subdirectory carries the counting level**, so every family lands at
 #: ``<family>/<doc|author>/by_{defense,attack}/`` and a reader flips between two panels that
@@ -4670,9 +4564,9 @@ def plot_config_comparison(kind: str, panels: dict[str, list[Series]],
     ``extra_legend`` is a second legend block for figures whose lines carry two channels -- the
     cross-dataset scaling figures, where colour is the compared entity and dash is the corpus.
 
-    **This is where :data:`GRID_SCALE` is spent, for every family at once** (`accuracy/` alone
-    from 2026-09-16; the rest from 2026-09-17, on request). Everything that reaches the page
-    through this function -- the panels' text, their strokes, their notes, the legend -- is drawn
+    **This is where :data:`GRID_SCALE` is spent, for every family at once.** Everything that
+    reaches the page through this function -- the panels' text, their strokes, their notes, the
+    legend -- is drawn
     at twice the file's base sizes on the square :data:`GRID_FIGSIZE` canvas, and the families
     that do not come through here (`clustering/`, `temporal/`, `per_run/`) are untouched. Keeping
     it at the dispatch point rather than in the constants is what lets the drawing helpers serve
@@ -4791,7 +4685,7 @@ def plot_attack_comparison(dataset: str, defense: str, runs: list[Run], curves: 
     The transpose of :func:`plot_defense_comparison` -- with the defense held fixed, it says which
     representation and estimator the attacker should reach for.
 
-    **Two channels since 2026-09-12, on request: colour is the attack, dash is the feature**, with
+    **Two channels: colour is the attack, dash is the feature**, with
     a legend for each. It used to be one line per (feature, attack) pair in its own hue, which was
     readable at two attacks and is not at ten -- the registry has grown and a panel was carrying a
     dozen colours. Splitting the two axes onto two channels makes the comparison the figure exists
@@ -4895,8 +4789,7 @@ def plot_openset_reach(dataset: str, reach: pd.DataFrame, output_dir: Path) -> l
     Both bars are shares of the same test quarter, so they share one axis -- two measures on two
     y scales would be a different figure pretending to be one. The absolute counts ride as direct
     labels instead, in text ink rather than the bar's colour, because the denominator is what
-    makes a share mean anything here: WildChat's test quarter is 43,127 documents and the largest
-    known side reaches barely a third of them.
+    makes a share mean anything here.
 
     This is the figure that keeps the rest of the project honest. Every accuracy elsewhere is
     conditioned on the documents in these bars, and the bars are also the confound behind any
@@ -4993,11 +4886,11 @@ def corpus_documents(dataset: str) -> pd.DataFrame | None:
     far too expensive to re-run for a column.
 
     The ordering reproduces ``load_documents_and_features`` exactly, because it is what every
-    window boundary is defined against: undated documents dropped (SWE-chat's are ~8% of the
+    window boundary is defined against: undated documents dropped (a real share of SWE-chat's
     corpus, so keeping them would shift every boundary), then sorted by ``ended_at`` with ties
     broken by ``doc_id``. Verified against both corpora: the reconstructed ``known0025`` boundary
-    lands on the same author count the runner recorded (81 and 7,456) and on the first
-    ``position`` its predictions file reports.
+    lands on the same author count the runner recorded and on the first ``position`` its
+    predictions file reports.
 
     Three columns are read, so the 411 MB WildChat parquet costs a projection rather than a load.
     Memoised because a dataset's runs all need the same frame.
@@ -5041,10 +4934,6 @@ def dataset_languages(dataset: str) -> tuple[str, ...] | None:
     configurations, counting levels, defenses and attacks. Per-panel top-N would let two cells of
     one grid put different languages in the same slot, which is the failure the fixed colour-slot
     rule exists to prevent.
-
-    Measured: WildChat is English, Russian, Spanish, Persian, French, Chinese, Korean and then
-    12.4% ``Other``; swe-chat is English, Chinese, Japanese, Korean, Portuguese, Russian, German
-    and a single ``Other`` document, which every panel drops as too thin to draw.
     """
     if dataset not in _DATASET_LANGUAGES:
         frame = corpus_documents(dataset)
@@ -5061,7 +4950,7 @@ def modal_label(keys, labels, order: tuple[str, ...]) -> pd.Series:
     """Each key's most frequent label, ties broken toward the earlier label in ``order``.
 
     Vectorised rather than ``groupby(...).agg(lambda values: values.value_counts().idxmax())``,
-    which is a Python call per group -- and the known side of WildChat has 19,711 of them. The
+    which is a Python call per group and the known side can hold many thousands of them. The
     tie-break is explicit because a user who split a panel evenly between two languages must not
     land in a different series depending on row order.
     """
@@ -5116,9 +5005,9 @@ def document_word_counts(dataset: str) -> pd.Series | None:
     would move documents between bins from line to line, so no two points above one tick would
     describe the same conversations.
 
-    Streamed a batch at a time because ``turns`` is 98% of the WildChat parquet (3.4 GB resident
-    if read whole); only the counts are kept. ~15 s over both corpora. Memoised per dataset and
-    warmed by :func:`warm_baselines` in the parent, so the forked curve workers inherit it.
+    Streamed a batch at a time because ``turns`` is the large majority of the WildChat parquet;
+    only the counts are kept. Memoised per dataset and warmed by :func:`warm_baselines` in the
+    parent, so the forked curve workers inherit it.
     """
     if dataset not in _WORD_COUNTS:
         path = DATA_DIR / f"{dataset}.parquet"
@@ -5165,7 +5054,7 @@ def known_documents(dataset: str, known_config: str) -> pd.DataFrame | None:
     ``accuracy_by_known_ndocs/`` wants the raw per-author count as its x axis, and
     ``accuracy_by_language/`` wants how many authors write each language -- so the boundary
     arithmetic lives here once. Memoised, because every run of a dataset asks for the same six
-    known sides and the slice costs a sort of the whole corpus (172,509 rows on WildChat).
+    known sides and the slice costs a sort of the whole corpus.
 
     What is memoised is the *ordering* (:func:`dated_corpus`), one frame per dataset, rather than
     the six slices: a slice keeps its parent frame alive, so caching them would hold six copies of
@@ -5184,7 +5073,7 @@ def known_documents(dataset: str, known_config: str) -> pd.DataFrame | None:
 def dated_corpus(dataset: str) -> pd.DataFrame | None:
     """:func:`corpus_documents` in ``load_documents_and_features``'s order, memoised per dataset.
 
-    Undated documents dropped -- swe-chat's are ~8% of the corpus, so keeping them would shift
+    Undated documents dropped -- a real share of swe-chat's corpus, so keeping them would shift
     every window boundary -- then sorted by ``ended_at`` with ``doc_id`` breaking ties. Every
     known-side reconstruction slices this, so the sort is paid once per dataset instead of once
     per (dataset, configuration).
@@ -5239,7 +5128,7 @@ def temporal_accuracy(run: Run, known_config: str = TEMPORAL_KNOWN_CONFIG,
     line can be the surviving population changing rather than the attack holding up. Read it as
     the aggregate it is. (An earlier version split each week into users making their first
     appearance in the unknown stream and users seen earlier, which separated those two readings;
-    it was removed for simplicity on 2026-08-06 and is recoverable from git history.)
+    it was removed for simplicity and is recoverable from git history.)
 
     One known side (``known_config``), so there is nothing to average and no interval to draw:
     every point is the whole population of its week. ``counts`` carries the populations instead,
@@ -5583,7 +5472,7 @@ POOL_INTERPOLABLE_ATTACKS = ("nearest_neighbor", "cosine")
 #: Geometric step between the candidate-pool sizes the scaling curve is evaluated at. A *fixed*
 #: ratio rather than "sixty points between 2 and this run's pool" so that every run lands on the
 #: same lattice and two runs can be compared at a matched pool size -- both on the figure and,
-#: without interpolating twice, in the companion CSV. 1.15 gives ~66 points from 2 to 20,000.
+#: without interpolating twice, in the companion CSV.
 POOL_SIZE_RATIO = 1.15
 
 
@@ -5618,9 +5507,9 @@ def subpool_weights(n_candidates: int, pool_sizes: np.ndarray) -> np.ndarray:
     that sub-pool. For a uniformly random sub-pool containing the true author that probability is
     ``C(N-r, n-1) / C(N-1, n-1)``, so this matrix holds that weight for every (rank, pool size)
     pair and the accuracy against a smaller gallery is the rank distribution times it -- the
-    standard gallery-size extrapolation, and the same reasoning
-    the package's ``evaluation.pool_size_sweep`` used to implement by sampling (removed
-    2026-08-04 -- this closed form replaced it).
+    standard gallery-size extrapolation, and the same reasoning the package's
+    ``evaluation.pool_size_sweep`` used to implement by sampling before this closed form replaced
+    it.
 
     Being a *matrix product* is what makes bootstrapping it affordable: a replicate re-weights
     the rank histogram and multiplies, rather than re-running the binomial sweep. Ranks worse
@@ -5647,9 +5536,9 @@ def config_scaling(run: Run, table: pd.DataFrame, weights: PanelWeights
                    ) -> ScalingCurve | None:
     """Top-1 accuracy against the number of candidate users, interpolated down from one cell.
 
-    The measured runs give only a handful of pool sizes per dataset -- 81/106/124 on SWE-chat,
-    7,456/13,694/19,711 on WildChat -- which on a shared log axis leaves the two corpora as two
-    isolated clumps with two orders of magnitude of nothing between them. A configuration's *rank
+    The measured runs give only a handful of pool sizes per dataset, which on a shared log axis
+    leaves the two corpora as two isolated clumps with two orders of magnitude of nothing between
+    them. A configuration's *rank
     distribution* is enough to say what the same attack would have scored against any smaller
     gallery (:func:`subpool_weights`), so each cell contributes a curve from 2 candidates up to
     its own pool and the two datasets overlap instead of merely coexisting.
@@ -5698,8 +5587,8 @@ def config_scaling(run: Run, table: pd.DataFrame, weights: PanelWeights
 
     # The bootstrap skips the CMC entirely: `grouped_sums` already *is* the rank distribution the
     # differencing above recovers, so a replicate is its share of each occupied rank times the
-    # interpolation rows for those ranks. That never materialises the 19,711-wide cumulative curve
-    # for a thousand replicates, which was the largest single array this file built.
+    # interpolation rows for those ranks. That never materialises the full cumulative curve for a
+    # thousand replicates, which was the largest single array this file built.
     replicate_weights = weights.documents
     if len(replicate_weights):
         present, sums = grouped_sums(np.ceil(ranks).astype(np.int64), replicate_weights)
@@ -5718,8 +5607,9 @@ def config_scaling(run: Run, table: pd.DataFrame, weights: PanelWeights
 
 
 #: Documents a user may have before :func:`author_subpool_bounds` stops computing the exact
-#: inclusion-exclusion upper bound and falls back to Boole. The cost is ``2 ** m`` subsets, and
-#: 12 keeps the worst user at 4,096 while covering 84.5% of WildChat's -- the median user has two.
+#: inclusion-exclusion upper bound and falls back to Boole. The cost is ``2 ** m`` subsets, so 12
+#: keeps the worst case affordable while covering the large majority of real users, whose typical
+#: document count is far lower.
 IE_MAX_DOCUMENTS = 12
 
 
@@ -5744,8 +5634,7 @@ def author_subpool_bounds(ranks: np.ndarray, weights: np.ndarray, n_candidates: 
     * **upper** -- inclusion-exclusion with the ``B_i`` taken as disjoint as their sizes permit,
       ``|B_T| = min(sum_i (r_i - 1), N-1)``, which is the largest the union of the *events* can be.
       Boole (``min(1, sum_i P_i)``) is also valid but strictly looser: it needs the events pairwise
-      disjoint, which cannot happen whenever a sub-pool can miss two ``B`` sets at once. Measured,
-      the difference is 0.427 against 0.437 at 50 candidates on WildChat.
+      disjoint, which cannot happen whenever a sub-pool can miss two ``B`` sets at once.
 
     Both coincide at ``n = n_candidates``, where each reduces to "does any document rank first".
 
@@ -5995,33 +5884,31 @@ CLUSTERING_ALGORITHM_SLOTS = {name: index for index, name in enumerate(CLUSTERIN
 #: name here changes nothing about the others; dropping it *there* would recolour every algorithm
 #: below it and put a paper's existing figures out of step with a re-run.
 #:
-#: **``average_linkage`` is out and ``componentwise_agglomerative`` is in** (2026-09-11, on
-#: request). The two are the same method -- the second runs it one connected component at a time
-#: so it fits in memory at WildChat's scale -- and only the second exists on both corpora, which is
-#: what decided it: WildChat has no ``average_linkage`` row at all, so keeping that one would have
-#: left that corpus with three algorithms. Where both exist (SWE-chat, all five defenses) they
-#: agree on F to within **0.009**, the per-component variant trading a little recall for precision
-#: (up to +0.08 P, -0.04 R), which is visible on the precision/recall figure and invisible on the
-#: bar chart. It is labelled simply "Agglomerative" now: with nothing to distinguish it from, the
-#: qualifier said only that an implementation detail existed.
+#: **``average_linkage`` is out and ``componentwise_agglomerative`` is in.** The two are the same
+#: method -- the second runs it one connected component at a time so it fits in memory at
+#: WildChat's scale -- and only the second exists on both corpora, which is what decided it: with
+#: no WildChat run of the first, keeping it would have left that corpus with three algorithms.
+#: Where both exist they agree closely, the per-component variant trading a little recall for
+#: precision, which is visible on the precision/recall figure and invisible on the bar chart. It is
+#: labelled simply "Agglomerative" now: with nothing to distinguish it from, the qualifier said
+#: only that an implementation detail existed.
 CLUSTERING_DRAWN_ALGORITHMS = ("hdbscan", "leiden", "connected", "componentwise_agglomerative")
 
 #: Reference partitions, drawn beside the algorithms as **grey bars**. They are properties of the
 #: collection rather than measurements of an attack, and grey is the channel that says so -- the
 #: same reservation the dashed baseline relies on elsewhere, and grey is a hue no series occupies.
 #:
-#: They were dashed horizontal lines until 2026-08-13, on request. The dash was the file's own
+#: They were dashed horizontal lines until they were changed to bars. The dash was the file's own
 #: "not a measurement" convention, but it made the one comparison the figure exists for -- did the
-#: attack beat doing nothing? -- a matter of reading a bar against a line, with four lines within
-#: ~0.1 of each other and their names pushed apart by a de-cluttering pass to stop them stacking.
-#: As bars they are on the axis the algorithms are on, named on the same ticks, and the grey still
+#: attack beat doing nothing? -- a matter of reading a bar against a line, with several lines close
+#: to each other and their names pushed apart by a de-cluttering pass to stop them stacking. As
+#: bars they are on the axis the algorithms are on, named on the same ticks, and the grey still
 #: carries what the dash did.
 #:
-#: ``baseline_model_owner`` is deliberately absent (omitted 2026-08-13, on request). It partitions
-#: by which provider served the conversation, and on a corpus whose documents nearly all come from
-#: one provider that is the one-cluster partition under another name -- measured on WildChat it
-#: scores F = 0.002565, identical to ``baseline_single_cluster`` to six decimals. `run_clustering.py`
-#: still computes it; nothing draws it.
+#: ``baseline_model_owner`` is deliberately absent. It partitions by which provider served the
+#: conversation, and on a corpus whose documents nearly all come from one provider that is the
+#: one-cluster partition under another name. `run_clustering.py` still computes it; nothing draws
+#: it.
 CLUSTERING_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseline_random",
                         "baseline_language_primary")
 
@@ -6033,12 +5920,12 @@ CLUSTERING_PR_BASELINES = ("baseline_singleton", "baseline_single_cluster", "bas
 #: edge. They are the figure's frame of reference: two points on one contour are the same F bought
 #: with different trades, which is the comparison F alone cannot show.
 #:
-#: **The range the results occupy, and no more** (settled 2026-09-11): every measured point on both
-#: corpora sits between F 0.3 and 0.6, which is where a reader interpolates, and the low levels
-#: place the baselines -- ``Random`` and ``One cluster`` sit beside 0.1, ``Singletons`` between 0.1
-#: and 0.3 on WildChat (0.285) and just above 0.1 on SWE-chat (0.112), which is what 0.2 is for.
-#: 0.7 and 0.9 were dropped: nothing comes near them, and they were the two contours that ran
-#: through the legend block in the top-right corner.
+#: **The range the results occupy, and no more**: every measured point on both corpora sits well
+#: within this range, which is where a reader interpolates, and the low levels place the baselines
+#: -- ``Random`` and ``One cluster`` sit near the bottom, ``Singletons`` a little above them on one
+#: corpus and just above the floor on the other, which is what the middle level is for. The higher
+#: levels were dropped: nothing comes near them, and they ran through the legend block in the
+#: top-right corner.
 CLUSTERING_ISO_F_LEVELS = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
 
 #: How far above 1.0 a computed precision may sit and still count as "on the top edge". It exists
@@ -6054,16 +5941,16 @@ CLUSTERING_PR_MARKER_SIZE = 7.0
 CLUSTERING_LABELS = {
     "hdbscan": "HDBSCAN",
     "leiden": "Leiden",
-    # Retired from `CLUSTERING_DRAWN_ALGORITHMS` 2026-09-11 and kept here for its colour slot and
-    # its meaning: it is average linkage over the whole graph, which only SWE-chat has a run of.
+    # Retired from `CLUSTERING_DRAWN_ALGORITHMS` and kept here for its colour slot and its
+    # meaning: it is average linkage over the whole graph, which only SWE-chat has a run of.
     "average_linkage": "Average linkage",
     # The same method, run one connected component at a time so it fits in memory at WildChat's
     # scale. It is the agglomerative row every figure draws now, and the qualifier came off with
     # the row it used to be told apart from.
     "componentwise_agglomerative": "Agglomerative",
     "connected": "Connected comp.",
-    # Short names, on request (2026-09-11): these sit beside the measured methods, and a
-    # parenthetical qualifier on a reference partition reads as a caveat about the *attack*.
+    # Short names: these sit beside the measured methods, and a parenthetical qualifier on a
+    # reference partition reads as a caveat about the *attack*.
     # What "matched" and "all" said is in each figure's own documentation instead.
     "baseline_singleton": "Singletons",
     "baseline_single_cluster": "One cluster",
@@ -6094,11 +5981,11 @@ CLUSTERING_GROUP_GAP = 0.9
 #: or ``_quantile`` qualifier out of the comparable set. Not every projection x rescoring pair is
 #: here -- only the ones that have been run -- so registering a new combination is one line.
 #:
-#: The by-hand directories written before 2026-09-09 carried a *fixed* weight in the name
-#: (``time0.45``, ``contrastive_time0.45``) and are not registered: the weight is now searched, so
-#: ``time`` means "tuned" and a number in that slot would be a different experiment.
+#: The by-hand directories that carried a *fixed* weight in the name (``time0.45``,
+#: ``contrastive_time0.45``) are not registered: the weight is now searched, so ``time`` means
+#: "tuned" and a number in that slot would be a different experiment.
 CLUSTERING_VARIANT_LABELS = {
-    # **Named for the channel, not for the material** (2026-09-17, on request): these two rows
+    # **Named for the channel, not for the material**: these two rows
     # differ by whether elapsed time is fused into the edge score, so saying so outright is what
     # a reader needs, and the pair reads as one contrast wherever they appear together -- the
     # variants dumbbells, and the `precision_recall/timing/` figure's "Edge score" legend, which
@@ -6134,10 +6021,10 @@ class ClusteringRun:
     that occupies the same positional slot. So what varies is the corpus, what was done to the
     text, how the text was represented, and what was done to the graph.
 
-    The plain three-part names written before 2026-09-09 no longer parse. That is deliberate
-    rather than a migration gap: a directory with no variant part cannot say whether it holds a
-    pure-text run or something else, and guessing ``plain`` for it would file a timing-fused run
-    among the pure-text ones.
+    The plain three-part names written before the variant part existed no longer parse. That is
+    deliberate rather than a migration gap: a directory with no variant part cannot say whether it
+    holds a pure-text run or something else, and guessing ``plain`` for it would file a
+    timing-fused run among the pure-text ones.
     """
 
     dataset: str
@@ -6222,8 +6109,8 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
 #: moves when a scope is added.
 #:
 #: **The second field is documentation now, not drawing.** It was the clause a figure's title
-#: ended with, and titles were removed 2026-09-11; the subdirectory is what separates the scopes
-#: today, so a reader tells them apart by the path rather than by a line on the image. It is kept
+#: ended with, and titles were removed; the subdirectory is what separates the scopes today, so a
+#: reader tells them apart by the path rather than by a line on the image. It is kept
 #: because it is the wording to reach for if a scope ever has to be visible on the figure again --
 #: as a :func:`panel_note`, which is where per-panel facts belong.
 #:
@@ -6231,19 +6118,18 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
 #: reference partitions, and the difference is not subtle: **BCubed's floor is a closed form of the
 #: collection's authors-per-document ratio**. The all-singleton partition has precision 1 and
 #: recall ``A / N`` -- the document-weighted mean of ``1 / m_author`` -- so its
-#: ``F = 2(A/N) / (1 + A/N)``, which is 0.343 on ``unseen`` against 0.285 on ``all`` (WildChat;
-#: 0.220 against 0.112 on SWE-chat). Raw F is therefore higher on ``unseen`` while the attack is
-#: slightly *weaker*: ``connected`` gains 0.033 against a floor that gains 0.058, so its margin
-#: falls 0.225 to 0.201. The comparable quantity is each bar's distance from the grey reference bar
-#: beside it, which is why those bars are on every panel.
+#: ``F = 2(A/N) / (1 + A/N)`` is higher on ``unseen`` than on ``all`` on both corpora. Raw F is
+#: therefore higher on ``unseen`` while the attack is actually slightly *weaker* there, since the
+#: floor rises faster than the attack's own score does. The comparable quantity is each bar's
+#: distance from the grey reference bar beside it, which is why those bars are on every panel.
 #:
 #: **What raises A/N is the loss of the heavy authors, not the absence of singletons.** It is true
 #: that ``unseen`` has no single-document authors -- the corpus keeps no author with fewer than two
 #: documents, so one absent from the known side has at least two inside the test quarter -- but
-#: that mechanism has the wrong sign, and this note used to claim it: a one-document author has
-#: ratio 1.0, far above the 0.166 average, so removing the 537 of them from ``all`` would take the
-#: floor *down* to 0.270. The rise comes from excluding everyone with known-side history, who are
-#: disproportionately the heavy users: mean documents per author 6.01 -> 4.84, max 509 -> 238.
+#: that mechanism has the wrong sign, and this note used to claim it: a one-document author has a
+#: ratio far above the average, so removing them from ``all`` would take the floor *down*. The rise
+#: instead comes from excluding everyone with known-side history, who are disproportionately the
+#: heavy users.
 CLUSTERING_SCOPES = {
     "all": ("", ""),
     "unseen": ("unseen", ", authors with no known-side history"),
@@ -6266,9 +6152,9 @@ def clustering_results(run: ClusteringRun, scope: str = "all") -> pd.DataFrame:
     A directory that exists without the file is a run that was interrupted or is still going;
     every drawing routine below treats that as "no series", not as a failure.
 
-    Since 2026-08-16 a clustering run attacks its collection under two author scopes (see
+    A clustering run attacks its collection under two author scopes (see
     :data:`CLUSTERING_SCOPES`) and writes both into this one file. A file written *before* that
-    change has no ``scope`` column and is entirely the ``all`` scope -- so it answers for ``all``
+    became true has no ``scope`` column and is entirely the ``all`` scope -- so it answers for ``all``
     and, correctly, holds nothing for any other scope. Returning the whole legacy table for a
     scope it predates would relabel one population as another, which is the one mistake this
     split exists to prevent.
@@ -6400,14 +6286,12 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     # One legend entry -- the algorithms are named on the ticks, so all the legend has to say is
     # what the grey means: that those bars are not an attack.
     #
-    # **Below the whole figure, not inside the last panel** (moved 2026-09-11). It used to sit at
-    # that panel's upper right, facing the panel note at the upper left, and the two fitted only
-    # while both were small: at the larger `FONT_ANNOTATION`/`FONT_LEGEND` the legend ran straight
-    # through "997 docs / 59 authors". A panel here is one fifth of the figure, so there is no
-    # in-axes corner wide enough for a legend beside a note -- the strip below is, and it also
-    # stops the legend belonging to one defense's panel when it describes all of them. The strip
-    # is measured in inches over the figure height, exactly as `finish_facets` does it, because a
-    # legend is a fixed physical size.
+    # **Below the whole figure, not inside the last panel.** It used to sit at that panel's upper
+    # right, facing the panel note at the upper left, and the two collided once the text grew large
+    # enough. A panel here is one fifth of the figure, so there is no in-axes corner wide enough for
+    # a legend beside a note -- the strip below is, and it also stops the legend belonging to one
+    # defense's panel when it describes all of them. The strip is measured in inches over the
+    # figure height, exactly as `finish_facets` does it, because a legend is a fixed physical size.
     figure.legend([plt.Rectangle((0, 0), 1, 1, color=TEXT_MUTED,
                                  alpha=CLUSTERING_BASELINE_ALPHA)],
                   ["Reference partition"], loc="lower center", bbox_to_anchor=(0.5, 0.005),
@@ -6469,31 +6353,24 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     # figure to the other's.
     markers = defense_markers(defenses)
 
-    # Sized so the legend block clears the data. The legend is a **fixed physical size** (1.82 in
-    # wide at `FONT_LEGEND`, set by its longest label) while the axes scale with the figure, so the
-    # question is what fraction of the plot it covers: at the old (5.8, 5.2) the square axes came
-    # out 3.89 in and the block took 47% of it, putting its left edge at recall 0.543 -- on top of
-    # Leiden at 0.547. At (6.6, 5.9) the axes is 4.41 in, the block is 41%, and its edge sits at
-    # 0.599 against data reaching 0.547 on SWE-chat and 0.493 on WildChat.
+    # Sized so the legend block clears the data. The legend is a **fixed physical size** (set by
+    # its longest label) while the axes scale with the figure, so the question is what fraction of
+    # the plot it covers -- sized to clear the highest-recall points on both corpora with margin.
     #
     # **The timing form needs more**, because its third legend block is taller *and* its points
-    # reach further right: SWE-chat's HDBSCAN pairs run out to recall 0.692 at precision 0.299,
-    # under where the block used to end. Measured over both corpora, (7.6, 6.9) puts the block's
-    # bottom edge at precision 0.390 (0.432 on WildChat) with nothing inside any of the three
-    # boxes; (7.2, 6.5) also clears but by 0.05 rather than 0.09.
+    # reach further right, so it gets a larger canvas.
     #
     # **What would break either is a longer defense label, not another one**: rows add height, and
     # the width is the longest label. A future `styleremix_openanon` arm would want re-measuring.
     figure, axes = plt.subplots(figsize=(7.6, 6.9) if fused else (6.6, 5.9))
     figure.patch.set_facecolor(SURFACE)
 
-    # Markers are **solid and all one size** (2026-09-11, on request). Both were the other way
-    # round before, and the reason is worth keeping because it is what this now trades away: the
-    # defenses land almost on top of each other -- WildChat's base and openanonymity differ by
-    # 0.005 in precision and 0.003 in recall -- and open outlines of stepped sizes let a
-    # coincident pair read as nested rings, where solid marks of one size occlude each other
-    # completely. **A defense that barely moves the result can now hide under the arm it barely
-    # moved.** The mitigations if that bites: a jitter, a small alpha, or the old ladder back.
+    # Markers are **solid and all one size**. Both were the other way round before, and the reason
+    # is worth keeping because it is what this now trades away: some defenses land almost on top of
+    # each other, and open outlines of stepped sizes let a coincident pair read as nested rings,
+    # where solid marks of one size occlude each other completely. **A defense that barely moves
+    # the result can now hide under the arm it barely moved.** The mitigations if that bites: a
+    # jitter, a small alpha, or the old ladder back.
     #
     # Size carries nothing now, which is the gain: shape means defense, colour means algorithm,
     # and `MARKER_SIZE_SCALE` evens the shapes out so a square does not read as a bigger result
@@ -6534,8 +6411,8 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     # Offsets chosen per baseline rather than shared: all three sit against an edge of the unit
     # square, and a single offset direction pushes at least one of them into the data. Singletons
     # are at precision 1.0 (top edge) and random sits alone near the origin corner, so both take
-    # their label **centred directly above the mark** (2026-09-11, on request) -- nothing sits
-    # above either, and centred is what reads as "this label belongs to this point". One cluster
+    # their label **centred directly above the mark** -- nothing sits above either, and centred is
+    # what reads as "this label belongs to this point". One cluster
     # is the exception: it is pinned to the right edge at recall 1.0, where a centred label would
     # run off the figure, so it keeps its corner offset.
     offsets = {"baseline_singleton": (0, 8), "baseline_single_cluster": (-8, 8),
@@ -6557,30 +6434,28 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
                      "bcubed_f": float(row["bcubed_f"].iloc[0]), "is_reference": True})
 
     # Iso-F contours, so a reader can see which points are equivalent trades rather than guessing.
-    # **Dashed and labelled** (2026-09-11, on request): the dash is this file's mark for a line
-    # that is not a measurement, which a contour of the metric's own geometry certainly is not,
-    # and `AXIS` rather than `GRID` because a dashed hairline at the grid's weight disappears --
-    # these carry a number now, so they have to be readable. The label goes where the contour
-    # leaves the axes on the right, at ``p = F / (2 - F)`` (set ``r = 1`` in the contour below),
-    # which is inside the unit square for every level, so every contour gets one.
+    # **Dashed and labelled**: the dash is this file's mark for a line that is not a measurement,
+    # which a contour of the metric's own geometry certainly is not, and `AXIS` rather than `GRID`
+    # because a dashed hairline at the grid's weight disappears -- these carry a number, so they
+    # have to be readable. The label goes where the contour leaves the axes on the right, at
+    # ``p = F / (2 - F)`` (set ``r = 1`` in the contour below), which is inside the unit square for
+    # every level, so every contour gets one.
     #
     # **Each contour's own top end is forced into its grid**, and without it the low levels
     # visibly failed to reach precision 1.0. A contour reaches it at ``r = F / (2 - F)`` and has
     # its asymptote at ``r = F / 2``, so the whole run from p = 1 down to the first sampled point
-    # is only ``F^2 / (2(2 - F))`` wide -- **quadratic in F**: 0.0026 at F = 0.1 against a grid
-    # step of 0.005, so no sample landed in it at all and the curve began at p = 0.574 (0.92 at
-    # F = 0.3, 0.94 at F = 0.4; F = 0.5 looked right only because its crossing falls 0.0001 from a
-    # sample). Parametrising by precision instead would fix the top and lose the tail; one exact
-    # point costs nothing and puts every contour on the top edge where it belongs.
+    # is only ``F^2 / (2(2 - F))`` wide -- **quadratic in F**, so at low F no sample lands in it
+    # from a uniform grid at all. Parametrising by precision instead would fix the top and lose
+    # the tail; one exact point costs nothing and puts every contour on the top edge where it
+    # belongs.
     base_grid = np.linspace(0.01, 1.0, 200)
     for level in CLUSTERING_ISO_F_LEVELS:
         grid = np.union1d(base_grid, [level / (2 - level)])
         precision = level * grid / (2 * grid - level)
-        # The tolerance is what makes the point above actually land: at F = 0.4 and F = 0.5 the
-        # end point evaluates to 1 + 2e-16 (0.5 - 0.4 is 0.09999999999999998 in binary), so a bare
-        # `<= 1.0` dropped the one sample this exists to add and left those two contours short by
-        # the same 0.06 as before. Clamping the kept values is safe because nothing else comes
-        # within 1e-9 of the top -- the next sample down is at p = 0.94.
+        # The tolerance is what makes the point above actually land: at some levels the end point
+        # evaluates to just over 1.0 in floating point, so a bare `<= 1.0` drops the one sample
+        # this exists to add. Clamping the kept values is safe because nothing else comes close to
+        # the top from below.
         usable = (precision > 0) & (precision <= 1.0 + ISO_F_EDGE_TOLERANCE)
         axes.plot(grid[usable], np.minimum(precision[usable], 1.0), color=AXIS, linewidth=0.9,
                   linestyle=BASELINE_DASH, zorder=1)
@@ -6597,11 +6472,10 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     quarter_ticks(axes.xaxis)
     quarter_ticks(axes.yaxis)
     # **One unit of recall is one unit of precision.** Both axes span [0, 1], so without this the
-    # box is whatever shape `figsize` leaves after the labels -- 4.50 x 4.00 in, stretching x by
-    # 15% and rendering the unit square as a landscape rectangle. That is not cosmetic here: the
-    # iso-F contours are curves in the P x R plane and a reader judges a point by how far it sits
-    # from the top-right corner, both of which an unequal scale distorts. `figsize` was chosen
-    # when the legend sat below the axes and its strip made up the height.
+    # box is whatever shape `figsize` leaves after the labels, stretching one axis and rendering
+    # the unit square as a rectangle. That is not cosmetic here: the iso-F contours are curves in
+    # the P x R plane and a reader judges a point by how far it sits from the top-right corner,
+    # both of which an unequal scale distorts.
     axes.set_aspect("equal", adjustable="box")
 
     # **Two legends, one per channel**, the same construction and for the same reason as the
@@ -6625,11 +6499,10 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
                              color=TEXT_SECONDARY, markeredgewidth=0,
                              label=DEFENSE_LABELS[defense])
                   for defense in defenses]
-    # **Inside the axes, top right** (2026-09-11, on request), one column each and Algorithm above
-    # Defense. That corner is the one place a precision/recall figure is reliably empty: it is high
-    # precision *and* high recall at once, which is the ideal no partition here comes near -- the
-    # best F on either corpus is ~0.57. The three baselines occupy the other three corners, which
-    # is why the block was under the axes before.
+    # **Inside the axes, top right**, one column each and Algorithm above Defense. That corner is
+    # the one place a precision/recall figure is reliably empty: it is high precision *and* high
+    # recall at once, which is the ideal no partition here comes near. The three baselines occupy
+    # the other three corners, which is why the block was under the axes before.
     first = add_legend(axes, handles=by_algorithm, ncol=1, title="Algorithm",
                        loc="upper right", bbox_to_anchor=(0.995, 0.995))
     # A second `.legend()` call on an axes *replaces* the first, so each block has to be adopted
@@ -6661,9 +6534,9 @@ def plot_clustering_precision_recall(dataset: str, feature: str, runs: list[Clus
     return [save_figure(figure, stem)]
 
 
-#: Height of one row of a variants dumbbell chart, in inches. Halved from 0.52 on 2026-09-17, on
-#: request: these charts are read as a ranking, and the rows are single marks rather than anything
-#: with internal structure, so the pitch only has to keep two adjacent rows apart.
+#: Height of one row of a variants dumbbell chart, in inches. These charts are read as a ranking,
+#: and the rows are single marks rather than anything with internal structure, so the pitch only
+#: has to keep two adjacent rows apart.
 VARIANT_ROW_HEIGHT = 0.26
 
 #: Row label for the pure-text run drawn beside the variants -- the method with nothing applied
@@ -6695,8 +6568,8 @@ def plot_clustering_variants(dataset: str, defense: str, runs: list[ClusteringRu
     **The gap between the two dots is the finding, not the level of either.** Each strategy was
     selected by searching a labelled tuning slice, so its tuning score is the number that decided
     it was worth running -- and the honest measure of what it is worth is the test score beside it.
-    Measured here, that gap is +0.007 to +0.017, and it is *larger for the strategies that looked
-    best*, which is exactly what a search over one labelled slice produces.
+    That gap is *larger for the strategies that looked best*, which is exactly what a search over
+    one labelled slice produces.
 
     Both numbers come from one row of one ``clustering_results.csv`` (``tuning_bcubed_f`` and
     ``bcubed_f``), so they are the same configuration on two slices rather than a best-of-many
@@ -6729,7 +6602,7 @@ def plot_clustering_variants(dataset: str, defense: str, runs: list[ClusteringRu
 
 
 #: Variants left off :func:`plot_clustering_variants_by_defense`, the one chart that puts every
-#: defense's strategies on one axis (2026-09-17, on request). ``contrastive_time`` is the fused
+#: defense's strategies on one axis. ``contrastive_time`` is the fused
 #: arm -- a learned projection AND a timing channel -- so it is the row that changes two things
 #: at once, and dropping it leaves that chart comparing one intervention per row. Every one of
 #: them keeps its own per-defense figure, where the full set is drawn.
@@ -6781,11 +6654,10 @@ def draw_variant_dumbbells(drawn: list[tuple[str, float, float]], rows: list[dic
     Rows are drawn top-down in the order given: the caller decides whether that is the strategy
     vocabulary (per defense, so a strategy sits in the same place on both corpora) or a sort.
 
-    **The row pitch is :data:`VARIANT_ROW_HEIGHT`, halved from 0.52 in on 2026-09-17 on request.**
-    That is what moved the value labels off the bottom of their marks: at 0.26 in a row is 18.7 pt
-    tall, and a number set 15 pt below a dot lands on the row beneath it. They now sit on the
-    *outer* side of the test dot -- the side the arrow points -- vertically centred on the row, so
-    the label is beside the mark it names, never over the connector, and never in another row.
+    **The row pitch is :data:`VARIANT_ROW_HEIGHT`.** At this pitch a value label set below a dot
+    would land on the row beneath it, which is why the labels sit on the *outer* side of the test
+    dot instead -- the side the arrow points -- vertically centred on the row, so the label is
+    beside the mark it names, never over the connector, and never in another row.
     """
     figure, axes = plt.subplots(figsize=(8.2, VARIANT_ROW_HEIGHT * len(drawn) + 1.9))
     figure.patch.set_facecolor(SURFACE)
@@ -6795,7 +6667,7 @@ def draw_variant_dumbbells(drawn: list[tuple[str, float, float]], rows: list[dic
     for position, (_, tuning, test) in zip(positions, drawn):
         axes.plot([test, tuning], [position, position], color=TEXT_MUTED, linewidth=2.0,
                   zorder=1, solid_capstyle="round")
-        # An arrowhead at the midpoint, pointing train -> test (2026-09-11, on request). A dumbbell
+        # An arrowhead at the midpoint, pointing train -> test. A dumbbell
         # says how far the two scores are apart but not which way round they are, and here the
         # direction IS the finding: a head pointing left is a strategy that lost what the search
         # credited it with. It rides on the connector in the connector's own ink -- the endpoint
@@ -6866,11 +6738,10 @@ def plot_clustering_variants_by_defense(dataset: str, runs: list[ClusteringRun],
     **Every row's train dot is one of two numbers, and that is the experiment rather than a
     drawing fault**: ``run_clustering.py``'s ``--known-defense`` defaults to ``base``, so on a
     defended cell the tuning slice is built from *undefended* vectors. The train dot therefore
-    carries the strategy and nothing else -- 0.497 for pure text and 0.506 for timing fused on
-    swe-chat, identical across all five defenses -- so read the chart as a ranking of test scores
-    against two shared reference marks rather than as ten independent pairs. It is also why the
-    arrow direction is a property of the *pair*: every timing-fused row that beats its reference
-    points right, every pure-text row points left.
+    carries the strategy and nothing else, identical across every defense sharing it -- so read
+    the chart as a ranking of test scores against two shared reference marks rather than as ten
+    independent pairs. It is also why the arrow direction is a property of the *pair*: every
+    timing-fused row that beats its reference points right, every pure-text row points left.
 
     One figure per (dataset, scope), so the defense rides in the row label rather than in the
     file name -- which is what the file name says by being ``all_defenses``.
@@ -6884,9 +6755,9 @@ def plot_clustering_variants_by_defense(dataset: str, runs: list[ClusteringRun],
         record = connected_variant_record(run, scope)
         if record is None:
             continue
-        # No separator between the two (2026-09-17, on request): with the variants named for the
-        # timing channel the label reads as one phrase -- "StyleRemix w/ timing" -- where a middle
-        # dot would punctuate a sentence that does not need it.
+        # No separator between the two: with the variants named for the timing channel the label
+        # reads as one phrase -- "StyleRemix w/ timing" -- where a middle dot would punctuate a
+        # sentence that does not need it.
         label = f"{run.defense_label} {run.variant_label}"
         drawn.append((label, float(record["tuning_bcubed_f"]), float(record["bcubed_f"])))
         rows.append(variant_row(dataset, run, label, record))
@@ -7168,10 +7039,9 @@ def parse_args() -> argparse.Namespace:
         description="Draw every figure in the project from experiments/results/.")
     parser.add_argument("--bands", action="store_true",
                         help=f"Draw the 95%% confidence bands, at {BOOTSTRAP_REPLICATES} "
-                             f"replicates. **Off by default** (2026-09-12, on request): a band "
-                             f"per series is a lot of ink on a panel carrying several, and the "
-                             f"bootstrap is most of what a curve build costs. Same as "
-                             f"--bootstrap {BOOTSTRAP_REPLICATES}.")
+                             f"replicates. **Off by default**: a band per series is a lot of ink "
+                             f"on a panel carrying several, and the bootstrap is most of what a "
+                             f"curve build costs. Same as --bootstrap {BOOTSTRAP_REPLICATES}.")
     parser.add_argument("--bootstrap", type=int, default=None, metavar="N",
                         help=f"Replicates behind every band, resampling *users* with replacement. "
                              f"0 (the default) draws no band; --bands is shorthand for "
@@ -7187,11 +7057,11 @@ def parse_args() -> argparse.Namespace:
                              f"raises -- a traceback from a forked child loses its outer frames.")
     parser.add_argument("--png", action="store_true",
                         help="Also write a 200 dpi PNG beside every PDF. Off by default: the "
-                             "PNGs cost more than the PDFs they accompany (79 s against 47 s "
-                             "over a full sweep) and only the PDF goes into a paper.")
+                             "PNGs cost more to render than the PDFs they accompany and only the "
+                             "PDF goes into a paper.")
     parser.add_argument("--per-run", action="store_true",
                         help="Also draw per_run/<run>/ -- each run's own CMC, pool-growth and "
-                             "top-k bar figures. Off by default: they are 160 of the 262 figures "
+                             "top-k bar figures. Off by default: they are most of the figures "
                              "a full sweep writes and none of them compares runs, so they are "
                              "diagnostics rather than results.")
     parser.add_argument("--families", nargs="+", choices=FIGURE_FAMILIES, metavar="FAMILY",
@@ -7244,8 +7114,8 @@ def parse_args() -> argparse.Namespace:
 # --- what has already been drawn ---------------------------------------------
 #
 # A sweep is dominated by work that did not need doing: adding one attack leaves most of the tree
-# untouched, and re-running the script after editing a caption redraws 448 figures to change one.
-# The cache is a manifest of what the last sweep drew and of everything that decided it, so a
+# untouched, and re-running the script after editing a caption redraws the whole tree to change one
+# figure. The cache is a manifest of what the last sweep drew and of everything that decided it, so a
 # figure is skipped exactly when nothing it depends on has moved.
 #
 # WHAT A FIGURE DEPENDS ON, and every one of these is in its key:
@@ -7518,7 +7388,8 @@ def warm_baselines(runs: list[Run], tables: dict[Run, dict[str, pd.DataFrame]]) 
     """Fill :func:`known_inclusion`'s memo in this process, before the curve workers fork.
 
     The Monte Carlo behind the proportional baseline depends only on (dataset, known
-    configuration), so a dataset's 21 runs want six results between them. Under ``fork`` a child
+    configuration), so a dataset's many runs want only a handful of results between them. Under
+    ``fork`` a child
     inherits whatever the parent has already computed, so filling the memo here means it is paid
     for six times rather than once per worker -- and the workers, which would each have filled
     their own copy, get it for free.
@@ -7568,10 +7439,9 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1,
     ``needed`` restricts which runs are *built*, never which are *read*: both bootstraps resample
     the union of every run's users, and narrowing that universe would move the band on every
     figure of the dataset -- including the ones the cache is about to skip, which would then be
-    inconsistent with the ones it redraws. So a cached sweep still pays for reading (27 s on
-    WildChat) and skips the expensive half (67 s per run). The caller guarantees that every run
-    feeding a figure it intends to draw is in ``needed``; a figure whose runs are not all built
-    would silently lose the missing series.
+    inconsistent with the ones it redraws. So a cached sweep still pays for reading and skips the
+    expensive half. The caller guarantees that every run feeding a figure it intends to draw is in
+    ``needed``; a figure whose runs are not all built would silently lose the missing series.
     """
     tables = {run: config_predictions(run) for run in runs}
     unusable = [run for run in runs if not tables[run]]
@@ -7594,8 +7464,8 @@ def build_curves(runs: list[Run], bootstrap_replicates: int, workers: int = 1,
     # Two tiers of work. A run whose figures are all cached still owes the counting-mode figure a
     # row -- `accuracy/macro_micro.pdf` draws one bar group per run, so *any* run changing makes
     # it stale and drawing it needs every run's three numbers. That would drag the whole dataset
-    # into a full rebuild for one small figure, so the modes are computed on their own: measured
-    # 2.1 s against 67 s for the curves, which is cheap enough to pay unconditionally.
+    # into a full rebuild for one small figure, so the modes are computed on their own: cheap
+    # enough compared to the full curve build to pay unconditionally.
     heavy = [run for run in live if needed is None or run in needed]
     light = [run for run in live if run not in set(heavy)]
     jobs = ([(run_curves, (run, tables[run], bootstrap, open_tables[run], open_bootstrap), {})

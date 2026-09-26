@@ -1,62 +1,46 @@
 """Nearest-neighbor linkage whose whole top-K is reordered by Claude Sonnet 5, with reasons.
 
 The listwise sibling of :mod:`.euclidean_llm_judge`. That attack shortlists the top-K authors by
-embedding distance, shows a judge the unknown text plus those K candidates, and asks **which one**
-wrote it; the winner is promoted to rank 1 and everything else keeps the distance order. This one
-shows the judge exactly the same thing and asks it to **rank all K**, most to least likely, with a
-sentence or two per position saying why that candidate belongs there. The full ordering is folded
-back into the score matrix by :func:`~prompt_anonymity.attacks.llm.listwise.fold_listwise`, so
-top-1 through top-(K-1) all move while top-K stays pinned to the base attack's own number -- see
-that module for why the pinned ceiling is what makes the comparison readable.
+embedding distance and asks the judge **which one** wrote the unknown text, promoting the winner to
+rank 1 and leaving the rest in distance order. This one asks the judge to **rank all K**, most to
+least likely, with a sentence or two per position saying why. The full ordering is folded back into
+the score matrix by :func:`~prompt_anonymity.attacks.llm.listwise.fold_listwise`, so ranks 1 through
+K-1 all move while top-K stays pinned to the base attack's own number.
 
-Two things the single-pick version cannot measure follow from that. The CMC curve between ranks 1
-and K becomes an outcome rather than a constant, which is where most of the difference between a
-usable attack and an unusable one lives; and because every position carries a justification, the
-detail table says *what the model thought it was seeing* -- the raw material for calibrating the
-rubric, and the only way to tell a judge that is reading style from one that is reading topic.
+That makes two things measurable that the single-pick version can't: the CMC curve between ranks 1
+and K becomes an outcome rather than a constant, and because every position carries a justification,
+the detail table shows what the model thought it was seeing -- useful for calibrating the rubric and
+for telling a style-reading judge from a topic-reading one.
 
 The judge
 ---------
-Claude Sonnet 5 over OpenRouter (``anthropic/claude-sonnet-5``) with **reasoning enabled**:
-``reasoning.effort``, which OpenRouter maps onto Anthropic's ``output_config.effort`` for Claude 4.6
-and newer. The older fixed thinking budget is not available and must not be sent -- ``budget_tokens``
-is rejected with a 400 on Sonnet 5, which uses adaptive thinking steered by effort instead.
+Claude Sonnet 5 over OpenRouter (``anthropic/claude-sonnet-5``) with reasoning enabled via
+``reasoning.effort`` -- the older fixed ``budget_tokens`` thinking control is rejected on this model.
 
 Requests go through the **Batch API** by default
-(:class:`~prompt_anonymity.attacks.llm._openrouter_batch.OpenRouterBatch`), at roughly half the
-real-time price with a 24-hour window, resuming rather than resubmitting if the job is interrupted.
-Its key is ``SONNET_OR_KEY``, read from a ``.env`` at the repo root.
+(:class:`~prompt_anonymity.attacks.llm._openrouter_batch.OpenRouterBatch`), at a discount with a
+24-hour window, resuming rather than resubmitting if the job is interrupted. Its key is
+``SONNET_OR_KEY``, read from a ``.env`` at the repo root.
 
 ``batch=False`` takes the synchronous thread-pool client
 (:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`) instead, under
-:data:`SYNC_API_KEY_ENV` (``SONNET_API_KEY``). **It is a full run, not a lesser one**: same model,
-same rubric, same ``reasoning.effort``, and the verdicts land in the same cache namespace. What it
-trades is money for time -- full real-time price, ~$2/$10 per MTok against the batch tier's
-~$1/$5 -- and what it buys is a result in one sitting instead of a submit job, a 24-hour window
-and a collect job. Throughput is then just how many requests are in flight, which
-``LISTWISE_RERANK_MAX_WORKERS`` sets.
+:data:`SYNC_API_KEY_ENV` (``SONNET_API_KEY``). It's a full run, not a lesser one: same model, rubric
+and effort, landing in the same cache namespace -- it trades the batch discount for a result in one
+sitting. Throughput is then just how many requests are in flight
+(``LISTWISE_RERANK_MAX_WORKERS``).
 
-**The discount is carried by the model slug, not by the endpoint.** OpenRouter lists
-``anthropic/claude-sonnet-5`` and ``anthropic/claude-sonnet-5:batch`` as two separate models, at
-$2/$10 and $1/$5 per MTok; the batch endpoint accepts either, and the plain one simply runs at full
-price. ``judge_model`` here is therefore the *logical* model -- the batch client appends the
-``:batch`` variant itself when it submits, and prints the slug it actually used. Because the cache is
-namespaced by the logical model, a ``batch=False`` smoke run and the full batched run share one
-namespace and the smoke run's verdicts are reused rather than re-bought.
+``judge_model`` is the *logical* model; the batch client appends the ``:batch`` variant itself when
+it submits and prints the slug actually used, so a ``batch=False`` smoke run and the full batched
+run share one cache namespace and neither re-buys the other's verdicts.
 
-**Cost.** At ``snippet_chars=800`` and ``top_k=10`` a row is roughly 2.4k input tokens plus thinking
-and ten justifications out, which at batch rates lands near **$0.01-0.015 per unknown document**;
-``top_k=5`` is roughly half that. Verdicts are cached by prompt text under ``<cache_dir>/attacks``,
-so a re-run -- or a re-swept ambiguity gate -- costs nothing, and a fully-cached run makes no
-request and needs no key. Start small and read the reasons before spending a corpus on a rubric
-that may turn out to be miscalibrated.
+Verdicts are cached by prompt text under ``<cache_dir>/attacks``, so a re-run -- or a re-swept
+ambiguity gate -- costs nothing, and a fully-cached run makes no request and needs no key.
 
-Two knobs are inherited unchanged from the single-pick judge, and for the same reasons:
-**candidate shuffling** (on by default -- LLM rankers over-weight the end of a list, and presenting
-in distance order would systematically reward the distance metric's worst candidate) and the
-**ambiguity gate** (``margin_quantile``, applying the rerank only to rows where the vectors were
-close to a coin flip). Every row is still judged, so the cache is complete and re-sweeping the gate
-needs no new API calls.
+Two knobs are inherited unchanged from the single-pick judge: **candidate shuffling** (on by
+default -- LLM rankers over-weight the end of a list, and presenting in distance order would
+systematically reward the distance metric's worst candidate) and the **ambiguity gate**
+(``margin_quantile``, applying the rerank only to rows where the vectors were close to a coin flip).
+Every row is still judged, so the cache is complete and re-sweeping the gate needs no new API calls.
 """
 
 from __future__ import annotations
@@ -121,21 +105,17 @@ DEFAULT_REASONING_EFFORT = "high"
 #: Seed for the per-row candidate shuffle -- reproducible, so the judge cache stays stable.
 DEFAULT_SEED = 47
 
-#: Output budget: thinking tokens count against it too, so this is deliberately loose. It is a cap,
-#: not a spend -- a truncated reply loses the whole JSON object, which costs far more than the
-#: headroom does.
+#: Output budget: thinking tokens count against it too, so this is deliberately loose -- a cap, not
+#: a spend, since a truncated reply loses the whole JSON object.
 MAX_TOKENS_BASE = 2000
 #: Additional budget per candidate, covering that position's justification.
 MAX_TOKENS_PER_CANDIDATE = 200
-#: Output budget on the Foundry provider, thinking included. Far above the OpenRouter figure: with
-#: adaptive thinking at high effort, 3,000 tokens is tight enough that a hard row can be cut off
-#: mid-JSON and silently fall back to the distance order. It is a cap, not a spend -- only tokens
-#: produced are billed. (The OpenRouter budget is left as it was, so that channel's configuration is
-#: unchanged.)
+#: Output budget on the Foundry provider, thinking included -- generous, since a hard row cut off
+#: mid-JSON silently falls back to the distance order.
 FOUNDRY_MAX_TOKENS = 16000
 
-#: Output budget on the local provider, thinking included. Qwen's thinking runs long; 16k fits the
-#: 32k served window beside a ~2k-token prompt, and a reply that still hits it is counted.
+#: Output budget on the local provider, thinking included. Qwen's thinking runs long, so this fits
+#: the served window beside the prompt.
 LOCAL_MAX_TOKENS = 16384
 
 #: Where the unbatched judge is reached. ``openrouter`` is the original channel; ``foundry`` is Claude
@@ -258,19 +238,19 @@ class ListwiseLLMRerankAttack:
         cannot be switched off there). Both are unbatched only, so they require ``batch=False``.
         Part of the cache key.
     top_k : int
-        How many nearest authors to rerank per unknown row (the headline comparison is 5 vs 10).
+        How many nearest authors to rerank per unknown row.
     snippet_chars : int
         Chars of each conversation shown to the judge, per text.
     reasoning_effort : str or None
         Thinking depth: ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, or ``None`` to send
         no reasoning field at all.
     batch : bool
-        ``True`` (default) submits through OpenRouter's Batch API at ~50% of the real-time price,
-        with a 24-hour window, under ``SONNET_OR_KEY``. ``False`` uses the synchronous thread-pool
-        client under :data:`SYNC_API_KEY_ENV`, at full price and with
-        :data:`SYNC_MAX_WORKERS` requests in flight -- for when waiting beats saving. It is **not**
-        part of the cache key: it changes the delivery channel, not the prompts, so the two share
-        one cache namespace and either one's verdicts are reused by the other.
+        ``True`` (default) submits through OpenRouter's Batch API, with a 24-hour window, under
+        ``SONNET_OR_KEY``. ``False`` uses the synchronous thread-pool client under
+        :data:`SYNC_API_KEY_ENV`, with :data:`SYNC_MAX_WORKERS` requests in flight -- for when
+        waiting beats saving. Not part of the cache key: it changes the delivery channel, not the
+        prompts, so the two share one cache namespace and either one's verdicts are reused by the
+        other.
     wait : bool
         Batch mode only. ``False`` submits, records resume tickets and exits, so the run can be
         collected by re-running the same command later.
@@ -296,17 +276,13 @@ class ListwiseLLMRerankAttack:
         :meth:`attack`. See :func:`~prompt_anonymity.attacks.llm.listwise.detail_table`.
     cost_usd : float
         What OpenRouter billed for the requests this run actually made, or ``nan`` when nothing was
-        billed through a channel that reports it (a fully-cached run). Both clients report it; the
-        synchronous one's figure is a floor, since a reply that arrives without a usage block
-        contributes nothing to it. Following
-        :mod:`prompt_anonymity.evaluation.utility._deepseek`: a cached row contributes nothing and
-        never overwrites what was really paid.
+        billed (a fully-cached run). A cached row contributes nothing and never overwrites what was
+        really paid.
     reasoning_stats : dict
         ``replies``, ``replies_with_reasoning`` and ``reasoning_tokens`` for the replies this run
-        actually received -- proof that thinking happened rather than just that it was requested --
-        plus ``truncated`` and ``refused`` (Foundry only; ``0`` on OpenRouter, which does not
-        report them). Synchronous channel only (the batch client does not count them) and cached
-        rows contribute nothing, so a fully-cached run reports zero replies; set by :meth:`attack`.
+        actually received -- proof that thinking happened, not just that it was requested -- plus
+        ``truncated`` and ``refused`` (Foundry only). Synchronous channel only; set by
+        :meth:`attack`.
     """
 
     def __init__(self, *, judge_model: str | None = None, provider: str = "openrouter",
@@ -359,25 +335,19 @@ class ListwiseLLMRerankAttack:
                     reasoning_effort=self.reasoning_effort, wait=self.wait, ticket_dir=ticket_dir,
                 )
             elif self.provider == "local":
-                # The rubric is unchanged, so this judge owes the same reason per position as the
-                # API judges. Thinking on; only the text after </think> reaches the parser.
+                # Same rubric as the API judges; only the text after </think> reaches the parser.
                 self._client = LocalVLLMChat(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
                     seed=self.seed,
                 )
             elif self.provider == "foundry":
-                # Same rubric and effort, different transport: adaptive thinking at this effort,
-                # credentials from FOUNDRY_API_KEY_ENV / FOUNDRY_ENDPOINT_ENV. See _foundry.py.
                 self._client = FoundryChat(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
                     reasoning_effort=self.reasoning_effort, max_workers=SYNC_MAX_WORKERS,
                 )
             else:
-                # Same model, same rubric, same effort as the batch path -- only the delivery
-                # channel differs, which is what makes an unbatched run a measurement rather than
-                # a shape check. temperature/top_p are passed as None so the client omits them
-                # entirely: Sonnet 5 rejects both with a 400, and a default sent anyway is
-                # indistinguishable from this attack asking for them.
+                # temperature/top_p passed as None so the client omits them: this model rejects
+                # both, and a default sent anyway would be indistinguishable from asking for them.
                 self._client = OpenRouterChat(
                     self.judge_model, system_prompt, max_tokens=self._max_tokens(k),
                     temperature=None, top_p=None, reasoning_effort=self.reasoning_effort,
@@ -390,21 +360,14 @@ class ListwiseLLMRerankAttack:
         return self._client.complete_batch(prompts)
 
     def _judge_stream(self, prompts: list[str], k: int, ticket_dir):
-        """``(index, reply)`` as each one lands -- the unbatched channel.
-
-        Same concurrency as :meth:`_judge`; what differs is that the caller learns about a reply
-        the moment it arrives and can bank it. At real-time prices a full corpus is hours of paid
-        calls, and a job killed at 90% must not have to buy the first 90% again.
-        """
+        """``(index, reply)`` as each one lands -- the unbatched channel, so a job killed partway
+        through doesn't have to re-buy what it already received."""
         self._build_client(k, ticket_dir)
         yield from self._client.complete_stream(prompts)
 
     def _cache(self, cache_dir, k: int) -> TransformCache:
-        # Keyed by prompt text; namespaced by the judge model + rubric + effort + presentation params
-        # so any change that alters the prompts (or the model, or how hard it thinks) re-caches.
-        # `batch` and `margin_quantile` are deliberately NOT in the key: neither changes a prompt,
-        # so a smoke run's verdicts are reused by the real one and re-sweeping the gate is free. The
-        # class source + version guard against silent logic drift (see caching.py).
+        # Keyed by prompt text; namespaced by model + rubric + effort + presentation params. `batch`
+        # and `margin_quantile` are deliberately excluded: neither changes a prompt.
         return TransformCache(
             Path(cache_dir) / "attacks", "listwise_llm_rerank",
             logic_hash([OpenRouterBatch, ListwiseLLMRerankAttack], version=RERANK_VERSION),
@@ -445,8 +408,7 @@ class ListwiseLLMRerankAttack:
         known_texts = [str(text) for text in np.asarray(data.known_texts)]
         unknown_texts = [str(text) for text in np.asarray(data.unknown_texts)]
 
-        # Shortlist the most likely AUTHORS, each represented by their own document nearest to this
-        # unknown one. See .candidates for why the unit is the author rather than the conversation.
+        # Shortlist the most likely authors, each represented by their document nearest this one.
         candidates = author_candidates(
             data.known_embeddings, data.known_labels, data.unknown_embeddings,
             top_k=self.top_k, metric=data.metric,
@@ -469,12 +431,10 @@ class ListwiseLLMRerankAttack:
             cache = self._cache(cache_dir, k)
             tickets = Path(cache_dir) / "attacks" / "_batches"
             if self.batch:
-                # One submission is the unit of work, and the batch client keeps its own resume
-                # tickets, so there is nothing finer to bank here.
                 replies = cache.apply_batch(prompts, lambda batch: self._judge(batch, k, tickets))
             else:
-                # flush_every=1: a verdict is written the moment it arrives. At real-time prices
-                # each one is real money, and a preemption a minute later must not re-buy it.
+                # flush_every=1: a verdict is written the moment it arrives, so a preemption doesn't
+                # re-buy it.
                 replies = cache.apply_streaming(
                     prompts, lambda batch: self._judge_stream(batch, k, tickets),
                     flush_every=1,

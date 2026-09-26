@@ -3,16 +3,14 @@
 Every other metric in this package runs the attack in the identification direction -- given an
 anonymous document, which user wrote it? This module runs the same score matrix the other way:
 given a **known user as the query**, rank all the anonymous documents and see how many of theirs
-come to the top. That is a genuinely different attacker capability (targeted surveillance of one
-person, rather than triage of one document) and it is usually the one a privacy threat model
-cares about, so it deserves its own numbers rather than being inferred from top-k accuracy.
+come to the top -- targeted surveillance of one person rather than triage of one document, and
+usually the capability a privacy threat model actually cares about.
 
-It also fixes a degeneracy. Identification has exactly one relevant item per query, which
+It also avoids a degeneracy: identification has exactly one relevant item per query, which
 collapses mean average precision onto the mean reciprocal rank already reported by
-:mod:`prompt_anonymity.evaluation.metrics.ranking` -- reporting both would be reporting one number twice.
-In this direction a query has many relevant documents, so average precision is non-trivial and
-measures what it is meant to: whether the user's documents are concentrated at the top of the
-ranking or scattered through it.
+:mod:`~prompt_anonymity.evaluation.metrics.ranking`. Here a query has many relevant documents, so
+average precision is non-trivial and measures whether a user's documents are concentrated at the
+top of the ranking or scattered through it.
 """
 
 from __future__ import annotations
@@ -79,11 +77,9 @@ def author_query_metrics(scores, candidate_authors, true_authors) -> pd.DataFram
         n_relevant = int(relevant.sum())
         column_scores = scores[:, column]
         if not np.isfinite(column_scores).all():
-            # A candidate filter (``run_experiment.py --language-aware``) scores the documents
-            # this author was never a candidate for as -inf, meaning "would never be retrieved":
-            # they belong at the bottom of the ranking. Both metrics below read only the *order*
-            # of the scores, so substituting a value below every real one is exact -- and it is
-            # necessary, because average_precision_score rejects non-finite input outright.
+            # A candidate filter can score some documents -inf ("never a candidate for this
+            # author"); substitute a value below every real score since both metrics below only
+            # read order, and average_precision_score rejects non-finite input.
             eligible = np.isfinite(column_scores)
             floor = column_scores[eligible].min() - 1.0 if eligible.any() else 0.0
             column_scores = np.where(eligible, column_scores, floor)

@@ -3,16 +3,11 @@
 Every other package under :mod:`prompt_anonymity.attacks` answers *"which enrolled author wrote
 this document?"* and returns an ``[n_documents x n_authors]`` score matrix. This one answers a
 different question -- *"which of these documents were written by the same person?"* -- and returns
-**one cluster label per document**. No author is named and no known side is required at attack
-time, which is what makes it a distinct threat model rather than a variation:
-
-* **Identifiability** (the rest of the package) needs the attacker to hold labelled documents by
-  the target. Strip the identifiers from a log and enrol nobody, and there is nothing to attack.
-* **Linkability** (here) needs nothing but the log. It re-assembles a person's sessions out of an
-  anonymised dump, and it is what makes identification cheap afterwards: if a user's thirty
-  conversations land in one cluster, de-anonymising *one* of them by any means hands over the
-  other twenty-nine. :mod:`prompt_anonymity.evaluation.metrics.clustering` reports that as
-  ``amplification``.
+**one cluster label per document**. No author is named and no known side is required, which makes
+it a distinct threat model: an attacker with no labelled documents can still re-assemble a person's
+sessions out of an anonymised dump, and that is what makes identification cheap afterwards -- one
+cluster de-anonymised by any means hands over every document in it
+(:mod:`prompt_anonymity.evaluation.metrics.clustering` reports that as ``amplification``).
 
 The task, the measure and the baselines follow PAN 2016's author-clustering shared task
 (Stamatatos et al., CLEF 2016), which is also where BCubed comes from -- see the metrics module.

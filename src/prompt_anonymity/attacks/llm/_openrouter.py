@@ -1,42 +1,23 @@
 """Lean OpenRouter chat client shared by the LLM-judge attacks.
 
-:mod:`.euclidean_llm_judge` and :mod:`.bt_tournament` ask a remote model to decide which candidate
-author wrote an unknown conversation. This module holds the one client they share:
-:class:`OpenRouterChat`, a thin wrapper over the chat-completions endpoint -- a lazily read
-``OPENROUTER_API_KEY`` (from a ``.env``; the key's variable is a constructor argument, and the
-listwise reranker overrides it), jittered exponential backoff on transient failures, fail-fast on
+:class:`OpenRouterChat` is a thin wrapper over the chat-completions endpoint: a lazily read
+``OPENROUTER_API_KEY``, jittered exponential backoff on transient failures, fail-fast on
 non-retryable 4xx, and a thread pool to fan a batch of requests out.
 
-**Reasoning models are first-class here, not only in the batch client.** ``reasoning_effort`` sends
-``reasoning.effort``, and ``temperature=None``/``top_p=None`` omit those fields rather than sending
-a default -- both are needed by Claude Sonnet 5, which rejects the sampling controls with a 400 and
-does its thinking under an effort level. That is what makes an unbatched run of
-:mod:`.listwise_llm_rerank` comparable to the batched one rather than a cheaper, thinking-free
-imitation of it.
+**Reasoning models are first-class here.** ``reasoning_effort`` sends ``reasoning.effort``, and
+``temperature=None``/``top_p=None`` omit those fields entirely rather than sending a default --
+Claude Sonnet 5 rejects the sampling controls with a 400 and does its thinking under an effort
+level instead.
 
-**It lived in** :mod:`prompt_anonymity.evaluation.utility` **until the utility judge moved off OpenRouter**
-(first to a Microsoft Foundry Claude deployment, then to DeepSeek --
-:mod:`prompt_anonymity.evaluation.utility._deepseek`), which left the judge attacks as its main
-callers -- hence the move here. The two clients are deliberately not merged: they point at
-different providers under different credentials, and an attack's judge is a component of the thing
-being measured while a utility judge is the measuring instrument, so pinning them together would
-make one impossible to change without disturbing the other.
+**Not only the judge attacks call this.** :mod:`prompt_anonymity.defenses.frame_shift` reuses it
+to rewrite prompts through a hosted model, so a defense imports it across package boundaries --
+worth knowing before moving this module again. That is also why :meth:`OpenRouterChat.complete`
+takes a per-call ``max_tokens``: a judge's reply is a fixed-size verdict, a rewrite's is as long as
+its input.
 
-**The judge attacks are not the only caller, despite where this module now sits.** The Frame Shift
-defense (:mod:`prompt_anonymity.defenses.frame_shift`) reuses this client to rewrite prompts through
-a hosted model, so a *defense* imports it across package boundaries -- worth knowing before moving
-it again. (The OpenAnonymity defense was a third caller and now runs a local model through vLLM,
-:mod:`prompt_anonymity.defenses.openanonymity`.) The judges stay remote because a judge is meant to
-be a stronger, independent model than the one under test.
-
-That second kind of caller is why :meth:`OpenRouterChat.complete` takes a per-call ``max_tokens``:
-a judge's reply is a fixed-size verdict, a rewrite's is as long as its input.
-
-One prompt is one request, with no token-budget chunking / context-length re-split (which the
-scrubber does do). That is safe for both callers: a judge sees a shortlist of bounded snippets
-rather than whole conversations, and the rewriter is handed one user turn at a time.
-``requests`` and ``python-dotenv`` are imported lazily so importing this module
-(e.g. to reach the prompt constants or the verdict parser) never requires the network deps or a key.
+One prompt is one request, with no chunking/re-split -- safe here since a judge sees bounded
+snippets and the rewriter is handed one turn at a time. ``requests``/``python-dotenv`` are imported
+lazily so importing this module never requires the network deps or a key.
 """
 
 from __future__ import annotations
@@ -60,14 +41,10 @@ OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 def check_credentials(api_key_env: str = OPENROUTER_API_KEY_ENV, *, timeout: float = 30.0):
     """``(ok, message)`` for the key in ``$api_key_env`` -- resolved, then actually used.
 
-    Checking that a ``.env`` *file exists* is not checking that it holds the key you need, and the
-    difference is expensive: a job whose preflight passed on the file's existence goes on to build
-    a corpus of prompts, open a thread pool and get 401 on the first one, hours after you walked
-    away. This asks the provider, costs nothing (no completion is generated) and takes a second.
+    Asks the provider directly rather than just checking the ``.env`` file exists, so a bad or
+    missing key is caught before a long job burns time reaching the first request.
 
-    Never returns or logs the key itself, only its length and last four characters -- enough to
-    tell "the variable is set to the wrong thing" from "the variable is not set", which is the
-    distinction you need at 2am, without putting a credential in a log file that outlives the job.
+    Never returns or logs the key itself, only its length and last four characters.
     """
     import os
 
@@ -77,12 +54,10 @@ def check_credentials(api_key_env: str = OPENROUTER_API_KEY_ENV, *, timeout: flo
     key = os.environ.get(api_key_env)
     if not key:
         return False, (f"{api_key_env} is not set, and no .env on the way up from {os.getcwd()} "
-                       f"defines it. Note that load_dotenv walks UP from the working directory, "
-                       f"so a .env in a subdirectory is never found.")
+                       f"defines it (load_dotenv walks up from the working directory).")
     if key != key.strip():
-        return False, (f"{api_key_env} has leading or trailing whitespace ({len(key)} chars). A "
-                       f"quoted value or a trailing newline in .env does this, and the provider "
-                       f"sees a malformed Authorization header.")
+        return False, (f"{api_key_env} has leading or trailing whitespace ({len(key)} chars); "
+                       f"the provider will see a malformed Authorization header.")
 
     import requests
 
@@ -100,9 +75,7 @@ def check_credentials(api_key_env: str = OPENROUTER_API_KEY_ENV, *, timeout: flo
         return True, f"{api_key_env} authenticates ({shape}); {headroom}"
     if response.status_code == 401:
         return False, (f"{api_key_env} is set ({shape}) but OpenRouter rejects it: 401 "
-                       f"{response.text.strip()[:200]}. The variable holds something, just not a "
-                       f"valid key -- check you did not put the batch key, another provider's "
-                       f"key, or a placeholder in it.")
+                       f"{response.text.strip()[:200]}.")
     return False, (f"{api_key_env} ({shape}) got HTTP {response.status_code} from OpenRouter: "
                    f"{response.text.strip()[:200]}")
 
@@ -110,26 +83,21 @@ def check_credentials(api_key_env: str = OPENROUTER_API_KEY_ENV, *, timeout: flo
 class OpenRouterChat:
     """Minimal OpenRouter chat client: one fixed system prompt, one user message per call.
 
-    Built lazily by the utility scorer on first real need, so a fully-cached scoring run
-    constructs no client and needs no API key. ``temperature=0`` by default -> greedy and
-    reproducible, so cache hits are stable.
+    Built lazily on first real need, so a fully-cached run constructs no client and needs no API
+    key. ``temperature=0`` by default -> greedy and reproducible, so cache hits are stable.
 
     Parameters
     ----------
     model : str
         OpenRouter chat model id (e.g. ``"openai/gpt-4o"``).
     system_prompt : str
-        System message prepended to every request (the response-model persona or the judge rubric).
+        System message prepended to every request.
     temperature, top_p, max_tokens : float or None / float or None / int
-        Standard sampling controls; ``temperature=0`` keeps decoding deterministic. **``None``
-        omits the field from the payload entirely**, which is what a reasoning model needs: Claude
-        Sonnet 5 rejects ``temperature`` and ``top_p`` outright, and a default of 0.0 sent anyway
-        is a 400 rather than a suggestion the provider is free to ignore.
+        Standard sampling controls. ``None`` omits the field from the payload entirely, which a
+        reasoning model needs -- Claude Sonnet 5 rejects ``temperature``/``top_p`` outright.
     reasoning_effort : str or None
-        ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, sent as ``reasoning.effort`` --
-        which OpenRouter maps onto Anthropic's ``output_config.effort`` for Claude 4.6 and newer.
-        ``None`` (default) sends no reasoning field, so every existing caller is unaffected. The
-        older fixed thinking budget must NOT be sent: ``budget_tokens`` is a 400 on Sonnet 5.
+        ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, sent as ``reasoning.effort``.
+        ``None`` (default) sends no reasoning field.
     max_workers : int
         Thread-pool width for :meth:`complete_batch` (requests are network I/O-bound).
     max_retries, backoff_cap, timeout : int / float / float
@@ -138,10 +106,8 @@ class OpenRouterChat:
     Attributes
     ----------
     total_cost : float
-        What OpenRouter reported billing for the requests this client actually made, in USD,
-        accumulated across threads. Best effort: the endpoint is asked for a usage block and any
-        reply that arrives without one contributes nothing, so this is a floor on the spend rather
-        than an invoice. Callers read it through ``getattr(client, "total_cost", nan)``.
+        What OpenRouter reported billing for requests this client actually made, in USD. Best
+        effort: a reply with no usage block contributes nothing, so this is a floor on the spend.
     """
 
     def __init__(self, model: str, system_prompt: str = "", *, temperature: float | None = 0.0,
@@ -165,17 +131,14 @@ class OpenRouterChat:
         self.timeout = timeout
         self.base_url = base_url
         self.total_cost = 0.0
-        # Evidence that reasoning actually happened, not just that it was asked for: a request can
-        # carry reasoning.effort and still come back without thinking (a provider that drops the
-        # field, a model that does not support it). See _record_usage.
+        # Tracks whether reasoning actually happened, not just whether it was asked for -- see
+        # _record_usage.
         self.n_replies = 0
         self.n_replies_with_reasoning = 0
         self.total_reasoning_tokens = 0
         self._cost_lock = threading.Lock()
 
-        # Walks UP from the working directory: a .env at the repo root (or above it) is found, one
-        # in a SUBdirectory is not -- `DS_env/.env` does not work when the job runs from the root.
-        load_dotenv()
+        load_dotenv()  # walks up from the working directory to find a .env
         self.api_key = os.environ.get(api_key_env)
         if not self.api_key:
             raise RuntimeError(
@@ -189,12 +152,8 @@ class OpenRouterChat:
         time.sleep(random.uniform(0, delay))  # full jitter de-synchronizes concurrent workers
 
     def _record_cost(self, reply) -> None:
-        """Add one reply's billed cost to :attr:`total_cost`, ignoring a reply that carries none.
-
-        Deliberately total: a provider that omits the usage block, or reports it under a shape this
-        does not recognise, must not turn a completed run into a crash over a bookkeeping field.
-        The worst case is an under-count, which the caller reports as a floor.
-        """
+        """Add one reply's billed cost to :attr:`total_cost`, tolerating any shape it doesn't
+        recognise -- a bookkeeping miss should never crash a completed run."""
         try:
             cost = (reply.get("usage") or {}).get("cost")
         except AttributeError:
@@ -211,11 +170,9 @@ class OpenRouterChat:
     def _record_usage(self, reply) -> None:
         """Count one reply, and whether it reasoned, toward the ``n_replies*`` counters.
 
-        A reply counts as reasoned if its usage reports ``completion_tokens_details.reasoning_tokens
-        > 0`` or its message carries a non-empty ``reasoning`` / ``reasoning_details``. Either field is
-        accepted because which one a provider fills varies. Total for the same reason as
-        :meth:`_record_cost`: a shape this does not recognise counts as a reply without reasoning,
-        never as a crash.
+        A reply counts as reasoned if its usage reports reasoning tokens or its message carries a
+        non-empty ``reasoning``/``reasoning_details`` field. An unrecognised shape counts as a
+        reply without reasoning rather than raising.
         """
         tokens, reasoned = 0, False
         try:
@@ -237,15 +194,12 @@ class OpenRouterChat:
     def complete(self, text: str, max_tokens: int | None = None) -> str:
         """Return the model's reply to ``text`` under the fixed system prompt.
 
-        A blank input has nothing to answer and 400s some providers, so short-circuit it to ``""``.
+        A blank input has nothing to answer and 400s some providers, so short-circuits to ``""``.
         Transient failures (429, 5xx, network/JSON errors) are retried with jittered exponential
-        backoff; a non-retryable 4xx (bad model id, malformed/over-limit prompt) fails fast with
-        OpenRouter's error body attached (``raise_for_status`` alone carries only the status line).
+        backoff; a non-retryable 4xx fails fast with OpenRouter's error body attached.
 
-        ``max_tokens`` overrides the instance default for this one call. The judges leave it unset
-        (their replies are a verdict and a sentence, so one fixed cap fits every call); a *rewrite*
-        caller needs a budget proportional to its input, since a long turn's rewrite is long too and
-        the fixed default would silently truncate it.
+        ``max_tokens`` overrides the instance default for this one call -- useful for a rewrite
+        caller whose output length scales with its input, unlike a judge's fixed-size verdict.
         """
         if not text.strip():
             return ""
@@ -256,12 +210,9 @@ class OpenRouterChat:
                 {"role": "user", "content": text},
             ],
             "max_tokens": self.max_tokens if max_tokens is None else int(max_tokens),
-            # Asks for the billed amount on the reply itself, which is the only way this client can
-            # report what a run cost -- there is no batch object to read it off afterwards.
-            "usage": {"include": True},
+            "usage": {"include": True},  # only way to learn the billed cost of a single call
         }
-        # Sampling controls are sent only when set. See the class docstring: a reasoning model
-        # rejects them, and sending a default is indistinguishable from the caller asking for it.
+        # Sampling controls are sent only when set -- a reasoning model rejects them outright.
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if self.top_p is not None:
@@ -284,8 +235,7 @@ class OpenRouterChat:
                 status = err.response.status_code
                 body = err.response.text
                 last_err = RuntimeError(f"{status} {err.response.reason}: {body}")
-                # 429 (rate-limit) is transient and retryable; other 4xx are client errors that fail
-                # identically on retry, so surface the offending prompt and stop.
+                # 429 is transient; other 4xx fail identically on retry, so stop immediately.
                 if 400 <= status < 500 and status != 429:
                     snippet = text[:200].replace("\n", " ")
                     raise RuntimeError(
@@ -304,12 +254,10 @@ class OpenRouterChat:
     def complete_batch(self, texts: list[str], max_tokens=None) -> list[str]:
         """Answer a batch of prompts concurrently, preserving input order.
 
-        Network I/O-bound, so a thread pool gives near-linear speedup despite the GIL; a prompt
-        that still fails after retries raises, aborting the batch (same contract as the scrubber).
+        A prompt that still fails after retries raises, aborting the batch.
 
-        ``max_tokens`` is either ``None`` (use the instance default for every call), one int applied
-        to all of them, or a sequence carrying a per-prompt budget -- which is what a rewrite caller
-        wants, its budget scaling with each input's length.
+        ``max_tokens`` is either ``None`` (instance default for every call), one int applied to
+        all of them, or a sequence carrying a per-prompt budget.
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -332,18 +280,14 @@ class OpenRouterChat:
         return budgets
 
     def complete_stream(self, texts: list[str], max_tokens=None):
-        """Answer a batch of prompts concurrently, yielding ``(index, reply)`` **as each lands**.
+        """Answer a batch of prompts concurrently, yielding ``(index, reply)`` as each lands.
 
-        The same work as :meth:`complete_batch` at the same concurrency, reported differently:
-        results come back in completion order rather than input order, each tagged with its
-        position. That is what lets a caller persist a reply the moment it arrives instead of
-        holding a thousand of them in memory until the last one returns -- so a run that is
-        preempted, requeued or killed on wall clock keeps everything it already paid for. See
-        :meth:`prompt_anonymity.caching.TransformCache.apply_streaming`, the intended consumer.
+        Same work as :meth:`complete_batch`, but results come back in completion order rather than
+        input order, so a caller can persist each reply as it arrives instead of waiting on the
+        last one -- see :meth:`prompt_anonymity.caching.TransformCache.apply_streaming`.
 
-        A prompt that still fails after its retries raises here, ending the generator and
-        cancelling what has not started. Replies already yielded are unaffected, which is the
-        whole point: a failure costs the run, not the spend.
+        A prompt that still fails after retries raises here, ending the generator and cancelling
+        what has not started; replies already yielded are unaffected.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 

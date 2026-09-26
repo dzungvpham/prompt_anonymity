@@ -1,15 +1,11 @@
-"""OpenRouter's asynchronous Batch API: the same prompts, at roughly half the price.
+"""OpenRouter's asynchronous Batch API: the same prompts, at a discount, with a 24h turnaround.
 
-:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` answers prompts in real time by
-fanning a thread pool at the chat-completions endpoint. That is the right shape for a defense
-rewriting turns inside a job, and the wrong one for a reranking attack: a reranker's prompts are all
-known up front, nothing downstream is waiting on any individual verdict, and the corpus is large
-enough that the bill is the binding constraint. OpenRouter bills batched requests at **~50% of the
-model's standard per-token price** with a 24-hour completion window, which is exactly that trade.
-
-This client is a sibling of ``OpenRouterChat`` rather than a mode of it. ``OpenRouterChat`` is
-imported by both existing judge attacks *and* by the Frame Shift defense across package boundaries,
-and its contract -- call it, get an answer -- should not quietly grow a path that blocks for a day.
+:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` answers prompts in real time
+through a thread pool -- the right shape for a defense rewriting turns inside a job, but wasteful
+for a reranking attack whose prompts are all known up front and whose bill is the real constraint.
+This client is a sibling of it rather than a mode of it, so ``OpenRouterChat``'s call-and-get-an-
+answer contract (used by other judges and by Frame Shift) never grows a path that can block for a
+day.
 
 The API
 -------
@@ -19,23 +15,19 @@ The API
     GET  /api/beta/batches/:id   -> validating -> in_progress -> finalizing -> completed
                                     (terminal: completed | failed | expired | cancelled)
 
-``endpoint`` and ``model`` must be serialized **before** ``requests`` in the JSON body, so the
-payload is built in that order and handed over as a pre-serialized string rather than a dict.
-Results come back inline in the completed batch object's ``results`` array, **in arbitrary order**,
-each keyed by the ``custom_id`` it was submitted under -- never by position.
+``endpoint`` and ``model`` must be serialized **before** ``requests``, so the payload is built by
+hand in that order. Results come back **in arbitrary order**, keyed by the ``custom_id`` each
+request was submitted under -- never by position.
 
 Surviving the wall clock
 ------------------------
-A 24-hour window is longer than any SLURM allocation this project runs in, so a submitted batch must
-outlive the process that submitted it. Before submitting, this client writes a *ticket* -- the batch
-id, keyed by a hash of the exact prompts it covers -- under the cache directory. On re-entry with
-the same prompts it resumes polling that batch instead of submitting a second copy of it. Nothing
-reaches the :class:`~prompt_anonymity.caching.TransformCache` until results land, so a killed job
-re-enters with an identical set of cache misses and therefore an identical ticket hash. Without
-this, every re-run of an interrupted batch pays for the whole thing again.
+A 24-hour window outlives any SLURM allocation here, so a submitted batch must outlive the process
+that submitted it. Before submitting, this client writes a *ticket* -- the batch id, keyed by a hash
+of the exact prompts -- under the cache directory, and resumes polling an existing ticket instead of
+resubmitting. Nothing reaches the :class:`~prompt_anonymity.caching.TransformCache` until results
+land, so a killed job re-enters with the same cache misses and the same ticket hash.
 
-``wait=False`` submits, records the tickets and stops, which is what a login node wants: come back
-tomorrow and run the same command to collect.
+``wait=False`` submits, records the tickets and stops -- come back later and re-run to collect.
 """
 
 from __future__ import annotations
@@ -60,25 +52,16 @@ SONNET_API_KEY_ENV = "SONNET_OR_KEY"
 TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled", "canceled"}
 
 #: Exit status for "the batch is queued; come back and collect it" under ``wait=False``.
-#:
-#: Distinct from 1 on purpose. A submit job that exits 1 is indistinguishable from one that crashed,
-#: so SLURM would mark every successful submission FAILED and a script could not tell a queued batch
-#: from a broken build -- which is the difference between "wait an hour" and "something is wrong and
-#: you are about to pay for it again". Callers branch: 0 = nothing to submit (all cached), 3 =
-#: queued, anything else = a real failure.
+#: Distinct from 1 so SLURM (and any caller) can tell a queued submission from a real crash.
+#: Callers branch: 0 = nothing to submit (all cached), 3 = queued, anything else = a real failure.
 BATCH_QUEUED_EXIT = 3
 
 #: Variant suffix selecting OpenRouter's batch-priced copy of a model.
 #:
-#: **This is not cosmetic, and it is not implied by posting to the batch endpoint.**
-#: ``anthropic/claude-sonnet-5`` and ``anthropic/claude-sonnet-5:batch`` are two separate slugs in
-#: ``GET /api/v1/models``, priced $2/$10 and $1/$5 per MTok respectively -- exactly the 50% the
-#: batch discount is supposed to be. The quickstart's own example uses a plain slug, so submitting
-#: one is accepted; it just runs the batch at full price. That is a silent overcharge rather than an
-#: error, which is why the suffix is applied here instead of being left to whoever names the model.
-#:
-#: The variant keeps ``reasoning`` and ``reasoning_effort`` among its supported parameters, so
-#: extended thinking survives the swap -- verified against the live model list, not assumed.
+#: Not cosmetic: a model's plain slug and its ``:batch`` slug are billed differently, and posting to
+#: the batch endpoint with the plain slug is silently accepted at full price rather than rejected.
+#: The suffix is applied here rather than left to whoever names the model, and the variant is
+#: confirmed to keep ``reasoning``/``reasoning_effort`` among its supported parameters.
 BATCH_VARIANT_SUFFIX = ":batch"
 
 
@@ -107,22 +90,15 @@ class OpenRouterBatch:
     system_prompt : str
         System message prepended to every request in the batch.
     temperature, top_p : float or None
-        Sampling controls, **omitted from the payload when ``None``, which is the default**.
-        Unlike :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`, which always sends
-        them, this client leaves them out: Claude Sonnet 5 removed the sampling controls entirely
-        (``temperature`` and ``top_p`` are absent from its ``supported_parameters`` on OpenRouter,
-        and Anthropic answers a 400 for them), and a batch that 400s is a day lost rather than a
-        retry. A thinking model is not made deterministic by ``temperature=0`` anyway, so nothing is
-        given up; set them explicitly for a model that does take them.
+        Sampling controls, omitted from the payload when ``None`` (the default). Some models reject
+        these entirely, and a batch that 400s on one bad field is a day lost rather than a retry, so
+        they're left out unless a caller explicitly wants them.
     max_tokens : int
         Output budget. Thinking tokens count against it.
     reasoning_effort : str or None
-        ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, sent as ``reasoning.effort``.
-        OpenRouter maps this onto Anthropic's ``output_config.effort`` for Claude 4.6 and newer, so
-        this is how extended thinking is requested on Sonnet 5. ``None`` omits the field.
-
-        The older fixed thinking budget is **not** an option here: ``budget_tokens`` is rejected
-        with a 400 on Sonnet 5, which uses adaptive thinking steered by effort instead.
+        ``"low"``/``"medium"``/``"high"``/``"xhigh"``/``"max"``, sent as ``reasoning.effort`` --
+        how extended thinking is requested on models that use adaptive effort rather than a fixed
+        thinking-token budget. ``None`` omits the field.
     requests_per_batch : int
         Chunk size. Each chunk is its own batch with its own ticket, so a large corpus makes
         progress in pieces rather than as one all-or-nothing submission.
@@ -153,8 +129,7 @@ class OpenRouterBatch:
         #: The model as configured -- what the cache is namespaced by, so a real-time smoke run and
         #: a batched run of the same prompts share their verdicts.
         self.model = model
-        #: The slug actually submitted: the batch-priced variant of :attr:`model`. Different from it
-        #: is the normal case, and is what earns the discount.
+        #: The slug actually submitted: the batch-priced variant of :attr:`model`.
         self.batch_model = batch_slug(model, variant_suffix)
         self.system_prompt = system_prompt
         self.temperature = temperature
@@ -172,22 +147,17 @@ class OpenRouterBatch:
         self.ticket_dir = None if ticket_dir is None else Path(ticket_dir)
 
         #: Token and dollar totals reported by OpenRouter for the batches this client waited on.
-        #: Tokens are the record; ``cost`` is OpenRouter's own figure for what was actually billed,
-        #: so a cached re-run correctly adds nothing.
         self.total_tokens = 0
         self.total_cost = 0.0
 
-        # Walks UP from the working directory: a .env at the repo root (or above it) is found, one
-        # in a SUBdirectory is not -- `DS_env/.env` does not work when the job runs from the root.
-        load_dotenv()
+        load_dotenv()  # walks up from the working directory to find a repo-root .env
         self.api_key = os.environ.get(api_key_env)
         if not self.api_key:
             raise RuntimeError(
                 f"{api_key_env} not set. Add it to a .env file at the REPO ROOT "
                 f"(e.g. '{api_key_env}=sk-or-...') so the batched rerank attack can call OpenRouter."
             )
-        # Printed rather than silent: the submitted slug is the one that sets the price, and a run
-        # that quietly fell back to the full-price model looks identical to one that did not.
+        # Printed so a silent fallback to the full-price model doesn't go unnoticed.
         print(f"listwise rerank: OpenRouter batch client submitting as '{self.batch_model}'"
               + (f" (configured '{model}')" if self.batch_model != model else "")
               + (f" at reasoning effort '{reasoning_effort}'." if reasoning_effort else "."))
@@ -199,10 +169,8 @@ class OpenRouterBatch:
         time.sleep(random.uniform(0, delay))  # full jitter de-synchronizes concurrent workers
 
     def _call(self, method: str, url: str, payload: str | None = None) -> dict:
-        """One HTTP call with the same retry policy as the synchronous client: 429 and 5xx and
-        network errors are retried with jittered exponential backoff, other 4xx fail fast with
-        OpenRouter's error body attached (``raise_for_status`` alone carries only the status line).
-        """
+        """One HTTP call: 429/5xx/network errors retry with jittered backoff, other 4xx fail fast
+        with OpenRouter's error body attached."""
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         last_err = None
         for attempt in range(self.max_retries):
@@ -236,8 +204,8 @@ class OpenRouterBatch:
     def _ticket_path(self, texts: list[str]) -> Path | None:
         """Where this exact chunk's resume ticket lives, or ``None`` when resumption is disabled.
 
-        Keyed by the prompts themselves plus everything that changes what was submitted, so a
-        ticket can only ever be reused for a byte-identical resubmission.
+        Keyed by the prompts plus everything else that changes what was submitted, so a ticket is
+        only ever reused for a byte-identical resubmission.
         """
         if self.ticket_dir is None:
             return None
@@ -271,8 +239,8 @@ class OpenRouterBatch:
     # --- batch lifecycle ------------------------------------------------------
 
     def _body(self, text: str) -> dict:
-        """One request body. Every optional knob is omitted rather than sent as a default, because
-        a parameter a model does not accept is a 400 on the whole batch -- see ``temperature``."""
+        """One request body. Optional knobs are omitted rather than defaulted, since a parameter a
+        model rejects 400s the whole batch."""
         body = {
             "messages": [
                 {"role": "system", "content": self.system_prompt},
@@ -289,8 +257,7 @@ class OpenRouterBatch:
         return body
 
     def _submit(self, texts: list[str]) -> str:
-        # Serialized by hand, and in this order: OpenRouter requires `endpoint` and `model` to
-        # appear before `requests` in the JSON body.
+        # `endpoint` and `model` must appear before `requests` in the JSON body.
         payload = json.dumps({
             "endpoint": OPENROUTER_CHAT_ENDPOINT,
             "model": self.batch_model,
@@ -321,11 +288,9 @@ class OpenRouterBatch:
     def _collect(self, batch: dict, n: int) -> list[str]:
         """The batch's replies in submission order, keyed back through ``custom_id``.
 
-        A request that errored yields ``""``. The callers treat an unparseable reply as a refusal
-        and fall back to the base attack's own ordering for that row, so one failed request costs
-        that row's rerank and nothing else -- unlike the synchronous client, where a single failure
-        aborts the whole batch. At batch scale that is the right trade: losing a day's work to one
-        bad row is not.
+        A request that errored yields ``""``; callers treat an unparseable reply as a refusal and
+        fall back to the base attack's own ordering for that row, so one failed request costs only
+        that row rather than the whole batch's day of work.
         """
         status = batch.get("status")
         if status != "completed":
@@ -373,8 +338,7 @@ class OpenRouterBatch:
                   for start in range(0, len(texts), self.requests_per_batch)]
         tickets = [self._ticket_path(chunk) for chunk in chunks]
 
-        # Submit (or recover) every chunk first, so `wait=False` leaves the whole run queued rather
-        # than one chunk of it, and a wait=True run has all its work in flight while it polls.
+        # Submit (or recover) every chunk first, so all work is in flight before any polling starts.
         batch_ids = []
         for chunk, ticket in zip(chunks, tickets):
             batch_id = self._read_ticket(ticket)
@@ -467,11 +431,9 @@ def _stub_transport(state: dict):
 def _selftest(ticket_dir) -> None:
     """Wire shape, result keying and ticket bookkeeping -- offline, no key, no spend.
 
-    The three things checked here are the three that fail *expensively*: a payload OpenRouter
-    rejects, results reassembled by position instead of ``custom_id`` (which silently attributes
-    every reason to the wrong document), and a resume that resubmits instead of resuming (which
-    pays for the same 24-hour batch twice). Run with
-    ``python -m prompt_anonymity.attacks.llm._openrouter_batch --selftest``.
+    Covers the failures that are expensive rather than merely wrong: a rejected payload, results
+    reassembled by position instead of ``custom_id``, and a resume that resubmits instead of
+    resuming. Run with ``python -m prompt_anonymity.attacks.llm._openrouter_batch --selftest``.
     """
     import sys
     import types
@@ -503,8 +465,6 @@ def _selftest(ticket_dir) -> None:
     check("endpoint and model are serialized before requests",
           list(body) == ["endpoint", "model", "requests"], str(list(body)))
     check("endpoint is the chat-completions one", body["endpoint"] == OPENROUTER_CHAT_ENDPOINT)
-    # The one failure here that costs money instead of raising: the plain slug is accepted by the
-    # batch endpoint and billed at FULL price, so the discount is only earned by the :batch variant.
     check("a plain slug is submitted as its :batch variant",
           body["model"] == "anthropic/claude-sonnet-5:batch", body["model"])
     check("the configured (logical) model is left alone for the cache",
@@ -513,9 +473,7 @@ def _selftest(ticket_dir) -> None:
           [r["custom_id"] for r in body["requests"]] == ["0", "1", "2"])
     check("reasoning effort is sent as reasoning.effort",
           body["requests"][0]["body"]["reasoning"] == {"effort": "high"})
-    # budget_tokens is rejected with a 400 on Sonnet 5; effort is the only thinking control.
     check("no budget_tokens is emitted", "budget_tokens" not in state["calls"][0][2])
-    # Sonnet 5 removed the sampling controls; sending them 400s the batch a day after submission.
     check("no temperature/top_p is emitted by default",
           "temperature" not in body["requests"][0]["body"]
           and "top_p" not in body["requests"][0]["body"])
@@ -538,7 +496,7 @@ def _selftest(ticket_dir) -> None:
     check("a dash in the model name is not mistaken for a variant",
           batch_slug("anthropic/claude-sonnet-5") == "anthropic/claude-sonnet-5:batch")
 
-    # --no-wait leaves a ticket; re-entering with the same prompts must RESUME, not resubmit.
+    # --no-wait leaves a ticket; re-entering with the same prompts must resume, not resubmit.
     state["submitted"] = 0
     queued = OpenRouterBatch("anthropic/claude-sonnet-5", "SYSTEM", max_tokens=3000,
                              reasoning_effort="high", ticket_dir=tickets, wait=False,

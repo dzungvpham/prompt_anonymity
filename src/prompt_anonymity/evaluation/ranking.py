@@ -1,23 +1,19 @@
 """Rank once, evaluate many times.
 
-:class:`LinkageRanking` sorts each unknown conversation's known candidates a single time
-and caches the ranking, so top-k accuracy on any sub-pool of candidate users is a cheap
-vectorized lookup instead of a fresh sort. This is the engine behind the pool-size
-sweep, where the same ranking is scored against hundreds of random sub-pools.
+:class:`LinkageRanking` sorts each unknown conversation's known candidates once and caches the
+ranking, so top-k accuracy on any sub-pool of candidate users is a vectorized lookup instead of a
+fresh sort -- the engine behind sweeping accuracy over many random sub-pools.
 
 For a one-off accuracy on the full pool, the stateless
 :func:`prompt_anonymity.evaluation.metrics.top_k_accuracy` is simpler; this class produces the same
-numbers (verified) but pays the sort only once and scores sub-pools without re-sorting.
+numbers but pays the sort only once.
 
 Implementation note
 -------------------
-Identities are integer-coded once, and for each unknown conversation we cache (a) its
-known candidates ranked nearest-first as identity codes, and (b) the distinct identities
-in ranked order together with the rank of the *true* identity within them. Restricting
-to a sub-pool of candidate identities is then a single vectorized pass: an identity is
-re-identified at top-k iff fewer than ``k`` *candidate* identities outrank its true
-identity. This avoids the per-row Python filtering that made the naive version
-unusably slow on the larger pools.
+Identities are integer-coded once, and for each unknown conversation we cache its known candidates
+ranked nearest-first as identity codes, plus the distinct identities in ranked order together with
+the rank of the true identity among them. Restricting to a sub-pool is then one vectorized pass: an
+identity is re-identified at top-k iff fewer than ``k`` candidate identities outrank it.
 """
 
 from __future__ import annotations
@@ -152,8 +148,8 @@ class LinkageRanking:
             top_k_codes = self._ranked_known_codes[:, :k]
             hit = np.any(top_k_codes == unknown_codes[:, None], axis=1)
             return float(np.mean(hit))
-        # Sub-pool: keep only candidate known conversations, then take the top k of each
-        # evaluated unknown. (Not used by the sweep, so a per-row pass is fine here.)
+        # Sub-pool: keep only candidate known conversations, then take the top k of each evaluated
+        # unknown, per row (not vectorized -- this path is off the hot loop).
         rows = np.flatnonzero(membership[unknown_codes])
         if len(rows) == 0:
             return 0.0

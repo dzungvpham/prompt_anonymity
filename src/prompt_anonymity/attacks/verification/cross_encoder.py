@@ -4,19 +4,13 @@ Trains a binary classifier on pairs of (known, known) conversation feature vecto
 same author else 0, then scores each unknown document against every known one and aggregates to
 an author score.
 
-Naming
-------
 Filed under *verification* because that is the task: "were these two documents written by the
-same person?" is authorship verification, the pairwise counterpart of attribution, and the
-framing the PAN shared tasks use.
+same person?" is authorship verification, the pairwise counterpart of attribution.
 
-The class is a **cross-encoder**, not the "two tower" its original filename claimed. A two-tower
-(dual-encoder) model runs each side through its own encoder and compares the two embeddings with
-a fixed metric, which is what makes precomputation and approximate retrieval possible. This model
-does the opposite: :func:`_build_pair_features` *interacts* the two vectors -- elementwise
-``|a - b|`` and ``a * b`` -- before any scoring, so nothing can be precomputed per document and
-every pair costs a full model evaluation. That interaction-before-scoring shape is the definition
-of a cross-encoder, and it is why this attack is the expensive one in the package.
+This is a **cross-encoder**, not a two-tower model: :func:`_build_pair_features` *interacts* the
+two vectors (elementwise ``|a - b|`` and ``a * b``) before any scoring, so nothing can be
+precomputed per document and every pair costs a full model evaluation -- which is why this attack
+is the expensive one in the package.
 """
 
 from __future__ import annotations
@@ -51,21 +45,12 @@ def _build_pair_features(vecs_a: np.ndarray, vecs_b: np.ndarray) -> np.ndarray:
     if vecs_a.ndim == 1:
         diff = np.abs(vecs_a - vecs_b)
         product = vecs_a * vecs_b
-        # concat = np.concatenate([vecs_a, vecs_b])
-
-        return np.concatenate(
-            [diff, product]
-        )
+        return np.concatenate([diff, product])
 
     # Batch during inference
     diff = np.abs(vecs_a - vecs_b)
     product = vecs_a * vecs_b
-    # concat = np.concatenate([vecs_a, vecs_b], axis=1)
-
-    return np.concatenate(
-        [diff, product],
-        axis=1,
-    )
+    return np.concatenate([diff, product], axis=1)
 
 
 def _make_training_pairs(embeddings: np.ndarray, labels: np.ndarray, seed: int = 47):
@@ -133,12 +118,8 @@ def _tune_xgb(X_train, y_train, groups, seed=47, max_search_samples=20000):
 
     cv = GroupKFold(n_splits=5)
 
-    # Lazy, exactly as multiclass/boosted_trees.py imports it, and for a reason that is not about
-    # this function: `attacks/__init__.py` imports this package eagerly to build the registry, so
-    # a top-level xgboost import here made xgboost a hard requirement of `import
-    # prompt_anonymity.attacks` -- and therefore of every entry point in the project, including
-    # the two rerankers, which never touch it. An environment missing one optional wheel should
-    # cost you this attack, not all of them.
+    # Lazy: attacks/__init__.py imports this package eagerly to build the registry, and a
+    # top-level xgboost import would make it a hard requirement of every entry point.
     from xgboost import XGBClassifier
 
     search = HalvingRandomSearchCV(

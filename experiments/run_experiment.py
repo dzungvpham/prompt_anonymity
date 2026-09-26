@@ -1,20 +1,17 @@
 #!/usr/bin/env python
 """Rolling-window authorship attribution on the unified prompt dataset.
 
-**The** experiment runner. It replaced an earlier fixed-split script of the same name (removed
-2026-08-04, recoverable from git history), which read the pre-unification per-dataset CSVs, ran
-one known/unknown split rather than a configuration grid, and applied a *defense* to the text
-itself as part of the run. Defending is now a build-time step of its own
+**The** experiment runner. Defending happens at build time
 (``prompt_anonymity.data.apply_defenses`` then ``compute_features --defense``), so ``--defense``
-here selects which already-defended vectors to attack and rewrites nothing. The one capability
-that left with the old script was ``--fidelity``, its LLM-judge scoring of how much of a prompt a
-defense preserved; that subpackage is now :mod:`prompt_anonymity.evaluation.utility` and has its own driver,
-``experiments/eval_utility.py``, run separately over the same defended parquet.
+here selects which already-defended vectors to attack and rewrites nothing. Utility scoring
+(how much of a prompt a defense preserved) lives separately in
+:mod:`prompt_anonymity.evaluation.utility`, run via ``experiments/eval_utility.py`` over the same
+defended parquet.
 
 1. **Input is the built parquet pair.** ``<split>.parquet`` (documents) joined on ``doc_id`` to
    ``<split>_<feature>.parquet`` (precomputed vectors from
-   ``prompt_anonymity/data/compute_features.py``). No
-   featurization, no defense, no GPU: this script only reads vectors that already exist.
+   ``prompt_anonymity/data/compute_features.py``). No featurization, no defense, no GPU: this
+   script only reads vectors that already exist.
 
 2. **Interval known sides against one held-out test set.** Documents are ordered by ``ended_at``.
    The **final ``--test-fraction`` of the corpus (default 25%) is held out from every known side**
@@ -38,9 +35,9 @@ defense preserved; that subpackage is now :mod:`prompt_anonymity.evaluation.util
    ==========  =============  ======  =====================
 
    Read the gap-0 rows against each other for the **volume** effect at fixed recency, and the
-   three 25%-size rows for the **staleness** effect at fixed volume. Under the old prefix sweep
-   both moved together and neither could be measured. The grid is triangular by necessity -- a
-   75%-size known side cannot also be two quarters stale -- so there is no seventh cell.
+   three 25%-size rows for the **staleness** effect at fixed volume. The grid is triangular by
+   necessity -- a 75%-size known side cannot also be two quarters stale -- so there is no seventh
+   cell.
 
    Each configuration still **scores its whole remaining future**, not just the test set: it costs
    only a matmul and it is what feeds the weekly temporal-decay figure. Restricting to the shared
@@ -48,10 +45,9 @@ defense preserved; that subpackage is now :mod:`prompt_anonymity.evaluation.util
 
    Comparing configurations on their own in-set documents mixes attack strength with
    **enrollment reach**: a larger or fresher known side enrolls more users, so it scores more
-   test documents, and the extra ones are systematically easier. Measured on swe-chat, tripling
-   the known side lifts top-1 by +0.133 unpaired but only +0.008 on the documents all
-   configurations can score. ``plot_results.py`` therefore reports per-config accuracy as the
-   headline and every *claim about an axis* on the paired intersection.
+   test documents, and the extra ones are systematically easier. ``plot_results.py`` therefore
+   reports per-config accuracy as the headline and every *claim about an axis* on the paired
+   intersection.
 
 3. **The candidate pool can be narrowed by language** (``--language-aware``, off by default).
    Language is metadata an attacker reads straight off an anonymous document, and prompt
@@ -71,16 +67,14 @@ The attack
 The known side is fully labelled -- it is the attacker's own data -- so the scorer is **trained**
 on it rather than being a fixed distance. ``--attacks`` selects one or more from
 :data:`prompt_anonymity.attacks.ATTRIBUTION_ATTACKS`, each run against every window; the default
-is multinomial logistic regression over the known authors, which measured best by a wide margin.
-Unknown documents contribute nothing but their StyloMetrix vectors, and no unknown label is read
-anywhere in this pipeline.
+is multinomial logistic regression over the known authors. Unknown documents contribute nothing
+but their feature vectors, and no unknown label is read anywhere in this pipeline.
 
-Supervision is what makes the attack work. Cosine to an author centroid treats every StyloMetrix
+Supervision is what makes the attack work. Cosine to an author centroid treats every feature
 direction as equally informative, but some vary wildly *within* an author (noise) while others
-separate authors (signal). With ~124 candidates that mistake is fatal: the best of 124 impostor
-distances lands closer than a genuine match, so the nearest centroid is usually the wrong one.
-On the 75% window, learning the weighting instead doubles top-1 (0.129 -> 0.258) and lifts
-out-of-set AUROC from 0.523 to 0.631.
+separate authors (signal); with a large candidate pool that mistake is fatal, since the best of
+many impostor distances lands closer than a genuine match. Learning the weighting instead of
+using a fixed distance substantially improves both closed-set and open-set accuracy.
 
 Language-aware attribution (``--language-aware``, off by default)
 -----------------------------------------------------------------
@@ -94,21 +88,19 @@ once per window on the whole known side exactly as it would be otherwise, and th
 writes ``-inf`` into the ineligible (document, author) cells before anything reads the matrix.
 Two things follow. The comparison is clean -- the fitted model is identical to the unfiltered
 run's, so the difference between the two runs is the pruning and nothing else. And the cost is
-flat: one fit per window rather than one per language group, which is what makes it runnable on
-WildChat's **181 distinct language sets** (SWE-chat has 12). The work is done group by group
+flat: one fit per window rather than one per language group. The work is done group by group
 (:func:`language_candidate_groups`): the eligible-author mask depends only on a document's *set*
 of languages, so it is derived once per distinct set and applied to that group's rows at once.
 
-**Read the baselines, not the accuracy.** Narrowing 19,000 candidates to 300 raises top-1 whether
-or not the attack learned anything, so every chance baseline is recomputed against each
-document's own pool -- ``random_id<k>``, ``random_conv``, ``random_mrr``,
-``mean_percentile_rank``, the CMC ``random`` column, and the new ``random_top1_candidate_pool``
--- and only the ``advantage`` columns say whether the attack itself improved. ``rolling_results.csv``
-also carries what the filter costs: ``n_true_author_pruned`` counts in-set documents whose own
-author writes none of their languages on the known side and who are therefore now unattributable,
-and ``n_language_fallback`` counts documents kept on the full pool because *no* known author
-writes their language (the filter has no evidence there, and an empty pool would leave every
-metric undefined for them).
+**Read the baselines, not the accuracy.** Narrowing the candidate pool raises top-1 whether or not
+the attack learned anything, so every chance baseline is recomputed against each document's own
+pool -- ``random_id<k>``, ``random_conv``, ``random_mrr``, ``mean_percentile_rank``, the CMC
+``random`` column, and ``random_top1_candidate_pool`` -- and only the ``advantage`` columns say
+whether the attack itself improved. ``rolling_results.csv`` also carries what the filter costs:
+``n_true_author_pruned`` counts in-set documents whose own author writes none of their languages
+on the known side and who are therefore now unattributable, and ``n_language_fallback`` counts
+documents kept on the full pool because *no* known author writes their language (the filter has
+no evidence there, and an empty pool would leave every metric undefined for them).
 
 ``--tune`` searches the unfiltered task, which is the consistent choice rather than an
 oversight: the filter does not change what is fitted, so the model a language-aware run scores
@@ -134,41 +126,40 @@ each other on the same documents; ``margin_*`` is recorded on **every** run, wit
 background pool, because a base run is what a background run has to be compared to.
 
 Only the multiclass attacks fit a class per label, so ``--background`` is rejected for the
-similarity family rather than silently ignored. On WildChat that means ``logistic_sgd``: see
+similarity family rather than silently ignored. See
 :class:`~prompt_anonymity.attacks.multiclass.MinibatchLogisticAttribution` for why the plain
-``logistic`` cannot be fitted at 19,711 authors at all.
+``logistic`` cannot be fitted at WildChat's author count at all.
 
 The reject option (``--ood reject``, off by default)
 ----------------------------------------------------
 Raw scores are not comparable across documents -- a short, generic document scores low against
 *every* author -- so the accept/reject decision uses a **cohort-normalised** score: each
 document's scores are z-scored across the candidate authors, and the rejection score is the
-negated maximum (:func:`prompt_anonymity.attacks.rejection_score`). Worth ~0.09 of DIR@10%.
+negated maximum (:func:`prompt_anonymity.attacks.rejection_score`).
 
 The threshold is calibrated **from the known side alone** (:func:`calibrate_threshold`), by
 simulating the task inside it: enrol 70% of the known authors, treat the rest as never-seen
 impostors, and score held-out documents from both. Two things make that simulation usable:
 
 * The two conditional rates -- P(reject | out-of-set) and P(correct and accepted | in-set) --
-  are measured separately and only then combined under an assumed out-of-set rate. Mixing them
-  at the simulation's own proportion (~60% out-of-set, nothing like reality) is what made an
-  earlier version reject 95% of everything.
+  are measured separately and only then combined under an assumed out-of-set rate, rather than
+  mixed at the simulation's own (unrealistic) proportion.
 * That rate is itself forecast from known data by :func:`estimate_ood_prior`, which replays the
   same chronological split *inside* the known window. The unknown window is never inspected.
 
 What gets measured
 ------------------
-Top-k accuracy is three samples of a ranking over 80-125 candidate authors, so the closed-set
-tables are backed by the fuller families in :mod:`prompt_anonymity.evaluation.metrics` (all computed from
-the one score matrix, see :func:`closed_set_detail`):
+Top-k accuracy is a sample of a ranking over the candidate authors, so the closed-set tables are
+backed by the fuller families in :mod:`prompt_anonymity.evaluation.metrics` (all computed from the
+one score matrix, see :func:`closed_set_detail`):
 
 * **Whole ranking** -- ``mrr``, ``median_rank``, ``mean_percentile_rank``, and the complete CMC
   curve. Percentile rank is the only accuracy-like number here that is comparable across
   windows whose candidate pools differ in size, which the sweep guarantees they do.
 * **Per user rather than per document** -- ``macro_conv_acc<k>``, ``macro_f1``, and a per-author
-  risk table. The document-weighted headline is not wrong, but on this corpus one author owns a
-  fifth of a window's documents, and the macro view answers the question a privacy claim needs:
-  how exposed is a *typical* user, and how wide is the spread.
+  risk table. The document-weighted headline can be dominated by a handful of prolific authors,
+  and the macro view answers the question a privacy claim needs: how exposed is a *typical*
+  user, and how wide is the spread.
 * **Retrieval** -- ``map`` / ``mean_r_precision``, running each known author as a query against
   the anonymous documents ("find everything this person wrote"), a different threat model from
   identification and the only direction where MAP is not a restatement of MRR.
@@ -209,19 +200,14 @@ The search is :class:`sklearn.model_selection.HalvingRandomSearchCV`: sample
 ``--tune-candidates`` configurations from :data:`HYPERPARAMETER_SPACES`, score them on a small
 subsample of each fold's training block, discard all but the best ``1/--tune-factor``, triple the
 data, repeat. Sampling rather than gridding also allows continuous ranges for ``C`` and the
-learning rate, and lets xgboost past 300 trees -- the old grid's maximum, which it selected in
-every single window, meaning the grid rather than the data was setting that answer.
+learning rate, and lets xgboost search past a fixed tree-count ceiling.
 
-**How much this actually saves, measured.** Less than the rung sizes suggest -- 63 minutes
-against the grid's ~75 for the same three-attack sweep, at unchanged accuracy -- and the reason is
-worth knowing before tuning anything bigger. Halving assumes cost is proportional to the sample,
-but these attacks are dominated by the *author count*: on the swe-chat 75% window a logistic fit
-on a ninth of the documents costs 0.23 of the full one, not 0.11, because the 124-class softmax
-and the 196x124 coefficient matrix are the same size either way (xgboost 0.18, and only the SVM,
-whose cost really is superlinear in the sample, gets the full 0.05). So the first rung is the
-expensive one, and ``--tune-candidates`` -- not ``--tune-factor`` -- is the dial that matters.
-The other resources sklearn can halve on are no better here: ``max_iter`` is not a real budget
-because lbfgs converges in 104-215 iterations, well inside the 3,000 it is allowed.
+**Halving saves less than the rung sizes suggest**, because these attacks are dominated by the
+*author count* rather than the sample size: a fit on a fraction of the documents costs much more
+than that fraction of the full one, since the softmax and coefficient matrix are the same size
+either way. So the first rung is the expensive one, and ``--tune-candidates`` -- not
+``--tune-factor`` -- is the dial that matters. ``max_iter`` is not a real halving lever either,
+since lbfgs converges well inside the iterations it is allowed.
 
 The larger saving was never in the search but in how often it runs: it belongs to the known side,
 so it runs once per ``--known-windows`` value and is reused across the attacks that share it
@@ -237,8 +223,7 @@ columns, so a multi-attack run stays one tidy table per file:
   ``gap_weeks``) and the identity-level top-k (``id_acc<k>``, ``random_id<k>``,
   ``n_identities``). ``gap_weeks`` is the real elapsed time between the end of the known side and
   the start of the test set, which is what a staleness axis should be labelled in: documents are
-  not uniformly dense, so one quarter of the corpus is 14.6 weeks on WildChat and 2.9 on
-  swe-chat.
+  not uniformly dense, so a quarter of the corpus spans a different number of weeks per source.
 * ``cmc_results.csv`` -- one row per (known config, attack, k): document-level top-k at every
   k, over the whole unknown side.
 * ``predictions_<stem>.csv`` and ``author_report_<stem>.csv`` -- per document and per author
@@ -320,19 +305,13 @@ NO_DEFENSE_TAG = "base"
 #: ``swe-chat``; it is hashed into every ``author_id``, so it is data rather than a name and did
 #: not follow this spelling.)
 #:
-#: **This is deliberately a subset of ``build_dataset.SOURCES``, which also has ``sharechat``.**
-#: That split publishes no user id -- its ``author_id`` column is null throughout, because a
-#: shared conversation link identifies the conversation and not the person -- and every stage of
-#: this runner is keyed on the author: it enrolls a known side per author, scores an
-#: ``[n_documents x n_authors]`` matrix, and reports per-author metrics. Handed nulls it would
-#: either fail or silently treat the whole corpus as one author. ShareChat exists as a pool of
-#: **out-of-set documents** for the open-set work; adding it here needs code that consumes an
-#: author-less pool on purpose, not a name in this tuple.
+#: **Deliberately a subset of ``build_dataset.SOURCES``**, which also has ``sharechat`` -- that
+#: split has no author (a shared conversation link identifies the conversation, not the person),
+#: and every stage here is keyed on the author, so it belongs as an out-of-set/background pool
+#: (see :data:`BACKGROUND_SOURCES`) rather than a candidate here.
 #:
 #: ``wildchat_small`` is the seeded subset :mod:`prompt_anonymity.data.build_subset` cuts out of
-#: ``wildchat`` for the leave-one-out defense. It is a real split with the same schema and the same
-#: author-keyed structure, so everything below works on it unchanged -- it is simply small enough
-#: that a roughly-quadratic defense and a budget sweep over it finish in an afternoon.
+#: ``wildchat``, with the same schema and author-keyed structure, sized for quicker iteration.
 SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat")
 
 # The extra class: "this document's author is not among the known authors". Not a valid
@@ -400,8 +379,8 @@ DOCUMENT_COLUMNS = ("doc_id", "author_id", "ended_at", "language_primary", "lang
 FEATURE_ROW = "_feature_row"
 
 #: Feature columns read per pass in :func:`read_feature_matrix`. Only sets the size of the
-#: transient Arrow slab (256 x n_documents x 4 B, 177 MB on WildChat); the output is preallocated
-#: whole, so this trades a handful of extra reads of a columnar file against holding the table.
+#: transient Arrow slab; the output is preallocated whole, so this trades a handful of extra reads
+#: of a columnar file against holding the table.
 FEATURE_COLUMN_BATCH = 256
 
 
@@ -412,8 +391,8 @@ def read_feature_matrix(feature_file: pq.ParquetFile, columns: list[str],
     Built column-slab by column-slab into a preallocated output rather than through pandas. The
     obvious ``read_parquet(...)[columns].to_numpy(dtype=float)`` holds three copies of the matrix
     at once -- the Arrow table, its pandas frame, and a **float64** result at double the width --
-    which is 10 GB of peak on WildChat's Gemini vectors for numbers every attack immediately casts
-    back to float32 (see :mod:`prompt_anonymity.attacks.similarity.kernel`).
+    for numbers every attack immediately casts back to float32 anyway (see
+    :mod:`prompt_anonymity.attacks.similarity.kernel`).
 
     ``float32`` is therefore the width the vectors already have on disk and the width they are
     used at; nothing downstream sees a different number. Rows are gathered as each column lands,
@@ -444,7 +423,7 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
     metadata is unchanged by a defense, so it always comes from the undefended ``<split>.parquet``
     -- which is exactly why the two files join on ``doc_id`` at all.
 
-    Some documents carry no timestamp at all (SWE-chat: ~8%, all from one agent), and a
+    Some documents carry no timestamp at all (SWE-chat: a minority, all from one agent), and a
     chronological experiment has to decide where they go. ``undated="drop"`` (the default)
     removes them, because placing an undated document anywhere on the timeline invents an
     ordering and risks handing the attacker a document that is really from the future;
@@ -465,9 +444,8 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
                              + (f" --defense {defense}" if defended else ""))
 
     # Read only the metadata this script actually uses. ``turns`` holds the raw conversation
-    # text and is 98% of the wildchat parquet (1.07 GB of 1.09 GB uncompressed, several times
-    # that once pandas materialises it as Python objects) -- and nothing downstream reads it,
-    # because featurisation already happened. Skipping it is most of this function's footprint.
+    # text and is most of the parquet's size -- and nothing downstream reads it, because
+    # featurisation already happened. Skipping it is most of this function's footprint.
     document_schema = pq.ParquetFile(documents_path).schema_arrow.names
     wanted = [column for column in DOCUMENT_COLUMNS if column in document_schema]
     documents = pd.read_parquet(documents_path, columns=wanted)
@@ -481,10 +459,10 @@ def load_documents_and_features(data_dir, source: str, feature: str, undated: st
                        if column != "doc_id" and column not in document_schema]
 
     # The join is an index lookup, and the vectors never enter the frame. A merged frame would
-    # carry all n_features columns through the filter, the undated cut, the sort and the
-    # reset_index, and pandas copies every column at every one of those steps -- 2.1 GB apiece on
-    # WildChat's 172,509 x 3,072 Gemini matrix, which is what OOM-killed this job. Here only the
-    # metadata moves around and the matrix is permuted exactly once, on the way out.
+    # carry every feature column through the filter, the undated cut, the sort and the
+    # reset_index, and pandas copies the whole thing at every one of those steps -- large enough
+    # to OOM-kill the job on the biggest feature matrices. Here only the metadata moves around and
+    # the matrix is permuted exactly once, on the way out.
     keys = pd.Index(pd.read_parquet(features_path, columns=["doc_id"])["doc_id"])
     if not keys.is_unique:
         raise SystemExit(f"{features_path} repeats a doc_id; the join to documents is one-to-one.")
@@ -589,12 +567,9 @@ def load_background(data_dir, source: str, feature: str, size: int,
     without reference to the split under attack, and no unknown document or label is touched: an
     attacker holding a public dump of chat logs has exactly this.
 
-    **The cost is that the pool is a different corpus, and it is measurable.** A logistic
-    classifier separates 10,000 ShareChat documents from 10,000 WildChat ones at held-out AUROC
-    **0.820** on StyloMetrix (against 0.532 for a WildChat-vs-WildChat control), driven mostly by
-    two verb-tense features -- ``VT_MUST_PROGRESSIVE`` and ``VT_FUTURE_PERFECT`` sit +1.79 and
-    +1.54 WildChat sigma apart. So some of this class's capacity goes on telling the corpora
-    apart rather than on telling strangers from enrolled users.
+    **The cost is that the pool is a different corpus, and that is measurable**: a classifier can
+    partly separate the two corpora on surface features alone, so some of this class's capacity
+    goes on telling the corpora apart rather than on telling strangers from enrolled users.
 
     That confound can only *shrink* the measured effect, which is why the experiment is still
     readable: the out-of-set documents at test time are WildChat users who happen not to be
@@ -734,9 +709,10 @@ def gap_weeks(frame: pd.DataFrame, config: KnownConfig, known: slice) -> float:
 
     The design's staleness axis is defined in *positions* -- equal document counts, which is what
     holds the volume axis exactly fixed -- but positions are not time: documents are far denser
-    early in both corpora, so one quarter of WildChat is 14.6 weeks and one quarter of swe-chat is
-    2.9. Every figure and table should be labelled with this rather than with "quarters", and a
-    cross-dataset staleness axis has to use it. ``nan`` when either end has no usable timestamp.
+    early in both corpora, so the same fraction of the timeline spans very different amounts of
+    real time across corpora. Every figure and table should be labelled with this rather than with
+    "quarters", and a cross-dataset staleness axis has to use it. ``nan`` when either end has no
+    usable timestamp.
     """
     test_index = int(round(config.test_start * len(frame)))
     if known.stop < 1 or test_index >= len(frame):
@@ -804,8 +780,7 @@ def _zscore(block: np.ndarray, center: np.ndarray, scale: np.ndarray) -> np.ndar
 # Language is metadata the attacker gets for free: it is readable straight off an anonymous
 # document, and it is not something prompt anonymisation removes. Restricting each document to
 # the authors already on record as writing one of its languages is therefore a legitimate
-# narrowing of the candidate pool, and on a corpus like WildChat -- 181 distinct language sets,
-# with English and Russian covering two thirds of the documents between them -- it is a large one.
+# narrowing of the candidate pool, and on a multilingual corpus like WildChat it is a large one.
 #
 # Everything below works on the *set* of languages a document is in, ``language_primary`` plus
 # ``language_secondary`` where one was detected, so a document that mixes English and Russian
@@ -859,8 +834,8 @@ def language_candidate_groups(unknown_languages: np.ndarray, known_languages: np
     """``(languages, document_rows, eligible_authors, is_fallback)`` per distinct language set.
 
     Grouping is what makes this cheap. The eligible-author mask depends only on the document's
-    *set* of languages, so it is derived once per distinct set -- 12 on SWE-chat, 181 on WildChat
-    -- rather than once per document, and applied to that group's rows in a single pass.
+    *set* of languages, so it is derived once per distinct set rather than once per document, and
+    applied to that group's rows in a single pass.
 
     ``eligible_authors`` is a boolean over ``authors`` (the columns of the score matrix, in their
     order): true where the author wrote at least one known document in at least one of the
@@ -895,10 +870,10 @@ def apply_language_filter(scores: np.ndarray, authors: np.ndarray, unknown_langu
                           true_labels: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, dict]:
     """Mark every author who does not write a document's language as ineligible, **in place**.
 
-    In place because the alternative is a second copy of a matrix that reaches 4 GB on WildChat;
-    the attacks all return a freshly computed score matrix, so nothing else holds a reference to
-    it. Assignment through :func:`numpy.ix_` with a scalar writes element-wise and allocates
-    nothing beyond the index arrays, which is what keeps this inside the 16 GB job cap.
+    In place because the alternative is a second copy of a matrix that can reach several GB on
+    WildChat; the attacks all return a freshly computed score matrix, so nothing else holds a
+    reference to it. Assignment through :func:`numpy.ix_` with a scalar writes element-wise and
+    allocates nothing beyond the index arrays, which is what keeps this inside the job's memory cap.
 
     Returns ``(candidate_counts, true_author_is_candidate, stats)``:
 
@@ -982,28 +957,18 @@ def build_attack(name: str, args: argparse.Namespace, overrides: dict | None = N
 # (an SVM's ``gamma`` only exists for the RBF kernel, so each kernel is its own sub-space and one
 # is chosen uniformly per draw).
 #
-# These are continuous where the old grids were a handful of points, which is the part of random
-# search that is free: a draw from a range costs exactly what a draw from a list costs. What is
-# *not* free is how expensive an individual draw can be -- see the xgboost note below -- so these
-# ranges are bounded by fit cost rather than by what is plausible. The xgboost range does reach
-# past 300 trees, which every window of the earlier grid search picked: a boundary hit that meant
-# the grid, not the data, was setting that answer.
+# These are continuous rather than a handful of grid points, which is the part of random search
+# that is free: a draw from a range costs exactly what a draw from a list costs. What is *not*
+# free is how expensive an individual draw can be -- see the xgboost note below -- so these ranges
+# are bounded by fit cost rather than by what is plausible.
 # Attacks absent from this mapping have nothing worth tuning and are used as configured.
 HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
-    # The ceiling was 5 until 2026-09-25, for a cost reason (above it lbfgs needs more iterations
-    # to converge), and raised to 100 because char_ngram_tfidf picked the largest candidate below 5
-    # on all six swe-chat configurations -- the optimum was outside the range. Expect slower fits
-    # and a ConvergenceWarning at the top of it; raise max_iter if the warning shows.
     "logistic": {"C": loguniform(0.02, 100.0), "class_weight": [None, "balanced"]},
-    # Same two knobs as `logistic`, over a range that reaches two decades lower. The floor is not
-    # copied from there because the shape of the problem is not the same: at 19,711 authors over
-    # 196 features the model carries 3.9M parameters against 129,382 documents, where swe-chat's
-    # 124 authors carry 24k against 2,992 -- and even at that easier ratio the search picks
-    # C = 0.11 in four of six configurations and never picks the C = 1.0 default. `steps` and
-    # `learning_rate` are deliberately absent: the first is a compute budget rather than a
-    # hyper-parameter, and the second measured insensitive over 0.02-0.1 (same top-1, same final
-    # loss to four decimals), so sampling it would spend the budget learning nothing.
-    # Ceiling raised 5 -> 100 on 2026-09-25, for the reason given under `logistic`.
+    # Same two knobs as `logistic`, over a range that reaches lower. The floor is not copied from
+    # there because the shape of the problem is not the same at a much larger author count. `steps`
+    # and `learning_rate` are deliberately absent: the first is a compute budget rather than a
+    # hyper-parameter, and the second measured insensitive over its useful range, so sampling it
+    # would spend the search budget learning nothing.
     "logistic_sgd": {"C": loguniform(0.002, 100.0), "class_weight": [None, "balanced"]},
     "svm": [
         {"kernel": ["linear"], "C": loguniform(0.1, 30.0)},
@@ -1011,11 +976,10 @@ HYPERPARAMETER_SPACES: dict[str, dict | list[dict]] = {
         {"kernel": ["rbf"], "C": loguniform(1.0, 300.0), "gamma": loguniform(1e-3, 1e-1)},
     ],
     # An xgboost fit costs roughly depth x trees x documents, so this is the one space where
-    # widening is not free -- a first draft reaching depth 8 and 800 trees made the halving search
-    # *slower* than the grid it replaced, having spent the saving on individually huge candidates.
-    # The floor on learning_rate is what keeps the tree count honest: a slow learner needs many
-    # more rounds to pay off, so the cheap way to allow "more trees than the old grid's 300" is to
-    # rule out the configurations that would need thousands of them.
+    # widening is not free -- an overly aggressive range makes the halving search *slower* than a
+    # plain grid, having spent the saving on individually huge candidates. The floor on
+    # learning_rate keeps the tree count honest: a slow learner needs many more rounds to pay off,
+    # so the cheap way to allow more trees is to rule out configurations that would need thousands.
     "xgboost": {
         "n_estimators": [100, 200, 300, 500],
         "max_depth": [2, 3, 4, 6],
@@ -1168,10 +1132,9 @@ def halving_budget(n_known: int, n_authors: int, n_candidates: int, factor: int)
     winner's ``known_cv_top1`` a full-size number, comparable across searches and against a
     non-halving baseline.
 
-    (Getting this wrong is not loud: at six candidates and factor three an earlier version ran two
-    rounds ending at a *third* of the known side, which cost only ~0.006 of measured top-1 but
-    moved every reported known-side CV score down by a uniform ~0.055, purely because they were
-    measured on less data.)
+    (Getting this wrong is not loud: an under-anchored search still finds a reasonable winner, but
+    every reported known-side CV score is quietly lower across the board, purely because they were
+    measured on less data than the search's own last rung.)
 
     The one floor: a rung with fewer than ~2 documents per author is not the task being tuned for,
     and every candidate scores near zero there.
@@ -1206,14 +1169,9 @@ def tune_on_known(name: str, embeddings: np.ndarray, labels: np.ndarray,
     have been selected partly on documents that ``known0025`` must attribute, which is exactly the
     leak the per-configuration search exists to avoid.
 
-    **What it costs, measured.** Against the exhaustive grid this replaced -- same eight windows,
-    same folds, same criterion -- it is roughly a wash for a fifth less wall clock (63 vs ~75
-    minutes for ``--attacks logistic svm xgboost --tune``). Mean unknown-side top-1 moved by
-    -0.001 over the 24 runs, with halving ahead in 9 of them: logistic 0.265 -> 0.254, svm
-    0.279 -> 0.291, xgboost 0.311 -> 0.308. On its own known-side criterion the selected
-    configuration scored -0.010 (logistic), -0.006 (svm) and +0.003 (xgboost) against the grid's
-    best, so the cheaper search is choosing about as well, and the wider continuous ranges make
-    up most of what the coarser search loses.
+    Against an exhaustive grid over the same folds and criterion, this is roughly a wash in final
+    accuracy for meaningfully less wall clock; the wider continuous ranges make up most of what the
+    coarser halving search loses relative to a full grid.
 
     The failure mode to watch for is a first rung that ranks candidates differently from a
     full-size fit -- an RBF SVM that beats every linear one on all the data can sit below them on
@@ -1290,10 +1248,9 @@ def load_tuned_settings(source: Path, attacks, tags) -> dict[tuple[str, str], di
     Backs ``--tuned-from``. A defended run with the default ``--known-defense none`` tunes on the
     **undefended** known side -- the same vectors, labels, folds and seeded candidates as the base
     run -- so its search is a repeat of the base run's and must pick the same settings; this reads
-    them instead of spending the search again (9 h 47 m against 69 min on WildChat
-    ``char_ngram_tfidf``/``logistic_sgd``). The values come from ``tuning_trials.csv``'s selected
-    rows at full precision, not from ``rolling_results.csv``, whose column is rounded to four
-    significant figures.
+    them instead of spending the search again. The values come from ``tuning_trials.csv``'s
+    selected rows at full precision, not from ``rolling_results.csv``, whose column is rounded to
+    four significant figures.
 
     The returned dict has the shape of :func:`tuned_settings`' cache, which is what it is loaded
     into. An attack with no registered space needs nothing and gets ``{}``. An attack **with** one
@@ -1402,9 +1359,9 @@ def estimate_ood_prior(known_labels: np.ndarray, known_fraction: float, window: 
 
     The rate is forecastable, though, without touching the unknown side: replay the same
     chronological split *inside* the known window and measure how many documents in its final
-    slice came from authors absent earlier. On swe-chat this lands at 0.13-0.36 against a true
-    0.18-0.30 -- imperfect, but far closer than the simulation's implicit prior, and it is exactly
-    the kind of estimate a real attacker could make from their own history.
+    slice came from authors absent earlier. Imperfect, but far closer than the simulation's
+    implicit prior, and it is exactly the kind of estimate a real attacker could make from their
+    own history.
     """
     known_labels = np.asarray(known_labels)  # already in chronological order
     cut = int(round(len(known_labels) * known_fraction / (known_fraction + window)))
@@ -1711,15 +1668,15 @@ def split_background(scores: np.ndarray, authors: np.ndarray) -> tuple[np.ndarra
     peaked the author scores happen to be, and which is kept alongside it so the two can be read
     against each other on the same run.
 
-    Both reductions run in row blocks against the same budget as everything else here:
-    ``logsumexp`` over a 43,127 x 19,711 matrix is another float64 copy of it if taken in one go.
+    Both reductions run in row blocks against the same memory budget as everything else here:
+    ``logsumexp`` over the full score matrix is another float64 copy of it if taken in one go.
 
     **The author block is a slice, not a fancy index**, which is why the background column's
-    position is asserted rather than assumed. Dropping one column of a 3.4 GB matrix with a
-    boolean mask copies all of it, and the copy would be live alongside the original -- 6.8 GB at
-    ``known0075``, on a run whose measured peak is already 14.6 GB against a 16 GB cap.
-    :data:`BACKGROUND_LABEL` begins with ``<``, and every real ``author_id`` with a source name,
-    so ``np.unique`` always sorts it to the front and the real authors are a contiguous tail.
+    position is asserted rather than assumed. Dropping one column of a large matrix with a boolean
+    mask copies all of it, and the copy would be live alongside the original -- doubling peak
+    memory on a job that is already close to its cap. :data:`BACKGROUND_LABEL` begins with ``<``,
+    and every real ``author_id`` with a source name, so ``np.unique`` always sorts it to the front
+    and the real authors are a contiguous tail.
     """
     column = int(np.flatnonzero(authors == BACKGROUND_LABEL)[0])
     if column != 0:
@@ -1769,8 +1726,8 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     matrix. Keeping the fit global is what makes the comparison clean -- the model is byte for
     byte the one an unfiltered run uses, so the difference between the two runs is the pruning
     and nothing else -- and it is also what keeps the cost flat: one fit per window rather than
-    one per language group, which is the difference between running and not running on WildChat's
-    181 groups.
+    one per language group, which is the difference between running and not running on a corpus
+    with many distinct language sets.
     """
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
     # The two sides may come from DIFFERENT feature matrices. By default the known side is the
@@ -1863,11 +1820,10 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # ``plot_results.py`` rebuilds the shared test set's CMC without re-running the attack. Documents
     # whose author is not on the known side have no rank (no correct answer exists) and stay NaN.
     document_ranks = np.full(len(unknown_labels), np.nan)
-    # The in-set rows are taken **once** and the full matrix released. At WildChat's scale the
-    # matrix is 4.7 GB (86,255 unknown x 13,694 authors, float32) and every `author_scores[in_set]`
-    # is a fresh copy of most of it, so slicing it in three places -- here, for the closed-set
-    # table, and for the CMC -- put four multi-gigabyte arrays live at once and was killed by the
-    # 16 GB job cap. Nothing below this point reads the full matrix.
+    # The in-set rows are taken **once** and the full matrix released. `author_scores[in_set]` is
+    # a fresh copy of most of the matrix, so slicing it in several places (here, for the
+    # closed-set table, and for the CMC) can put multiple multi-gigabyte arrays live at once and
+    # blow the job's memory cap. Nothing below this point reads the full matrix.
     in_set_scores = author_scores[in_set]
     in_set_labels = unknown_labels[in_set]
     del author_scores
@@ -2183,15 +2139,12 @@ def parse_args() -> argparse.Namespace:
                         help="Z-score features using known-side statistics before scoring "
                              "(default: on; disable with --no-standardize). StyloMetrix mixes "
                              "ratios in [0, 1] with raw counts, so without scaling a handful of "
-                             "wide-range columns dominate every method. Measured on swe-chat: "
-                             "centroid top-1 0.055 unscaled vs 0.136 standardized, and "
-                             "nearest-neighbour top-1 0.092 vs 0.154.")
+                             "wide-range columns dominate every method.")
     parser.add_argument("--attacks", nargs="+", default=["logistic"],
                         choices=sorted(ATTRIBUTION_ATTACKS),
                         help="Attack(s) fitted on the known side, from "
                              "prompt_anonymity.attacks.ATTRIBUTION_ATTACKS; every window runs "
-                             "each of them (default: logistic, the best measured on swe-chat -- "
-                             "see that module for the comparison). 'cosine' is the unsupervised "
+                             "each of them (default: logistic). 'cosine' is the unsupervised "
                              "centroid baseline and 'nearest_neighbor' the original attack.")
     parser.add_argument("--background", default="none",
                         choices=["none", *sorted(BACKGROUND_SOURCES)],
@@ -2206,9 +2159,9 @@ def parse_args() -> argparse.Namespace:
                              "cohort-normalised accept_score. Only the multiclass attacks fit a "
                              "class per label, so this is rejected for the similarity family.")
     parser.add_argument("--background-size", type=int, default=20000,
-                        help="Documents drawn from the --background pool (default: 20,000, ~13%% "
-                             "of WildChat's largest known side). This is the dial for how heavily "
-                             "the extra class counts, but only while --balanced is off (the "
+                        help="Documents drawn from the --background pool (default: 20,000). This "
+                             "is the dial for how heavily the extra class counts, but only while "
+                             "--balanced is off (the "
                              "default): the raw document count is then its prior. Under "
                              "--balanced every class carries equal total weight, so the "
                              "background pool counts for as much as one single-document author "
@@ -2217,8 +2170,7 @@ def parse_args() -> argparse.Namespace:
                         help="Inverse regularisation strength C for the logistic attack (default: 1).")
     parser.add_argument("--balanced", action="store_true",
                         help="Weight known authors equally in the logistic attack. Off by "
-                             "default: the document counts are genuinely informative priors, and "
-                             "leaving them in measured better (top-1 0.258 vs 0.252).")
+                             "default: the document counts are genuinely informative priors.")
     parser.add_argument("--shrinkage", type=float, default=0.2,
                         help="Covariance shrinkage for the wccn / plda attacks (default: 0.2).")
     parser.add_argument("--xgboost-device", default="cpu", choices=["cpu", "cuda", "auto"],
@@ -2227,9 +2179,7 @@ def parse_args() -> argparse.Namespace:
                              "CUDA and a device is visible. Not the default because the GPU "
                              "builder sums gradients in a different order and can pick different "
                              "splits, which would make a run reproducible only on the same kind "
-                             "of machine. How much it helps on these windows is unmeasured: they "
-                             "have ~10^3 rows, well below where a GPU normally pays off, though "
-                             "the wide feature axis works in its favour.")
+                             "of machine.")
     parser.add_argument("--tuned-from", default=None, metavar="base|DIR",
                         help="Skip the hyper-parameter search and reuse the settings another run "
                              "selected, per (attack, known configuration), from its "
@@ -2264,11 +2214,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tune-candidates", type=int, default=6,
                         help="Configurations sampled per --tune search, i.e. the width of the "
                              "first halving rung (default: 6). This is the main speed dial. A "
-                             "first-rung fit is not free -- measured on swe-chat it costs ~0.2 of "
-                             "a full-size one, not the 1/9 its data share suggests, because the "
-                             "124-class softmax and the 196x124 coefficient matrix do not shrink "
-                             "with the sample -- so 12 candidates spend ~2.5 full fits before the "
-                             "search has narrowed anything. Raise it when the search is picking "
+                             "first-rung fit is not free -- its cost is dominated by the author "
+                             "count rather than the sample size, so it does not shrink in "
+                             "proportion to its data share. Raise it when the search is picking "
                              "implausible configurations, not by default.")
     parser.add_argument("--tune-factor", type=int, default=3,
                         help="Halving aggressiveness (default: 3): each rung keeps the best "

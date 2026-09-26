@@ -9,12 +9,9 @@ toward a shared identity. The featurize stage re-derives features from the scrub
 
 The scrubber runs **locally, through vLLM** -- ``gpt-oss-safeguard-120b`` from a checkpoint on this
 machine by default (:data:`OPENANON_MODEL`), a safety-tuned sibling of ``gpt-oss-120b`` sharing its
-architecture, tokenizer and harmony chat format, so the backend needs no special handling for it --
-not against a hosted API. Two things follow. Cost is GPU
-hours rather than per-token billing, which is what makes a whole-corpus run affordable: scrubbing
-WildChat per turn is ~600K generations, and the prompts are dominated by the ~1K-token system
-prompt that a local model re-reads for free. And the prompts never leave the cluster, so the
-scrubber does not itself have to be trusted with the data it de-identifies.
+architecture, tokenizer and harmony chat format -- not against a hosted API. That makes a
+whole-corpus run affordable (GPU hours rather than per-token billing) and keeps the prompts on the
+cluster, so the scrubber never has to be trusted with the data it de-identifies.
 
 It needs a GPU large enough for the model (gpt-oss-120b is a 61 GB MXFP4 checkpoint -- one 80 GB
 A100/H100, or several smaller GPUs via :data:`OPENANON_TENSOR_PARALLEL_SIZE`). The model is built
@@ -54,11 +51,8 @@ OPENANON_TOP_P = 1.0
 OPENANON_OUTPUT_TAG = "scrubbed_prompt"
 
 #: Scrub through OpenRouter instead of a local engine, e.g. ``openai/gpt-oss-120b``. Empty (the
-#: default) keeps the local vLLM path exactly as it was.
-#:
-#: This exists because the local checkpoint is 120B and is NOT mirrored under /datasets/ai: a local
-#: run resolves ``models.toml``'s bare repo id and downloads ~60 GB into $HF_HOME, which on a
-#: cluster still pointing at a home directory is a filled quota rather than a slow start. It is in
+#: default) keeps the local vLLM path. Exists as an escape hatch for when the local checkpoint isn't
+#: mirrored and a local run would otherwise download tens of GB; it is in
 #: :meth:`OpenAnonymityDefense.params`, so an API run and a local run never share a cache entry.
 OPENANON_API_MODEL = os.environ.get("OPENANON_API_MODEL", "")
 
@@ -92,11 +86,9 @@ OPENANON_REASONING_BUDGET = int(os.environ.get("OPENANON_REASONING_BUDGET", "102
 OPENANON_OUTPUT_RATIO = float(os.environ.get("OPENANON_OUTPUT_RATIO", "1.5"))
 #: Slack for the wrapper/template tokens the budget arithmetic cannot see exactly.
 OPENANON_TOKEN_MARGIN = int(os.environ.get("OPENANON_TOKEN_MARGIN", "256"))
-#: Rows defended between cache flushes. A run over a full corpus takes hours, so it checkpoints: a
-#: killed run resumes from the last flush instead of restarting (see
-#: :meth:`~prompt_anonymity.caching.IndexedRowCache.apply`). Each flush rewrites the cache table
-#: whole, so flushing too often is quadratic in the table's size -- another reason a large corpus
-#: wants to be run in shards, which bound that table as well as the runtime.
+#: Rows defended between cache flushes, so a killed run resumes from the last flush instead of
+#: restarting. Each flush rewrites the cache table whole, so flushing too often is quadratic in the
+#: table's size -- another reason a large corpus wants to be run in shards.
 OPENANON_CHECKPOINT_EVERY = int(os.environ.get("OPENANON_CHECKPOINT_EVERY", "1000"))
 
 OPENANON_SYSTEM_PROMPT = """
@@ -306,9 +298,9 @@ class _OpenAnonBackend:
         )
         self.tokenizer = self.llm.get_tokenizer()
 
-        # What one request costs before any of the user's text: the system prompt, the wrapper and
-        # the chat template's own tokens. Measured through the real template rather than estimated,
-        # since it is subtracted from the window every request.
+        # What one request costs before any of the user's text: system prompt + wrapper + chat
+        # template tokens. Measured through the real template, since it's subtracted from the
+        # window on every request.
         self.fixed_prompt_tokens = self._render_tokens("")
         # The longest turn fragment that leaves room for its own rewrite. Prompt and completion
         # share one window, so a fragment of T tokens needs fixed + T for the prompt and up to
@@ -331,16 +323,13 @@ class _OpenAnonBackend:
     def _render_tokens(self, text: str) -> int:
         """Token length of the full chat request for ``text`` -- system prompt, wrapper, template.
 
-        Called once at startup, on the empty prompt, to measure the fixed part. Per request the
-        length is *added up* instead (:attr:`fixed_prompt_tokens` + the text's own tokens) rather
-        than re-rendered: the template never changes, so re-templating it for every turn would
-        re-tokenize the ~1K-token system prompt hundreds of thousands of times to learn a number
-        that is already known. The seam between the two is what :attr:`token_margin` covers.
+        Called once at startup, on the empty prompt, to measure the fixed part; per request the
+        length is added up (:attr:`fixed_prompt_tokens` + the text's own tokens) instead of
+        re-rendered, since the template never changes. :attr:`token_margin` covers the seam.
 
-        ``apply_chat_template`` returns either a list of ids or a ``BatchEncoding`` depending on the
-        tokenizer and transformers version -- and ``len()`` of the latter is its *field count* (2),
-        not a token count, which would silently hand back a fixed cost of 2 tokens for a 1,000-token
-        prompt and leave every generation budget over-sized. Unwrap it explicitly.
+        ``apply_chat_template`` can return either a list of ids or a ``BatchEncoding`` depending on
+        the tokenizer/transformers version, and ``len()`` of the latter is its field count, not a
+        token count -- unwrap it explicitly rather than silently mis-sizing every budget.
         """
         rendered = self.tokenizer.apply_chat_template(
             self._conversation(text), add_generation_prompt=True, tokenize=True,
@@ -489,10 +478,9 @@ OPENANON_API_WORKERS = int(os.environ.get("OPENANON_API_WORKERS", "8"))
 class _OpenAnonAPIBackend:
     """The same scrubber, served by OpenRouter instead of a local vLLM engine.
 
-    Exists because the checkpoint is 120B: ``models.toml`` names it as a bare repo id, so a local
-    run DOWNLOADS ~60 GB into ``$HF_HOME`` on first use unless the weights are already mirrored --
-    which on this cluster they are not, and which has filled a disk quota once already. Renting the
-    weights by the token is the cheaper and far less fragile way to get this arm measured.
+    Exists because the checkpoint is 120B and, unmirrored, a local run would download tens of GB into
+    ``$HF_HOME``; renting the weights by the token is the cheaper, less fragile way to get this arm
+    measured.
 
     Deliberately mirrors :class:`_OpenAnonBackend`'s contract rather than sharing code with it:
     same system prompt, same input template, same :func:`parse_scrubbed_output`, same
@@ -580,8 +568,7 @@ class OpenAnonymityDefense(PerTurnBatchRewriteDefense):
     """
 
     name = "openanonymity"
-    # 2: the scrubber moved from the OpenRouter API to a local vLLM model. The rewrites differ, and
-    # the class source hash would have caught it anyway -- this is the explicit record of why.
+    # 2: scrubber moved from the OpenRouter API to a local vLLM model; rewrites differ.
     version = "2"
     checkpoint_every = OPENANON_CHECKPOINT_EVERY
 
@@ -592,19 +579,14 @@ class OpenAnonymityDefense(PerTurnBatchRewriteDefense):
         self.system_prompt = system_prompt
         self.reasoning_effort = reasoning_effort
         #: Set (by ``$OPENANON_API_MODEL``, or explicitly) to scrub through OpenRouter instead of a
-        #: local engine. The 120B checkpoint is not mirrored on this cluster, so a local run would
-        #: download ~60 GB; renting it by the token is what makes this arm runnable at all.
+        #: local engine (see :data:`OPENANON_API_MODEL`).
         self.api_model = api_model if api_model is not None else OPENANON_API_MODEL
         self._backend = None
 
     def params(self) -> dict:
-        # What determines the (greedy) scrub: the model, the prompt it is given, and how much it
-        # thinks first. The prompt is a module constant, not covered by the class source hash, so
-        # include it verbatim so an edit re-caches.
-        #
-        # `api_model` is in here because it changes WHICH WEIGHTS ANSWER -- unlike a serving knob,
-        # this genuinely changes the output, and a local run and an API run must never share a cache
-        # entry. Absent (the local path) it stays out, so existing local caches keep hitting.
+        # The prompt is a module constant, not covered by the class source hash, so it's included
+        # verbatim so an edit re-caches. `api_model` changes which weights answer, so it must never
+        # share a cache entry with the local path; absent, it stays out so existing caches still hit.
         base = {"model": self.model, "system_prompt": self.system_prompt,
                 "reasoning_effort": self.reasoning_effort}
         return {**base, "api_model": self.api_model} if self.api_model else base

@@ -1,13 +1,7 @@
 """The dataset build pipeline: raw upstream corpora in, the unified public dataset out.
 
-This package used to hold a second family of modules beside the build pipeline -- per-dataset
-*loaders* (``splits.py``, ``wildchat.py``, ``swe_chat.py``) that read the pre-unification CSVs,
-applied a dataset-specific known/unknown split and returned an
-:class:`~prompt_anonymity.core.AttackData` for a defense and an attack. Their only caller was the
-fixed-split experiment runner, and both went on 2026-08-04: the split is now a property of the
-*experiment* (``experiments/run_experiment.py`` cuts the timeline into known intervals itself,
-straight from the built parquets), not of a loader. Recover them from git history if the
-per-dataset CSV path is ever needed again.
+The known/unknown split is a property of the experiment runner, not of a loader here -- this
+package only builds and validates the dataset.
 
 The pipeline's entry points are meant to be run as scripts, in this order:
 
@@ -37,8 +31,6 @@ machine.
 
 from __future__ import annotations
 
-# Deliberately empty of re-exports. Every module here is either a script (`python -m
-# prompt_anonymity.data.<name>`) or a stage imported by one, so importing this package should cost
-# nothing: `build_dataset` alone pulls in pyarrow, the raw-source adapters and language detection,
-# which is not a price `import prompt_anonymity.data` should pay to reach `config.data_dir`.
+# Deliberately empty of re-exports: every module here is a script or a stage imported by one, so
+# importing this package should not pull in any of their heavy dependencies.
 __all__: list[str] = []

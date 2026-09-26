@@ -10,8 +10,8 @@ directly and never opens ``experiments/results/``, so it needs no experiment to 
 question is the one every attack in this project rests on -- **do a user's documents sit together
 in embedding space at all?** -- and it answers it by eye rather than by a metric.
 
-**Every document in the corpus is projected**, all 172,509 of WildChat's from all 25,357 users;
-nothing is sampled away. What makes that legible is that the figure has two layers rather than one:
+**Every document in the corpus is projected**, nothing is sampled away. What makes that legible
+is that the figure has two layers rather than one:
 
 *context*
     every document that is not in focus, as a **grey density field** -- a fine 2D histogram,
@@ -77,9 +77,9 @@ from plot_results import (  # noqa: E402
 #: expensive half, minutes on WildChat against seconds to draw.
 CACHE_DIR = REPO_ROOT / "experiments" / ".cache" / "umap"
 
-#: The feature to project when ``--feature`` is not given. The semantic vectors are the ones worth
-#: looking at: they carry more than double StyloMetrix's attribution accuracy, so they are where a
-#: by-eye cluster is expected to show up at all.
+#: The feature to project when ``--feature`` is not given. The semantic embedding is the one worth
+#: looking at: it carries far more attribution signal than the surface-statistic featurizers, so
+#: it is where a by-eye cluster is expected to show up at all.
 DEFAULT_FEATURE = "gemini_embedding_2"
 
 #: Sentinel for ``--focus-users all``: colour *every* user, leaving no grey field at all.
@@ -88,18 +88,13 @@ ALL_USERS = -1
 #: How many users are drawn in colour, most prolific first, when ``--focus-users`` is not given --
 #: **a property of the corpus, because the two corpora differ by two orders of magnitude in users.**
 #:
-#: SWE-chat's 157 users all fit: measured, a 157-colour palette still holds a minimum pairwise
-#: CIELAB separation of 14.3 (median nearest 16.4), roughly six times the just-noticeable
-#: difference, so no two users collide even though no reader could hold 157 colours in their head.
-#: That is the right reading of this figure anyway -- with no legend and no labels, colour marks a
-#: cluster's *extent and coherence*, not which person it belongs to.
+#: SWE-chat's user count all fits in one palette with no two users colliding, even though no
+#: reader could hold that many colours in their head -- which is the right reading of this figure
+#: anyway: with no legend and no labels, colour marks a cluster's *extent and coherence*, not
+#: which person it belongs to.
 #:
-#: WildChat's 25,357 cannot, so it takes a focus set over the grey field. **250 is where the
-#: palette stops being comfortable, not an arbitrary round number**: the sRGB gamut is 820,338
-#: dE^3 in CIELAB and 503,417 after the bounds below, which sphere-packs to ~211 colours at a
-#: comfortable dE 15 and ~712 at dE 10, the floor for marks this small. Measured, the construction
-#: below holds dE 12.1 at 250 and 9.0 at 500 -- so 250 sits just under the comfortable bound and
-#: 500 would be at the limit of what reads apart at all.
+#: WildChat's far larger user count cannot, so it takes a focus set over the grey field. 250 is
+#: near where the palette stops being comfortably distinct at this mark size.
 DEFAULT_FOCUS_USERS = {"wildchat": 250, "swe_chat": ALL_USERS}
 
 #: Used for a dataset with no entry above.
@@ -118,11 +113,9 @@ DEFAULT_SEED = 0
 # --- reading the vectors -----------------------------------------------------
 #
 # Read **by column slab, not by row batch**. These parquets hold one row group, so `iter_batches`
-# has nothing to skip and materialises the whole group whatever row filter is applied: measured on
-# WildChat's 3.0 GB file, keeping 20,000 of 172,509 rows still cost 7.9 GB resident, half the
-# cluster's 16 GB cap. Projecting a column slab reads only those column chunks, so the *entire*
-# 172,509 x 3,072 matrix comes back in 8.0 s at 2.58 GB -- less memory for all of it than the row
-# path spent on a tenth of it.
+# has nothing to skip and materialises the whole group whatever row filter is applied, which can
+# cost more memory than the cluster allows even for a small subsample. Projecting a column slab
+# instead reads only those column chunks, so even the whole matrix comes back cheaply.
 
 #: Columns decoded at once. At 172,509 rows a slab of this width is ~177 MB, so peak memory is the
 #: result plus one slab.
@@ -170,16 +163,14 @@ def umap_layout(vectors: np.ndarray, n_neighbors: int, min_dist: float, metric: 
                 seed: int) -> np.ndarray:
     """Project ``vectors`` to two dimensions with UMAP, deterministically.
 
-    ``random_state`` is set, which pins the result at the cost of UMAP's parallel optimiser. That
-    is the right trade and it is cheaper than it sounds: measured over all 172,509 WildChat
-    documents, seeded is 123 s against 72 s unseeded, and a figure that moves between runs cannot
-    be compared with the one in a draft.
+    ``random_state`` is set, which pins the result at the cost of UMAP's parallel optimiser --
+    the right trade, since a figure that moves between runs cannot be compared with the one in a
+    draft.
 
     The vectors are fed **raw**, at their full width, so ``metric`` means exactly what
-    ``run_experiment.py`` means by it. Reducing them with PCA first would roughly halve the time
-    and the memory (259 s / 9.5 GB becomes 134 s / ~5 GB on WildChat) but only by swapping the
-    stated metric for one that merely ranks the same way, which is not worth caveating a figure
-    over.
+    ``run_experiment.py`` means by it. Reducing them with PCA first would be faster but only by
+    swapping the stated metric for one that merely ranks the same way, which is not worth
+    caveating a figure over.
     """
     import umap  # imported lazily: it pulls in numba, seconds of import time for nothing if cached
 
@@ -325,8 +316,7 @@ CONTEXT_RAMP = LinearSegmentedColormap.from_list("context", [SURFACE, "#e6e5e1",
                                                              "#52514e"])
 
 #: Bins per side of the density histogram. Fine enough that the field keeps the grain of individual
-#: documents rather than reading as blocks -- at this resolution WildChat fills 69,934 of the 1.44M
-#: cells, so the field is nearly a scatter, which is the texture it is wanted for.
+#: documents rather than reading as blocks, which is the texture it is wanted for.
 DEFAULT_DENSITY_BINS = 1200
 
 #: Gaussian smoothing applied to the field, in bins. **Zero by default, deliberately.** A blur
@@ -337,9 +327,8 @@ DEFAULT_DENSITY_BINS = 1200
 DENSITY_BLUR = 0.0
 
 #: Focus marks carry a thin surface ring so overlapping points stay separable (the project's mark
-#: spec) and are rasterized, because at full corpus scale there are 172,509 of them. Size is
-#: interpolated in log point count -- 9 pt reads well for SWE-chat's 4,334 marks and would be a
-#: solid slab at WildChat's 172,509 -- and the ring is dropped once a mark is too small to hold one.
+#: spec) and are rasterized, since at full corpus scale there can be very many of them. Size is
+#: interpolated in log point count, and the ring is dropped once a mark is too small to hold one.
 POINT_SIZE_RANGE = (2.5, 9.0)
 POINT_COUNT_RANGE = (3.5, 5.3)  # log10 documents, i.e. ~3,000 to ~200,000
 POINT_EDGE_WIDTH = 0.35
@@ -400,8 +389,8 @@ def draw_umap(frame: pd.DataFrame, focus: list[str], options):
     # nothing left to be context, and binning it would only add an empty raster.
     if len(context):
         # One raster the size of its own bin grid, not one artist per document: `imshow` embeds the
-        # field at `bins` resolution whatever the figure's dpi, which is both sharper and ~20x
-        # smaller in the PDF than the equivalent rasterized scatter.
+        # field at `bins` resolution whatever the figure's dpi, sharper and far smaller in the PDF
+        # than the equivalent rasterized scatter.
         counts, x_edges, y_edges = np.histogram2d(
             context["x"].to_numpy(), context["y"].to_numpy(), bins=options.density_bins,
             range=(x_limits, y_limits))

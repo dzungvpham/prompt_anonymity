@@ -7,20 +7,14 @@ input, in input order.
 
 **The provider is reached through the ``openai`` library, not a DeepSeek-specific SDK.** DeepSeek
 serves an OpenAI-compatible ``/chat/completions`` endpoint, so ``OpenAI(base_url=..., api_key=...)``
-is the supported client -- the library is a transport here, and nothing about it implies an OpenAI
-model. Both values come from the gitignored ``.env``: ``DEEPSEEK_BASE_URL`` (the endpoint) and
-``DEEPSEEK_API_KEY``, and **both are required** -- the base URL has no default worth guessing, and
-the library would otherwise talk to OpenAI's own API, where this key is not a credential.
+is the supported client -- the library is a transport here, not a claim about the model. Both
+``DEEPSEEK_BASE_URL`` and ``DEEPSEEK_API_KEY`` come from the gitignored ``.env`` and **both are
+required**: without the base URL the client would talk to OpenAI's own API, where this key is not
+a credential.
 
-**This replaced a Microsoft Foundry Claude deployment on 2026-08-11** (`git log --follow` for
-``_foundry.py``). The Message Batches API went with it -- already unavailable on Foundry, and not
-part of the OpenAI-compatible surface either -- and is not a choice waiting to be revisited.
-Anthropic's ``output_config.effort`` knob went too, and that one *did* come back: see
-:data:`DEFAULT_REASONING_EFFORT`, added later the same day. In between, ``temperature=0`` stood in
-as the reproducibility lever; enabling reasoning ended that, because thinking mode ignores
-temperature, so the response cache is what makes a re-run reproducible now. The judging model is
-the only thing that differs between the utility axis and the attack judges, which use OpenRouter
-(:mod:`prompt_anonymity.attacks.llm._openrouter`).
+The Message Batches API is not available on this provider and is not a choice waiting to be
+revisited. The judging model is the only thing that differs between the utility axis and the
+attack judges, which use OpenRouter (:mod:`prompt_anonymity.attacks.llm._openrouter`).
 
 Retries are the SDK's own (connection errors, 408/409/429 and 5xx, exponential backoff), configured
 by ``max_retries`` rather than hand-rolled. A request that still fails raises and aborts the batch
@@ -49,33 +43,20 @@ DEFAULT_JUDGE_MODEL = "DeepSeek-V4-Flash"
 
 #: Reasoning budget, sent as the OpenAI-compatible ``reasoning_effort`` field. ``None`` omits it.
 #:
-#: **How this deployment actually behaves, probed 2026-08-11 (do not re-probe; do not "fix" the
-#: call to match DeepSeek's published guide).** The guide
-#: (https://api-docs.deepseek.com/guides/thinking_mode/) says to send ``reasoning_effort`` *and*
-#: ``extra_body={"thinking": {"type": "enabled"}}``, and that thinking is on by default at effort
-#: ``high``. Neither holds on this Azure-hosted deployment:
-#:
-#: * ``extra_body={"thinking": ...}`` is a hard **400** -- ``unrecognized_request_argument:
-#:   thinking``. The field must be sent bare, which works.
-#: * **Thinking is OFF here unless the field is sent.** With no ``reasoning_effort`` the model
-#:   returns no ``reasoning_content`` at all (measured: 38 output tokens, 0 reasoning characters
-#:   over 5 samples). So setting this to ``"low"`` *enables* reasoning rather than reducing it --
-#:   it is a ~6x increase in output tokens, which are the dear ones (see :data:`MODEL_RATES`).
-#: * ``"none"`` is honoured and turns thinking off (41 tokens, 0 reasoning chars).
-#: * **The level is only partly honoured.** Over 5 samples each, mean reasoning was 830 chars at
-#:   ``low``, 1,059 at ``high``, 2,108 at ``max`` -- ``max`` separates cleanly, but ``low`` and
-#:   ``high`` overlap heavily, and the control settles it: an **invalid** value (``"bogus"``) is
-#:   accepted without error and lands at 903 chars, indistinguishable from ``low``. So the value
-#:   is not validated, and anything that is not ``"none"`` buys reasoning somewhere in that band.
-#:   Treat ``low`` as "reasoning on, modest" rather than as a precise dial.
+#: **This deployment does not follow DeepSeek's published guide, and the call must not be "fixed"
+#: to match it.** ``extra_body={"thinking": ...}``, which the guide pairs with this field, is a
+#: hard 400 here -- the field must be sent bare. And thinking is OFF by default here, not on: with
+#: no ``reasoning_effort`` set the model returns no reasoning at all, so setting this to ``"low"``
+#: *enables* reasoning rather than reducing it. ``"none"`` turns it back off. The level is only
+#: loosely honoured -- treat it as "how much reasoning", not a precise dial, and don't trust it to
+#: validate an unrecognized value.
 DEFAULT_REASONING_EFFORT = "low"
 
-#: Sampling controls. **Both are no-ops while reasoning is enabled** -- DeepSeek's guide states
-#: thinking mode ignores ``temperature`` and ``top_p`` (accepted for compatibility, no effect) --
-#: so 1.0/1.0 is the honest setting: the neutral value that says "not steering the sampler",
-#: rather than a 0.0 that reads as determinism the API is not providing. The consequence is real
-#: and is the reason this is spelled out: **verdicts are no longer deterministic**, and the
-#: response cache, not the temperature, is what makes a re-run reproducible.
+#: Sampling controls. **Both are no-ops while reasoning is enabled** -- this deployment's thinking
+#: mode ignores ``temperature`` and ``top_p`` -- so 1.0/1.0 is the honest "not steering the
+#: sampler" value rather than a 0.0 that would falsely read as determinism. The real consequence:
+#: **verdicts are no longer deterministic**, and the response cache, not the temperature, is what
+#: makes a re-run reproducible.
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_TOP_P = 1.0
 
@@ -95,9 +76,8 @@ class TokenRates:
     """List price in **US dollars per million tokens** for one model.
 
     ``cached_input`` is the discounted rate for input tokens the provider served from its own
-    context cache. It is a separate tier rather than a multiplier because the discount is steep and
-    provider-specific -- on the Azure-hosted DeepSeek deployment it is about 15% of the full input
-    rate, which is far too large to fold into an approximation.
+    context cache -- a separate tier rather than a multiplier, since the discount is steep and
+    provider-specific.
     """
 
     input: float
@@ -105,11 +85,10 @@ class TokenRates:
     output: float
 
 
-#: Published list price per model. The DeepSeek deployment is Azure-hosted and priced from its
-#: published rate card. **Add a model here rather than guessing**: an invented price produces a
-#: plausible dollar figure in the score file that nobody would think to re-check, which is worse
-#: than a blank one -- an unpriced model leaves ``judge_cost_usd`` as ``nan``, which reads as
-#: "unknown" instead of "free".
+#: Published list price per model. **Add a model here rather than guessing**: an invented price
+#: produces a plausible dollar figure that nobody would think to re-check, which is worse than a
+#: blank one -- an unpriced model leaves ``judge_cost_usd`` as ``nan``, which reads as "unknown"
+#: instead of "free".
 MODEL_RATES: dict[str, TokenRates] = {
     "DeepSeek-V4-Flash": TokenRates(input=0.19, cached_input=0.028, output=0.51),
 }
@@ -159,10 +138,7 @@ class JudgeUsage:
 
         **This subtraction is the whole point.** ``cached_tokens`` is a *subset* of
         ``prompt_tokens``, not an additional bucket, so pricing both at their own rate without
-        removing the overlap would bill the cached tokens twice. Confirmed arithmetically on the
-        first real run: 2,277 input tokens against 1,792 cached over two requests is ~1,138 per
-        request, which is the ~900-token rubric plus a short conversation -- consistent only with
-        the cached figure being contained in the total.
+        removing the overlap would bill the cached tokens twice.
         """
         return max(0, self.input_tokens - self.cached_input_tokens)
 

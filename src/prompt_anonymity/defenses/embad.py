@@ -16,30 +16,18 @@ Why the appended turn is *readable text* and not token soup
 ------------------------------------------------------------
 
 An earlier version of this file ran gradient-guided discrete search (GASLITE via TROPT) over token
-ids against a local surrogate. That approach is gone, and the reason is measurement rather than
-taste. Ranked by how far they moved the encoder these defenses actually face, the shapes came out:
-
-=========================================  ==========
-appended turn                              self-cosine
-=========================================  ==========
-a repeated filler token                    0.94
-64 random round-trip-safe tokens           0.92
-an entire unrelated conversation           0.91
-a gradient-optimized token trigger         ~0.86
-**a written instruction to ignore the      **0.71**
-preceding text, plus a decoy subject**
-=========================================  ==========
-
-Entropy is the wrong axis and meaning is the right one, so the search space here is natural
-language: candidates are sentences, and the operators recombine and rewrite them.
+ids against a local surrogate. That approach is gone: a written instruction with a decoy subject
+moves the target encoder far more than any token-soup trigger, gradient-optimized or not. Entropy is
+the wrong axis and meaning is the right one, so the search space here is natural language: candidates
+are sentences, and the operators recombine and rewrite them.
 
 **The mechanism and the subject are separate, and the mutator only ever sees the mechanism.** A
 candidate is written with :data:`TOPIC_SLOT` where a subject belongs and the subject is substituted
-at scoring time, so what the population evolves is the redirection itself. Two rounds of measurement
-forced this: with the subject free the ensemble piled up unrelated topics and abandoned negation,
-and with the subject fixed *but visible* it simply restated the permitted one three or four times.
-Both are decoy-token mass, which is what the local encoders reward and what does not transfer. A
-model that does not know the subject cannot spend its budget on it. See :data:`DECOY_TOPIC`.
+at scoring time, so what the population evolves is the redirection itself. Leaving the subject
+visible to the mutator lets it win by piling on decoy-token mass instead of improving the mechanism
+-- naming it, restating it, flooding the topic -- which is what the local encoders reward and what
+does not transfer. A model that does not know the subject cannot spend its budget on it. See
+:data:`DECOY_TOPIC`.
 
 The search
 ----------
@@ -65,16 +53,14 @@ scores an agent exploit with a critic LLM, ours scores a geometric displacement:
 Batching, and why it is structural
 ----------------------------------
 
-Both models here are throughput-bound and neither is remotely saturated by one document's round:
-generation runs at 76 tok/s at a single concurrent request and 6,988 tok/s at 128, and a member
-encoder costs 6.1 ms per candidate at a batch of 13 against 3.4 ms from 32 upwards. So the unit of
-work is not a document but a **pool** of them: :class:`SearchPool` advances ``pool_size`` searches in
-lockstep, and each round is one generation call over ``pool_size * prompts_per_round`` prompts
-followed by one embedding pass over every document's children.
+Both models here are throughput-bound and neither is remotely saturated by one document's round of
+generation or embedding. So the unit of work is not a document but a **pool** of them:
+:class:`SearchPool` advances ``pool_size`` searches in lockstep, and each round is one generation
+call over ``pool_size * prompts_per_round`` prompts followed by one embedding pass over every
+document's children.
 
 The searches remain independent -- separate grids, separate origins, nothing shared -- and each
-grid is seeded from its document's id, so the pool changes throughput and not results. Measured on
-an L40S, per document: **318 ms per candidate one at a time, 4.5 ms pooled**.
+grid is seeded from its document's id, so the pool changes throughput and not results.
 
 Command line::
 
@@ -126,25 +112,22 @@ OBJECTIVES = ("ensemble", "summary", "remote")
 #: only thing that differs between them. ``"local"`` is the small model on this machine
 #: (:class:`LLMMutator`); ``"claude"`` is the hosted frontier model (:class:`ClaudeMutator`).
 #:
-#: **``"claude"`` is the default since 2026-09-07, and it is a trade rather than an upgrade.**
-#: Measured on the direct-Gemini search, Opus 5 converges ~3x faster than Qwen3-1.7B and **lands in
-#: the same place** -- so what the default buys is wall-clock, not a better trigger. What it costs
-#: is two things worth stating plainly: it **bills per call** -- uncapped by default, though it
-#: prints its running total every round (:data:`DEFAULT_HOSTED_MUTATOR_BUDGET`) -- and it **does
-#: not reproduce**, because the hosted models expose no sampler, where the local mutator seeds
-#: every request and replays exactly. Pass
-#: ``mutator="local"`` for a run that has to be reproducible, or when no credentials are set.
+#: **``"claude"`` is the default, and it is a trade rather than an upgrade.** It converges faster
+#: than the local model but lands in the same place, so the default buys wall-clock, not a better
+#: trigger. What it costs: it **bills per call** -- uncapped by default, though it prints its
+#: running total every round (:data:`DEFAULT_HOSTED_MUTATOR_BUDGET`) -- and it **does not
+#: reproduce**, because the hosted models expose no sampler, where the local mutator seeds every
+#: request and replays exactly. Pass ``mutator="local"`` for a run that has to be reproducible, or
+#: when no credentials are set.
 MUTATORS = ("local", "claude")
 
-#: There is **no cap on the appended turn.** It was 128 tokens (64 before 2026-09-07), inherited
-#: from the GCG-style search this work started from, where a fixed token budget is part of the
-#: method. The evolutionary search never needed it, and enforcing it did active harm: a winning
-#: mechanism with two :data:`TOPIC_SLOT` slots overflowed for **74% of the subject pool**, so what
-#: shipped was a sentence severed mid-assertion. A trigger is now whatever length the search
-#: evolved, rendered whole.
+#: There is **no cap on the appended turn.** A fixed token budget is inherited from the GCG-style
+#: search this work started from, but the evolutionary search doesn't need one, and enforcing it did
+#: active harm: a winning mechanism with two :data:`TOPIC_SLOT` slots could overflow it, truncating a
+#: sentence mid-assertion. A trigger is now whatever length the search evolved, rendered whole.
 #:
-#: What the cap was standing in for is still real -- fitness correlates about **-0.85 with document
-#: length**, so nothing stops the search preferring mass over mechanism. :data:`DEFAULT_LENGTH_BINS`
+#: What the cap was standing in for is still real -- fitness correlates strongly with document
+#: length, so nothing stops the search preferring mass over mechanism. :data:`DEFAULT_LENGTH_BINS`
 #: and :data:`DEFAULT_LENGTH_BOUNDARIES` are what keep short mechanisms in the archive now: MAP-
 #: Elites reserves cells for them, so a long lineage cannot occupy every niche. **Watch the winner's
 #: length**; if the search starts returning only long triggers, that axis is the thing to tighten,
@@ -207,19 +190,15 @@ HOSTED_MUTATOR_MODEL = "claude-sonnet-5-2"
 #: large search space behind it, which is the shape effort is for.
 HOSTED_MUTATOR_EFFORT = "medium"
 
-#: Ceiling on billed mutator calls per run, or ``None`` for no ceiling -- **which is the default
-#: since 2026-09-07.**
-#:
-#: It was 200, and the arithmetic is why it went: :meth:`UniversalSearch.run` issues exactly
-#: ``prompts_per_round`` calls per generation -- 4 by default, since crossover and the fallback
-#: never reach a model -- so a 20-generation run makes **80**, and the cap bound at 50 generations.
-#: That is inside the range a deeper search wants, and there is no CLI flag to lift it, so the
-#: ceiling was more likely to kill a legitimate run at generation 50 than to catch a runaway one.
+#: Ceiling on billed mutator calls per run, or ``None`` for no ceiling -- **which is the default.**
+#: A fixed call cap bites a deep search (:meth:`UniversalSearch.run` issues a handful of calls per
+#: generation, and there's no flag to raise the cap independently of generation count), so it was
+#: more likely to kill a legitimate long run than catch a runaway one.
 #:
 #: Unlike :data:`DEFAULT_REMOTE_BUDGET`, which stays a hard ceiling: a misbehaving embedding loop
 #: can buy thousands of vectors inside a single round before anything prints, where the mutator
-#: bills 4 calls per generation and prints its running total after every one of them. The spend is
-#: visible as it happens, so a human is the backstop rather than a constant.
+#: bills only a few calls per generation and prints its running total after every one of them. The
+#: spend is visible as it happens, so a human is the backstop rather than a constant.
 #:
 #: Pass ``hosted_mutator_budget=N`` to put a ceiling back for a particular run.
 DEFAULT_HOSTED_MUTATOR_BUDGET = None
@@ -263,14 +242,8 @@ REMOTE_ENCODER = "gemini_embedding_2"
 #: Paid embeddings one :class:`RemoteObjective` will buy before it refuses to buy any more.
 #:
 #: A hard ceiling rather than a warning, because the failure mode is a runaway loop billing a card,
-#: not a slow run. **Raised from 8,000 on 2026-09-07, when :data:`DEFAULT_TOPICS_PER_DOCUMENT` went
-#: to 8 and multiplied every round's embedding count by the same factor.**
-#:
-#: Sized against the default universal search rather than left as slack: 16 origins, 512 for the
-#: seed generation, ~1,000-1,350 per generation over 20 generations, and 576 to rank the finalists
-#: comes to **~22,000-28,000 paid embeddings**, roughly $1 at $0.20/M tokens. So this ceiling is a
-#: genuine guard on that configuration -- a deeper search or a larger document pool has to raise it
-#: deliberately, which is the intent.
+#: not a slow run. Sized to cover the default universal search with headroom -- a deeper search or a
+#: larger document pool has to raise it deliberately, which is the intent.
 DEFAULT_REMOTE_BUDGET = 30000
 
 #: Candidates per :meth:`RemoteObjective.cosines` chunk. Larger than the local default: the cost
@@ -291,19 +264,13 @@ DEFAULT_LENGTH_BINS = 3
 DEFAULT_DIVERSITY_BINS = 3
 
 #: Character boundaries between length bins. The reference uses ``[100, 300]`` for uncapped
-#: triggers; these are pulled in because the mechanisms this search evolves are shorter, and
-#: they are now the ONLY thing keeping short candidates in the archive -- see the note where the
-#: token cap used to be defined.
+#: triggers; these are pulled in because the mechanisms this search evolves are shorter, and they
+#: are now the ONLY thing keeping short candidates in the archive -- see the note where the token
+#: cap used to be defined. All three bins need to stay reachable given the appended turn's actual
+#: length range, or the top bin silently becomes dead weight in the grid.
 #:
-#: **The top bin was unreachable until the cap moved to 128, and nobody noticed.** Measured over
-#: 12,000 (seed mechanism, subject) renderings: a 64-token turn reaches at most **266 characters**,
-#: so nothing could ever land in the ``>= 280`` bin and the length axis was silently a 2-bin axis
-#: carrying a third of the grid as dead cells. At 128 tokens the ceiling is ~530 characters and all
-#: three bins are occupiable for the first time.
-#:
-#: The seed population still sits almost entirely in the middle bin (1,594 below 150 against 10,406
-#: between 150 and 280), which is correct -- the top bin is somewhere the *search* has to evolve to,
-#: not somewhere it starts.
+#: The seed population sits almost entirely in the middle bin, which is correct -- the top bin is
+#: somewhere the *search* has to evolve to, not somewhere it starts.
 DEFAULT_LENGTH_BOUNDARIES = (150, 280)
 
 #: Elites sampled when placing a candidate on the diversity axis. Sampling rather than scanning
@@ -316,17 +283,14 @@ DEFAULT_CHILDREN = 16
 DEFAULT_PARENTS = 4
 
 #: Prompts issued per document per round, each drawing its own parent sample. **Not just a batching
-#: trick.** One prompt asking for sixteen passages returns thirteen unique ones in 4.13 s; four
-#: asking for four return sixteen in 1.68 s -- a long generation makes the model repeat itself, and
-#: batch-1 decode leaves the card idle. Several samples also mean several islands are explored per
-#: round rather than the one :meth:`MapElitesController.parents` returns.
+#: trick**: a single long generation makes the model repeat itself, so several shorter, independent
+#: prompts return more unique candidates than one big one. Several samples also mean several islands
+#: are explored per round rather than the one :meth:`MapElitesController.parents` returns.
 DEFAULT_PROMPTS_PER_ROUND = 4
 
 #: Documents whose searches advance in lockstep. They are independent -- no shared population, no
 #: shared origin -- so a round of the whole pool is one batched generation and one batched embedding
-#: pass, which is what actually saturates a GPU. Decode runs at 76 tok/s at one concurrent request
-#: and 6,988 tok/s at 128; the encoders cost 6.1 ms per candidate at a batch of 13 and 3.4 ms from
-#: 32 upwards. Costs memory linear in the pool and nothing else.
+#: pass, which is what actually saturates a GPU. Costs memory linear in the pool and nothing else.
 DEFAULT_POOL_SIZE = 32
 
 #: Archive candidates re-scored on the validation pool before one is chosen. Small on purpose: the
@@ -339,11 +303,10 @@ DEFAULT_CHECKPOINT_EVERY = 50
 
 #: The one subject every trigger points at. **The mutator never sees it.**
 #:
-#: Left free, the ensemble evolved candidates naming two or three unrelated subjects and dropped
-#: negation entirely (measured 2026-09-05: 23 of 32 winners, scoring 0.203 against 0.126 for the
-#: ones that kept it). Telling the model to hold one subject fixed cured the drift -- 0 of 32
-#: winners strayed -- but it simply moved the exploit: winners then stated the *permitted* subject
-#: three or four times over, which is topic-flooding again under a tighter budget.
+#: Left free, the ensemble evolved candidates naming several unrelated subjects and dropped negation
+#: entirely. Telling the model to hold one subject fixed cured the drift, but it simply moved the
+#: exploit: winners then stated the *permitted* subject over and over, which is topic-flooding again
+#: under a tighter budget.
 #:
 #: So the subject is not in the prompt at all. Candidates are written with :data:`TOPIC_SLOT` where
 #: a subject belongs, and it is substituted at scoring time. The model cannot spend its output on
@@ -716,9 +679,8 @@ class EnsembleObjective:
         """``[len(triggers), n_members]`` self-cosines, 1.0 meaning the document did not move.
 
         ``documents`` gives each trigger's index into the primed pool, so **one call scores the
-        whole pool's round**. That is where the speed is: a member costs 6.1 ms per candidate at a
-        batch of 13 and 3.4 ms from 32 upwards, so scoring one document at a time runs the encoders
-        at a third of their throughput. Defaults to document 0, which is the one-document path.
+        whole pool's round** -- a bigger batch keeps the encoders near their peak throughput, where
+        scoring one document at a time would not. Defaults to document 0, the one-document path.
         """
         if not self._origin:
             raise RuntimeError("call prime(document) or prime_many(documents) before scoring.")
@@ -774,9 +736,8 @@ class SummaryObjective:
     ----------------------------------
 
     Every raw-text surrogate tried here converges on the same strategy: pile up decoy tokens until
-    they outweigh the document. It works locally and does not transfer -- four configurations (three
-    small encoders, an 8B at two budgets) all land at 0.919-0.923 against the adversary's encoder
-    where a direct search reaches 0.706.
+    they outweigh the document. That works against the local surrogates but does not transfer to
+    the adversary's own encoder.
 
     A summariser is a **semantic bottleneck**. The candidate is appended, a language model is asked
     what the conversation is about, and only the answer is embedded. Decoy tokens glued onto a
@@ -1100,10 +1061,8 @@ class LLMMutator:
         """The vLLM engine, built on first use.
 
         **vLLM rather than ``transformers.generate``, and this is the file's largest speed lever.**
-        Decode is memory-bandwidth-bound, so a single sequence leaves the card idle: measured on an
-        L40S, batch-1 HF generate runs at 76 tok/s and costs 318 ms per candidate, while vLLM at 128
-        concurrent requests runs at 6,988 tok/s and costs 4.5 ms -- 71x on the term that is 98% of a
-        generation. Continuous batching is what :class:`SearchPool` exists to feed.
+        Decode is memory-bandwidth-bound, so a single sequence leaves the card idle; vLLM's
+        continuous batching is what :class:`SearchPool` exists to feed.
 
         ``enable_prefix_caching`` shares the system message across every request of every round.
         Modest here (the parents differ per prompt) but free.
@@ -1519,8 +1478,7 @@ class SearchPool:
     running them together changes no result. What it changes is batch size: every round issues one
     generation call covering ``len(documents) * prompts_per_round`` prompts and one embedding pass
     covering every document's children. Both models are throughput-bound and neither is anywhere
-    near saturated by a single document (see :data:`DEFAULT_POOL_SIZE` for the measurements), so
-    this is where nearly all of the speed comes from.
+    near saturated by a single document, so this is where nearly all of the speed comes from.
 
     The loop itself is the reference's: seed, evaluate, then repeatedly sample parents, produce
     children by crossover and LLM mutation, evaluate, and place them back in the grid.
@@ -1700,10 +1658,9 @@ DEFAULT_SEARCH_SOURCE = "sharechat"
 DEFAULT_SEARCH_SAMPLES = 8
 DEFAULT_VALIDATION_SAMPLES = 8
 
-#: Character band the search samples from. ShareChat's true median document is **156 characters**,
-#: where a 64-token appended turn is most of the text -- a degenerate measurement, and one that
-#: cannot be compared with any earlier result. This band is the one every EmBad measurement in this
-#: project used. Set both ends to 0 to sample the corpus as it is.
+#: Character band the search samples from. ShareChat's raw documents skew too short for a
+#: meaningful measurement, where the appended turn would dominate the text. Set both ends to 0 to
+#: sample the corpus as it is.
 DEFAULT_SEARCH_MIN_CHARS = 400
 DEFAULT_SEARCH_MAX_CHARS = 1600
 
@@ -1790,8 +1747,8 @@ class UniversalSearch:
     ``SearchPool`` runs *n* independent searches -- one grid and one origin per document -- and
     returns *n* winners, each partly fitted to its own document. That is the wrong objective for a
     defense that ships **one** trigger: collapsing those winners to a single mechanism afterwards
-    was measured to cost +0.034 self-cosine with a small mutator and +0.008 with a strong one, i.e.
-    a third of one arm's apparent gain was per-document fitting that did not survive deployment.
+    gives back a meaningful chunk of an arm's apparent gain, which was really per-document fitting
+    that does not survive deployment.
 
     Here there is one grid, and a candidate's fitness is its aggregate self-cosine **across every
     search document at once**. A mechanism that only works on one document cannot take a cell.
@@ -1896,13 +1853,13 @@ class UniversalSearch:
 
         *Shared* is what keeps the archive honest. Drawing subjects independently per candidate
         would make ``candidate.score > incumbent.score`` partly a question of who drew easier
-        subjects: the measured spread across subjects is 0.058 against a mechanism bar of 0.064, so
-        a per-candidate draw is roughly half noise. Scoring every candidate of a round on one slate
-        makes the comparison paired, and the subject's main effect cancels out of it.
+        subjects, which is close to as noisy as the mechanism signal itself. Scoring every candidate
+        of a round on one slate makes the comparison paired, and the subject's main effect cancels
+        out of it.
 
-        **Several subjects per document rather than one** since 2026-09-07: sharing a slate cancels
-        the subject's main effect but not its interaction with the candidate, and one draw per
-        document left that resting on a single sample. The scoring cube gains the axis
+        **Several subjects per document rather than one**: sharing a slate cancels the subject's
+        main effect but not its interaction with the candidate, and one draw per document left that
+        resting on a single sample. The scoring cube gains the axis
         (``candidates x documents x topics``) and :meth:`score_many` averages it out per document
         before any aggregation, so what the archive compares is still one number per document.
         See :data:`DEFAULT_TOPICS_PER_DOCUMENT` for the cost.
@@ -2185,8 +2142,8 @@ class EmBadDefense(CachedDefense):
     appended its own winner, which optimised something the defense does not ship. A deployed
     defense appends *one* turn -- that is what makes it O(1) rather than a paid search per document,
     and what lets it run on a corpus it has never embedded. Collapsing per-document winners to a
-    single mechanism afterwards was measured to cost +0.034 self-cosine with a small mutator and
-    +0.008 with a strong one; :class:`UniversalSearch` optimises the collapsed quantity directly.
+    single mechanism afterwards gives up real performance to per-document fitting that does not
+    survive deployment; :class:`UniversalSearch` optimises the collapsed quantity directly.
 
     **The corpus being defended is never read.** The search draws its documents from a separate
     optimization corpus (``search_source``, default :data:`DEFAULT_SEARCH_SOURCE`), so this is now a
@@ -2217,16 +2174,9 @@ class EmBadDefense(CachedDefense):
     """
 
     name = "embad"
-    #: Bumped to "11": a round now scores every document under
-    #: :data:`DEFAULT_TOPICS_PER_DOCUMENT` subjects instead of one, and averages that axis out per
-    #: document before aggregating. ("9"/"10": the defense searches ONE universal trigger against a
-    #: pool of documents
-    #: from a separate corpus and appends it everywhere, where "8" searched every document
-    #: separately. "7" moved the population to *mechanisms* carrying :data:`TOPIC_SLOT` with the
-    #: subject hidden from the mutator; "6" fixed the subject but still showed it; "5" was the move
-    #: to vLLM; "4" the move from gradient-guided token flipping to evolutionary search over
-    #: natural-language passages.) The base class hashes this file's class hierarchy but not the
-    #: featurizers or the mutator, so the bump is what keeps earlier searches out.
+    #: Bump on any change to the search method, objective shape or scoring reduction: the base class
+    #: hashes this file's class hierarchy but not the featurizers or the mutator, so this is what
+    #: keeps an incompatible earlier search's cache out.
     version = "11"
 
     #: Adds a turn rather than rewriting one, like ``frame_pad``.

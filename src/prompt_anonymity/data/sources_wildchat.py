@@ -1,11 +1,8 @@
 """WildChat source adapter: raw WildChat parquet -> normalized per-conversation documents.
 
-Reads the raw ``allenai/WildChat-4.8M`` parquet directly (no dependency on the
-``wildchat/`` scripts or their intermediate CSVs), keeping every conversation on one of the
-studied models -- *without* the old "identity used >=2 distinct models" requirement. A
-document is one conversation, represented by its ``user``-role turns; a conversation with no
-user turns is dropped (this is a user-prompt dataset, so we do not fall back to assistant text
-as the legacy pipeline did).
+Reads the raw ``allenai/WildChat-4.8M`` parquet directly. A document is one conversation,
+represented by its ``user``-role turns; a conversation with no user turns is dropped (this is a
+user-prompt dataset, so there is no fallback to assistant text).
 
 Two filters are applied here rather than downstream, because both are cheap at load time and
 both shrink what the (memory-hungry) second pass has to hold:
@@ -39,10 +36,8 @@ from tqdm import tqdm
 from .common import model_owner, normalize_language
 from .identity import is_programmatic_user_agent, wildchat_device_info, wildchat_identity
 
-# The studied WildChat models. These are pooled with no roles attached: no model is the "known"
-# side and no model is the "unknown" side. The old by-model linkage split (gpt-4o = labeled,
-# gpt-4.1-mini = anonymous) is gone, so the list is simply which slices of WildChat to include,
-# and the downstream split is free to be assigned on any axis (e.g. by day).
+# The studied WildChat models, pooled with no roles attached -- the known/unknown split is
+# assigned downstream on its own axis (e.g. by day), not by model.
 WILDCHAT_MODELS = [
     "gpt-4o-2024-08-06",
     "gpt-4.1-mini-2025-04-14",

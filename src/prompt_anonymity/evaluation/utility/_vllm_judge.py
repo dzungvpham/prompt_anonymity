@@ -2,42 +2,31 @@
 
 The same OpenAI-compatible ``/chat/completions`` surface as the hosted DeepSeek judge
 (:mod:`._deepseek`), so :class:`VLLMJudge` is only endpoint resolution on top of
-:class:`~._deepseek.OpenAICompatibleJudge`: everything that shapes a verdict -- the rubric, the
-input format, the score parser, the cache -- is shared, and the two backends differ in *where* a
-request goes and *what it costs*.
+:class:`~._deepseek.OpenAICompatibleJudge`: the rubric, input format, score parser and cache are
+all shared, and the two backends differ only in where a request goes and what it costs.
 
-**Where the server is.** ``$LOCAL_LLM_BASE_URL`` when set (a full ``http://host:port/v1``), else
-``http://localhost:$LOCAL_LLM_PORT/v1`` -- the port ``scripts/serve_qwen.sh`` reads from the same
-``.env`` key, so the server and this client agree on one value. vLLM needs no key; the SDK insists
-on a non-empty one, so ``"EMPTY"`` is sent (vLLM's own convention).
+**Where the server is.** ``$LOCAL_LLM_BASE_URL`` when set, else ``http://localhost:$LOCAL_LLM_PORT/v1``
+-- the same ``.env`` key ``scripts/serve_qwen.sh`` reads, so client and server agree. vLLM needs no
+key; the SDK insists on a non-empty one, so ``"EMPTY"`` is sent (vLLM's own convention).
 
-**Which model.** The served model name is part of the judge cache key (it is ``judge_model`` in
-:meth:`~.prompt_judge.ConversationUtility.params`), so it must name what the server really runs.
-Rather than hardcode it, :func:`served_model_name` asks the server's ``/v1/models`` and takes the
-one model it lists; pass a name explicitly when the server hosts several, or to score a fully cached
-run with the server down.
+**Which model.** The served model name is part of the judge cache key, so it must name what the
+server really runs. :func:`served_model_name` asks ``/v1/models`` rather than hardcoding it; pass a
+name explicitly when the server hosts several, or to score a fully cached run with the server down.
 
-**What it costs: nothing, recorded as ``0.0``, not ``nan``.** ``nan`` in ``judge_cost_usd`` means
-"a bill exists but its price is unknown"; a self-hosted request has no bill, so :data:`FREE` rates
-make it an honest zero. The GPU time is real but is paid in SLURM allocation, like the local
-``semantic``/``fluency`` metrics.
+**Cost is recorded as ``0.0``, not ``nan``**: ``nan`` in ``judge_cost_usd`` means "a bill exists but
+its price is unknown", while a self-hosted request has no bill. The GPU time is real but is paid in
+SLURM allocation, like the local ``semantic``/``fluency`` metrics.
 
-**Reasoning and sampling are honoured here, unlike on DeepSeek.** Probed 2026-09-25 against
-``qwen3.8-27b`` (Qwen3.8-27B-FP8, ``--reasoning-parser qwen3``):
-
-* Thinking is **on** by default (~345 output tokens on a toy pair, 1.3k reasoning chars).
-* ``reasoning_effort`` is **validated** -- ``"bogus"`` and even ``"high"`` are a 400; the chat
-  template accepts ``none``, ``low``, ``medium`` and ``xhigh`` (its default). ``"low"`` measured 222
-  tokens, ``"none"`` 13 with no reasoning at all -- a real dial, not DeepSeek's coarse one.
-* ``temperature``/``top_p`` **do** steer the sampler. As with DeepSeek, the response cache -- not
-  the sampler -- is what makes a re-run reproducible.
+**Reasoning and sampling are honoured here, unlike on DeepSeek** -- vLLM validates
+``reasoning_effort`` and its ``temperature``/``top_p`` do steer the sampler (the response cache, not
+the sampler, is what makes a re-run reproducible).
 
 **Thinking is off by default (``reasoning_effort="none"``); the chain of thought is written into
 the answer instead**, as the ``Chain_of_thought`` field of
-:data:`~.prompt_judge.JUDGE_RESPONSE_FORMAT`. With thinking on, the model reasoned on a 10-point
-scale in its hidden trace and the 1-5 schema then cut "10" to "1" -- see that constant. Sampling is
-therefore Qwen's recommended *non-thinking* pair (0.7 / 0.8); greedy decoding is still avoided,
-since Qwen's model card warns it causes repetition.
+:data:`~.prompt_judge.JUDGE_RESPONSE_FORMAT`. With thinking on, the model reasoned on a wider scale
+in its hidden trace and the 1-5 schema then clipped it incorrectly -- see that constant. Sampling is
+Qwen's recommended non-thinking pair; greedy decoding is avoided since Qwen's model card warns it
+causes repetition.
 """
 
 from __future__ import annotations
@@ -64,15 +53,15 @@ LOCAL_LLM_API_KEY = "EMPTY"
 #: A self-hosted request bills nothing; see the module docstring for why this is 0, not ``None``.
 FREE = TokenRates(input=0.0, cached_input=0.0, output=0.0)
 
-#: Qwen's recommended non-thinking sampling (the model card's pair); see the module docstring.
+#: Qwen's recommended non-thinking sampling pair.
 DEFAULT_LOCAL_TEMPERATURE = 0.7
 DEFAULT_LOCAL_TOP_P = 0.8
 
 #: Hidden thinking off: the reasoning is written into the answer's ``Chain_of_thought`` field.
 DEFAULT_LOCAL_REASONING_EFFORT = "none"
 
-#: Client-side concurrency. The server batches internally (``serve_qwen.sh`` caps it at
-#: ``--max-num-seqs 5``) and queues the rest, so a few more in flight than it runs keeps it full.
+#: Client-side concurrency. The server batches and queues internally, so a few more in flight
+#: than it runs at once keeps it full.
 DEFAULT_LOCAL_MAX_WORKERS = 8
 
 

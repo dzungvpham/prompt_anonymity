@@ -4,38 +4,24 @@ Companion to :mod:`prompt_anonymity.data.build_dataset`: that script writes the 
 (``dist/swe_chat.parquet``), this one writes the *features* for them
 (``dist/swe_chat_stylometrix.parquet``), keyed by ``doc_id`` so the two join cleanly.
 
-Featurization is **not reimplemented here**. The script drives the registered featurizers of
-the installed ``prompt_anonymity`` package (``prompt_anonymity.features.FEATURIZERS``) -- the
-same registry the experiment runner uses -- so ``--feature`` accepts whatever that registry
-exposes and a newly registered featurizer becomes available with no change to this file. It
-supersedes the one-off ``swe-chat/stylometrix.py`` / ``wildchat/stylometrix.py`` scripts, which
-called StyloMetrix directly.
-
-Differences from those older scripts, worth knowing before comparing numbers:
-
-* **Turns are joined with a blank line** (:data:`TURN_SEPARATOR`, ``"\n\n"``) rather than the
-  older ``"\n===\n"`` marker, which is not natural writing and left its own mark on the features.
-* The input is the unified dataset's cleaned, identifier-scrubbed ``turns``, not the raw
-  per-source session text.
-* Vectors are cached per document (content-addressed), so a re-run recomputes nothing and an
-  interrupted run resumes from the last completed chunk.
+Featurization is **not reimplemented here** -- the script drives the registered featurizers of
+the installed ``prompt_anonymity`` package (``prompt_anonymity.features.FEATURIZERS``), so a
+newly registered featurizer becomes available with no change to this file.
 
 **Every document in the split is featurized by default**, with one language model
-(``--language-code``, default ``en``) -- as the older per-source scripts did. The model is a
-property of the featurizer, not a filter: a Japanese document still gets a feature vector, just
-one an English model computed. ``--language`` is a separate, optional filter for the times you
-want only one language's documents, and makes the output a *subset* of the split; either way,
-join the result back on ``doc_id``.
+(``--language-code``, default ``en``). The model is a property of the featurizer, not a filter: a
+Japanese document still gets a feature vector, just one an English model computed. ``--language``
+is a separate, optional filter for the times you want only one language's documents, and makes
+the output a *subset* of the split; either way, join the result back on ``doc_id``.
 
 How much of each document is read is the ``--max-len`` window, set **per source**
 (:data:`MAX_LEN_BY_SOURCE`): SWE-chat is read **in full**, while other sources keep the
 featurizer's own default (StyloMetrix: the first 2,048 characters). The split is deliberate --
 StyloMetrix costs grow faster than linearly with document length, and SWE-chat's tail is short
-enough to absorb that (longest session ~117K characters) where WildChat's is not (longest
-~953K, at spaCy's 1,000,000-character parser guard). SWE-chat's uncapped window is a decision
-rather than a default: ``--max-len`` cannot truncate it (see :func:`resolve_max_len`), because
-the feature file name records no window and a truncated run would quietly overwrite the full-text
-vectors with a different feature space under the same name.
+enough to absorb that where WildChat's is not (long enough to hit spaCy's parser guard).
+SWE-chat's uncapped window is a decision rather than a default: ``--max-len`` cannot truncate it
+(see :func:`resolve_max_len`), because the feature file name records no window and a truncated run
+would quietly overwrite the full-text vectors with a different feature space under the same name.
 
 Featurization runs across worker processes where the featurizer supports it (StyloMetrix does),
 sized from the CPUs and memory this job is actually allocated rather than the machine's -- see
@@ -43,42 +29,36 @@ sized from the CPUs and memory this job is actually allocated rather than the ma
 
 **Remote (paid) featurizers.** ``--feature gemini_embedding_2`` embeds the documents through
 OpenRouter instead of computing anything locally, so it needs no GPU but does need an
-``OPENROUTER_API_KEY`` in the environment or a ``.env``, and it costs money -- about $0.32 for
-all of SWE-chat at ``gemini-embedding-2``'s $0.20/M tokens. Three things follow:
+``OPENROUTER_API_KEY`` in the environment or a ``.env``, and it costs money. Three things follow:
 
 * ``--workers`` there means *concurrent HTTP requests*, not processes.
 * ``--dimensions`` trims the embedding (768 / 1536 instead of the native 3072), which mostly
   matters for the size of the output parquet.
-* ``--task`` picks what Embedding 2 is told the vector is *for* (``clustering`` by
-  default, or ``sentence similarity`` / ``classification``). It genuinely changes the vectors -- the same
-  document under two tasks embeds to cosine ~0.88 -- so a non-default task is appended to the
-  output filename (``swe_chat_gemini_embedding_2_clustering.parquet``) and caches separately,
-  letting two tasks sit side by side for comparison. ``gemini_embedding_001`` has no working
-  task mechanism and rejects the flag rather than ignoring it.
+* ``--task`` picks what Embedding 2 is told the vector is *for* (``clustering`` by default, or
+  ``sentence similarity`` / ``classification``). It genuinely changes the vectors, so a non-default
+  task is appended to the output filename (``swe_chat_gemini_embedding_2_clustering.parquet``) and
+  caches separately, letting two tasks sit side by side for comparison. ``gemini_embedding_001``
+  has no working task mechanism and rejects the flag rather than ignoring it.
 * The vector cache is worth more than usual: every cache miss is a paid call, so a re-run, a
   resumed run and a re-run with different sharding all cost nothing for documents already done.
   The run prints what it actually spent when it finishes.
 
 ``--max-len`` does not apply to it. The embedding model reads a fixed window (8,192 tokens), so
-each document is cut to just above that (10,000) and embedded **once** -- one document, one call,
-one vector, no pooling -- which also caps what any single document can cost, however long it is.
-Each input carries the model's task prefix (``task: sentence similarity | query: ...``), which is
-how Embedding 2 is told what the vector is for. The vector therefore represents a document's
-opening, not all of it; see :mod:`prompt_anonymity.features.gemini_embedding`.
+each document is cut to just above that and embedded **once** -- one document, one call, one
+vector, no pooling. Each input carries the model's task prefix, which is how Embedding 2 is told
+what the vector is for. The vector therefore represents a document's opening, not all of it; see
+:mod:`prompt_anonymity.features.gemini_embedding`.
 
-**Sharding (SLURM array jobs).** A whole source can be more than one job's worth of work
-(WildChat is ~172K documents), so a run can be restricted to one *shard* of the split --
-``--num-shards N --shard-index I`` -- and N such runs launched as a SLURM job array, each on its
-own node and GPU. Either flag is filled in from the array task's own environment when omitted
-(``SLURM_ARRAY_TASK_ID`` / ``SLURM_ARRAY_TASK_COUNT``), so ``scripts/compute_features_slurm.sh``
-needs no per-task bookkeeping. A sharded run writes ``dist/shards/<split>_<feature>.<I>-of-<N>.parquet``
-rather than the final file, and the last shard to finish concatenates them all into it (in split
-order) -- so the array produces exactly the file a single unsharded run would have. ``--merge``
+**Sharding (SLURM array jobs).** A whole source can be more than one job's worth of work, so a run
+can be restricted to one *shard* of the split -- ``--num-shards N --shard-index I`` -- and N such
+runs launched as a SLURM job array, each on its own node and GPU. Either flag is filled in from
+the array task's own environment when omitted (``SLURM_ARRAY_TASK_ID`` / ``SLURM_ARRAY_TASK_COUNT``).
+A sharded run writes ``dist/shards/<split>_<feature>.<I>-of-<N>.parquet`` rather than the final
+file, and the last shard to finish concatenates them all into it (in split order). ``--merge``
 does that concatenation on demand, without a GPU, for when a task had to be re-run.
 
 Shards are independent by construction: each vector depends only on its own document, and the
-on-disk cache is content-addressed with atomic writes, so concurrent tasks share one cache safely
-(a document featurized by an earlier run is a hit for whichever shard now owns it).
+on-disk cache is content-addressed with atomic writes, so concurrent tasks share one cache safely.
 
 Run (from the repo root):
 
@@ -110,23 +90,18 @@ from prompt_anonymity.resources import describe_budget
 
 from .config import cache_dir, dist_dir, hf_dir
 
-# The sources, which are also their split and parquet base names -- one spelling per corpus, so
-# there is no mapping here any more, only a vocabulary. Kept as a literal rather than imported
-# from ``build_dataset`` (which it must match): featurizing does not otherwise need the build
-# pipeline, and importing it would pull the whole raw-source and language-detection stack in
-# behind ``--help``.
+# The sources, which are also their split and parquet base names -- one spelling per corpus. Kept
+# as a literal rather than imported from ``build_dataset`` (which it must match): featurizing does
+# not otherwise need the build pipeline, and importing it would pull the whole raw-source and
+# language-detection stack in behind ``--help``.
 #
 # ``wildchat_small`` is DERIVED, not built from raw: it is the seeded subset
 # ``prompt_anonymity.data.build_subset`` cuts out of ``wildchat``, carrying the identical schema so
-# every stage downstream reads it like any other split. It is deliberately absent from
-# ``build_dataset.SOURCES`` -- there is no raw adapter for it, and offering it there would advertise
-# a build that cannot run. The leave-one-out defense is roughly quadratic per document, so it needs
-# a split sized for iteration rather than for coverage.
+# every stage downstream reads it like any other split. Deliberately absent from
+# ``build_dataset.SOURCES``, since there is no raw adapter for it.
 SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "sharechat")
 
-# A document's text is its turns joined by a blank line. The earlier per-source scripts joined
-# with "\n===\n"; that marker is not natural writing and leaves its own fingerprint in the
-# features, so the unified dataset uses an ordinary paragraph break instead.
+# A document's text is its turns joined by an ordinary paragraph break.
 TURN_SEPARATOR = "\n\n"
 
 # Documents per featurizer call. Each call's vectors are written to the on-disk cache before the
@@ -145,18 +120,17 @@ LANGUAGE_CODES = {"English": "en", "German": "de", "Polish": "pl", "Russian": "r
 DEFAULT_LANGUAGE_CODE = "en"
 
 # Input window per source, in characters, for featurizers that read a prefix (0 = read whole
-# documents). SWE-chat is uncapped: its longest session is ~117K characters, so reading every
-# session in full is affordable, and truncating discards exactly the long sessions that carry the
-# most style evidence. A source absent from this map keeps the featurizer's own default
-# (StyloMetrix: 2,048 characters) -- WildChat deliberately does, since its length tail reaches
-# ~953K characters and StyloMetrix's cost grows faster than linearly with length. Featurizers that
-# take no character window at all (gemini_embedding_2 measures its own, in tokens) ignore this.
+# documents). SWE-chat is uncapped: reading every session in full is affordable there, and
+# truncating discards exactly the long sessions that carry the most style evidence. A source
+# absent from this map keeps the featurizer's own default (StyloMetrix: 2,048 characters) --
+# WildChat deliberately does, since StyloMetrix's cost grows faster than linearly with length and
+# WildChat's length tail is long enough to matter. Featurizers with no character window
+# (gemini_embedding_2 measures its own, in tokens) ignore this.
 #
 # A window of 0 here is a **decision, not a default**: the source is uncapped by design and
-# `--max-len` may not override it (see `resolve_max_len`). Since the output filename does not
-# encode the window, a truncated run would otherwise quietly overwrite the uncapped feature file
-# with a differently-computed one under the same name. To genuinely change a source's window,
-# change it here.
+# `--max-len` may not override it (see `resolve_max_len`), because the output filename does not
+# encode the window and a truncated run would otherwise quietly overwrite the uncapped feature
+# file with a differently-computed one under the same name.
 MAX_LEN_BY_SOURCE = {"swe_chat": 0}
 
 # Where a sharded run parks its partial outputs, under the output directory. They are the array
@@ -208,11 +182,9 @@ def load_documents(source: str, dist_dir: str | Path, columns: list[str],
 
     A defended file (:mod:`prompt_anonymity.data.apply_defenses`) carries only ``doc_id``,
     ``author_id`` and the rewritten ``turns`` -- a defense changes nothing else, so the rest stays
-    in ``<split>.parquet`` rather than being duplicated. Any other requested column is therefore
-    joined back from the undefended split on ``doc_id``, which is also what keeps this correct for
-    a *subset* of the split (a ``--language`` or ``--limit`` run) rather than assuming the two files
-    are row-aligned. The frame's index stays each row's position in the file being featurized, which
-    is what :func:`read_texts` reads back against.
+    in ``<split>.parquet``. Any other requested column is joined back from the undefended split on
+    ``doc_id``. The frame's index stays each row's position in the file being featurized, which is
+    what :func:`read_texts` reads back against.
     """
     if defense is None:
         return load_split(source, dist_dir, columns=columns, defense=None)
@@ -250,14 +222,10 @@ def read_texts(source: str, dist_dir: str | Path, positions, defense: str | None
     """Document text (``turns`` joined with :data:`TURN_SEPARATOR`) for these split row positions.
 
     Streams the ``turns`` column a batch at a time and materializes only the wanted rows, instead
-    of reading the split and indexing into it. ``turns`` *is* essentially the whole dataset --
-    WildChat's parquet is 412 MB on disk and ~3.8 GiB once pandas has turned it into Python lists
-    of strings -- while an array task needs 1/N of it, so this makes a task's memory scale with its
-    shard rather than with the corpus. That is the difference between fitting alongside the
-    featurizer's worker processes in a small allocation and being OOM-killed by the scheduler
-    (:meth:`~prompt_anonymity.features.stylometrix.StyloMetrixFeaturizer.resolve_workers` budgets
-    only :data:`~prompt_anonymity.features.stylometrix.PARENT_MEMORY_RESERVE_BYTES` for this
-    process).
+    of reading the split and indexing into it. ``turns`` is essentially the whole dataset, while an
+    array task needs only its own shard of it, so this makes a task's memory scale with its shard
+    rather than with the corpus -- the difference between fitting alongside the featurizer's worker
+    processes and being OOM-killed by the scheduler.
     """
     path = split_path(source, dist_dir, defense)
     wanted = {int(position) for position in positions}
@@ -281,11 +249,8 @@ def slurm_array_shard() -> tuple[int | None, int | None]:
     of also threading a task id through to every invocation. **The array is taken to be 0-based**:
     the task id is the shard index as-is, and the count is ``SLURM_ARRAY_TASK_COUNT`` (falling back
     to the id range). A 1-based array's last task then asks for a shard that does not exist and
-    :func:`resolve_sharding` rejects it -- deliberately, because the alternative (numbering from
-    ``SLURM_ARRAY_TASK_MIN``) reads ``sbatch --array=7``, the way one failed task of an array is
-    re-run, as "shard 0 of 1" and silently recomputes the whole split under the final output's
-    name. Failing loudly on an unusual array beats quietly computing the wrong shard on a routine
-    re-run.
+    :func:`resolve_sharding` rejects it -- failing loudly on an unusual array beats silently
+    recomputing the whole split under the wrong shard's name.
 
     Both entries are ``None`` outside a job array (an ordinary ``sbatch``, ``srun`` or laptop run),
     which leaves the run unsharded. Either can be overridden by its flag, and a re-run of part of
@@ -329,11 +294,10 @@ def resolve_sharding(shard_index: int | None, num_shards: int | None) -> tuple[i
 def select_shard(documents: pd.DataFrame, shard_index: int, num_shards: int) -> pd.DataFrame:
     """This shard's documents: every ``num_shards``-th row starting at ``shard_index``.
 
-    Interleaved rather than cut into contiguous blocks, for wall-clock balance. Featurization cost
-    grows with document length, and the split is ordered (by source, then broadly by time), so
-    contiguous blocks hand one task all of a long-document region and leave the array waiting on
-    it; taking every N-th row spreads any such run across all shards. Which documents land in
-    which shard does not otherwise matter -- the merge restores split order by ``doc_id``.
+    Interleaved rather than cut into contiguous blocks, for wall-clock balance: the split is
+    ordered (by source, then broadly by time), so contiguous blocks would hand one task all of a
+    long-document region. Which documents land in which shard does not otherwise matter -- the
+    merge restores split order by ``doc_id``.
 
     The index still carries each document's split row position, for :func:`read_texts`.
     """
@@ -346,17 +310,15 @@ def select_author_shard(documents: pd.DataFrame, shard_index: int, num_shards: i
 
     :func:`select_shard` interleaves by row, which is right for featurization -- one document's
     vector does not depend on any other's -- and wrong for a defense that measures a document
-    against its author's other documents. ``afr`` cascades document *k* against the *defended* text
-    of ``1..k-1``; handed documents 1, 9 and 17 of one author it would cascade them as though they
-    were consecutive, and emit a plausible parquet that means something else. Whole authors per
-    shard reproduce exactly what an unsharded run computes.
+    against its author's other documents (``afr`` cascades document *k* against the defended text
+    of ``1..k-1``; split by row it would cascade documents that aren't actually consecutive). Whole
+    authors per shard reproduce exactly what an unsharded run computes.
 
     Balanced longest-processing-time-first rather than round-robin: author document counts are very
-    uneven (wildchat_small averages 23 but reaches into the hundreds), and an author's timeline is
-    *serial* inside the cascade, so a shard that draws two giant authors sets the array's wall clock
-    on its own. Taking the heaviest author first and always placing it on the currently-lightest
-    shard flattens that. Ties break on ``author_id``, so the assignment depends only on the
-    selection and ``num_shards`` -- never on frame order -- and a re-run reproduces it.
+    uneven and an author's timeline is *serial* inside the cascade, so a shard that draws two giant
+    authors sets the array's wall clock on its own. Taking the heaviest author first and always
+    placing it on the currently-lightest shard flattens that. Ties break on ``author_id``, so the
+    assignment depends only on the selection and ``num_shards``, and a re-run reproduces it.
 
     The index still carries each document's split row position, for :func:`read_texts` and
     :func:`~prompt_anonymity.data.apply_defenses.read_turns`.
@@ -381,10 +343,9 @@ def resolve_max_len(source: str, requested: int | None) -> int | None:
 
     ``--max-len`` (``requested``) normally wins over the per-source default. The exception is a
     source pinned to ``0`` in :data:`MAX_LEN_BY_SOURCE` -- uncapped by design -- where a truncated
-    run is rejected rather than performed: the output filename carries no window, so it would
-    overwrite that source's full-text feature file with vectors computed over a prefix, leaving
-    two incompatible feature spaces indistinguishable on disk. Passing ``--max-len 0`` explicitly
-    is still fine (it asks for what the source already does).
+    run is rejected rather than performed, since the output filename carries no window and would
+    silently overwrite that source's full-text feature file with a different feature space.
+    Passing ``--max-len 0`` explicitly is still fine.
     """
     default = MAX_LEN_BY_SOURCE.get(source)
     if requested is None:

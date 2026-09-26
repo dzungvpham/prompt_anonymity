@@ -3,9 +3,7 @@ defended.
 
 ``apply_defenses`` writes parquet (``data/dist/<split>_<defense>.parquet``), which is the right
 format for the pipeline and the wrong one for *reading the text*: a list-of-strings column in a
-columnar file is not something you open and eyeball, and the defended text is exactly what needs
-eyeballing for a defense like DP-MLM, whose output goes from gibberish to usable prompt text as
-epsilon rises. This script is the bridge:
+columnar file is not something you open and eyeball. This script is the bridge:
 
     python experiments/export_defended_csv.py --source wildchat --defense dp_mlm_eps100
     # -> data/dist/csv/wildchat_dp_mlm_eps100.csv
@@ -29,13 +27,11 @@ when the file is going somewhere the source text should not.
 Memory
 ------
 
-Streamed, a parquet batch at a time, because WildChat's ``turns`` column is ~3.8 GiB once pandas
-has made Python lists of strings out of it -- and this script is meant to be runnable on a login
-node. The undefended split is walked *alongside* the defended one rather than loaded into a lookup
-dict, which works because both files carry the split's row order (a merged array output is
-"row-for-row what a single unsharded run would have written", see ``merge_shards``) and a defended
-file is a subset of the split in that same order. Documents the defended file skips -- a
-``--language`` or ``--limit`` run -- are passed over and dropped, so memory stays flat.
+Streamed, a parquet batch at a time, so this script stays runnable on a login node even on a large
+corpus. The undefended split is walked *alongside* the defended one rather than loaded into a
+lookup dict, which works because both files carry the split's row order (see ``merge_shards``) and
+a defended file is a subset of the split in that same order. Documents the defended file skips --
+a ``--language`` or ``--limit`` run -- are passed over and dropped, so memory stays flat.
 
 If the two files are *not* in a compatible order the forward scan runs off the end of the split and
 this exits with an error naming the document, rather than emitting a file whose "original" column
@@ -163,7 +159,7 @@ def write_csv(defended_path: Path, out_path: Path, *, original_path: Path | None
             doc_id = str(document["doc_id"])
             author_id = str(document["author_id"])
             defended = [str(turn) for turn in document["turns"]]
-            # A turn-ADDING defense (frame_pad, epi) emits more turns than the split records, so the
+            # A turn-ADDING defense (frame_pad) emits more turns than the split records, so the
             # tail has no original to sit beside; "" says that plainly rather than misaligning the
             # column. DP-MLM preserves the count exactly, so this never fires for it.
             original = originals.get(doc_id) if originals else []

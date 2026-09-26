@@ -43,8 +43,7 @@ a hard error rather than a silent misalignment, which is the same contract
 ``experiments/run_experiment.py`` applies to its feature parquets. Only the sampled rows' ``turns``
 are read (streamed a batch at a time through
 :func:`~prompt_anonymity.data.apply_defenses.read_turns`), because ``turns`` is essentially the
-whole dataset -- several GiB on WildChat once it is Python strings -- and a calibration run needs
-three of them.
+whole dataset once it is Python strings.
 """
 
 from __future__ import annotations
@@ -314,9 +313,8 @@ def main() -> None:
                         help="how much the judge thinks before answering (default per backend: "
                              + ", ".join(f"{name} {backend.reasoning_effort}"
                                          for name, backend in sorted(JUDGE_BACKENDS.items()))
-                             + "). deepseek: none, low, high, max -- 'none' is ~6x fewer output "
-                             "tokens, 'max' the only level measurably above 'low'. local vLLM: "
-                             "none, low, medium, xhigh, validated by the server")
+                             + "). deepseek: none, low, high, max. local vLLM: none, low, medium, "
+                             "xhigh, validated by the server")
     parser.add_argument("--out", default=None,
                         help="where to write the merged score table "
                              "(default: experiments/utility/<source>_<defense>.csv)")

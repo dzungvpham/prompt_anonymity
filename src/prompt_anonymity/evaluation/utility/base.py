@@ -2,29 +2,26 @@
 
 A utility metric answers one question: *did the defense keep what mattered?* Each one scores a
 post-defense :class:`~prompt_anonymity.core.AttackData` against its pre-defense ``reference``, and
-they differ in what they compare and what they report. There is one today --
-:mod:`.prompt_judge`, which compares the two **conversations** and returns a 1-5 score -- and this
-base exists so a second (say, one that compares the *answers* two prompts elicit) is a subclass
-rather than a fork.
+they differ in what they compare and what they report -- :mod:`.prompt_judge` compares the two
+whole conversations and returns a 1-5 score; a future metric could compare something else as a
+subclass of this base.
 
 A developer writing a new metric subclasses :class:`UtilityMetric` and implements
-:meth:`~UtilityMetric.score`; the base supplies the three things every metric needs and would
-otherwise copy: side loading + validation (:meth:`~UtilityMetric._load_sides`), seeded sampling
-for cheap calibration runs (the ``limit`` argument), and a ready
-:class:`~prompt_anonymity.caching.TransformCache` whose key is derived from the subclass's
-``version`` and :meth:`~UtilityMetric.params` (:meth:`~UtilityMetric._cache`). Results subclass
-:class:`UtilityResult`, which supplies the shared ``__str__`` and the
-:meth:`~UtilityResult.scores` frame every metric contributes to the one output file.
+:meth:`~UtilityMetric.score`; the base supplies side loading + validation
+(:meth:`~UtilityMetric._load_sides`), seeded sampling for cheap calibration runs (the ``limit``
+argument), and a ready :class:`~prompt_anonymity.caching.TransformCache`
+(:meth:`~UtilityMetric._cache`). Results subclass :class:`UtilityResult`, which supplies the shared
+``__str__`` and the :meth:`~UtilityResult.scores` frame every metric contributes to the shared
+output file.
 
-Cache invalidation deliberately differs from :class:`prompt_anonymity.defenses.base.CachedDefense`.
-A defense hashes its whole class hierarchy, so editing a base class invalidates every defense --
-affordable there, because recomputing is local GPU time. Here recomputing means **billed API
-calls**, and :func:`~prompt_anonymity.caching.source_digest` hashes comments and docstrings too, so
-hierarchy hashing would throw away a cache of paid judge replies every time someone reworded a
-comment in this file. Metrics therefore hash only the classes named by
-:meth:`~UtilityMetric.logic_classes` (by default just the API client), and real logic changes are
-declared by bumping :attr:`~UtilityMetric.version`. The trade is explicit: a logic edit *without*
-a version bump serves stale results, which is the cheaper mistake of the two.
+**Cache invalidation deliberately differs from**
+:class:`prompt_anonymity.defenses.base.CachedDefense`, which hashes its whole class hierarchy --
+affordable there since recomputing is local GPU time. Here recomputing means billed API calls, and
+source hashing would see comments and docstrings too, so any edit to this file would silently
+discard paid judge replies. Metrics instead hash only the classes named by
+:meth:`~UtilityMetric.logic_classes` (by default none), and real logic changes are declared by
+bumping :attr:`~UtilityMetric.version`. The trade is explicit: a logic edit without a version bump
+serves stale results, which is the cheaper mistake of the two.
 """
 
 from __future__ import annotations
@@ -48,9 +45,8 @@ class Sides(NamedTuple):
     Attributes
     ----------
     indices : list of int
-        Row positions in the *full* split that ``original`` / ``defended`` came from -- how a
-        metric recovers each sampled row's identity (its ``conv_id``) from the bundle it was
-        handed, so a sampled run's scores join against a full one's.
+        Row positions in the *full* split that ``original`` / ``defended`` came from, so a sampled
+        run's scores can be joined back against a full one's.
     original, defended : list of str
         Pre-defense and post-defense text, paired positionally.
     total : int
@@ -147,18 +143,12 @@ class UtilityMetric:
         return {}
 
     def logic_classes(self) -> list:
-        """Classes whose source is hashed into the cache key. **Empty by default.**
+        """Classes whose source is hashed into the cache key. Empty by default.
 
-        This used to name the API client, which meant every edit to the client -- a new timeout
-        default, a log line, the usage accounting added on 2026-08-11 -- silently discarded every
-        cached verdict and re-bought it at full price. None of those edits change what a judge
-        replies; what does is the model, the rubric, and the effort, and all three are already in
-        :meth:`params` and therefore already in the key.
-
-        So invalidation here is entirely deliberate: bump :attr:`version` when the metric's
-        behaviour really changes. The risk that buys the saving is the stated one -- a behavioural
-        edit *without* a bump serves stale results -- and it is the cheaper mistake, because a
-        stale namespace can be deleted by hand while re-buying a corpus cannot be undone.
+        Naming the API client here would invalidate every cached verdict on any edit to it (a
+        timeout default, a log line) even though none of those change what a judge replies -- what
+        does (model, rubric, effort) is already in :meth:`params`. Invalidation is instead entirely
+        deliberate: bump :attr:`version` when the metric's behaviour really changes.
         """
         return []
 

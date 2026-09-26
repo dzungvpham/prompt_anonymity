@@ -2,31 +2,20 @@
 
 ``connected`` adds every edge under a threshold and takes the transitive closure, which is single
 linkage cut at a height. Its failure is that one bad edge welds two people together permanently,
-and the damage grows with what it welds -- joining two 400-document clusters through a single
-spurious pair destroys precision for all 800.
+and the damage grows with what it welds.
 
 **This is the PAN 2016 winner's fix, and it is a constraint on the merge rather than a repair
-afterwards.** Bagnall's system (F = 0.8223, first place) is described in the task overview as
-"constraining a single-linkage approach to avoid merging large clusters". The distinction from
-re-thresholding matters and was measured here: cutting a finished blob at a stricter threshold
-moves along the same precision/recall frontier the threshold already optimised and buys nothing,
-because it discards the good links along with the bad. Refusing the merge *at the moment it would
-happen* keeps every link made before it.
-
-Why it should work here specifically
-------------------------------------
-The loss decomposition on WildChat's tuning slice says over-merging is the whole of the reachable
-headroom: repairing it exactly takes BCubed F from 0.560 to **0.658**, while repairing
-under-merging *lowers* F to 0.440 (recall bought at that price is not worth having). Half the
-corpus -- 21,565 of 43,128 documents -- sits in a cluster holding more than one author. A rule
-that refuses the merges which create those clusters attacks exactly that.
+afterwards.** Bagnall's system is described in the task overview as "constraining a single-linkage
+approach to avoid merging large clusters". Cutting a finished blob at a stricter threshold just
+moves along the same precision/recall frontier the threshold already optimised, discarding the
+good links along with the bad; refusing the merge *at the moment it would happen* keeps every link
+made before it.
 
 Two rules, because "large" has two readings
 --------------------------------------------
 ``cap``       refuse a merge whose result would exceed ``max_cluster_size``. Simple, and it bounds
               the damage any single bad edge can do -- but it also refuses a *correct* merge for a
-              genuinely prolific author, and WildChat's heaviest tuning-slice author wrote 1,475
-              documents.
+              genuinely prolific author.
 ``both``      refuse only when **both** sides are already larger than ``max_cluster_size``. A big
               cluster may still absorb a singleton, so a real author keeps growing; what is
               forbidden is welding two established groups together, which is the merge that costs
@@ -71,15 +60,11 @@ def capped_linkage(source: np.ndarray, target: np.ndarray, order: np.ndarray, n_
         edge distance** above this. ``inf`` disables it.
 
         This is Bagnall's "modified agglomerative approach where each link's score is adjusted to
-        the mean of all the links in the cluster it forms", which his PAN 2016 paper reports
-        "appeared to give better results" but which a programming error kept out of the submitted
-        system -- so the winning entry is not even the best version he had. It is a *cohesion*
-        constraint where the two size rules are *capacity* constraints, and it is the better-posed
-        one: it does not care how big a cluster is, only whether it is still tight. A prolific
-        author whose documents are genuinely close keeps merging; a chain whose links are each
-        individually acceptable but collectively loose is stopped. Edges arrive closest-first, so
-        every accepted mean is bounded by the current edge's distance and the constraint only
-        binds when set tighter than the budget's own cut.
+        the mean of all the links in the cluster it forms" from his PAN 2016 submission -- a
+        *cohesion* constraint where the two size rules above are *capacity* constraints. It does
+        not care how big a cluster is, only whether it is still tight: a prolific author whose
+        documents are genuinely close keeps merging, while a chain of individually-acceptable but
+        collectively loose links gets stopped.
     checkpoints : numpy.ndarray, optional
         Edge counts at which to snapshot the partition. Because the algorithm is incremental, a
         whole budget sweep costs **one** pass rather than one pass per budget -- the same saving
@@ -153,10 +138,9 @@ def _labels(parent: np.ndarray, n_documents: int, find) -> np.ndarray:
     """Current component label per document, compacted to ``0..n_clusters-1``.
 
     Resolved by **vectorised pointer doubling** rather than by calling ``find`` per node: this runs
-    once per budget checkpoint, and a sweep takes 160 of them for each of ~80 configurations, so a
-    Python loop over 43,128 nodes here costs more than the entire union-find it is reporting on.
-    ``parent[parent]`` halves the remaining depth each pass, so it converges in log2(depth) passes
-    -- typically under ten.
+    once per budget checkpoint across a whole sweep, so a Python loop over every node here would
+    cost more than the entire union-find it is reporting on. ``parent[parent]`` halves the
+    remaining depth each pass, converging in a handful of passes.
     """
     root = parent.copy()
     while True:

@@ -1,57 +1,34 @@
 """Resolve per-document language labels (primary + secondary) with a language detector.
 
-**Why.** SWE-chat's upstream language labels are unreliable: about a third of documents ship with
-*no* label (the detector abstained on prompts that open with a ``/slash-command`` or a ``<PATH>`` /
-``<URL>`` placeholder, or are short / code-heavy), and some are mislabeled ``English`` where the
-prose is actually CJK (the upstream detector recoded out-of-allowlist languages to English). So we
+**Why.** SWE-chat's upstream language labels are unreliable: many documents ship with no label (the
+detector abstained on prompts that open with a ``/slash-command`` or a placeholder, or are short /
+code-heavy), and some are mislabeled ``English`` where the prose is actually CJK. So we
 **re-detect every SWE-chat document** with a dedicated detector and fall back to the upstream label
 only where the detector abstains.
 
-**Tool.** `Lingua <https://github.com/pemistahl/lingua-py>`_ (``lingua-language-detector``), chosen
-for its short-text accuracy and built-in abstention. It ships its models in-package (offline,
-deterministic) and exposes both a whole-text confidence ranking (for the *primary* language) and a
-span segmenter (for detecting a *secondary* language).
+**Tool.** `Lingua <https://github.com/pemistahl/lingua-py>`_, chosen for its short-text accuracy and
+built-in abstention. It exposes both a whole-text confidence ranking (for the *primary* language)
+and a span segmenter (for a *secondary* language).
 
-**Primary vs. secondary (script-first).** The key observation is that in coding conversations
-English is often *pasted* content -- error messages, logs, code, tool names, file paths -- so a
-naive whole-text vote (or character count) calls a document English even when the human is clearly
-writing in another language. So detection is by **script**: if a non-Latin script (CJK, Cyrillic,
-Arabic, ...) is a substantial share of the letters (``MINORITY_MIN_SHARE``), it is the **primary**
-language -- it is what the user actually wrote -- and **English** becomes the **secondary** when the
-Latin content is a substantial, confidently-English share (only English: the Latin residual is
-code/tech terms, and a structureless bag of identifiers gets mis-tagged as German/Dutch/etc., so
-those are dropped). A Japanese prompt with English tech terms is ``Japanese``; a Chinese request
-quoting an English error is ``(Chinese, English)``. Latin-dominant documents fall back to Lingua's
-whole-text top language (``English``, ``Spanish``, genuine ``German``/``Italian`` prose, ...) and
-get no secondary. Same-script bilingual text (e.g. English + Spanish) is not separable this way.
-See :func:`detect_languages`.
-
-**Method.** Strip scaffolding (fenced/inline code, placeholders, ``/slash-commands``, ``@path``
-refs) so detection runs on prose; require a minimum number of letters and a confidence floor; where
-the detector is unsure, fall back to the upstream label, and where neither has one (pure code /
-ultra-short prompts) default to :data:`DEFAULT_LANGUAGE` -- so ``language_primary`` is never null.
+**Primary vs. secondary (script-first).** In coding conversations English is often *pasted* content
+(errors, logs, code, paths), so a naive whole-text vote calls a document English even when the human
+is writing in another language. Detection is instead by **script**: a substantial non-Latin share of
+the letters (``MINORITY_MIN_SHARE``) becomes the **primary** language, and **English** becomes the
+**secondary** only when the Latin content is itself a substantial, confidently-English share (other
+Latin-language guesses on that residual are jargon, not a real secondary). Latin-dominant documents
+fall back to Lingua's whole-text top language and get no secondary. See :func:`detect_languages`.
 
 **Output schema.** :func:`resolve_document_languages` replaces the upstream ``languages`` list with
-two columns, ``language_primary`` and ``language_secondary`` (the latter ``None`` when there is no
-second language). ``redetect=True`` runs the Lingua pass above (SWE-chat); ``redetect=False`` simply
-splits the existing ``languages`` list into the two columns without re-detecting (the schema-only
-update for a source whose upstream labels are trusted, e.g. WildChat).
+``language_primary`` / ``language_secondary`` columns. ``redetect=True`` runs the Lingua pass above
+(SWE-chat); ``redetect=False`` just splits the existing ``languages`` list without re-detecting (for
+a source whose upstream labels are trusted, e.g. WildChat).
 
-**A second policy: trusted primary, detected secondary (WildChat).** WildChat ships a single
-upstream language per conversation and those labels are trusted (its authors ran Lingua over the
-full language set), so it does not go through the re-detection above -- instead
-:func:`add_secondary_languages` keeps ``language_primary`` verbatim and detects only a *second*
-language. The script-first reasoning does not transfer to it: WildChat is open-domain multilingual
-chat rather than coding logs, so non-primary Latin text is not presumed to be pasted English and
-**any** language may be a secondary -- including a non-English secondary under an English primary,
-the combination :func:`detect_languages` deliberately forbids. Two guards keep it honest: candidates
-are restricted to the languages that actually occur as primaries in the corpus (rare confusables
-like Maori or Basque would otherwise steal short spans, which is what makes an all-languages pass
-unusable), and a secondary is admitted only when the primary is itself present in the text, so an
-upstream *mislabel* (e.g. Arabic prose tagged ``Chinese``) yields no secondary rather than a
-spurious one. At the default threshold ~0.9% of WildChat documents get a secondary, dominated by
-genuine bilingual / closely-related pairs (Russian+Bulgarian, Malay+Indonesian, Persian+Urdu,
-English+French, ...).
+**A second policy: trusted primary, detected secondary (WildChat).** WildChat's upstream primary
+label is trusted, so instead of the re-detection above, :func:`add_secondary_languages` keeps
+``language_primary`` verbatim and detects only a *second* language, over the corpus's own observed
+primary vocabulary (which keeps rare confusable languages from stealing short spans) -- with a
+guard requiring the primary to itself be present in the text, so an upstream mislabel yields no
+secondary rather than a spurious one.
 """
 from __future__ import annotations
 
@@ -160,20 +137,11 @@ def detect_languages(text: str, *, min_chars: int = MIN_CHARS, min_confidence: f
                      ) -> tuple[str | None, str | None]:
     """Detect a document's ``(primary, secondary)`` languages, ``(None, None)`` if undetermined.
 
-    Strips scaffolding first (:func:`strip_for_detection`), then decides by **script**, because in
-    these coding conversations English is frequently *pasted* content (errors, logs, code, tool
-    names, paths) that would swamp a whole-text vote even when the human is writing in another
-    language. So:
-
-    * If a **non-Latin** script (CJK, Cyrillic, Arabic, ...) covers at least ``minority_min_share``
-      of the letters, that script's language is the **primary** -- it is what the user actually
-      *wrote* -- and **English** becomes the **secondary** when the Latin content is a substantial,
-      confidently-*English* share. Only English is accepted here: the Latin residual is code /
-      technical terms, and a structureless bag of identifiers gets confidently mis-tagged as
-      German/Dutch/etc., so those guesses are dropped as jargon. (A Japanese prompt with English
-      tech terms -> ``Japanese``; a Chinese request quoting an English error -> ``(Chinese, English)``.)
-    * Otherwise the document is Latin-dominant: the **primary** is Lingua's whole-text top language
-      (``English``, ``Spanish``, ...) and there is no secondary.
+    Strips scaffolding first (:func:`strip_for_detection`), then decides by **script** (see the
+    module docstring for why): a substantial non-Latin share of the letters makes that script's
+    language the **primary**, with **English** as the **secondary** only when the Latin content is
+    itself a substantial, confidently-English share. Otherwise the document is Latin-dominant: the
+    primary is Lingua's whole-text top language and there is no secondary.
 
     Returns ``(None, None)`` when there are fewer than ``min_chars`` letters or the language is not
     identified confidently (``min_confidence``), so the caller can fall back. Labels are Title-cased
@@ -187,18 +155,13 @@ def detect_languages(text: str, *, min_chars: int = MIN_CHARS, min_confidence: f
     n_latin = scripts.count("Latin")
 
     if (n - n_latin) / n >= minority_min_share:
-        # Substantial non-Latin script -> the user's writing language (English here is usually
-        # pasted code / errors). It takes primary; Latin is a secondary only if also substantial.
+        # Substantial non-Latin script -> the user's writing language. Latin is a secondary only
+        # if also substantial, and only when it's confidently English (a bag of technical
+        # identifiers can mis-tag as German/Dutch/etc., so other guesses are dropped as jargon).
         primary = _confident_language(_script_runs(prose, set(scripts) - {"Latin"}), min_confidence)
         if primary is not None:
             secondary = None
             if n_latin / n >= minority_min_share:
-                # The Latin content in a non-Latin-primary coding prompt is English (code, errors,
-                # tech terms). A bag of technical identifiers has no grammar, so an LID model
-                # confidently mis-tags it as German/Dutch/etc.; only English is accepted as the
-                # secondary -- other Latin-language guesses are treated as English jargon (no
-                # secondary). Genuine non-English Latin prose is a *primary* (detected below), not
-                # this residual.
                 if _confident_language(_script_runs(prose, {"Latin"}), secondary_min_confidence) == "English":
                     secondary = "English"
             return primary, secondary
@@ -214,17 +177,14 @@ def resolve_document_languages(
     """Add ``language_primary`` / ``language_secondary`` columns, replacing the ``languages`` list.
 
     ``redetect=True`` re-detects every document with Lingua (:func:`detect_languages`) and, where
-    Lingua abstains, keeps only the upstream *primary* (its secondary there is unverifiable -- a
-    short/undetectable prompt upstream sometimes tagged with a spurious second language -- so it is
-    dropped) -- the SWE-chat policy. ``redetect=False`` just splits the existing list (primary =
-    first element, secondary = second, if any) without re-detecting -- the schema-only update for a
-    trusted-label source such as WildChat. A document that neither the detector nor the upstream list
-    can label (pure code / ultra-short prompts) falls back to :data:`DEFAULT_LANGUAGE`, so
+    it abstains, keeps only the upstream primary -- its secondary there is unverifiable and dropped
+    (the SWE-chat policy). ``redetect=False`` just splits the existing list without re-detecting
+    (the schema-only update for a trusted-label source such as WildChat). A document neither the
+    detector nor the upstream list can label falls back to :data:`DEFAULT_LANGUAGE`, so
     ``language_primary`` is **never null**.
 
-    Leaves the intermediate ``languages`` column in place (the caller's final column selection drops
-    it). Returns ``(new_frame, stats)`` with ``n_lingua`` (labeled by Lingua), ``n_fallback``
-    (taken from upstream) and ``n_default`` (defaulted to :data:`DEFAULT_LANGUAGE`).
+    Leaves the intermediate ``languages`` column in place. Returns ``(new_frame, stats)`` with
+    ``n_lingua``, ``n_fallback`` and ``n_default`` counts.
     """
     upstream = [list(ls) for ls in frame["languages"]]
     turns = list(frame["turns"])
@@ -243,11 +203,8 @@ def resolve_document_languages(
             n_lingua += 1
         elif len(up) >= 1:                           # fall back to the upstream label
             primary = up[0]
-            # Keep the upstream *secondary* only when we trust the upstream labels wholesale
-            # (redetect=False, e.g. WildChat). After a Lingua abstention (redetect=True) the upstream
-            # secondary is exactly the unverifiable part -- a short/undetectable prompt (often just a
-            # slash-command) that upstream sometimes tagged with a spurious second language -- so we
-            # drop it and keep only the primary.
+            # Keep the upstream secondary only when we trust the upstream labels wholesale
+            # (redetect=False). After a Lingua abstention the secondary is the unverifiable part.
             if not redetect:
                 secondary = up[1] if len(up) >= 2 else None
             n_fallback += 1
@@ -326,11 +283,10 @@ def add_secondary_languages(
 ) -> tuple[pd.DataFrame, dict]:
     """Fill ``language_secondary`` for a frame whose ``language_primary`` is already resolved.
 
-    Runs :func:`detect_secondary_language` over every document (the ``turns`` list joined with
-    newlines), *replacing* the existing ``language_secondary`` column -- this is for a source whose
-    upstream data carries no second language of its own (WildChat), so there is nothing to preserve.
-    ``language_primary`` is never touched. Single-process and Lingua-bound: a few minutes for
-    ~100k documents.
+    Runs :func:`detect_secondary_language` over every document, *replacing* the existing
+    ``language_secondary`` column -- this is for a source whose upstream data carries no second
+    language of its own (WildChat), so there is nothing to preserve. ``language_primary`` is never
+    touched.
 
     Returns ``(new_frame, stats)`` with ``n_docs`` and ``n_secondary`` (documents that got one).
     """

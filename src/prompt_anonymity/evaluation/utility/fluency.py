@@ -1,44 +1,31 @@
 """Is the rewrite still well-formed text? Perplexity under a small multilingual language model.
 
-This is PAN's third obfuscation axis. Their triad is **safe** (no longer attributable), **sound**
-(the content survives) and **sensible** (the output is well-formed and inconspicuous); the attacks
-measure the first, :mod:`.prompt_judge` and :mod:`.semantic` the second, and nothing measured the
-third until this module. It is worth having separately because a rewrite can be perfectly faithful
-and still unusable -- degenerate repetition, a collapsed sentence, a model that lost the plot --
-and a content metric will happily call that preserved.
+This is PAN's third obfuscation axis: **safe** (no longer attributable), **sound** (the content
+survives) and **sensible** (the output is well-formed). The attacks measure the first,
+:mod:`.prompt_judge` and :mod:`.semantic` the second, this module the third -- a rewrite can be
+perfectly faithful and still unusable (degenerate repetition, a collapsed sentence), which a
+content metric alone would call preserved.
 
-**The score is a ratio, not an absolute.** Perplexity is dominated by what a text is *about*: a
-dense stack trace scores far worse than small talk under any language model, so an absolute number
-mostly ranks the corpus by topic. What is meaningful is each document against *itself*:
-``ppl_ratio = perplexity(rewrite) / perplexity(original)``. Content cancels, and what is left is
-what the rewrite did to the text's well-formedness. Above 1 is less fluent than the original,
-below 1 is more (which happens, and is not automatically good -- a defense that replaces a
-specific technical question with a bland paraphrase lowers perplexity while destroying utility,
-which is precisely why this is reported *beside* the content metrics and never instead of them).
+**The score is a ratio, not an absolute.** Perplexity is dominated by what a text is *about*, so
+each document is compared against *itself*: ``ppl_ratio = perplexity(rewrite) / perplexity(original)``.
+Content cancels, leaving what the rewrite did to well-formedness. Above 1 is less fluent, below 1
+is more -- and lower is not automatically better, since a bland paraphrase can lower perplexity
+while destroying utility. Report this beside the content metrics, never instead of them.
 
-**Aggregated as a geometric mean**, because the quantity is a ratio: a document that doubles its
-perplexity (2.0) and one that halves it (0.5) should cancel, and under an arithmetic mean they
-average to 1.25 -- a fictitious 25% degradation. The geometric mean is equivalently the arithmetic
-mean of the log ratios, which is how it is computed.
+**Aggregated as a geometric mean**, since it's a ratio: an arithmetic mean would let a doubled and
+a halved perplexity fail to cancel.
 
-**Multilingual by requirement.** The default is a small Qwen3 *base* checkpoint: these corpora
-contain Chinese conversations, and an English-only LM would report every one of them as
-catastrophically disfluent in both versions -- the ratio would partly cancel that, but not
-reliably. See :data:`DEFAULT_FLUENCY_MODEL` for why it is a base model rather than an instruct one.
+**Multilingual by requirement**: these corpora contain non-English conversations, and an
+English-only LM would call all of them disfluent regardless of the rewrite. See
+:data:`DEFAULT_FLUENCY_MODEL` for why it is a base model rather than an instruct one.
 
 **CoLA acceptability is deliberately not implemented**, although the StyleRemix defense ships one
-upstream. CoLA is an English grammatical-acceptability corpus; running it on this corpus would
-score the Chinese half as unacceptable regardless of what the defense did to it. Perplexity under
-a multilingual LM measures the same underlying property without that failure. If an English-only
-split is ever scored in isolation, adding CoLA becomes reasonable.
+upstream -- it's an English-only grammaticality corpus, which would misscore every non-English
+conversation regardless of what the defense did.
 
-**Results are not cached, unlike the LLM judge's.** A cache exists on the base class and these
-metrics deliberately do not use it: a cache miss here is GPU-minutes, not a re-billed API call, so
-the argument that justifies caching paid verdicts does not carry over. The cost of that choice is
-**resumability**, and it has a concrete limit -- 50 conversations take well under a minute on an
-A16, so a full swe-chat split (4,334) is minutes, but WildChat (172,509) is hours and will not fit
-one ``--qos=short`` allocation. Shard it by passing a subset, or add caching, before running the
-larger corpus.
+**Results are not cached, unlike the LLM judge's.** A miss here is GPU-minutes, not a re-billed API
+call, so caching paid verdicts is not the same argument. The cost is resumability: shard a large
+split into a subset per run rather than scoring it in one long job.
 """
 
 from __future__ import annotations
@@ -55,19 +42,15 @@ from .base import DEFAULT_SEED, UtilityMetric, UtilityResult
 #: Small multilingual causal LM used as the fluency reference. Deliberately small: perplexity
 #: *ranking* is stable across model sizes, and this runs over whole corpora.
 #:
-#: **A base model, not an instruct one.** Perplexity here is meant to answer "is this text
-#: well-formed?", and an instruction-tuned checkpoint answers a subtly different question: its
-#: distribution has been reshaped toward assistant-style replies, so it finds polished prose
-#: unusually likely and terse developer shorthand unusually surprising -- which is exactly the
-#: contrast this metric measures, now partly attributable to the scorer. The base model is the
-#: neutral language model the ratio assumes.
+#: **A base model, not an instruct one.** An instruction-tuned checkpoint's distribution is shaped
+#: toward assistant-style replies, so it finds polished prose unusually likely and terse developer
+#: shorthand unusually surprising -- exactly the contrast this metric is trying to measure, which a
+#: base model stays neutral to.
 #:
-#: This is a HuggingFace repo id on purpose: it is committed code, so it must work on a machine
-#: with no local mirror. Point ``$UTILITY_FLUENCY_MODEL`` (in ``.env``) or a ``[fluency]`` entry in
-#: a ``models.toml`` of your own at a copy already on disk -- on this machine that is
-#: ``/datasets/ai/qwen3/hub/models--Qwen--Qwen3-0.6B-Base``, and
-#: :func:`~prompt_anonymity.defenses._backends.resolve_model_path` follows a hub cache directory
-#: like that one into its snapshot.
+#: A HuggingFace repo id on purpose, since it must work on a machine with no local mirror. Point
+#: ``$UTILITY_FLUENCY_MODEL`` (in ``.env``) or a ``[fluency]`` entry in a ``models.toml`` at a copy
+#: already on disk; :func:`~prompt_anonymity.defenses._backends.resolve_model_path` follows a hub
+#: cache directory into its snapshot.
 DEFAULT_FLUENCY_MODEL = "Qwen/Qwen3-0.6B-Base"
 FLUENCY_MODEL_ENV = "UTILITY_FLUENCY_MODEL"
 
@@ -79,9 +62,8 @@ DEFAULT_MAX_LENGTH = 1024
 #: multilingual vocabulary makes that the dominant allocation of the whole metric.
 DEFAULT_BATCH_SIZE = 4
 
-#: Sequence positions whose logits are upcast to fp32 at once. The one knob that decides whether
-#: this metric fits on a card: see :meth:`_PerplexityScorer.perplexity` for why the obvious
-#: unchunked implementation needs ~10 GB of scratch and this one needs a few hundred MB.
+#: Sequence positions whose logits are upcast to fp32 at once, so a large vocabulary's logit tensor
+#: isn't materialized in full at that precision. See :meth:`_PerplexityScorer.perplexity`.
 LOGIT_CHUNK_TOKENS = 128
 
 #: A rewrite whose perplexity exceeds the original's by more than this is counted in
@@ -107,8 +89,7 @@ class _PerplexityScorer:
         print(f"Utility(fluency): loading '{model}' on {self.device}")
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token is None:
-            # Needed only to make batching legal; padded positions are masked out of the loss
-            # below, so the choice of pad token cannot affect a score.
+            # Just to make batching legal; padded positions are masked out of the loss below.
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = AutoModelForCausalLM.from_pretrained(
             model, dtype=torch_dtype(self.device)).to(self.device).eval()
@@ -116,19 +97,14 @@ class _PerplexityScorer:
     def perplexity(self, texts: list[str]) -> list[float]:
         """Token-level perplexity of each text; ``nan`` for text too short to score.
 
-        Computed by hand rather than through the model's own ``labels=`` loss because that averages
-        over the whole batch and returns one number -- useless here, where the point is the
-        per-document value.
+        Computed by hand rather than through the model's own ``labels=`` loss, which averages over
+        the whole batch into one number where a per-document value is wanted.
 
-        **The arithmetic is chunked along the sequence, and that is not an optimisation.** The
-        logits are ``[batch, sequence, vocab]``, and a modern multilingual vocabulary is enormous
-        (151,936 for Qwen3): at batch 4 and 1,024 tokens that single tensor is 1.2 GB in fp16. The
-        obvious implementation -- upcast it and take ``log_softmax`` -- allocates two *more* copies
-        at fp32, about 5 GB each, and OOMs a 15 GB card on the first batch (observed). Instead the
-        sequence is walked in slices, and only a slice is ever upcast; and rather than a full
-        ``log_softmax`` (which materialises a probability for all 152k tokens when 1 is wanted),
-        each target's log-probability comes from ``logit[target] - logsumexp(logits)``, which is
-        the same value with no vocabulary-sized intermediate.
+        **Chunked along the sequence, and only a slice is ever upcast to fp32** -- a modern
+        multilingual vocabulary makes the full ``[batch, sequence, vocab]`` logit tensor too large
+        to upcast and softmax at once. Each target's log-probability is taken as
+        ``logit[target] - logsumexp(logits)`` rather than a full ``log_softmax``, which avoids
+        materializing a probability for the whole vocabulary when only one is needed.
         """
         scores: list[float] = []
         for start in range(0, len(texts), self.batch_size):

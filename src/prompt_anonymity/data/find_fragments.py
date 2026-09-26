@@ -7,42 +7,26 @@ it is arguably worse for the linkage study: a fragmented author makes a *correct
 wrong, because the attacker links an unknown document to the right human under a different label
 and is scored as a miss.
 
-This is a **ground-truth cleaning** tool, not part of the attack. The distinction matters for what
-evidence is fair game:
-
-* ``accept_language`` / ``device_info`` / ``country`` are *label-construction* metadata. The
-  attacker never sees them, so using them here does not leak anything into the experiment.
-* **Content similarity is fair game too** -- it is being used to decide whether two labels denote
-  the same person, not to perform the attack. (It would be circular only if the merged labels were
-  then used to score a content-based attack *as though* the merge were independent evidence.)
-
-So: **metadata for recall, content for precision.**
+This is a **ground-truth cleaning** tool, not part of the attack. ``accept_language`` /
+``device_info`` / ``country`` are label-construction metadata the attacker never sees, and content
+similarity here decides whether two labels denote the same person rather than performing an
+attack -- so both are fair game. **Metadata for recall, content for precision.**
 
 Method
 ------
 1. **Block** on ``(accept_language, device_info, country)`` -- the components that survive an IP
-   change. O(N) hash grouping, so this never materializes an N^2 comparison over the corpus.
+   change.
 2. **Constrain.** Within a block, keep pairs whose activity intervals are **disjoint** (an overlap
    means two people sharing a fingerprint, never one person) with a gap under ``--max-gap`` days.
 3. **Score with content.** Build a char-n-gram TF-IDF centroid per author and take the cosine
-   between the two candidates. Each pair is also compared against a null: the same author's mean
-   similarity to random authors in the corpus. ``lift = sim / null_sim`` is the headline number.
+   between the two candidates, calibrated against a null (the same author's mean similarity to
+   random authors). ``lift = sim / null_sim`` is the headline number.
 4. **Assemble chains** by union-find over accepted pairs, rejecting any chain whose members'
    intervals overlap.
 
-Precision, measured honestly: against a control of pairs matched on primary language and forced to
-be temporally disjoint but drawn from *different* fingerprint blocks, same-fingerprint candidates
-are only ~2.7x enriched at ``sim >= 0.5``. So roughly **half** the accepted pairs are expected to
-be coincidence. Treat the output as a **ranked shortlist for manual verification**, not a decided
-merge. (The control is itself conservative: someone who changes phone gets a new ``device_info``
-and lands in the control while genuinely being a fragment, so true precision is somewhat better.)
-
-Why content is required: metadata alone cannot call individual pairs. Scoring pairs purely on how
-surprising their timing is, given block density, and correcting for multiple testing across ~10^6
-candidate pairs accepts *zero* pairs -- in a block of 82 identities over 359 days a 5-day gap is
-unremarkable. The aggregate excess over a permutation null is real (~200x), so fragmentation is
-pervasive, but naming *which* authors needs the content signal. See
-``data/fragmentation_findings.md``.
+Timing alone cannot call individual pairs -- naming *which* authors needs the content signal, and
+even then the output is a **ranked shortlist for manual verification**, not a decided merge. See
+``data/fragmentation_findings.md`` for the precision estimate.
 
 Usage
 -----
@@ -193,15 +177,12 @@ def score_with_content(pairs: pd.DataFrame, documents: pd.DataFrame, *, n_null: 
 def assemble_chains(accepted: pd.DataFrame, identities: pd.DataFrame) -> pd.DataFrame:
     """Greedily grow chains from the strongest links, keeping every chain temporally disjoint.
 
-    Plain union-find is wrong here. Transitive closure over a permissive similarity threshold
-    pulls unrelated identities into one blob -- the verified four-fragment Korean chain ended up
-    inside a 54-member cluster -- and a single overlapping member then invalidates the whole thing,
-    discarding the good chain along with the bad links.
-
-    Instead: consider links strongest-first and merge two chains only when the union stays
-    temporally disjoint (no two members overlap, since one person cannot be active as two
-    identities at once). A link that would violate that is skipped rather than poisoning the
-    cluster, so a strong chain survives a weak neighbour.
+    Plain union-find is wrong here: transitive closure over a permissive similarity threshold
+    pulls unrelated identities into one blob, and a single overlapping member then invalidates
+    the whole chain. Instead, links are considered strongest-first and a merge is only accepted
+    when the union stays temporally disjoint (no two members overlap, since one person cannot be
+    active as two identities at once) -- a link that would violate that is skipped rather than
+    poisoning the cluster.
     """
     meta = identities.set_index("author_id")
     spans = {a: (r.first, r.last) for a, r in meta.iterrows()}
@@ -256,10 +237,8 @@ def main() -> None:
     p.add_argument("--max-gap", type=float, default=45.0, help="max days between fragments (default 45)")
     p.add_argument("--max-block", type=int, default=200, help="skip fingerprints shared by more identities")
     p.add_argument("--min-sim", type=float, default=0.6,
-                   help="cosine between the two authors' char-n-gram TF-IDF centroids (default 0.6). "
-                        "A language-matched control of different-fingerprint pairs reaches this "
-                        "level 1.0%% of the time, so expect roughly half the accepted pairs to be "
-                        "coincidence -- this is a shortlist to verify, not a decided answer")
+                   help="cosine between the two authors' char-n-gram TF-IDF centroids (default 0.6); "
+                        "this is a shortlist to verify, not a decided answer")
     p.add_argument("--out-dir", default=None,
                    help="where the two CSVs go (default: the project's data/)")
     args = p.parse_args()

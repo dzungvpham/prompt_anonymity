@@ -2,10 +2,9 @@
 
 EmBad appends one short trigger turn to a document, and every trigger names a **decoy subject** --
 the thing it asserts the document is really about (see :data:`~prompt_anonymity.defenses.embad
-.DECOY_TOPIC`). Until now that subject was a single hardcoded string, which makes every measured
-result conditional on one arbitrary choice of topic. This module builds the pool the search draws
-from instead, so a trigger can be optimised over many subjects and *validated on subjects it never
-saw*.
+.DECOY_TOPIC`). A single hardcoded subject makes every measured result conditional on one
+arbitrary choice of topic, so this module builds a pool the search can draw from instead, letting a
+trigger be optimised over many subjects and validated on subjects it never saw.
 
 Two stages, deliberately separable
 ==================================
@@ -16,34 +15,20 @@ pipeline but never one job, because on a cluster they belong on different nodes.
    keeps the headings typed ``madsrdf:Topic``. LCSH is a controlled vocabulary of *what a document
    can be about*, maintained by librarians for exactly the question being asked here, so the
    diversity comes from the vocabulary rather than from a language model's sampler -- which is the
-   whole point. An LLM asked to invent 100,000 topics mode-collapses; an LLM handed 100,000
-   externally-supplied subjects cannot.
+   whole point. An LLM asked to invent topics from scratch mode-collapses; handed externally
+   supplied subjects, it cannot.
 
 2. **Expand** (:class:`TopicExpander`) rewrites each heading into the pool's format with a local
-   Qwen. This is a constrained rewrite of a supplied subject, not open-ended generation: normalise
+   model. This is a constrained rewrite of a supplied subject, not open-ended generation: normalise
    the heading's cataloguing conventions into plain English, then name three concrete things inside
-   it. A 9B model is comfortable with that and would not be trusted with the first stage.
+   it -- a task a small model is comfortable with and would not be trusted with the first stage.
 
 Why the MADS-RDF export and not the SKOS one
 ============================================
-LC publishes both. **Take MADS.** The SKOS export (``subjects.skosrdf.jsonld.gz``) types every
-heading as a bare ``skos:Concept``, which leaves the ~50% of LCSH that is place names, family
-names and building names to be separated from real subject matter by pattern-matching the label --
-measured here as regex whack-a-mole that still leaked ``Toppenish Creek (Wash.)`` and
-``Maquoketa River (Iowa)``. MADS types each heading structurally, so the filter is a field lookup.
-Measured over a 4 MB slice (12,736 typed records):
-
-===========================  ======  ====================================================
-type                          share   disposition
-===========================  ======  ====================================================
-``madsrdf:Topic``               41%   kept -- this is the pool's source
-``madsrdf:Geographic`` (both)   35%   dropped: place names
-``madsrdf:ComplexSubject``      15%   dropped for now; see :data:`COMPLEX_SUBJECTS_NOTE`
-``FamilyName``/``CorporateName`` 9%   dropped: families, buildings, institutions
-===========================  ======  ====================================================
-
-The full export is ~140 MB gzipped, which projects to roughly **447,000 headings, ~181,000 of them
-``Topic``** -- more than the search can consume, which is the point of a sampling frame.
+LC publishes both. **Take MADS.** The SKOS export types every heading as a bare ``skos:Concept``,
+leaving place names, family names and building names to be separated from real subject matter by
+pattern-matching the label. MADS types each heading structurally, so the filter is a field lookup
+instead.
 
 What the format has to satisfy
 ==============================
@@ -57,14 +42,10 @@ Two things, and **length is deliberately not one of them.**
   LCSH's bias toward what books are written about -- humanities, history, material culture,
   natural history -- helps here rather than hurting.
 
-An earlier version of this module banded entries tightly (45-80 characters) on the grounds that
-``embad.MAX_TOKENS`` capped a rendered trigger, so a long subject could truncate away
-and make a candidate's viability a function of the topic draw. **That reasoning is retired, and the cap itself was removed on 2026-09-07**: the
-64-token cap is an inheritance from the GCG-style search this work started from, not a property of
-the evolutionary search, which is free to evolve a trigger of whatever length it wants. The band
-that remains (:data:`TOPIC_MIN_CHARS`--:data:`TOPIC_MAX_CHARS`) is a **sanity bound** catching a
-degenerate or runaway generation, not a design constraint -- so it is wide, and nothing should be
-tuned against it.
+The character band on a finished entry (:data:`TOPIC_MIN_CHARS`--:data:`TOPIC_MAX_CHARS`) is a
+**sanity bound** catching a degenerate or runaway generation, not a design constraint the search is
+meant to respect -- it evolves a trigger of whatever length it wants, so the band is wide and
+nothing downstream should be tuned against it.
 
 Reproducibility
 ===============
@@ -78,7 +59,7 @@ Usage
 
 .. code-block:: shell
 
-    # stage 1 -- network, no GPU (~140 MB download, cached)
+    # stage 1 -- network, no GPU
     python -m prompt_anonymity.defenses.embad_topics --harvest
 
     # stage 2 -- GPU, no network. Ten seeds, which is the smoke test.
@@ -133,14 +114,11 @@ LABEL_KEY = "madsrdf:authoritativeLabel"
 #: longer the vocabulary's answer for its subject, and there is no reason to seed from it.
 DEPRECATED_KEY = "owl:deprecated"
 
-#: Why ``madsrdf:ComplexSubject`` is not harvested, though it is 15% of the export and holds some of
-#: its best material (``Choral singing--Studies and exercises``, ``String craft--Japan``, ``Art,
-#: Chinese--Western influences``). A complex subject is a *precoordinated string* of facets joined
-#: by ``--``, and a large share of those facets are geographic (``Marketplaces--Poland``,
-#: ``Faults (Geology)--Maine``), which is the material the MADS typing exists to exclude. Harvesting
+#: Why ``madsrdf:ComplexSubject`` is not harvested, even though it holds some good material. A
+#: complex subject is a *precoordinated string* of facets joined by ``--``, and a large share of
+#: those facets are geographic, which is the material the MADS typing exists to exclude. Harvesting
 #: them means re-deriving that judgement per facet -- a second filter with its own error rate -- for
-#: subjects the ``Topic`` type already supplies ~181,000 of. Revisit only if the pool turns out to
-#: be too narrow, which a sample audit would show before a search ever did.
+#: subjects the plain ``Topic`` type already supplies plenty of.
 COMPLEX_SUBJECTS_NOTE = "complex subjects are precoordinated facet strings; many facets are places"
 
 # --------------------------------------------------------------------------------------------
@@ -170,17 +148,15 @@ def is_non_ascii(heading: str) -> bool:
     """Whether a heading carries any character outside ASCII.
 
     In LCSH this is overwhelmingly one thing: a romanised non-English title written with combining
-    marks and half-rings (``Inspekt͡sii͡a medit͡sinskai͡a germenevtika``, ``Konakŭt na Salikh
-    aga``). Those are legitimate headings and useless decoys -- the subject is unreadable to anyone
-    who does not already know the work -- and they were 4.8% of a measured slice.
+    marks and half-rings. Those are legitimate headings and useless decoys -- the subject is
+    unreadable to anyone who does not already know the work.
 
     **The rule is deliberately blunter than the intent.** An NFKD fold was tried first, to keep an
-    ordinary English heading that merely carries an accent (``Cafe`` from ``Café``) while dropping
-    the transliterations; it does not work, because a transliteration folds to ASCII base characters
-    just as cleanly as an accent does -- the combining marks are exactly what NFKD strips. There is
-    no cheap test that separates the two, so the whole class goes. The cost is a handful of accented
-    English headings out of ~181,000; the benefit is that it matches what the pool itself requires,
-    since :func:`topic_rejection` rejects a non-ASCII entry anyway.
+    ordinary English heading that merely carries an accent while dropping the transliterations; it
+    does not work, because a transliteration folds to ASCII base characters just as cleanly as an
+    accent does. There is no cheap test that separates the two, so the whole class goes -- which
+    matches what the pool itself requires anyway, since :func:`topic_rejection` rejects a
+    non-ASCII entry too.
     """
     return any(ord(character) > 0x7F for character in heading)
 
@@ -306,15 +282,10 @@ def harvest_seeds(path: Path, *, shuffle: bool = True,
 
     **The shuffle is not cosmetic.** LCSH is exported in accession order, which is the order the
     Library catalogued the headings in, so the file is a sequence of *cataloguing batches* and
-    neighbouring headings share a subject. The first ten of this export are ``ActionScript``,
-    ``Women marine mammalogists``, ``White-faced saki`` and then seven consecutive enzymes and
-    biomolecules (``NAD-ADP-ribosyltransferase``, ``Uteroglobin``, ``Cyclooxygenase 2``, ...).
-
-    Left in file order, any prefix of the seed list is a clump rather than a sample: ``--limit 10``
-    would judge the expander on biochemistry alone, and a pool built from a truncated run would be
-    a pool about whatever the Library happened to catalogue first. One seeded shuffle makes every
-    prefix representative, which is what makes ``--limit`` mean "a smaller pool" instead of "a
-    different subject area".
+    neighbouring headings share a subject. Left in file order, any prefix of the seed list is a
+    clump rather than a sample -- a truncated run would build a pool about whatever the Library
+    happened to catalogue first. One seeded shuffle makes every prefix representative, which is
+    what makes ``--limit`` mean "a smaller pool" instead of "a different subject area".
     """
     import random
 
@@ -383,8 +354,8 @@ EXPANDER_SECTION = "embad_topics"
 EXPANDER_MODEL_ENV = "EMBAD_TOPIC_MODEL"
 
 #: Served context. The prompt is a fixed rubric plus one short heading, so this is generous; it is
-#: kept small because a 9B multimodal checkpoint's native context would spend the whole card on KV
-#: cache for a job whose prompts are 400 tokens.
+#: kept small because the checkpoint's native context would spend the whole card on KV cache for a
+#: job whose prompts are short.
 EXPANDER_MAX_MODEL_LEN = 2048
 
 #: Tokens per line. Comfortably more than a well-formed answer needs (the exemplars are ~16), so a
@@ -394,28 +365,18 @@ EXPANDER_MAX_TOKENS = 64
 
 EXPANDER_GPU_MEMORY_UTILIZATION = 0.90
 
-#: Concurrent sequences. **Deliberately far above ``scripts/serve_qwen.sh``'s 5.** That script
-#: serves an interactive orchestrator, where the figure of merit is time to first token, and it is
-#: tuned accordingly (``--performance-mode interactivity``, speculative MTP decoding, a tiny batch).
-#: This job is the opposite: ~172,000 independent one-line generations where nothing waits on any
-#: single answer, so it is throughput-bound and wants a deep batch. Prefix caching is kept from that
-#: script and earns much more here, since every prompt shares the same rubric; speculative decoding
-#: is dropped, because it buys latency at a cost in throughput.
-#:
-#: **1,024 rather than a few hundred, because prefix caching makes a sequence nearly free here.**
-#: The rubric plus three exemplars is ~950 shared tokens and only the heading differs, so the engine
-#: stores that prefix once at block level and each additional request costs KV for its own ~10-token
-#: heading plus its ~25-token answer. Measured on an A100-80GB at these settings: 16.8 GiB of
-#: weights leaves a **52.8 GiB KV cache, 658,227 tokens**, which the engine reported as 321x
-#: concurrency *at the full 2,048-token context* -- and a request here needs a fortieth of that.
-#: The cap is what the scheduler is allowed to admit, not a reservation, so an over-generous value
-#: costs nothing and an under-generous one silently idles the card.
+#: Concurrent sequences. **Deliberately far above ``scripts/serve_qwen.sh``'s interactive setting.**
+#: That script serves an interactive orchestrator where time-to-first-token matters and is tuned
+#: accordingly. This job is the opposite: many independent one-line generations where nothing waits
+#: on any single answer, so it is throughput-bound and wants a deep batch. Prefix caching earns much
+#: more here too, since every prompt shares the same rubric; speculative decoding is dropped because
+#: it buys latency at a cost in throughput. The cap is what the scheduler is allowed to admit, not a
+#: reservation, so an over-generous value costs nothing and an under-generous one silently idles the
+#: card.
 EXPANDER_MAX_NUM_SEQS = 1024
 
-#: Tokens the engine may prefill in one scheduler step. ``scripts/serve_qwen.sh`` sets 8,192, which
-#: is right for an interactive server (a big prefill blocks other users' decode). Nothing here is
-#: waiting on anything, so a wider step is pure throughput: it admits ~34 fresh prompts per prefill
-#: rather than ~8, and the shared prefix means most of those tokens are cache hits anyway.
+#: Tokens the engine may prefill in one scheduler step. Nothing here is waiting on anything, so a
+#: wide step is pure throughput, and the shared prefix means most of those tokens are cache hits.
 EXPANDER_MAX_NUM_BATCHED_TOKENS = 32768
 
 #: The rubric. Held as a module constant rather than built inline because it is the part most likely
@@ -444,9 +405,6 @@ EXPANDER_INSTRUCTIONS = (
     "Rules:\n"
     "- Exactly this shape: [subject], [thing], [thing] and [thing]\n"
     "- Exactly two commas and one \" and \". No other punctuation. No final period.\n"
-    # A word budget rather than a character count -- a model cannot count characters, and there is
-    # no longer any reason to make it try. This asks for brevity because a facet phrase reads as a
-    # facet phrase, not because anything downstream measures the line.
     "- Each of the three things is one to three words.\n"
     "- Lower case throughout, except words that are proper nouns.\n"
     "- Put the heading into natural English word order. Library headings are often inverted "
@@ -497,8 +455,7 @@ class TopicExpander:
     """Rewrites LCSH headings into pool entries with a local vLLM engine.
 
     One engine for the whole build. The batch is the entire seed list handed to vLLM at once, which
-    lets continuous batching keep the device busy rather than round-tripping per seed -- the same
-    lesson as EmBad's own mutator, where batching was measured at 71x on the generation step.
+    lets continuous batching keep the device busy rather than round-tripping per seed.
     """
 
     def __init__(self, model: str | None = None,
@@ -525,9 +482,8 @@ class TopicExpander:
             max_num_batched_tokens=max_num_batched_tokens,
             tensor_parallel_size=tensor_parallel_size,
             enable_prefix_caching=True,
-            # Qwen3.5-9B is a Qwen3_5ForConditionalGeneration checkpoint -- a vision-language model
-            # whose image and video towers this job never uses. Loading it whole would reserve
-            # encoder memory and multimodal cache for capacity that is dead weight here.
+            # The checkpoint is a vision-language model whose image/video towers this job never
+            # uses; loading it whole would reserve memory for capacity that is dead weight here.
             language_model_only=True,
         )
         # Greedy, as styleremix decodes: a pool that changed between builds would silently split

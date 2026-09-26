@@ -10,47 +10,37 @@ from ..common import group_by_author
 class RegularizedLeastSquares:
     """Weighted one-vs-all regularised least squares (RLSC): one factorisation for every author.
 
-    The eager classifier that survives a large author pool, and the method
-    Narayanan et al. used to attack 100,000 blogs at IEEE S&P 2012. Every other discriminative
-    attack here pays per author -- :class:`LogisticAttribution` fits ``T`` coupled weight
-    vectors, :class:`SupportVectorAttribution` fits ``T(T-1)/2`` pairwise problems, and
-    :class:`GradientBoostedTrees` grows one tree per author *per boosting round*. Squared loss
-    has a closed form instead, so the ``d x d`` system is factorised **once** and each author is
-    one more right-hand side: ``O(n d^2 + d^3 + d^2 T)`` rather than ``O(n d^2 + T d^3)``.
-    Measured on wildchat StyloMetrix, an xgboost fit costs ~0.097 s per author per 20 boosting
-    rounds -- 8 hours for one of the 19,711-author windows -- while this fits in seconds.
+    The eager classifier that survives a large author pool, and the method Narayanan et al. used
+    to attack 100,000 blogs at IEEE S&P 2012. Every other discriminative attack here pays per
+    author -- :class:`LogisticAttribution` fits ``T`` coupled weight vectors,
+    :class:`SupportVectorAttribution` fits ``T(T-1)/2`` pairwise problems, and
+    :class:`GradientBoostedTrees` grows one tree per author *per boosting round*. Squared loss has
+    a closed form instead, so the ``d x d`` system is factorised **once** and each author is one
+    more right-hand side: ``O(n d^2 + d^3 + d^2 T)`` rather than ``O(n d^2 + T d^3)``.
 
     The masking correction is **per author, on the left-hand side**, and it has to be. With ``T``
     authors a one-vs-all problem has ``T-1`` times more negatives than positives, so plain least
-    squares calls everything negative: Narayanan et al. found only 628 distinct classes ever
-    predicted across 50,000 test documents, with the same 100 authors covering 82% of
-    predictions. The fix is to up-weight each author's own documents by ``(n - n_a) / n_a`` so
-    the two sides of *that* author's problem carry equal total weight -- worth two orders of
-    magnitude of accuracy in the original.
+    squares calls almost everything negative. The fix is to up-weight each author's own documents
+    by ``(n - n_a) / n_a`` so the two sides of *that* author's problem carry equal total weight.
 
     That weight depends on which author is currently positive, so it perturbs the Gram matrix
     once per author and a single shared factorisation is *not* enough. Woodbury is what rescues
     the complexity: the perturbation is ``(a_a - 1) X_a^T X_a``, a rank-``n_a`` update, so each
     author costs one ``n_a x n_a`` solve against the shared inverse rather than a fresh ``d x d``
     factorisation. Authors with more documents than dimensions take the direct solve instead,
-    which is cheaper for them. This is the "careful algebra" the paper reports as preserving
-    RLSC's runtime.
+    which is cheaper for them.
 
     .. warning::
        Do **not** simplify this to one shared Gram matrix with a rescaled target, which is the
        obvious-looking way to keep the ``O(n d^2 + d^3)`` cost. All ``T`` right-hand sides then
-       differ only by a common scale and a common additive vector, so
-       ``argmax`` over authors is *identical* for every choice of target -- the whole method
-       degenerates into a whitened nearest-centroid rule and the masking correction becomes a
-       no-op. Measured on wildchat: that variant scored top-1 0.0159 against
-       :class:`WhitenedCentroid`'s 0.0164, with the positive target varied over four orders of
-       magnitude and the predictions bit-identical every time.
+       differ only by a common scale and a common additive vector, so ``argmax`` over authors is
+       *identical* for every choice of target -- the whole method degenerates into a whitened
+       nearest-centroid rule (see :class:`WhitenedCentroid`) and the masking correction becomes a
+       no-op.
 
-    Beware the shape of the problem: masking bites "as soon as the number of classes is on the
-    same order as the dimensionality of the data". With 196 StyloMetrix features against 7,456
-    authors that ratio is ~38:1; a 3,072-dimensional embedding brings it to ~6:1. Feature
-    normalisation mattered more than the classifier in that work, so try ``--standardize``
-    before concluding anything about this attack.
+    Beware the shape of the problem: masking bites once the number of classes is on the same
+    order as the dimensionality of the data, so feature normalisation can matter more than the
+    classifier -- try ``--standardize`` before concluding anything about this attack.
     """
 
     name = "rlsc"

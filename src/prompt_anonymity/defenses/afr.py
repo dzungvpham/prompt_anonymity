@@ -1,24 +1,19 @@
 r"""Agentic Footprint Reduction: the model optimizes against a real linkage measurement.
 
-Every other defense in this package applies a *fixed* transformation and hopes it helps -- neutralize
-style (``styleremix``, ``qwen_rewrite``), add per-word DP noise (``dp_mlm``), manufacture shared
-quirks (``collision_seeding``), reframe the scene (``frame_shift``). None of them ever check whether
-the edit worked. :mod:`.loo_unlink` is the first that measures, but the measurement drives a fixed
-greedy rule and the model is demoted to a span rewriter that never sees a score.
-
-AFR inverts that. **The model is the optimizer.** It is shown its draft's real similarity to the
-author's earlier prompts, told what a stranger's prompt scores, and given up to
-:data:`DEFAULT_MAX_PROBES` re-embeddings to close the gap. The surrounding Python only scores what it
-returns and enforces the contracts.
+Every other defense in this package applies a *fixed* transformation and hopes it helps.
+:mod:`.loo_unlink` is the first that measures, but the measurement drives a fixed greedy rule and
+the model never sees a score. AFR inverts that: **the model is the optimizer**. It is shown its
+draft's real similarity to the author's earlier prompts, told what a stranger's prompt scores, and
+given up to :data:`DEFAULT_MAX_PROBES` re-embeddings to close the gap. The surrounding Python only
+scores what it returns and enforces the contracts.
 
 The target is absolute, not relative
 ------------------------------------
 
-``loo_unlink`` chases a fractional budget ("30% less similar than you were"), which is unanchored:
-30% off a prompt that was never identifiable is wasted utility, and 30% off a glaring one is not
-enough. AFR is done when the prompt is **no closer to the author's earlier prompts than a randomly
-chosen unrelated prompt is** -- a statement about unlinkability rather than about how much text
-changed. With ``alpha`` the sweep knob and ``d0`` the first-pass abstraction:
+Unlike ``loo_unlink``'s fractional budget, AFR is done when the prompt is **no closer to the
+author's earlier prompts than a randomly chosen unrelated prompt is** -- a statement about
+unlinkability rather than about how much text changed. With ``alpha`` the sweep knob and ``d0`` the
+first-pass abstraction:
 
 .. code-block:: text
 
@@ -31,16 +26,14 @@ changed. With ``alpha`` the sweep knob and ``d0`` the first-pass abstraction:
 
 ``alpha=0`` is the full claim; ``alpha=0.5`` keeps half the excess linkage as a cheaper operating
 point. An author's FIRST prompt has nothing to be unlinked from, so the objective flips to
-*genericness* -- cosine to the reference pool's centroid, targeted at the pool's own median. A first
-prompt that is a distinctive outlier is precisely what a later prompt gets recognized against.
+*genericness* -- cosine to the reference pool's centroid, targeted at the pool's own median.
 
 The cascade, and why it dictates the caching
 --------------------------------------------
 
 Priors are the author's earlier prompts **in their already-defended form**, because that is what the
-attacker actually sees. ``build_dataset.finalize`` sorts by ``(source, author_id, started_at,
-doc_id)``, so an author's documents already arrive contiguous and chronological -- arrival order *is*
-the timeline and no extra column has to be plumbed through ``apply_defenses``.
+attacker actually sees. Documents already arrive contiguous and chronological per author, so arrival
+order *is* the timeline:
 
 .. code-block:: text
 
@@ -48,35 +41,25 @@ the timeline and no extra column has to be plumbed through ``apply_defenses``.
     d2 -> AFR(d2, priors=[D1])    -> D2
     d3 -> AFR(d3, priors=[D1,D2]) -> D3
 
-So documents within an author are *not* independent, and the cache namespace is one row per **author**
-rather than per document (see :meth:`AgenticFootprintDefense.transform`). ``shardable = False`` for
-the same reason as ``loo_unlink``, one level stronger: a shard holding an arbitrary subset of an
-author would not merely mis-measure the baseline, it would cascade from the wrong documents.
+So documents within an author are *not* independent, and the cache namespace is one row per
+**author** rather than per document. ``shardable = False`` for the same reason as ``loo_unlink``:
+a shard holding an arbitrary subset of an author would cascade from the wrong documents.
 
-Whole **authors**, though, split perfectly -- they share nothing but the reference pool -- so
-``shardable_by = "author"`` opts into ``apply_defenses``' author-aware split and an array job
-defends the corpus N ways without changing a single output token. The one thing that must not be
-sharded with it is that pool: it defines ``r_med`` and therefore the target every document is
-optimized to, so a per-shard pool would give each task its own criterion and quietly break
-comparability. :meth:`AgenticFootprintDefense.reference_pool_ids` selects it over the whole split
-instead, and the caller hands the same documents to every task on the known side.
+Whole **authors** split perfectly, though -- they share nothing but the reference pool -- so
+``shardable_by = "author"`` opts into an author-aware split and an array job defends the corpus N
+ways without changing a single output token. The pool itself must never be sharded: it defines
+``r_med`` and therefore the target every document is optimized to, so a per-shard pool would give
+each task its own criterion. :meth:`AgenticFootprintDefense.reference_pool_ids` selects it over the
+whole split instead.
 
 Throughput: why this batches across authors
 -------------------------------------------
 
-An earlier version of this file enforced **bitwise** determinism -- every ``chat()`` call at a fixed
-batch size (1 for most stages), ``enforce_eager=True``, authors processed strictly one at a time --
-on the reasoning that greedy decoding is not batch-invariant, so a cache hit could return different
-text than a cache miss.
-
-That contract cost roughly two orders of magnitude and made the defense unrunnable. Decode is
-memory-bandwidth bound: at batch 1 the whole weight matrix is read from HBM to emit one token, and at
-batch 128 the same read emits 128. The sibling defenses hand vLLM **~1,000 sequences per call** and
-finish swe_chat in ~47 engine calls (:func:`~._backends.defend_conversations_per_turn`); this file
-was issuing ~35,000 calls of one sequence each. It was also a stricter bar than the project applies
-anywhere else -- ``styleremix`` ships with ``temperature=0.6``.
-
-So the contract is now **seeded and logged, not bitwise**, and the loop is structured for batching:
+An earlier version enforced bitwise determinism (batch size 1, one author at a time), on the
+reasoning that greedy decoding is not batch-invariant. That made the defense too slow to run: decode
+is memory-bandwidth bound, so batching many sequences per call is nearly free relative to one at a
+time. So the contract is now **seeded and logged, not bitwise**, and the loop is structured for
+batching:
 
 1. **Lockstep across authors.** Documents *within* an author stay serial, because the cascade is
    causal. Authors are independent, so :func:`defend_authors` steps every author's timeline together
@@ -84,25 +67,21 @@ So the contract is now **seeded and logged, not bitwise**, and the loop is struc
    document. :func:`defend_documents` is the batched core; :func:`defend_document` is a
    single-document wrapper over it, so both paths run the same code.
 2. **The abstraction pass is batched corpus-wide.** Stage 1 reads no prior state, so every document
-   in the split is abstracted before the cascade starts. This is also what makes the ``afr_stage1``
-   ablation cheap rather than as expensive as the full arm.
-3. **The cascade is capped** at :data:`AFR_CASCADE_DEPTH`, which bounds the number of lockstep steps
-   and stops a single 400-document author from serializing the endgame at batch 1.
-4. **Prefix caching is on.** The system prompt is shared by every call in the corpus and the author
-   profile repeats across a document's proposal rounds.
+   in the split is abstracted before the cascade starts -- which is also what makes the
+   ``afr_stage1`` ablation cheap.
+3. **The cascade is capped** at :data:`AFR_CASCADE_DEPTH`, bounding the lockstep steps so one
+   long-timeline author can't serialize the endgame at batch 1.
+4. **Prefix caching is on.** The system prompt is shared by every call and the author profile
+   repeats across a document's proposal rounds.
 
-What survives from the old contract, because it is free:
-
-* ``temperature=0.0`` and ``seed=`` everywhere -- greedy decoding is near-deterministic in practice;
-  what was dropped is the *guarantee*, not the intent.
-* **Seeded sampling over a sorted list.** The reference pool follows ``build_subset.select_authors``:
-  sort by ``doc_id`` *before* drawing, so a rebuild that changes row order does not move the sample.
-* **No** :func:`hash`. Python's string hash is salted per process. (``loo_unlink._fake_backend``
-  uses it and is, as a result, not reproducible across processes; this module uses ``zlib.crc32``.)
+What survives from the old contract, because it is free: ``temperature=0.0`` and ``seed=``
+everywhere; seeded sampling over a sorted reference pool, so a rebuild that changes row order
+doesn't move the sample; and no :func:`hash` (Python's string hash is salted per process; this
+module uses ``zlib.crc32`` instead).
 
 The reproducibility artifacts of record are the cache table and ``edits_a<NN>.jsonl``, which record
 every score and edit per document. **Do not restore the fixed-batch rule to chase bit-equality**
-without measuring what it costs -- that is the mistake this note exists to prevent repeating.
+without measuring what it costs.
 
 Command line::
 
@@ -147,14 +126,11 @@ DEFAULT_ALPHA = 0.0
 #: Candidate embeddings allowed per document. The stage-1 baseline, the priors and the reference pool
 #: are fixed overhead and do NOT count against it -- only text the agent proposed does.
 #:
-#: **4, lowered from 10, on evidence rather than to save time.** The first corpus-scale run logged
-#: 414 documents ending at ``ladder_exhausted`` against 20 at ``target_met`` -- 70% against 3%. A
-#: document that has stalled through all three escalation rungs is not going to be rescued by
-#: probes 5 through 10; it is paying full generation cost to re-confirm a dead end, and the extra
-#: rounds more than doubled the wall clock for a few percent of outcomes. Four keeps the shape of
-#: the loop intact: round 1 explores :data:`DEFAULT_FIRST_ROUND_CANDIDATES` candidates at once, and
-#: three refinement rounds are enough to climb the whole ladder at
-#: :data:`DEFAULT_ESCALATE_AFTER` = 2 stalls per rung.
+#: A document that has stalled through every escalation rung is not going to be rescued by more
+#: probes at the same rung; it is paying full generation cost to re-confirm a dead end. This budget
+#: keeps the loop's shape intact: round 1 explores :data:`DEFAULT_FIRST_ROUND_CANDIDATES` candidates
+#: at once, and the remaining rounds are enough to climb the whole ladder at
+#: :data:`DEFAULT_ESCALATE_AFTER` stalls per rung.
 #:
 #: In ``params()``, so changing it starts a new cache namespace rather than mixing budgets.
 DEFAULT_MAX_PROBES = 4
@@ -163,22 +139,19 @@ DEFAULT_MAX_PROBES = 4
 #: and refine. Explore-then-exploit: several genuinely different approaches cost the same generation
 #: as one, and the loop cannot tell a dead end from a slow start without having tried more than one.
 #:
-#: **2, not 3, and it is tied to** :data:`DEFAULT_MAX_PROBES`. The first round spends this many
-#: probes at once, so at a budget of 4 a value of 3 leaves exactly one refinement round -- the loop
-#: would spend its whole budget at escalation level 0 and never reach the rungs that do the real
-#: work. Two keeps a choice in round one and still leaves room to climb. See the selftest, which
-#: asserts the ladder is actually walkable at these defaults rather than leaving it to arithmetic.
+#: Tied to :data:`DEFAULT_MAX_PROBES`: it must leave enough probes for at least one refinement round
+#: after the first, or the loop would spend its whole budget at escalation level 0 and never reach
+#: the rungs that do the real work. See the selftest, which asserts the ladder is actually walkable
+#: at these defaults rather than leaving it to arithmetic.
 DEFAULT_FIRST_ROUND_CANDIDATES = 2
 
 #: Consecutive rounds without improvement before the escalation ladder moves up a rung. A round that
 #: produced no admissible candidate at all counts as non-improving: a model stuck on the output
 #: format is stuck, and a different instruction is a better response than another identical retry.
 #:
-#: **1, lowered with the probe budget.** Two stalls per rung needs six rounds to cross three rungs,
-#: which only made sense at a budget of 10. With four probes there is no room to be patient: one
-#: non-improving round IS the signal, and spending a second confirming it costs a rung the document
-#: will never get to try. At these defaults a stubborn document walks 0 -> 1 -> 2 in three rounds
-#: and exits at ``ladder_exhausted`` having actually used the structural rewrite.
+#: Scaled with the probe budget: with few probes there is no room to be patient, so one
+#: non-improving round IS the signal -- spending a second confirming it costs a rung the document
+#: will never get to try.
 DEFAULT_ESCALATE_AFTER = 1
 
 #: How many of the author's most-similar prior prompts feed the smoothed feedback signal. The
@@ -203,10 +176,8 @@ DEFAULT_SEED = 47
 #: The two roles are inseparable here exactly as they are for the sibling defenses, where
 #: ``checkpoint_every`` is likewise both flush cadence and batch size.
 #:
-#: 32 rather than the 5 this started at: 5 authors meant ~5-wide batches, which on a
-#: memory-bandwidth-bound decode is barely better than the batch-1 loop it replaced. The cost of
-#: raising it is that a preemption discards up to one chunk of authors -- acceptable because the
-#: edit log now flushes per DOCUMENT, so progress is visible even inside an unfinished chunk.
+#: A preemption discards up to one chunk of authors -- acceptable because the edit log flushes per
+#: DOCUMENT, so progress is visible even inside an unfinished chunk.
 DEFAULT_CHECKPOINT_EVERY = int(os.environ.get("AFR_AUTHOR_BATCH", "32"))
 
 #: Tokens for a generated answer in the utility gate. Short on purpose: the judge compares whether a
@@ -220,13 +191,9 @@ DEFAULT_PROPOSE_TOKENS = 2048
 #: Tokens for the rolling author signature. Six bullets.
 DEFAULT_SIGNATURE_TOKENS = 256
 
-#: Served context window. **Not** the checkpoint's native window, which for Qwen3-30B-A3B-2507 is
-#: 262,144 tokens: at ~96 KiB of KV cache per token that is ~24 GB reserved on top of ~33 GB of FP8
-#: weights, which lands exactly on the "max seq len is larger than the maximum number of tokens that
-#: can be stored in KV cache" startup abort -- and reserves it for nothing, since the longest thing
-#: this defense ever generates is a 2,048-token proposal. Every other vLLM defense here pins a window
-#: (openanonymity 32k, qwen_rewrite 4k, styleremix 2k); this one had not, which is a startup failure
-#: an hour into a 16-hour job.
+#: Served context window. **Not** the checkpoint's native (much larger) window: reserving that much
+#: KV cache aborts startup, and reserves it for nothing since the longest thing this defense ever
+#: generates is one proposal. Every other vLLM defense here pins a window for the same reason.
 #:
 #: Environment-overridable, like STYLEREMIX_MAX_MODEL_LEN / QWEN_VLLM_MAX_MODEL_LEN, because the
 #: recovery path for an OOM must not be "edit committed source on the cluster".
@@ -234,84 +201,61 @@ AFR_MAX_MODEL_LEN = int(os.environ.get("AFR_MAX_MODEL_LEN", "32768"))
 
 #: Fraction of the card vLLM may take. Harrier co-resides -- and loads FIRST, since the reference
 #: pool is embedded before the first generation -- so this has to leave room for a model that is
-#: already resident. 0.90 because the default checkpoint is now bf16 (~54 GB) rather than FP8: an
-#: A100 has no native FP8, so an FP8 checkpoint there is dequantized through Marlin on every forward
-#: pass, which costs compute to save memory we do not need to save.
-#:
-#: 0.85 rather than 0.90 for margin. vLLM's fraction is of the card's TOTAL memory but it refuses to
-#: start if that exceeds what is *free* -- and Harrier is already resident by then. Even after
-#: reclaiming its allocator cache (see ``_engine``), a couple of GiB stay held, so asking for 0.90 of
-#: an 80 GB card leaves no room for the request to be granted. bf16 27B needs ~54 GB of weights, so
-#: 0.85 still leaves ~13 GB of KV cache.
+#: already resident. Left with margin below vLLM's usual default: vLLM's fraction is of the card's
+#: TOTAL memory but it refuses to start if that exceeds what is *free*, and Harrier's own allocator
+#: cache stays held even after it is done with a pass.
 AFR_GPU_MEM_UTIL = float(os.environ.get("AFR_GPU_MEM_UTIL", "0.85"))
 
-#: CUDA graphs and torch.compile. **On by default now.** This was ``True`` (i.e. disabled) to keep
-#: greedy decoding bit-reproducible; see the determinism note in the module docstring for why that
-#: contract was dropped. It is unusually expensive here because the default checkpoint is a hybrid
+#: CUDA graphs and torch.compile. **On by default now** (was disabled to keep greedy decoding
+#: bit-reproducible; see the determinism note in the module docstring for why that contract was
+#: dropped). Unusually expensive to enable here because the default checkpoint is a hybrid
 #: Mamba/attention model whose Triton kernels get neither fusion nor graph capture in eager mode.
 AFR_ENFORCE_EAGER = os.environ.get("AFR_ENFORCE_EAGER", "") == "1"
 
 #: Documents per Harrier forward pass. **Sized for the memory left AFTER vLLM, not before it.**
-#:
-#: vLLM's reservation is permanent: it takes ``AFR_GPU_MEM_UTIL`` of the card at startup and holds it
-#: for the engine's lifetime, so the embedder spends the whole run in the remainder -- roughly 10 GiB
-#: of an 80 GB card. Harrier's own default (32 documents x 8,192 tokens) needs ~2 GiB per forward
-#: pass, which is fine when it has the card to itself during the reference-pool embed and OOMs later
-#: when it does not. The lockstep driver made this reachable: it embeds every document in a chunk at
-#: once (2,356 texts for a 64-author chunk), where the old serial loop embedded one at a time.
-#:
-#: 8 keeps the peak near 0.5 GiB. Lower it if the embedder OOMs; raise it only if vLLM's share drops.
+#: vLLM's reservation is permanent for the engine's lifetime, so the embedder spends the whole run
+#: in whatever remains. The lockstep driver embeds every document in a chunk at once, where the old
+#: serial loop embedded one at a time, so this batch size bounds that peak. Lower it if the embedder
+#: OOMs; raise it only if vLLM's share drops.
 AFR_EMBED_BATCH = int(os.environ.get("AFR_EMBED_BATCH", "8"))
 
 #: How deep the causal cascade runs before an author's remaining documents stop extending the chain.
 #:
 #: The cascade is what serializes work: document ``k`` needs the defended text of ``1..k-1``, so an
 #: author's timeline is a chain of that length and the lockstep driver needs ``max(timeline)`` steps.
-#: On a corpus with a long tail -- swe_chat averages 27.6 documents per author but reaches into the
-#: hundreds -- the last few hundred steps run with one or two authors still active, at which point
-#: the GPU is idle and those steps dominate the wall clock.
+#: On a corpus with a long tail, the last steps of a long timeline run with only one or two authors
+#: still active, at which point the GPU is idle and those steps dominate the wall clock.
 #:
 #: Past this depth an author's documents all score against the same first ``N`` defended documents.
 #: They are then mutually independent, so they batch together in one wide step instead of a chain.
-#: The causal ordering is preserved exactly where it carries information -- a 33rd prompt learns
-#: little from prompts 33..449 that it did not already learn from 1..32 -- and the endgame is bounded.
+#: The causal ordering is preserved exactly where it carries information -- a much later prompt
+#: learns little from the documents just behind it that it did not already learn earlier -- and the
+#: endgame is bounded.
 AFR_CASCADE_DEPTH = int(os.environ.get("AFR_CASCADE_DEPTH", "32"))
 
-#: Sequences vLLM may decode concurrently. **Must be set explicitly for this checkpoint**, and not
-#: for throughput reasons -- vLLM's default (256) does not start.
+#: Sequences vLLM may decode concurrently. **Must be set explicitly for this checkpoint** -- vLLM's
+#: own default does not start.
 #:
 #: The agent is a hybrid Mamba/attention model, and every concurrent decode sequence needs its own
-#: Mamba recurrent-state block, carved out of what is left after the weights and the KV cache. On an
-#: 80 GB card at AFR_GPU_MEM_UTIL there is room for ~254 of them, so a default of 256 aborts startup:
-#:
-#:     ValueError: max_num_seqs (256) exceeds available Mamba cache blocks (254). Each decode
-#:     sequence requires one Mamba cache block, so CUDA graph capture cannot proceed.
-#:
-#: Speculative decoding is what made this reachable -- it reserves state for the drafted positions
-#: too, which pushed the block count just under the default. Raising gpu_memory_utilization is the
-#: error's other suggestion and the wrong lever here: Harrier co-resides on this card and that budget
-#: has already been tuned down twice to stop it OOMing.
-#:
-#: 128 rather than 254: it clears the ceiling with room for a checkpoint or a card that fits fewer
-#: blocks, and nothing here needs more. The lockstep batch is one author-chunk wide (~25 per task in
-#: an 8-way array), and the widest call any stage makes is the utility gate at a few sequences per
-#: document. A cap only bounds concurrency -- vLLM queues the remainder -- so exceeding it costs an
-#: extra wave, not correctness.
+#: Mamba recurrent-state block, carved out of what is left after the weights and the KV cache; the
+#: default number of sequences exceeds the blocks available and aborts startup. Raising
+#: gpu_memory_utilization is the wrong lever here, since Harrier co-resides on the same card and
+#: that budget is already tuned to avoid OOMing it. This value clears the ceiling with room to
+#: spare; a cap only bounds concurrency (vLLM queues the remainder), so it costs an extra wave, not
+#: correctness, if exceeded.
 AFR_MAX_NUM_SEQS = int(os.environ.get("AFR_MAX_NUM_SEQS", "128"))
 
 #: Whether a document too long for the served window may be emitted UNDEFENDED. **Off.**
 #:
-#: It used to be unconditional, and on the first corpus-scale run it fired on 63 of 594 documents --
-#: 11% of the defended split was original text the defense never touched. That is not admissible in
-#: an evaluation: those documents keep their full authorship signal, the attack links them, and the
-#: defense is charged for it. The comparison silently measures a corpus, not a method.
+#: Passing such documents through unconditionally means those documents keep their full authorship
+#: signal, the attack links them, and the defense is charged for it -- the comparison silently
+#: measures a corpus, not a method.
 #:
 #: The fix belongs in the CORPUS, not here -- ``build_subset --max-chars`` caps documents before any
-#: arm runs, so ``base``, ``afr_stage1`` and ``afr`` all read the same text and the truncation is a
-#: property of the split (recorded in its manifest) rather than an artifact of one defense.
-#: Truncating inside the defense would be worse than the pass-through it replaces: only the defended
-#: documents would be shorter, and shorter text carries less authorship signal, so the defense would
-#: score well for a reason that has nothing to do with the defense.
+#: arm runs, so every defense reads the same text and the truncation is a property of the split
+#: rather than an artifact of one defense. Truncating inside the defense would be worse than the
+#: pass-through it replaces: only the defended documents would be shorter, and shorter text carries
+#: less authorship signal, so the defense would score well for a reason unrelated to the defense.
 #:
 #: So this now stops the run and says how to cap the corpus. Set it to 1 only for an exploratory run
 #: whose numbers nobody will report.
@@ -319,15 +263,15 @@ AFR_TOO_LONG_PASSTHROUGH = os.environ.get("AFR_TOO_LONG_PASSTHROUGH", "") == "1"
 
 #: Speculative decoding: tokens the n-gram drafter proposes per step. ``0`` disables it.
 #:
-#: WHY IT IS ON. Decode here is memory-bandwidth bound -- producing one token reads all ~54 GB of bf16
-#: weights -- so the arithmetic units idle. Speculative decoding spends that idle compute: a cheap
-#: drafter guesses ``N`` tokens and the real model verifies all ``N`` in ONE forward pass, at
-#: essentially the cost of producing one. Accepted tokens are exactly the tokens the model would have
-#: emitted alone; at ``temperature=0`` verification is a plain argmax comparison, and any drafted
-#: token the model would not have chosen is rejected and overwritten. The drafter has no vote.
+#: WHY IT IS ON. Decode here is memory-bandwidth bound, so the arithmetic units idle waiting on
+#: weights. Speculative decoding spends that idle compute: a cheap drafter guesses ``N`` tokens and
+#: the real model verifies all ``N`` in ONE forward pass, at essentially the cost of producing one.
+#: Accepted tokens are exactly the tokens the model would have emitted alone; at ``temperature=0``
+#: verification is a plain argmax comparison, and any drafted token the model would not have chosen
+#: is rejected and overwritten. The drafter has no vote.
 #:
 #: WHY N-GRAM RATHER THAN A DRAFT MODEL. The ``ngram`` method needs no second checkpoint and no extra
-#: GPU memory -- both decisive when a 27B agent and Harrier already share one card. It drafts by
+#: GPU memory -- both decisive when the agent and Harrier already share one card. It drafts by
 #: finding the last few generated tokens in the PROMPT and copying whatever followed them there,
 #: which fits this workload almost exactly: every propose round rewrites a document sitting in its
 #: own prompt, and the spans the defense deliberately preserves (code blocks, error text, untouched
@@ -1678,10 +1622,9 @@ class _LocalBackend:
             #
             # Harrier runs first -- it embeds the whole reference pool before any generation -- and
             # PyTorch's caching allocator keeps the blocks from that peak instead of returning them
-            # to the driver. Measured: a 0.6B model whose weights are ~1.2 GB left **18.3 GiB**
-            # unavailable, so vLLM saw 60.9 of 79.2 GiB free, refused a 0.9 request, and the job died
-            # at startup. `empty_cache` releases the cached-but-unused blocks; Harrier's weights stay
-            # resident, which is what we want, since it is used again between rounds.
+            # to the driver, which can starve vLLM's memory request enough to fail startup.
+            # `empty_cache` releases the cached-but-unused blocks; Harrier's weights stay resident,
+            # which is what we want, since it is used again between rounds.
             try:
                 import torch
 
@@ -2277,16 +2220,14 @@ class AgenticFootprintDefense(CachedDefense):
         self._open_log(cache.dir)
 
         # Per-DOCUMENT durability, beside the per-author table. The author table is only written
-        # when a whole chunk finishes, which on a preemptible 16-hour job meant a killed task
-        # committed nothing at all -- seven tasks lost their full wall clock that way. This makes
-        # every finished document survive independently, so a resumed run pays only for what it had
-        # not already done. It lives under the cache directory, so it is scoped by logic_hash and
-        # params_hash exactly like the table and is discarded by the same invalidation.
+        # when a whole chunk finishes, so on a preemptible job a killed task could commit nothing at
+        # all. This makes every finished document survive independently, so a resumed run pays only
+        # for what it had not already done. It lives under the cache directory, so it is scoped by
+        # logic_hash and params_hash exactly like the table and is discarded by the same invalidation.
         documents_store = DocumentStore(Path(cache.dir) / "afr_docs")
 
-        # The pool is embedded ONCE for the whole run and then sliced per author. Re-embedding it
-        # per author would be ~n_authors x n_reference forward passes -- 100k on wildchat_small --
-        # to produce vectors that are identical every time.
+        # The pool is embedded ONCE for the whole run and then sliced per author, rather than once
+        # per author for vectors that would be identical every time.
         pool_matrix: list = [None]
 
         def pool_for(author: str) -> np.ndarray:
@@ -2652,8 +2593,8 @@ def _selftest() -> None:
 
     # BY DEFAULT an over-long document stops the run. Emitting it undefended would leave untouched
     # text in the defended split, where it keeps its full authorship signal and is charged to the
-    # defense that never saw it -- 11% of the first corpus-scale run. The fix is a corpus-level cap
-    # (build_subset --max-chars), which keeps every arm on the same text; the error says so.
+    # defense that never saw it. The fix is a corpus-level cap (build_subset --max-chars), which
+    # keeps every arm on the same text; the error says so.
     refused = None
     try:
         defend_document(long_turns, priors, prior_texts, pool, embed=embed, abstract=abstract,
@@ -2888,11 +2829,10 @@ def _selftest() -> None:
         cascade(two_authors, other_store, key="a different pool")
         check(other_store.hits == 0, "a different reference pool shares nothing")
 
-        # THE TEST THAT WAS MISSING, and whose absence cost days of GPU time. The resume checks
-        # above all resume a run that FINISHED, which is exactly the case where everything happens
-        # to be committed -- they passed while the store was in fact committing once per lockstep
-        # POSITION, so a job preempted mid-position (40 documents on the real corpus, every two
-        # hours) saved nothing at all. This kills the run partway through a position instead.
+        # The resume checks above all resume a run that FINISHED, which is exactly the case where
+        # everything happens to be committed -- they'd pass even if the store only committed once
+        # per lockstep POSITION, in which case a job preempted mid-position would save nothing at
+        # all. This kills the run partway through a position instead, to catch that.
         class _Preempted(Exception):
             pass
 

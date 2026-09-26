@@ -1,40 +1,21 @@
 """Shared machinery for the listwise rerankers: order the whole shortlist, not just its head.
 
-:mod:`.euclidean_llm_judge` asks its judge for **one digit** -- which of the K shortlisted authors
-wrote this? -- and promotes that one candidate to rank 1. Everything else in the row keeps the
-distance metric's order, so at ``top_k=5`` the top-5 and top-10 accuracies are identical to plain
-nearest-neighbor *by construction* and only top-1 can move. That is a deliberate, clean isolation
-of the rank-1 decision, and it is also most of what the judge knows thrown away: a model that has
-read five candidate texts has an opinion about all five, and ranks 2..K are where the rest of the
-CMC curve lives.
+Where :mod:`.euclidean_llm_judge` asks for one digit -- which shortlisted author wrote this? --
+and only top-1 can move, the attacks built on this module ask for the whole ordering of the
+shortlist. Two of them share it: :mod:`.listwise_llm_rerank` (a hosted LLM reading the texts) and
+:mod:`.listwise_jina_rerank` (a local cross-encoder scoring them). They differ only in how the
+order is produced; shortlisting, presentation, fold-back and reporting are all here.
 
-The attacks built on this module ask instead for the **whole ordering** of the shortlist. Two of
-them share it -- :mod:`.listwise_llm_rerank` (a hosted LLM reading the texts) and
-:mod:`.listwise_jina_rerank` (a local cross-encoder scoring them) -- and they differ only in how
-the order is produced. Shortlisting, presentation, fold-back and reporting are all here.
+**What moves, and what cannot.** :func:`fold_listwise` rewrites only the K shortlisted authors'
+scores, placing them strictly above every other author in the reranker's order. Shortlist
+*membership* stays exactly what the distance metric found -- at ``top_k=5``, top-1 through top-4
+can move but top-5 is pinned to the base attack's own top-5. That pinned number is the recall
+ceiling the reranker was handed, so any gain below it is attributable to the reranking alone.
 
-What moves, and what cannot
----------------------------
-:func:`fold_listwise` rewrites only the K shortlisted authors' scores, placing them strictly above
-every other author in the reranker's order. So shortlist *membership* is still exactly what the
-distance metric found, and:
-
-* at ``top_k=5``: top-1 through top-4 can move; **top-5 is pinned** to the base attack's top-5.
-* at ``top_k=10``: top-1 through top-9 can move; **top-10 is pinned**.
-
-That pinned number is the point. It is the recall ceiling the reranker was handed, unchanged by
-anything the reranker did, so the gain at every k below it is attributable to the reranking alone
-rather than to a shortlist that happened to be better.
-
-Failure degrades to the baseline, never to noise
-------------------------------------------------
-Candidates are presented in a seeded *shuffle* (see :func:`present`), so a "do nothing" order in
-presented-slot terms is a random order, not the distance order -- the opposite of what a refusal
-should cost. :func:`complete_order` therefore fills whatever the reranker did not rank by
-**distance rank**, nearest first. A row the model refused outright, or whose reply did not parse at
-all, comes out as the plain nearest-neighbor ordering: the same guarantee
-:mod:`.euclidean_llm_judge` gets by forcing a refusal to the nearest candidate, extended to a whole
-permutation.
+**Failure degrades to the baseline, never to noise.** Candidates are presented in a seeded
+shuffle (see :func:`present`), so "do nothing" in presented-slot terms would be a random order,
+not the distance order. :func:`complete_order` fills whatever the reranker did not rank by
+distance rank instead, so a refused or unparseable row comes out as plain nearest-neighbor order.
 """
 
 from __future__ import annotations
@@ -73,15 +54,13 @@ class Presentation(NamedTuple):
 def present(candidates: AuthorCandidates, *, seed: int, shuffle: bool = True) -> Presentation:
     """Lay each row's shortlist out for the reranker, shuffled by default.
 
-    Rerankers that read a list over-weight whichever end they saw last (position/recency bias).
-    Feeding candidates in distance-rank order then systematically rewards the distance metric's
-    *worst* shortlisted candidate, which is how a naive rerank ends up below its own baseline. Each
-    row's K candidates are therefore shown in a seeded -- and so reproducible, so cache-stable --
-    random order, and the reranker's positional answer is mapped back through
-    :attr:`Presentation.documents` / :attr:`Presentation.authors`.
+    Rerankers that read a list over-weight whichever end they saw last, so feeding candidates in
+    distance-rank order would systematically reward the metric's worst shortlisted candidate. Each
+    row's K candidates are shown in a seeded random order instead, and the reranker's positional
+    answer is mapped back through :attr:`Presentation.documents` / :attr:`Presentation.authors`.
 
-    ``shuffle=False`` presents them nearest-first; it exists to *measure* the bias (compare the two
-    runs' positional pick distributions), not as a working configuration.
+    ``shuffle=False`` presents them nearest-first; it exists to measure the position bias, not as
+    a working configuration.
     """
     n, k = candidates.author_index.shape
     rng = np.random.default_rng(seed)
@@ -94,17 +73,14 @@ def present(candidates: AuthorCandidates, *, seed: int, shuffle: bool = True) ->
 
 
 def complete_order(partial: Sequence[int], ranks: np.ndarray) -> list[int]:
-    """Complete a partial slot ordering by appending what is missing in **distance order**.
+    """Complete a partial slot ordering by appending what is missing in distance order.
 
     ``partial`` is the slots the reranker actually placed, best first; ``ranks`` is one row of
-    :attr:`Presentation.ranks`. Slots absent from ``partial`` -- because the reply was truncated,
-    skipped a candidate, or did not parse at all -- are appended nearest-first, so:
+    :attr:`Presentation.ranks`. Slots it left out are appended nearest-first, so an empty
+    ``partial`` reproduces the base attack's ordering exactly and a partial one keeps what the
+    reranker said and falls back to the distance metric below it.
 
-    * an empty ``partial`` reproduces the base attack's own ordering exactly, and
-    * a partial answer keeps what the reranker said and falls back to the distance metric below it.
-
-    Duplicates and out-of-range entries are the parser's job to drop before this is called; this
-    function only fills gaps.
+    Duplicates and out-of-range entries are the parser's job to drop before this is called.
     """
     seen = set(int(slot) for slot in partial)
     tail = sorted((slot for slot in range(len(ranks)) if slot not in seen),
@@ -114,13 +90,12 @@ def complete_order(partial: Sequence[int], ranks: np.ndarray) -> list[int]:
 
 def fold_listwise(scores: np.ndarray, presentation: Presentation, orders: Sequence[Sequence[int]],
                   *, apply_mask: np.ndarray | None = None) -> np.ndarray:
-    """Write a per-row shortlist ordering back into the score matrix (**higher = more likely**).
+    """Write a per-row shortlist ordering back into the score matrix (higher = more likely).
 
     Each shortlisted author is given ``row_max + (k - rank)``, so the reranker's first choice sits
-    at ``row_max + k`` and its last at ``row_max + 1``. Every one of them therefore clears
-    ``row_max`` -- the best score anywhere in that row -- while keeping the reranker's order intact
-    among themselves. Nothing outside the shortlist is touched, which is what pins top-K accuracy
-    at the shortlist size to the base attack's own number (see this module's docstring).
+    above its last, and every one of them clears ``row_max`` -- the best score anywhere in that
+    row. Nothing outside the shortlist is touched, which pins top-K accuracy at the shortlist size
+    to the base attack's own number (see this module's docstring).
 
     Parameters
     ----------
@@ -152,16 +127,12 @@ def detail_table(candidates: AuthorCandidates, presentation: Presentation,
                  applied: np.ndarray | None = None) -> pd.DataFrame:
     """One row per (unknown document x shortlisted candidate): what was shown, where it landed, why.
 
-    This is the side-car the score matrix cannot carry. It follows the precedent set by
-    :class:`~prompt_anonymity.evaluation.utility.prompt_judge.ConversationUtilityResult`, whose
-    free-text ``reason`` lives on a per-item detail table and is deliberately kept out of the
-    aggregated columns: a justification is for reading while calibrating the rubric, not for
-    averaging.
+    This is the side-car the score matrix cannot carry -- free-text justifications are for reading
+    while calibrating the rubric, not for averaging into a metric.
 
-    ``distance_rank`` is the column that diagnoses the reranker. If the model's ranks 1-3 sit on
-    distance ranks 0-1 it is finding the same neighbourhood the vectors did and sharpening it; if
-    its lower ranks correlate with nothing, the tail of a long shortlist is noise -- which is a
-    result to report, not a bug.
+    ``distance_rank`` is the column that diagnoses the reranker: if the model's top ranks sit on
+    low distance ranks it is sharpening the same neighbourhood the vectors found; if they
+    correlate with nothing, the tail of a long shortlist is noise.
 
     Parameters
     ----------
@@ -201,14 +172,9 @@ def report(orders: Sequence[Sequence[int]], presentation: Presentation, *, n_par
            n_applied: int, label: str = "listwise rerank") -> None:
     """Print the two distributions that say whether the rerank did anything real.
 
-    **Position axis** -- which presented slot the reranker put first. With shuffling on this should
-    be ~uniform; a spike on the last slot means position bias survived and the ranking is partly an
-    artifact of the layout.
-
-    **Signal axis** -- the *distance* rank of the candidate the reranker put first. Mass on 0-1
-    means it is agreeing with the vectors about the neighbourhood and re-ordering within it; a flat
-    spread across all K means it found no style signal the embedding had not already found, and the
-    rerank is closer to a shuffle than to an attack.
+    Position axis: which presented slot the reranker put first (should be ~uniform if unbiased).
+    Signal axis: the distance rank of the candidate it put first (mass on low ranks means it is
+    agreeing with the vectors and sharpening; a flat spread means no added style signal).
     """
     n = len(orders)
     k = len(presentation.authors[0]) if presentation.authors else 0
@@ -229,13 +195,9 @@ def progress_printer(label: str, *, lines: int = 40, stream=None):
     """An ``on_progress(done, total)`` for
     :meth:`~prompt_anonymity.caching.TransformCache.apply_streaming`, throttled to ``lines``.
 
-    A reranking run returns nothing until it ends -- hours, for the paid arm on a whole corpus --
-    so without this a job log is indistinguishable between working and hung. Throttled because the
-    other failure is a log with one line per row: at ``flush_every=1`` over a thousand documents,
-    per-result printing would bury everything else the job says.
-
-    Flushed on every line: SLURM's ``--output`` is a file, so Python would otherwise block-buffer
-    this and deliver the whole progress trace at once, when the job is already over.
+    Without this a long reranking run's job log is indistinguishable between working and hung, but
+    printing every row would bury everything else the log says. Flushed on every line since
+    SLURM's ``--output`` is a file and Python would otherwise block-buffer it.
     """
     import sys
 
@@ -259,7 +221,7 @@ def _synthetic(seed: int = 3, n_authors: int = 12, per_author: int = 5, dim: int
     """A small author-clustered corpus as an :class:`~prompt_anonymity.core.AttackData`.
 
     Clustered, so the nearest-neighbor baseline is well above chance without being perfect -- a
-    baseline that is already at 100% cannot show a rerank moving anything.
+    100% baseline cannot show a rerank moving anything.
     """
     from ...core import AttackData
 
@@ -283,14 +245,13 @@ def _selftest() -> None:
     """Every invariant the two listwise rerankers rest on -- offline, no key, no GPU.
 
     This repo has no test framework and no pytest dependency, so the checks live here rather than
-    introducing one (the same choice ``epi``, ``collision_seeding`` and ``frame_shift`` made). Run
-    with ``python -m prompt_anonymity.attacks.llm.listwise --selftest``.
+    introducing one (the same choice ``collision_seeding`` and ``frame_shift`` made). Run with
+    ``python -m prompt_anonymity.attacks.llm.listwise --selftest``.
 
-    Note that running this module as ``__main__`` gives it a second identity, so the
-    ``fold_listwise`` the attacks call is a different function object from the one checked directly
-    above it. The behaviour is identical and nothing here hashes the source (the end-to-end checks
-    pass ``cache_dir=None``), so the duplication is cosmetic -- but it is why a ``logic_hash`` must
-    never be asserted from inside a self-test.
+    Running this module as ``__main__`` gives it a second identity, so the ``fold_listwise`` the
+    attacks call is a different function object from the one checked directly above it -- harmless
+    here since nothing hashes the source, but a reason a ``logic_hash`` must never be asserted
+    from inside a self-test.
     """
     import json
 
@@ -305,9 +266,7 @@ def _selftest() -> None:
         if not condition:
             failures.append(name)
 
-    # 1. The parser repairs rather than rejects. A K-way permutation is a far larger target than the
-    #    single-pick judge's one digit, so every way a model can miss it is a way to lose a whole
-    #    row's judgement -- these are the shapes observed in practice.
+    # 1. The parser repairs rather than rejects malformed or partial rankings.
     k = 5
     good = json.dumps({"ranking": [{"candidate": c, "why": f"reason {c}"} for c in [3, 1, 5, 2, 4]]})
     check("parses a well-formed ranking", _parse_ranking(good, k)[0] == [2, 0, 4, 1, 3])
@@ -326,9 +285,7 @@ def _selftest() -> None:
     check("truncated JSON parses to nothing",
           _parse_ranking('{"ranking": [{"candidate": 3, "why": "abc', k) == ([], []))
 
-    # 2. Completion falls back to DISTANCE order, not to the presented order. Candidates are shown
-    #    shuffled, so "do nothing" in slot terms is a random ranking -- the opposite of what a
-    #    refusal should cost.
+    # 2. Completion falls back to distance order, not to the (shuffled) presented order.
     ranks = np.array([3, 0, 4, 1, 2])
     check("empty ordering reproduces the distance order",
           complete_order([], ranks) == [1, 3, 4, 0, 2])
@@ -337,9 +294,8 @@ def _selftest() -> None:
     check("complete ordering is left alone",
           complete_order([0, 1, 2, 3, 4], ranks) == [0, 1, 2, 3, 4])
 
-    # 3. Fold-back moves the order inside the shortlist and nothing else. This is the property every
-    #    reported number depends on: if it fails, top-K at the shortlist size stops being the base
-    #    attack's own recall ceiling and the comparison means nothing.
+    # 3. Fold-back moves the order inside the shortlist and nothing else -- every reported number
+    #    depends on this.
     data = _synthetic()
     rng = np.random.default_rng(0)
     candidates = author_candidates(data.known_embeddings, data.known_labels,
@@ -358,9 +314,8 @@ def _selftest() -> None:
           np.array_equal(fold_listwise(candidates.scores, layout, orders,
                                        apply_mask=np.zeros(n, dtype=bool)), candidates.scores))
 
-    # 4. End to end through the LLM attack, with the judge replaced by a canned reply. The canned
-    #    ranking REVERSES whatever it was shown, which is the most disruptive valid permutation
-    #    there is -- so if top-K still cannot move, nothing a real judge does will move it either.
+    # 4. End to end through the LLM attack, with the judge replaced by a canned reply that
+    #    reverses whatever it was shown -- the most disruptive valid permutation there is.
     ranker = NearestNeighbor(metric="cosine", linkage="max")
     ranker.fit(data.known_embeddings, data.known_labels)
     base = np.asarray(ranker.score(data.unknown_embeddings), dtype=float)
@@ -381,8 +336,7 @@ def _selftest() -> None:
     check("detail table is one row per candidate", attack.detail.shape[0] == n * 5)
     check("every position carries a reason", bool(attack.detail["reason"].str.len().gt(0).all()))
 
-    # 5. Batching is a delivery channel, not a prompt, so the two must share a cache namespace --
-    #    otherwise the cheap real-time smoke run is paid for twice, once again at batch rates.
+    # 5. Batching is a delivery channel, not a prompt, so the two must share a cache namespace.
     sync = ListwiseLLMRerankAttack(top_k=5, batch=False)
     batched = ListwiseLLMRerankAttack(top_k=5, batch=True)
     import tempfile

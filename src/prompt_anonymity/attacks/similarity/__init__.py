@@ -9,16 +9,14 @@ separating one author from another; that is the other family, in
 Not called "distance", deliberately: only :class:`NearestNeighbor` computes one, and even it
 returns the negation. :class:`CentroidCosine`, :class:`WhitenedCentroid` and
 :class:`LDACentroid` return cosine *similarities*, and :class:`PLDA` returns a same-author
-log-likelihood ratio, which is not a distance in any sense -- it can be negative and it depends
-on how many documents the author was enrolled with. The package contract is "higher = more
-likely", the opposite of a distance. Distances do appear here, but one level down, in
+log-likelihood ratio, which is not a distance in any sense -- it can be negative and depends on
+how many documents the author was enrolled with. The package contract is "higher = more likely",
+the opposite of a distance. Distances do appear here, but one level down, in
 :mod:`~prompt_anonymity.attacks.similarity.kernel`.
 
-The distinction is the one the swe-chat results turn on: these methods model *where each author
-sits*, while the multiclass ones learn *what separates them*. When authors are few and documents
-per author are many, learning the separation wins. When the author pool is huge and most authors
-have a handful of documents -- wildchat's median is 3 -- there is not enough per-author data to
-fit a separator, and plain nearest neighbour is hard to beat.
+These methods model *where each author sits*, while the multiclass attacks learn *what separates
+them*. The former tends to win when the author pool is large and each author has few documents to
+fit a separator from.
 
 ======================  =======================================================================
 attack                  what it compares

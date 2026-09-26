@@ -2,11 +2,10 @@
 
 Scrambles per-user stylometric signal by translating each user turn through a language chain and
 back to English: EN -> ZH -> JA -> EN. Argos has no direct zh->ja model, so that hop auto-pivots
-through English (effective path EN -> ZH -> (EN) -> JA -> EN); it is still a strong multi-hop
-translationese perturbation, just not a true cross-lingual zh->ja hop. The featurize stage
-re-derives features from the translated text, so this defense only supplies the rewrite.
+through English. The featurize stage re-derives features from the translated text, so this defense
+only supplies the rewrite.
 
-Models are downloaded once on first use (fully offline thereafter), mirroring the DS_env sandbox.
+Models are downloaded once on first use and are fully offline thereafter.
 """
 
 from __future__ import annotations

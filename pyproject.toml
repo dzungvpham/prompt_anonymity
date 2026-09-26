@@ -94,6 +94,6 @@ where = ["src"]
 # The dataset build's default source locations, and the user-agent -> device map WildChat
 # identities are built from.
 "prompt_anonymity.data" = ["datasets.toml", "resources/*.json"]
-"prompt_anonymity.defenses" = ["models.toml", "epi_topics.txt", "embad_topics.csv"]
+"prompt_anonymity.defenses" = ["models.toml", "embad_topics.csv"]
 # The judge rubric (conversation_judge.yaml), read at import by prompt_judge.load_judge_prompt.
 "prompt_anonymity.evaluation.utility" = ["*.yaml"]

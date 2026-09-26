@@ -1,14 +1,11 @@
 """What this process may actually use: CPU cores, memory, and GPU memory.
 
-**Why this exists.** On a shared batch node the obvious answers are wrong. ``os.cpu_count()``
-and ``/proc/meminfo`` (or ``free``) describe the *machine*, not the slice of it the scheduler
-handed this job -- on this project's cluster a 16-CPU / 32 GiB SLURM allocation sits on a node
-that reports 36 cores and 125 GiB. Sizing a worker pool from the machine's numbers oversubscribes
-the allocation: the CPU oversubscription just runs slower, but exceeding the memory cap gets the
-job killed by the OOM reaper, usually deep into a long run.
+On a shared batch node the obvious answers are wrong: ``os.cpu_count()`` and ``/proc/meminfo``
+describe the *machine*, not the slice of it the scheduler handed this job. Sizing a worker pool
+from the machine's numbers oversubscribes the allocation -- harmless for CPU, but exceeding the
+memory cap gets the job OOM-killed, usually deep into a long run.
 
-**Where the truth lives.** Three sources, in decreasing reliability, all consulted and the
-smallest answer taken:
+Three sources, in decreasing reliability, all consulted and the smallest answer taken:
 
 * **Scheduler affinity** (``os.sched_getaffinity``) -- authoritative for CPUs, since a cpuset
   cgroup shows up directly as the process's affinity mask.

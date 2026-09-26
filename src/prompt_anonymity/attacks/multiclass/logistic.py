@@ -9,13 +9,11 @@ from sklearn.linear_model import LogisticRegression
 class LogisticAttribution:
     """Multinomial logistic regression over the known authors; the score is the class logit.
 
-    The best method measured on swe-chat, and the reason is worth stating: the generative
-    methods above model *where each author sits*, while this learns *what separates them*. With
-    196 noisy features and ~124 authors, the discriminative objective spends its capacity on the
-    directions that actually discriminate, which nearly doubles top-1 over cosine.
+    Unlike the generative methods, which model *where each author sits*, this learns *what
+    separates them*, spending its capacity on the discriminating directions.
 
-    ``class_weight="balanced"`` matters here -- known authors range from 1 to 325 documents, and
-    without it the handful of prolific authors dominate the objective.
+    ``class_weight="balanced"`` matters: known authors vary widely in document count, and without
+    it the most prolific authors dominate the objective.
     """
 
     name = "logistic"

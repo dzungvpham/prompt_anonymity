@@ -1,17 +1,14 @@
 """SWE-chat source adapter: raw SALT-NLP/SWE-chat parquet -> normalized per-session documents.
 
-Reads the raw parquet directly (no dependency on the ``swe-chat/`` scripts or their
-intermediate CSVs). A document is one *session*, represented by its **human-authored**
-``user_prompt`` turns in conversation order. The raw ``user_prompt`` stream also carries a lot the
-person did not type -- coding-agent orchestration, tool-I/O echoes, CLI framework wrappers,
-/compact summaries, and injected slash-command expansions -- so this adapter keeps only the
-genuinely human turns (see :func:`filter_to_human_turns`). It returns the **raw** (uncleaned) turns
-as a list (``turns_raw``); text cleaning (which for SWE-chat also scrubs the session's repo/user
-tokens) happens in the parallelized stage in ``build_dataset.py``.
+Reads the raw parquet directly. A document is one *session*, represented by its
+**human-authored** ``user_prompt`` turns in conversation order. The raw ``user_prompt`` stream
+also carries a lot the person did not type -- coding-agent orchestration, tool-I/O echoes, CLI
+framework wrappers, /compact summaries, injected slash-command expansions -- so this adapter keeps
+only the genuinely human turns (see :func:`filter_to_human_turns`). It returns the **raw**
+(uncleaned) turns as a list (``turns_raw``); text cleaning happens in ``build_dataset.py``.
 
-Identity is the ``user_id``, with the same repo-based recovery the linkage loader used for
-id-less sessions (single-user repo -> that user; orphan repo -> the ``repo_id`` itself;
-multi-user repo -> dropped).
+Identity is the ``user_id``, with repo-based recovery for id-less sessions (single-user repo ->
+that user; orphan repo -> the ``repo_id`` itself; multi-user repo -> dropped).
 """
 
 from __future__ import annotations
@@ -24,21 +21,16 @@ import pyarrow.dataset as ds
 
 from .common import model_owner, normalize_language, ordered_languages
 
-# Turn types that represent the agent actually doing something in response to a user prompt
-# (an LLM reply, its thinking, a tool call, or that call's result) -- as opposed to bookkeeping
-# rows (``progress``, ``queue_operation``, ``file_snapshot``, ``system_event``, ...), which make
-# up the bulk of a session log. Used to tell whether a real agent turn sits between two
-# consecutive user prompts: a mere ``turn_number`` gap does not, because the gap is usually all
-# bookkeeping rows.
+# Turn types where the agent actually did something in response to a user prompt (a reply, its
+# thinking, a tool call or result) -- as opposed to bookkeeping rows, which make up most of a
+# session log. Used to tell whether a real agent turn ran between two consecutive user prompts,
+# since a mere ``turn_number`` gap does not (it's usually all bookkeeping).
 AGENT_TURN_TYPES = frozenset({"assistant_response", "assistant_thinking", "tool_use", "tool_result"})
 
 # Framework-injected "scaffolding" turns: coding-agent / CLI control messages that land in the
-# user-prompt stream but are not authored by the human -- slash-command invocations and expanded
-# command/skill templates, tool I/O markers, skill attachments, interrupt and image
-# placeholders. Matched against the *cleaned* turn text (identifiers already scrubbed to
-# ``<PATH>`` etc.). Heuristic but conservative, and used only to collapse *consecutive
-# duplicates* of such messages, so a false positive can at most drop an exact back-to-back
-# repeat. Longer command/skill template bodies not matched here are caught by the length rule.
+# user-prompt stream but are not authored by the human. Matched against the *cleaned* turn text.
+# Heuristic but conservative, and used only to collapse *consecutive duplicates* of such messages,
+# so a false positive can at most drop an exact back-to-back repeat.
 _SWE_SCAFFOLDING_RE = re.compile(
     r"^\[Request interrupted by user"                      # user-interrupt marker
     r"|^\[Image:"                                          # image placeholder, e.g. [Image: image/png]
@@ -64,21 +56,20 @@ def is_scaffolding_turn(text: str) -> bool:
 def _is_error_response(text: str) -> bool:
     """Whether an ``assistant_response`` is an API/transport error rather than a real reply.
 
-    Coding-agent logs record failed requests (expired auth, 500/529, rate-limit, connection
-    refused) as ``assistant_response`` turns whose content is an ``API Error: ...`` / JSON error
-    payload. These are *not* the agent engaging with the prompt, so a user turn resent after one
-    is a retry, not a reply-then-reask; :func:`_cum_agent_by_turn` excludes them.
+    Failed requests are logged as ``assistant_response`` turns whose content is an
+    ``API Error: ...`` / JSON error payload. These are not the agent engaging with the prompt, so
+    a user turn resent after one is a retry, not a reply-then-reask; :func:`_cum_agent_by_turn`
+    excludes them.
     """
     if not text:
         return False
     return text.lstrip().startswith("API Error") or '"type":"error"' in text
 
 
-# --- slash-command / skill normalization (see the two forms below) ----------
-# Form A -- a slash-command INVOCATION, recorded as just the tag block (the user typed
-# ``/name args``); we reduce it to that literal text. Form B -- an EXPANDED skill/command BODY
-# injected verbatim by the agent (skill file / command template), which the user did not author;
-# we drop it. See ``load_swe_chat_documents``.
+# --- slash-command / skill normalization ---
+# Form A: a slash-command INVOCATION, recorded as just the tag block (the user typed
+# ``/name args``) -- reduced to that literal text. Form B: an EXPANDED skill/command BODY
+# injected verbatim by the agent, which the user did not author -- dropped.
 _CMD_TAG_BLOCK_RE = re.compile(r"<command-(message|name|args)>.*?</command-\1>", re.S | re.I)
 _CMD_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S | re.I)
 _CMD_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S | re.I)
@@ -132,24 +123,21 @@ def _normalize_command_turn(text: str):
 # ---------------------------------------------------------------------------
 # Human-turn extraction -- keep only genuinely human-authored user prompts.
 # ---------------------------------------------------------------------------
-# The ``user_prompt`` stream carries a lot that the human did not type: coding-agent orchestration
-# (``<teammate-message>`` and its untagged continuation chunks), tool-I/O echoes (``<bash-*>``,
-# ``<ide_*>``, ``<task-notification>``), CLI framework wrappers (Conductor ``<system_instruction>``),
-# ``/compact`` continuation summaries, and -- importantly -- the *expanded body* of a slash command,
-# which the CLI injects as the turn(s) right after the human types ``/cmd`` (e.g. ``/retro`` ->
-# "Reflect on the work just completed ..."). None of it is authored by the person, and the raw
-# metadata cannot tell it apart (it is all ``role=user`` / ``turn_type=user_prompt``, and SWE-chat's
-# own intent/pushback classifiers even labelled it like ordinary prompts). So the split is done by
-# content plus adjacency, keyed on whether a real agent turn ran between two user prompts
-# (``agent_before``): consecutive user turns with no agent reply are one injected block.
+# The ``user_prompt`` stream carries a lot the human did not type: coding-agent orchestration,
+# tool-I/O echoes, CLI framework wrappers, ``/compact`` continuation summaries, and the *expanded
+# body* of a slash command the CLI injects right after the human types ``/cmd``. None of it is
+# authored by the person, and the raw metadata (``role=user`` / ``turn_type=user_prompt``) cannot
+# tell it apart. So the split is done by content plus adjacency, keyed on whether a real agent turn
+# ran between two user prompts (``agent_before``): consecutive user turns with no agent reply in
+# between are one injected block.
 
 HUMAN_TURN_MAX_LEN = 8000    # a user turn at least this long is treated as pasted / agent content
 CONTINUATION_MIN_LEN = 500   # a post-injection turn this long (or structured) is a continuation chunk
 
 # Framework wrapper blocks removed in place (keeping any human prose around them), matched on RAW
-# text where the tags are intact -- cleaning would mangle ``</system_instruction>`` into ``<PATH>``.
+# text -- cleaning would mangle the closing tags.
 _WRAPPER_BLOCK_RE = re.compile(
-    r"<system[_-]instruction>.*?</system[_-]instruction>"  # Conductor / attached-files wrapper (``_`` and ``-`` spellings)
+    r"<system[_-]instruction>.*?</system[_-]instruction>"  # Conductor / attached-files wrapper
     r"|<teammate-message\b[^>]*>.*?</teammate-message>",   # multi-agent orchestration message
     re.S | re.I,
 )
@@ -161,27 +149,21 @@ _CONTINUATION_RE = re.compile(r"(#{1,6}\s|\*\*|\||\d+[.)]\s|[-*]\s|```|>|\{)")
 
 # Injected non-human templates removed *in place* so a real request in the same turn survives.
 # BMAD-METHOD posts this fixed reminder as its own user turn right after a ``/bmad-*`` slash
-# command (e.g. ``/bmad-bmb-edit-module``); the ``{project-root}`` path varies. A turn that is
-# only the reminder becomes empty after removal and is dropped downstream (``empty``).
+# command. A turn that is only the reminder becomes empty after removal and is dropped downstream.
 _BMAD_REMINDER_RE = re.compile(
     r"IT IS CRITICAL THAT YOU FOLLOW THIS COMMAND: LOAD the FULL \{project-root\}.*?"
     r"READ its entire contents and follow its directions exactly!",
     re.S | re.I,
 )
 # The OMX Explore harness prepends a fixed read-only-agent system prompt and labels the real
-# user text ``User request:`` (after an ``... END EXPLORE PROMPT ...`` divider); keep only what
-# follows that label. Anchored to a turn that opens with the persona. ``(?:\s|\\n)*`` also eats a
-# leading literal ``\n`` -- these turns use escaped newlines, normalized later during cleaning.
-# A persona turn with no ``User request:`` label is left intact here and dropped by
-# :func:`_nonhuman_turn_reason` (``orchestration``).
+# user text ``User request:``; keep only what follows that label. A persona turn with no
+# ``User request:`` label is left intact here and dropped by :func:`_nonhuman_turn_reason`.
 _OMX_PROMPT_RE = re.compile(r"^You are OMX Explore\b.*?User request:(?:\s|\\n)*", re.S)
 
-# The ``/review`` slash-command posts a fixed "You are a code reviewer. Your job is to review code
-# changes ..." template body as a user turn; the only human-authored part is its ``Input:`` field
-# (the review target/instruction the user typed after ``/review`` -- often a commit/branch ref, a
-# free-text note, or empty). Reduce the turn to just that field, like OMX's ``User request:``. An
-# empty ``Input:`` leaves the turn empty and it is dropped downstream; a body whose ``Input:``/``---``
-# structure is missing is left intact and dropped by :func:`_nonhuman_turn_reason` (``skill-body``).
+# The ``/review`` slash-command posts a fixed reviewer-persona template as a user turn; the only
+# human-authored part is its ``Input:`` field. Reduce the turn to just that field, like OMX's
+# ``User request:``. A body whose ``Input:``/``---`` structure is missing is left intact and
+# dropped by :func:`_nonhuman_turn_reason`.
 _REVIEW_BODY_RE = re.compile(
     r"^You are a code reviewer\. Your job is to review code changes\b.*?Input:\s*(?P<input>.*?)\s*---",
     re.S,
@@ -197,15 +179,12 @@ def _reduce_review_command_body(text: str) -> str:
 def _strip_framework_wrappers(text: str) -> str:
     """Remove injected non-human template text *in place*, keeping human prose around it.
 
-    Strips, without dropping the turn: ``<system_instruction>``/``<system-instruction>`` blocks
-    (both the ``_`` and ``-`` spellings of the Conductor / attached-files wrapper) and
-    ``<teammate-message ...>`` blocks; the OMX Explore read-only-agent persona (keeping only the
-    text after its ``User request:`` label); the ``/review`` "You are a code reviewer ..." command
-    body (keeping only its ``Input:`` field); the BMAD-METHOD ``IT IS CRITICAL ...`` command
-    reminder; and a leading ``[Request interrupted ...]`` / ``[Image: ...]`` marker. A turn that
-    is *only* wrapper/template becomes empty (dropped downstream by the ``empty`` reason);
-    ``...</system-instruction>\\n\\nCreate a PR`` keeps ``Create a PR``. An unclosed wrapper is
-    dropped from its tag to end-of-turn.
+    Strips, without dropping the turn: ``<system_instruction>``/``<teammate-message>`` blocks; the
+    OMX Explore persona (keeping only the text after its ``User request:`` label); the ``/review``
+    command body (keeping only its ``Input:`` field); the BMAD-METHOD command reminder; and a
+    leading ``[Request interrupted ...]`` / ``[Image: ...]`` marker. A turn that is *only*
+    wrapper/template becomes empty (dropped downstream). An unclosed wrapper is dropped from its
+    tag to end-of-turn.
     """
     t = _WRAPPER_BLOCK_RE.sub("", text)
     if _WRAPPER_OPEN_RE.search(t):        # an unclosed wrapper -> drop from its tag to end-of-turn
@@ -225,28 +204,18 @@ def _strip_framework_wrappers(text: str) -> str:
 def _nonhuman_turn_reason(text: str) -> str | None:
     """Reason a (wrapper-stripped) turn is not human-authored, or ``None`` if it looks human.
 
-    Catches: ``empty`` (nothing left after stripping), framework ``tool-io`` tags
-    (``<bash-*>``, ``<ide_*>``, ``<local-command*>`` at the start, or a ``<task-notification>``
-    completion block anywhere in the turn -- leaked agent/tool output), ``env-context`` (an
-    injected ``<environment_context>`` block: cwd/shell/date/timezone), ``orchestration``
-    (multi-agent tmux-injection status lines carrying the ``[OMX_TMUX_INJECT]`` marker or an ``[OMX
-    ...]`` prefix, or an OMX Explore read-only-agent persona that :func:`_strip_framework_wrappers`
-    left intact because it had no ``User request:`` label -- all injected as fake user turns),
-    ``compaction`` (/compact continuation summaries),
-    ``plan-mode`` (``Implement the following plan: ...`` -- an approved plan the CLI injects to open
-    an execution session; the plan body is model-generated plan-mode output, not human prose),
-    ``skill-body`` (expanded skill/command bodies, including a ``/review`` "You are a code reviewer
-    ..." body left unreduced because its ``Input:`` field could not be found), ``scaffolding``
-    (standalone framework messages --
-    ``Tool loaded.``, ``Continue from where you left off.``, ``Summarize the task tool output ...`` --
-    see :data:`_SWE_SCAFFOLDING_RE`; these survived before because that regex was only applied to
-    *consecutive* duplicates, so a lone one between two real turns slipped through), ``markdown-body``
-    (a multi-paragraph Markdown document -- opens with a ``#`` heading or ``**`` bold *and* contains a
-    blank line; these are the expanded skill/command templates the CLI injects as user turns, e.g.
-    ``# NW-DESIGN ...\\n\\n**Wave**: ...`` or the reversed ``## Phase 7 ... ## Phase 1`` blocks, which
-    reach the stream far from -- or wrapped around -- their triggering command, so adjacency alone
-    misses them; the blank-line requirement spares a short single-line human ``## heading`` / ``**note**``),
-    and ``too-long`` (>= :data:`HUMAN_TURN_MAX_LEN` chars -- pasted logs or long injected bodies).
+    Catches: ``empty`` (nothing left after stripping); ``tool-io`` (leaked bash/IDE/task-
+    notification tool output); ``env-context`` (an injected ``<environment_context>`` block);
+    ``orchestration`` (multi-agent tmux-injection status lines, or an OMX Explore persona left
+    intact because it had no ``User request:`` label); ``compaction`` (/compact continuation
+    summaries); ``plan-mode`` (an approved plan the CLI injects to open an execution session --
+    model-generated, not human prose); ``skill-body`` (expanded skill/command bodies, including an
+    unreduced ``/review`` body); ``scaffolding`` (standalone framework messages, see
+    :data:`_SWE_SCAFFOLDING_RE`); ``markdown-body`` (a multi-paragraph Markdown document -- opens
+    with a ``#`` heading or ``**`` bold *and* contains a blank line, which is what the expanded
+    skill/command templates the CLI injects as user turns look like; the blank-line requirement
+    spares a short single-line human heading/note); and ``too-long`` (>= :data:`HUMAN_TURN_MAX_LEN`
+    chars -- pasted logs or long injected bodies).
     """
     if not text:
         return "empty"
@@ -292,15 +261,14 @@ def _is_markdown(text: str) -> bool:
 def merge_markdown_runs(turns_raw, is_command, agent_before, turn_ids):
     """Merge a run of consecutive Markdown turns (no agent turn between them) into one turn.
 
-    A single Markdown document -- an injected skill reference (e.g. the ``/claude-api`` skill's API
-    docs), or a long pasted spec -- is often recorded as many back-to-back ``user_prompt`` turns,
-    one per ``##`` section. That inflates the turn count and hides that it is one unit (and lets the
-    chunks slip past the human filter individually). A maximal run of turns that each open with
-    ``#`` and, after the first, had **no agent turn in between** (``agent_before`` false) is
-    concatenated into a single turn (keeping the run's first ``turn_id``/``agent_before``). The
-    merged turn is then subject to the normal human-turn filter, so an over-long injected doc is
-    dropped by the length cap while a short genuinely-human one survives as a single valid turn.
-    Turns that do not open with ``#`` (and slash commands) pass through unchanged. Returns aligned
+    A single Markdown document -- an injected skill reference or a long pasted spec -- is often
+    recorded as many back-to-back ``user_prompt`` turns, one per ``##`` section, which inflates
+    the turn count and lets the chunks slip past the human filter individually. A maximal run of
+    turns that each open with ``#`` and, after the first, had no agent turn in between is
+    concatenated into a single turn (keeping the run's first ``turn_id``/``agent_before``), then
+    subject to the normal human-turn filter -- so an over-long injected doc is dropped by the
+    length cap while a short genuinely-human one survives. Turns that do not open with ``#`` (and
+    slash commands) pass through unchanged. Returns aligned
     ``(turns, is_command, agent_before, turn_ids)``.
     """
     turns, cmds, agents, ids = [], [], [], []
@@ -330,25 +298,18 @@ def filter_to_human_turns(turns_raw, is_command, agent_before, turn_ids):
     turn or a slash command, either of which can be followed by injected continuation/expansion
     turns):
 
-    * a reduced slash-command invocation (``is_command``) is the human typing ``/cmd`` -- **kept**
-      (unless it too reaches :data:`HUMAN_TURN_MAX_LEN`, i.e. its argument is a big paste), and
-      flags that following turns may be its injected expansion;
-    * any other turn is wrapper-stripped (:func:`_strip_framework_wrappers`) and **dropped** if
-      non-human (:func:`_nonhuman_turn_reason`) -- this removes teammate/agent messages, tool I/O,
-      orchestration status, compaction, scaffolding, skill bodies, injected Markdown-document bodies
-      (``markdown-body``: the expanded skill/command templates, which open with ``#``/``**`` and span
-      multiple paragraphs, wherever they land in the stream), and over-long pastes, while keeping human
-      prose that merely sat inside a wrapper;
-    * a turn right after a non-human turn, with **no agent turn in between** (``agent_before`` false)
-      and that looks like a continuation (:func:`_is_continuation_like`), is an injected
-      continuation/expansion chunk -- **dropped**; a short free-form message there (``yes``,
-      ``merged``, a quick instruction) is **kept**.
+    * a reduced slash-command invocation is the human typing ``/cmd`` -- kept (unless its argument
+      is itself a big paste past :data:`HUMAN_TURN_MAX_LEN`) -- and flags that following turns may
+      be its injected expansion;
+    * any other turn is wrapper-stripped and dropped if non-human (:func:`_nonhuman_turn_reason`),
+      while keeping human prose that merely sat inside a wrapper;
+    * a turn right after a non-human turn, with no agent turn in between, that looks like a
+      continuation (:func:`_is_continuation_like`), is dropped as an injected expansion chunk; a
+      short free-form message there (``yes``, ``merged``) is kept.
 
-    ``agent_before`` is the key signal: an agent reply between two user turns means the second is the
-    human replying; a run of user turns with no agent reply is one injected block (a chunked command
-    body, a multi-part agent message). See the module notes above for why metadata alone cannot do
-    this. The returned per-turn lists stay aligned for the downstream cleaner and consecutive-dup
-    dedup.
+    ``agent_before`` is the key signal: an agent reply between two user turns means the second is
+    the human replying; a run of user turns with no agent reply is one injected block. Metadata
+    alone can't distinguish this from an ordinary human turn.
     """
     turns, cmds, agents, ids = [], [], [], []
     prev_nonhuman = False
@@ -395,14 +356,11 @@ def _recover_identity(sessions: pd.DataFrame) -> pd.Series:
 def _cum_agent_by_turn(dataset) -> pd.DataFrame:
     """Cumulative count of agent turns before each turn, keyed by ``(session_id, turn_number)``.
 
-    Scans *all* turn types (a session log is mostly non-agent bookkeeping rows) and counts, in
-    global ``turn_number`` order, how many :data:`AGENT_TURN_TYPES` turns precede each turn --
-    **excluding ``assistant_response`` turns that are API errors** (:func:`_is_error_response`),
-    since a failed request is not the agent engaging. Differencing this between two user prompts
-    then tells whether any *real* agent turn ran between them -- robust to bookkeeping rows and to
-    skipped (e.g. empty) user prompts, unlike a raw ``turn_number`` gap. The rare duplicate
-    ``turn_number`` rows (literal duplicate source rows) carry an equal count, so collapsing to
-    one row per key is safe.
+    Scans all turn types and counts, in global ``turn_number`` order, how many
+    :data:`AGENT_TURN_TYPES` turns precede each turn -- excluding API-error
+    ``assistant_response`` turns (:func:`_is_error_response`). Differencing this between two user
+    prompts then tells whether any real agent turn ran between them, robust to bookkeeping rows
+    and skipped user prompts, unlike a raw ``turn_number`` gap.
     """
     turns = dataset.scanner(columns=["session_id", "turn_number", "turn_type"]).to_table().to_pandas()
     turns = turns.sort_values(["session_id", "turn_number"], kind="stable")
@@ -429,12 +387,11 @@ def load_swe_chat_documents(raw_path: str | Path) -> pd.DataFrame:
     WildChat adapter's columns this adds three per-turn lists aligned with ``turns_raw`` --
     ``turn_ids`` (the source ``turn_id``), ``agent_before`` (whether an agent turn ran since the
     previous user prompt), and ``is_command`` (whether the turn is a reduced slash-command
-    invocation, so the cleaner preserves the ``/command`` token). ``turns_raw`` holds only the
-    genuinely **human-authored** turns: framework-injected skill/command bodies are dropped during
-    parsing, and :func:`filter_to_human_turns` then removes agent/orchestration turns, tool I/O,
-    /compact summaries, and injected command expansions (and strips framework wrappers in place).
-    ``repo_id``/``user_id`` are retained so the downstream cleaner can scrub them; all of these
-    helper columns are dropped from the final dataset.
+    invocation, so the cleaner preserves the ``/command`` token). ``turns_raw`` holds only
+    human-authored turns after :func:`filter_to_human_turns` removes agent/orchestration turns,
+    tool I/O, /compact summaries and injected command expansions. ``repo_id``/``user_id`` are
+    retained so the downstream cleaner can scrub them; all helper columns are dropped from the
+    final dataset.
     """
     dataset = ds.dataset(str(raw_path), format="parquet")
     sess_model = _dominant_model_per_session(dataset)
@@ -445,24 +402,18 @@ def load_swe_chat_documents(raw_path: str | Path) -> pd.DataFrame:
         filter=(ds.field("turn_type") == "user_prompt"),
     ).to_table().to_pandas()
     up = up[up["content"].notna()].copy()
-    # Normalize command/skill turns on the RAW text (before cleaning): drop framework-injected
-    # skill/command BODIES (form B -- not user-authored) and reduce slash-command INVOCATIONS
-    # (form A) to the literal ``/name args`` the user typed. ``is_command`` marks the reduced
-    # ones so the cleaner keeps the ``/command`` token and scrubs only the arguments.
+    # Normalize command/skill turns on the RAW text: drop injected skill/command bodies (form B)
+    # and reduce slash-command invocations (form A) to the literal ``/name args`` the user typed.
     norm = up["content"].map(_normalize_command_turn)
     keep = norm.map(lambda x: x is not None).to_numpy()
     up = up[keep].copy()
     norm = norm[keep]
     up["content"] = [x[0] for x in norm]
     up["is_command"] = [x[1] for x in norm]
-    # Order user prompts by the global ``turn_number`` (identical to conversation order but the
-    # canonical key for the agent-between computation below).
     up = up.sort_values(["session_id", "turn_number"], kind="stable")
     up["_lang"] = up["language"].map(normalize_language)
 
     # ``agent_before[i]`` = an agent turn ran between user prompt i-1 and i in the same session.
-    # Merge the cumulative agent count, re-sort (merge may reorder), then difference it between
-    # consecutive *non-empty* user prompts.
     up = up.merge(_cum_agent_by_turn(dataset), on=["session_id", "turn_number"], how="left")
     up = up.sort_values(["session_id", "turn_number"], kind="stable")
     up["agent_before"] = (up["cum_agent"] - up.groupby("session_id")["cum_agent"].shift(1)) > 0
@@ -480,11 +431,9 @@ def load_swe_chat_documents(raw_path: str | Path) -> pd.DataFrame:
         is_command=("is_command", list),    # per turn: reduced slash-command invocation (form A)
     ).reset_index()
 
-    # First merge Markdown documents that were split across consecutive turns (e.g. an injected
-    # skill reference recorded one ``##`` section per turn), then keep only genuinely human-authored
-    # turns (strip framework wrappers; drop agent/framework turns, tool I/O, compaction, plan-mode
-    # plans, and injected slash-command expansions). Sessions left with no human turns are dropped
-    # downstream by ``drop_empty_documents``. See merge_markdown_runs / filter_to_human_turns.
+    # First merge Markdown documents split across consecutive turns, then keep only genuinely
+    # human-authored turns. Sessions left with none are dropped downstream by
+    # ``drop_empty_documents``.
     def _process(tr, ic, ab, ti):
         return filter_to_human_turns(*merge_markdown_runs(tr, ic, ab, ti))
 

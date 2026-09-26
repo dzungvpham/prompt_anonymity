@@ -4,8 +4,8 @@
 experiment: dataset loaders (:mod:`prompt_anonymity.data`) produce it, defenses
 (:mod:`prompt_anonymity.defenses`) map it to a transformed copy, and attacks
 (:mod:`prompt_anonymity.attacks`) turn it into an unknown-vs-known distance matrix.
-Keeping it here (a tiny, dependency-light module) lets every subpackage depend on the
-contract without depending on each other.
+Kept in its own tiny module so every subpackage can depend on the contract without
+depending on each other.
 """
 
 from __future__ import annotations
@@ -36,18 +36,17 @@ class AttackData:
     metric : str
         Distance metric the attack uses to compare these vectors (smaller = more
         similar). A property of the *attack*, not of the featurizer: chosen at the
-        experiment level (default "cosine") and settable to any
-        ``scipy.spatial.distance.cdist`` metric name -- e.g. "cosine" or "euclidean".
+        experiment level (default "cosine"), any ``scipy.spatial.distance.cdist``
+        metric name.
     known_texts, unknown_texts : np.ndarray of str or None
         Optional raw prompt text per conversation, carried for inspection and for
         future text-level defenses; ``None`` when the loader does not provide it.
     known_ids, unknown_ids : np.ndarray or None
-        Optional stable row identifier from the *original* dataset -- ``session_id`` for
-        SWE-chat, ``idx`` for WildChat -- one per conversation. Carried so downstream
-        artifacts (notably the defense cache tables) are keyed by the dataset's own row
-        identity rather than by position in this split, which makes a cached rewrite
-        survive re-ordering or re-subsetting of the pool. ``None`` when the loader does
-        not provide it, in which case position is used as the identifier.
+        Optional stable row identifier from the *original* dataset (e.g. ``session_id``
+        for SWE-chat, ``idx`` for WildChat). Lets downstream artifacts like the defense
+        cache key on the dataset's own row identity instead of position, so a cached
+        rewrite survives re-ordering or re-subsetting the pool. ``None`` falls back to
+        position as the identifier.
     """
 
     known_embeddings: np.ndarray
@@ -61,8 +60,7 @@ class AttackData:
     unknown_ids: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        # Coerce to arrays and validate alignment up front, so every downstream stage
-        # can trust the shapes without re-checking.
+        # Validate up front so every downstream stage can trust the shapes.
         self.known_embeddings = np.asarray(self.known_embeddings)
         self.unknown_embeddings = np.asarray(self.unknown_embeddings)
         self.known_labels = np.asarray(self.known_labels)

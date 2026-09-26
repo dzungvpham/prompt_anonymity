@@ -1,27 +1,23 @@
 #!/usr/bin/env python
 """Is a rerank run's output actually usable? Structural checks, then a sample to read.
 
-``run_rerank.py`` can finish cleanly and still have produced something worthless. A judge that
+``run_rerank.py`` can finish cleanly and still have produced something worthless: a judge that
 refused every row, or whose replies never parsed, degrades silently to the plain nearest-neighbor
-ordering by design -- that is the right behaviour, and it is indistinguishable from a successful run
-if you only look at the accuracy columns. A judge that emits the same sentence for every position,
-or that is plainly reasoning about *topic* rather than style, also produces a complete, well-formed
-table. So this script asks two different questions:
+ordering by design, which is indistinguishable from a successful run if you only look at the
+accuracy columns. So this script asks two different questions:
 
 **Is the output well formed?** Every configuration's three tables exist, parse, agree with each
 other, and satisfy the invariants the attack is supposed to guarantee -- chiefly that each document's
 ``rerank_position`` is a genuine permutation of ``1..k`` and that top-K accuracy at the shortlist
-size still equals the baseline's. ``run_rerank.py`` asserts that last one in memory; re-checking it
-from disk is what catches a bad *write* rather than a bad computation.
+size still equals the baseline's. Re-checking the last one from disk is what catches a bad *write*
+rather than a bad computation.
 
 **Is it worth reading?** The share of positions carrying a real reason, how many distinct reasons
-there are, and how long they run. These are the numbers that separate a judge that worked from one
-that merely ran, and none of them appear in ``rerank_summary.csv``.
+there are, and how long they run -- none of which appears in ``rerank_summary.csv``.
 
 Then it prints a few complete reranked documents -- the query's true author, every candidate in the
 order the model put them, and each one's justification. No aggregate can tell you whether the judge
-is reading style or subject matter; three printed rows can, which is why the SLURM scripts end here
-rather than on a number.
+is reading style or subject matter; a few printed rows can.
 
 Style follows :mod:`prompt_anonymity.data.validate_dataset`: **collect, don't abort**, so one failure
 cannot hide five others; every check carries the measured quantity rather than just a verdict; exit

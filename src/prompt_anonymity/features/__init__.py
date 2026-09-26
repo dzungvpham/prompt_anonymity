@@ -15,14 +15,6 @@ The driver is :mod:`prompt_anonymity.data.compute_features`::
 which shards, caches every vector by content hash, and combines features by being run once per
 feature (the runner's ``--feature`` then names the parquet to attack).
 
-There used to be a second layer here, ``apply_featurizer``: it featurized both sides of an
-in-memory :class:`~prompt_anonymity.core.AttackData`, reusing the committed vectors for text a
-defense had left unchanged and concatenating several featurizers column-wise. Its only caller was
-the fixed-split experiment runner, and it was removed with it on 2026-08-04 -- the reuse
-optimisation it existed for is now structural rather than clever, because defended text gets its
-own parquet and is featurized once, offline. Recover it from git history if an in-memory path is
-ever wanted again.
-
 Add a featurizer by writing a :class:`Featurizer` and registering its class in
 ``FEATURIZERS``.
 
@@ -46,9 +38,8 @@ from .sentence_transformer import (EmbeddingGemma300mFeaturizer, Harrier270mFeat
 from .style_distance import StyleDistanceFeaturizer
 from .luar import LuarFeaturizer
 
-# Registry of featurizer classes, selectable by name (e.g. from a CLI argument). Values are
-# classes (not instances) because a featurizer may need configuration -- e.g. StyloMetrix's
-# language_code -- supplied when it is built; see :func:`get_featurizer`.
+# Registry of featurizer classes, selectable by name. Values are classes (not instances) because
+# a featurizer may need configuration (e.g. StyloMetrix's language_code); see :func:`get_featurizer`.
 FEATURIZERS: dict[str, type[Featurizer]] = {
     "gemini_embedding_2": GeminiEmbedding2Featurizer,
     "stylometrix": StyloMetrixFeaturizer,
@@ -56,9 +47,8 @@ FEATURIZERS: dict[str, type[Featurizer]] = {
     "function_words": FunctionWordFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
     "luar": LuarFeaturizer,
-    # Local, offline, instruction-conditioned -- the encoder the leave-one-out defense scores
-    # against. The three entries differ only in their instruction string and exist to be A/B'd
-    # against each other on undefended text; see harrier.py's module docstring.
+    # Local, offline, instruction-conditioned encoders used by the leave-one-out defense; see
+    # harrier.py.
     "harrier": HarrierFeaturizer,
     "harrier_imperative": HarrierImperativeFeaturizer,
     "harrier_plain": HarrierPlainFeaturizer,

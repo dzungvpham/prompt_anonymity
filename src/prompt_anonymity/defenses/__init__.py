@@ -24,8 +24,6 @@ from .argos import ArgosRTTDefense
 from .base import CachedDefense, CachedTextRewriteDefense
 from .collision_seeding import SWE_CHAT_MARKERS, CollisionSeedingDefense
 from .dp_mlm import DPMLMDefense
-from .epi import SINGLE_TOPIC_KEY as EPI_SINGLE_TOPIC
-from .epi import EmbeddingPromptInjectionDefense
 from .embad import EmBadDefense
 from .examples import ExampleTextNormalizationDefense, RoundTripTranslationDefense
 from .frame_pad import FramePadDefense
@@ -45,11 +43,9 @@ def no_defense(data: AttackData) -> AttackData:
     return data
 
 
-# Registry of ready-to-use defenses, selectable by name (e.g. from a CLI argument). The
-# model-backed defenses build their (heavy) backend lazily on first use, so registering them here
-# is free -- selecting one never loads a model, and a fully-cached run loads none either. The same
-# goes for frame_pad's passage bank: it is resolved (and if absent, generated) on first use, so
-# importing this registry never reads a file or needs an API key.
+# Registry of ready-to-use defenses, selectable by name (e.g. from a CLI argument). Model-backed
+# defenses build their heavy backend lazily on first use, so registering them here is free and a
+# fully-cached run loads no model.
 # RoundTripTranslationDefense is intentionally absent: it needs a translation model supplied by the
 # caller, so it cannot be a zero-config registry entry.
 DEFENSES: dict[str, Defense] = {
@@ -65,53 +61,37 @@ DEFENSES: dict[str, Defense] = {
     "collision_seeding": CollisionSeedingDefense(marker_keys=SWE_CHAT_MARKERS),
     "frame_shift": FrameShiftDefense(),
     "frame_pad": FramePadDefense(),
-    "epi": EmbeddingPromptInjectionDefense(),
 }
 
-#: Frame shift's single-frame ablation: the whole corpus is rewritten into ONE scene instead of
-#: drawing from the 50-entry codebook. It is the convergence-vs-dilution control, and a real
-#: contender rather than a straw man -- the default dilutes each author across 50 surface registers,
-#: while this converges every document onto one, the way ``styleremix`` and ``qwen_rewrite`` converge
-#: on one style. It is also the control that separates "the framing diluted the author" from
-#: "everything simply got longer", since both arms inflate length the same way.
-#: Cheaper to run than the default, too: with one frame shared by every row, turn-level cache dedup
-#: is fully restored (see :meth:`~.frame_shift.FrameShiftDefense._rewrite_side`).
+#: Frame shift's single-frame ablation: the whole corpus is rewritten into one scene instead of
+#: drawing from the codebook. It's the convergence-vs-dilution control -- the default dilutes each
+#: author across many surface registers, this converges every document onto one -- and separates
+#: "the framing diluted the author" from "everything simply got longer", since both arms inflate
+#: length the same way.
 DEFENSES["frame_shift_single"] = FrameShiftDefense(single_framing=SINGLE_FRAMING_KEY)
 
 #: Frame pad's single-scene ablation, the same control one level down: every document's appended turn
-#: is drawn from ONE scene's passages instead of from all 50 scenes', so the corpus circulates P pads
-#: rather than K x P. Read against ``frame_pad`` it asks whether pad *diversity* matters or only pad
-#: presence; read against ``frame_shift_single`` it holds the scene fixed and varies only whether the
-#: user's text was rewritten.
+#: is drawn from one scene's passages instead of from all of them. Read against ``frame_pad`` it asks
+#: whether pad *diversity* matters or only pad presence.
 DEFENSES["frame_pad_single"] = FramePadDefense(single_framing=SINGLE_FRAMING_KEY)
 
-#: Embedding prompt injection's single-topic ablation, the same control again: every document's
-#: appended sentence names ONE topic instead of one drawn from the 30-entry codebook, so the whole
-#: corpus ends on a byte-identical turn rather than splitting into 30 groups. Read against ``epi`` it
-#: asks whether topic *diversity* matters or only topic *presence* -- and it is the arm where the
-#: injected turn is maximal collision material, since every document shares it exactly.
-DEFENSES["epi_single"] = EmbeddingPromptInjectionDefense(single_topic=EPI_SINGLE_TOPIC)
-
-#: Collision-seeding variants. Unlike every other defense here this one is pure Python string work
-#: (no model, no GPU, seconds not hours), so a variant costs nothing to add and nothing to run --
-#: only the featurize and attack stages after it are expensive.
+#: Collision-seeding variants. Pure Python string work (no model, no GPU), so a variant costs nothing
+#: to add or run.
 #:
 #: The two K variants sweep the privacy knob: the codebook size sets the expected collision group at
-#: ``n_authors / K``, so k4 buys larger groups (stronger anonymity, more text touched per group) and
-#: k24 smaller ones. The two ablations exist to be *compared against*, not deployed:
+#: ``n_authors / K``, so k4 buys larger groups and k24 smaller ones. The two ablations are controls,
+#: not meant to be deployed:
 #:
-#: * ``_full`` applies each marker to 100% of an author's documents. The prediction is that it does
-#:   WORSE than the default despite being a bigger edit, because perfect consistency is a perfectly
-#:   reliable feature -- which is the premise the 40-70% rate rests on.
-#: * ``_indep`` draws markers per author independently instead of from the codebook, giving ~C(M,4)
-#:   possible signatures. The prediction is that it does worse than NO defense, because a
-#:   near-unique marker combination is a fingerprint. It is the control that shows the codebook is
-#:   doing the work.
-#: Every variant is wired to the audited marker set (see :data:`SWE_CHAT_MARKERS`) rather than the
-#: full 98-marker inventory. Without this the run would apply markers the audit rejected for having
-#: a base rate of exactly zero on this corpus -- the "perfect group indicator with no background to
-#: hide in" case the audit exists to catch. Re-point these at a ``WILDCHAT_MARKERS`` before running
-#: the WildChat arm.
+#: * ``_full`` applies each marker to 100% of an author's documents -- predicted to do WORSE than the
+#:   default despite being a bigger edit, since perfect consistency is a perfectly reliable feature.
+#: * ``_indep`` draws markers per author independently instead of from the codebook, giving a
+#:   near-unique signature per author -- predicted to do worse than no defense at all, since a
+#:   near-unique combination is a fingerprint. It's the control showing the codebook does the work.
+#:
+#: Every variant is wired to the audited marker set (:data:`SWE_CHAT_MARKERS`) rather than the full
+#: inventory, since an unaudited marker can have zero base rate on this corpus and become a perfect
+#: group indicator with no background to hide in. Re-point these at a ``WILDCHAT_MARKERS`` before
+#: running the WildChat arm.
 DEFENSES["collision_seeding_k4"] = CollisionSeedingDefense(
     n_profiles=4, marker_keys=SWE_CHAT_MARKERS)
 DEFENSES["collision_seeding_k24"] = CollisionSeedingDefense(
@@ -122,24 +102,20 @@ DEFENSES["collision_seeding_indep"] = CollisionSeedingDefense(
     independent=True, marker_keys=SWE_CHAT_MARKERS)
 
 #: DP-MLM per-word privacy budgets exposed as a sweep. Each registers a ``dp_mlm_eps<eps>`` defense
-#: selectable via ``--defense``. Because run_experiment.py's output_tag embeds the defense name, every
-#: epsilon writes to its OWN results directory, and each caches separately since epsilon is in
-#: ``params()``. The paper's set is {10,25,50,100,250}; the
-#: higher values are added because DP-MLM only becomes near-readable at large epsilon (weaker privacy
-#: -- the point of sweeping). ``dp_mlm`` itself defaults to eps=100, the readable end of the paper's
-#: set, so it and ``dp_mlm_eps100`` produce the same output and share a cache entry (the cache is
-#: keyed on the defense's ``name`` + ``params()``, not on the registry key).
-#: Keep this in sync with experiments/run_dpmlm_sweep.sh.
+#: selectable via ``--defense``, writing to its own results directory and caching separately since
+#: epsilon is in ``params()``. ``dp_mlm`` itself defaults to eps=100, so it and ``dp_mlm_eps100``
+#: produce the same output and share a cache entry (keyed on ``name`` + ``params()``, not the
+#: registry key). Keep this in sync with experiments/run_dpmlm_sweep.sh.
 DPMLM_SWEEP_EPSILONS = (10, 25, 50, 100, 250, 500, 1000)
 for _eps in DPMLM_SWEEP_EPSILONS:
     DEFENSES[f"dp_mlm_eps{_eps}"] = DPMLMDefense(epsilon=_eps)
 del _eps
 
-#: DP-MLM adaptive-length variants (the paper's Algorithm 3): at the default eps, each eligible word
-#: is deleted with probability ``del_prob`` and followed by an extra DP-drawn word with probability
-#: ``add_prob``, so the rewrite no longer preserves word count. Registered as ``dp_mlm_var_a<A*100>``
-#: at the paper's Appendix C grid (A in {0.1, 0.25}, D = 0.05); the plain ``dp_mlm`` and the epsilon
-#: sweep above stay fixed-length, so "same eps, with vs without length variability" is a clean A/B.
+#: DP-MLM adaptive-length variants: at the default eps, each eligible word is deleted with
+#: probability ``del_prob`` and followed by an extra DP-drawn word with probability ``add_prob``, so
+#: the rewrite no longer preserves word count. Registered as ``dp_mlm_var_a<A*100>``; the plain
+#: ``dp_mlm`` and the epsilon sweep above stay fixed-length, so this isolates length variability
+#: as its own axis.
 DPMLM_VARLEN_ADD_PROBS = (0.1, 0.25)
 DPMLM_VARLEN_DEL_PROB = 0.05
 for _add in DPMLM_VARLEN_ADD_PROBS:
@@ -148,30 +124,24 @@ for _add in DPMLM_VARLEN_ADD_PROBS:
     )
 del _add
 
-#: Leave-one-out content unlinkability, one entry per linkage budget. Unlike every sweep above, the
-#: axis here is a *target* rather than a mechanism parameter: ``loo_unlink_b30`` edits each prompt
-#: until its similarity to its author's other prompts has fallen 30%, or until the utility allowance
-#: runs out. So the arms are not equally expensive, and a prompt is allowed to fail its budget
-#: rather than be destroyed reaching for it -- ``edits.jsonl`` records which did.
-#: ``loo_unlink`` itself is ``loo_unlink_b30`` and shares its cache (the key is name + params, not
-#: the registry key), exactly as ``dp_mlm`` and ``dp_mlm_eps100`` do.
+#: Leave-one-out content unlinkability, one entry per linkage budget. Unlike the sweeps above, the
+#: axis here is a *target*, not a mechanism parameter: ``loo_unlink_b30`` edits each prompt until its
+#: similarity to its author's other prompts has fallen 30%, or until the utility allowance runs out --
+#: so a prompt may fail its budget rather than be destroyed reaching for it (``edits.jsonl`` records
+#: which did). ``loo_unlink`` itself is ``loo_unlink_b30`` and shares its cache.
 DEFENSES["loo_unlink"] = LOOUnlinkDefense()
 for _budget in LOO_UNLINK_BUDGETS:
     DEFENSES[f"loo_unlink_b{int(round(_budget * 100)):02d}"] = LOOUnlinkDefense(budget=_budget)
 del _budget
 
-#: Agentic footprint reduction, one entry per residual-linkage level. The axis is a target like
-#: ``loo_unlink``'s, but an ABSOLUTE one: ``afr_a00`` edits each prompt until it is no closer to its
+#: Agentic footprint reduction, one entry per residual-linkage level. Like ``loo_unlink``'s, the axis
+#: is a target, but an absolute one: ``afr_a00`` edits each prompt until it is no closer to its
 #: author's earlier prompts than a stranger's prompt is, and ``afr_a50`` until half that excess is
-#: gone. So the arms are not equally expensive, and a prompt is allowed to miss its target rather
-#: than be destroyed reaching for one -- ``edits_a<NN>.jsonl`` records which did.
+#: gone (``edits_a<NN>.jsonl`` records prompts that missed their target).
 #:
-#: ``afr_stage1`` is the control the whole defense stands on. It runs the same first-pass abstraction
-#: with the same model and then stops, so ``afr`` vs ``afr_stage1`` isolates *the measurement loop*
-#: rather than the model -- the ``none`` baseline is what isolates the model. If the loop buys
-#: nothing over the abstraction pass, that is the finding, and this entry is how it gets reported.
-#: ``afr`` itself is ``afr_a00`` and shares its cache (the key is name + params, not the registry
-#: key), exactly as ``dp_mlm``/``dp_mlm_eps100`` and ``loo_unlink``/``loo_unlink_b30`` do.
+#: ``afr_stage1`` runs the same first-pass abstraction with the same model and then stops, isolating
+#: the measurement loop from the model -- the ``none`` baseline is what isolates the model itself.
+#: ``afr`` itself is ``afr_a00`` and shares its cache.
 DEFENSES["afr"] = AgenticFootprintDefense()
 DEFENSES["afr_stage1"] = AgenticFootprintDefense(max_probes=0)
 for _alpha in AFR_RESIDUALS:
@@ -185,15 +155,13 @@ del _alpha
 #: against one set of encoders is not the same artifact as one evolved against another.
 EMBAD_ENSEMBLE = ("harrier", "embeddinggemma_300m", "jina_v5_nano")
 
-#: One registered name per **objective**, because the objective is the arm being compared and the
+#: One registered name per **objective**, since the objective is the arm being compared and the
 #: defended file is named ``<split>_<defense>.parquet`` -- three arms under one name would overwrite
-#: each other's parquet even though their searches cache separately. ``embad`` keeps the bare name
-#: for the local ensemble: it is the default, the cheap arm, and the one with results already on
-#: disk (``swe_chat_embad_gemini_embedding_2_*``).
+#: each other's parquet even though their searches cache separately.
 #:
-#: ``embad_gemini`` scores against the target encoder over the network and **bills real money** --
-#: roughly $1 for a default search, capped by ``DEFAULT_REMOTE_BUDGET``. Constructing it costs
-#: nothing (the objective is built lazily); running it spends.
+#: ``embad_gemini`` scores against the target encoder over the network and **bills real money**
+#: (capped by ``DEFAULT_REMOTE_BUDGET``). Constructing it costs nothing (the objective is built
+#: lazily); running it spends.
 DEFENSES["embad"] = EmBadDefense()
 DEFENSES["embad_summary"] = EmBadDefense(objective="summary")
 DEFENSES["embad_gemini"] = EmBadDefense(objective="remote")
@@ -244,7 +212,6 @@ __all__ = [
     "CollisionSeedingDefense",
     "FrameShiftDefense",
     "FramePadDefense",
-    "EmbeddingPromptInjectionDefense",
     "LOOUnlinkDefense",
     "LOO_UNLINK_BUDGETS",
     "AgenticFootprintDefense",

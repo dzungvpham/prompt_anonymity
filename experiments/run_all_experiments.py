@@ -17,11 +17,9 @@ Nothing here plots; run ``plot_results.py`` afterwards.
 
 Each clustering cell is run under every configuration in :data:`CLUSTERING_VARIANTS` -- by
 default both ``plain``, the pure-text run the ``by_defense`` figures draw, and
-``contrastive_time``, the strongest configuration measured (WildChat test BCubed F 0.510
-baseline, 0.537 with the contrastive projection, **0.562** with elapsed time fused in as well).
-The variant is the fourth part of the directory name, so the second lands in
-``plot_results.py``'s *variants* family rather than the comparable set, which is deliberate: a
-learned projection is not a point on a defense's curve.
+``contrastive_time``, the strongest configuration measured so far. The variant is the fourth part
+of the directory name, so the second lands in ``plot_results.py``'s *variants* family rather than
+the comparable set, which is deliberate: a learned projection is not a point on a defense's curve.
 
 **The clustering family has no known-side grid**, unlike the attribution one. ``run_clustering.py``
 cuts the timeline once at ``KNOWN_FRACTION`` = 0.75 -- the final quarter is the collection under
@@ -30,15 +28,14 @@ a ``--projection`` is fitted on. There is no ``--known-windows`` and no six-cell
 clustering cell is one experiment where an attribution cell is six.
 
 **Every cell of a family gets the same command line, and for clustering that is why this script
-exists.** The clustering runs that predate it were submitted by hand and did not agree: WildChat
-got ``--oracle-sweep`` and an explicit three-algorithm list, swe-chat got the runner's defaults
-and all five, so the two corpora answered different questions and neither could be read against
-the other. Here :data:`CLUSTERING_ALGORITHMS`, :data:`CLUSTERING_SCOPES` and the oracle sweep are
-properties of the *batch*, spelled once and passed to every cell whatever its source.
+exists.** Hand-submitted clustering runs used to differ across corpora in ways that made them
+unreadable against each other. Here :data:`CLUSTERING_ALGORITHMS`, :data:`CLUSTERING_SCOPES` and
+the oracle sweep are properties of the *batch*, spelled once and passed to every cell whatever its
+source.
 
 The one thing that still differs between corpora is not a setting: ``average_linkage`` needs a
-dense ``n^2`` distance matrix and the runner skips it, with a note, above ``MAX_DENSE_DOCUMENTS``
-= 20,000 documents. That is a property of the method and the corpus, so
+dense ``n^2`` distance matrix and the runner skips it, with a note, above
+``MAX_DENSE_DOCUMENTS``. That is a property of the method and the corpus, so
 :data:`CLUSTERING_SCALE_LIMITED` records it here too -- otherwise a WildChat cell would be
 missing a result it was never going to produce and would look permanently unfinished (see
 :func:`expected_results`).
@@ -197,20 +194,20 @@ NO_DEFENSE = "base"
 COLLISION_SEEDING = ("collision_seeding", "collision_seeding_k4",
                      "collision_seeding_full", "collision_seeding_indep")
 
-#: The frame-shift arm. ``frame_shift`` rewrites each document into one of 50 topic-heavy scenes
-#: drawn by a keyed hash of its doc_id; ``frame_shift_single`` forces the whole corpus into ONE scene
-#: and is the convergence-vs-dilution control (and the control for plain length inflation, since both
-#: arms lengthen documents the same way). Unlike collision seeding these cost money to produce -- a
-#: hosted rewrite per (frame, turn) -- so only the main arm is in the default grid; add the ablation
-#: with ``--defenses frame_shift_single`` once the first numbers are in.
+#: The frame-shift arm. ``frame_shift`` rewrites each document into one of a codebook of topic-heavy
+#: scenes drawn by a keyed hash of its doc_id; ``frame_shift_single`` forces the whole corpus into
+#: ONE scene and is the convergence-vs-dilution control (and the control for plain length
+#: inflation, since both arms lengthen documents the same way). Unlike collision seeding this costs
+#: money to produce (a hosted rewrite per turn), so only the main arm is in the default grid; add
+#: the ablation with ``--defenses frame_shift_single`` once the first numbers are in.
 FRAME_SHIFT = ("frame_shift",)
 
-#: The frame-pad arm: the same 50-scene codebook, but the document's own turns are left
-#: byte-identical and one dense, off-topic turn is APPENDED instead. It is frame_shift's other half
-#: on its own -- does added shared content dilute the author, with nothing rewritten? -- and it is
-#: effectively free to produce (the padding text is generated once into a bank of 400 passages, ~2
-#: cents, then reused across the whole corpus), so unlike frame_shift both it and its single-scene
-#: ablation could be run; only the main arm is in the default grid to keep the featurize bill down.
+#: The frame-pad arm: the same scene codebook, but the document's own turns are left byte-identical
+#: and one dense, off-topic turn is APPENDED instead. It is frame_shift's other half on its own --
+#: does added shared content dilute the author, with nothing rewritten? -- and it is effectively
+#: free to produce (the padding text is generated once into a reusable bank), so unlike frame_shift
+#: both it and its single-scene ablation could be run; only the main arm is in the default grid to
+#: keep the featurize bill down.
 FRAME_PAD = ("frame_pad",)
 
 EMBAD = ("embad", "embad_summary", "embad_gemini")
@@ -237,26 +234,19 @@ KNOWN_SIDE_FEATURES = ("char_ngram_tfidf",)
 
 #: In increasing cost order, which is the order cells are executed in. ``nearest_neighbor`` is a
 #: matmul; the rest fit one decision function per author, so their cost grows with the author
-#: count (xgboost measured ~0.097 s per author per 20 boosting rounds). ``logistic_sgd`` fits the
-#: same model as ``logistic`` but minibatched on a GPU, which is why it sits below it here despite
-#: being the only one of the three that runs at WildChat's 19,711 authors: the whole
-#: six-configuration StyloMetrix grid is 20 minutes on one A16.
+#: count. ``logistic_sgd`` fits the same model as ``logistic`` but minibatched on a GPU, which is
+#: why it sits below it here despite being the only one of the three that runs at WildChat's scale.
 ATTACKS = ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd", "logistic", "xgboost")
 
 #: Per-source attack restrictions -- a source absent here gets all of :data:`ATTACKS`.
 #:
-#: WildChat gets ``nearest_neighbor`` and ``logistic_sgd``, and nothing else. It has 19,711 known
-#: authors at the largest configuration and the two excluded attacks are linear in that: xgboost
-#: would be ~8 h for a *single* fit at the default 300 estimators, and sklearn's multinomial
-#: ``logistic`` is worse than slow -- its per-iteration logit matrix is 129,382 x 19,711 in
-#: float64, 20.4 GB against a 16 GB cap, so it cannot run at all. Measured scaling, wildchat
-#: StyloMetrix with the pool subsampled: 26 s at 250 authors, 34 s at 500, 64 s at 1,000, 158 s at
-#: 2,000. Do not add either back without a measurement showing the fit is affordable.
+#: WildChat gets ``nearest_neighbor`` and ``logistic_sgd``, and nothing else: its author count
+#: makes xgboost prohibitively slow, and sklearn's multinomial ``logistic`` needs more memory than
+#: the job cap allows. Do not add either back without a measurement showing the fit is affordable.
 #:
 #: ``logistic_sgd`` is that same ``logistic`` model fitted so that it does run there, and it is
-#: not an optional extra: it roughly **doubles** WildChat's StyloMetrix top-1 over
-#: ``nearest_neighbor`` (0.0655 -> 0.1387 at ``known0075``, 1.7-2.1x on every configuration), so a
-#: grid without it reports a corpus limit where there was only a solver limit.
+#: not an optional extra: it substantially improves WildChat's top-1 over ``nearest_neighbor``, so
+#: a grid without it reports a corpus limit where there was only a solver limit.
 SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "rlsc", "logistic_sgd")}
 
 #: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
@@ -294,10 +284,10 @@ CLUSTERING_SCOPES = ("all", "unseen")
 #: Where a clustering algorithm cannot run, so that its absence is not read as an unfinished
 #: cell. Mirrors the runner's own guard rather than importing it, for the same reason the grid
 #: above is literal: ``average_linkage`` needs a dense ``n_documents^2`` float64 distance matrix,
-#: which is 14.9 GB at WildChat's 43,127-document test quarter and over the 20,000-document
-#: ``MAX_DENSE_DOCUMENTS`` limit, so the runner skips it there with a printed note.
-#: ``componentwise_agglomerative`` is the method that gets average linkage back at that scale by
-#: agglomerating inside one connected component at a time, and has no such limit.
+#: which is over the runner's ``MAX_DENSE_DOCUMENTS`` limit at WildChat's scale, so the runner
+#: skips it there with a printed note. ``componentwise_agglomerative`` is the method that gets
+#: average linkage back at that scale by agglomerating inside one connected component at a time,
+#: and has no such limit.
 CLUSTERING_SCALE_LIMITED = {"average_linkage": ("wildchat",)}
 
 #: The clustering configurations every cell is run under: name -> (``--projection``, whether the
@@ -311,14 +301,12 @@ CLUSTERING_SCALE_LIMITED = {"average_linkage": ("wildchat",)}
 #: * ``plain`` is the pure-text run, the comparable set every ``by_defense`` and
 #:   ``precision_recall`` figure draws. Dropping it would empty those figures.
 #: * ``time`` fuses elapsed time into the edge score and reads no learned projection. It is the
-#:   control that makes the row below readable -- timestamps alone re-link users nearly as well
-#:   as a tuned style attack (WildChat test BCubed F 0.463 for timing only against 0.510 for the
-#:   baseline), so a fused number has to be shown against it to claim the gain is joint. CPU only,
-#:   since there is no projection to fit.
+#:   control that makes the row below readable -- timestamps alone re-link users nearly as well as
+#:   a tuned style attack, so a fused number has to be shown against it to claim the gain is joint.
+#:   CPU only, since there is no projection to fit.
 #: * ``contrastive_time`` fits a contrastive projection on the first half of the timeline and
-#:   fuses elapsed time into the edge score, which is the strongest configuration measured: on
-#:   WildChat's test slice, BCubed F 0.510 baseline -> 0.537 contrastive -> **0.562** with timing.
-#:   It goes to the variants family instead, where the strategy is the axis.
+#:   fuses elapsed time into the edge score, the strongest configuration measured. It goes to the
+#:   variants family instead, where the strategy is the axis.
 #:
 #: **Every variant searches its distance thresholds as quantiles of the graph's own edge weights**
 #: -- ``run_clustering.py`` has no absolute-radius mode any more (see ``search_spaces``). So the
@@ -352,28 +340,26 @@ BASELINE_PREFIX = "baseline_"
 # lets another cluster be adopted by editing one TOML -- the rule is a property of the experiment
 # and travels with it, the flags are not.
 
-#: Attacks worth allocating a GPU for. ``xgboost`` measured 17x (22.1 s CPU against 1.29 s on one
-#: A100 at 1,000 documents x 3,072 features over 81 authors); ``logistic_sgd`` is ~2 TFLOP per
-#: pass of pure matmul and is the one attack here that is *only* practical on a device -- its
-#: WildChat StyloMetrix grid is 20 minutes on one A16 against a projected ~9 h on eight CPU cores.
+#: Attacks worth allocating a GPU for. ``xgboost`` fits substantially faster on a device;
+#: ``logistic_sgd`` is heavy matmul and is the one attack here that is only practical on a GPU.
 #: Every other attack is BLAS on the CPU and would leave a card idle for the whole job.
 GPU_ATTACKS = ("xgboost", "logistic_sgd")
 
-#: Sources whose score matrix does not fit a default allocation. WildChat's is 86,255 x 13,694
-#: float32 = 4.72 GB at ``known0050`` alone; runs have been OOM-killed at 16 GB.
+#: Sources whose score matrix does not fit a default allocation -- WildChat's has been OOM-killed
+#: under the default memory cap.
 LARGE_MEMORY_SOURCES = ("wildchat",)
 
 #: Sources whose *collection* does not fit the small clustering profile -- a different resource
-#: story from the one above, which is why the clustering classes are their own. WildChat clusters
-#: 43,127 documents: two neighbour graphs, HDBSCAN's minimum spanning tree over ~1.5M edges, and
-#: componentwise agglomeration's dense per-component matrix, on top of the 172,509 x 3,072 feature
-#: matrix held while loading (2.1 GB). See the notes in ``scripts/slurm.toml``.
+#: story from the one above, which is why the clustering classes are their own. WildChat's test
+#: quarter is large enough that its neighbour graphs, HDBSCAN's spanning tree and componentwise
+#: agglomeration's per-component matrices need more memory than the small profile gives. See the
+#: notes in ``scripts/slurm.toml``.
 LARGE_COLLECTION_SOURCES = ("wildchat",)
 
-#: Projections worth allocating a GPU for. The contrastive fit is 30,000 steps of a 3,072 x 1,024
-#: matmul over a 2,048-document batch -- ~6 minutes on one A100 against hours on eight cores. The
-#: closed-form projections (``wccn``, ``lda``) and every clustering algorithm are CPU work, so a
-#: variant that does not fit a contrastive map stays on the CPU classes.
+#: Projections worth allocating a GPU for. The contrastive fit is many steps of matmul over a
+#: large batch, minutes on a GPU against hours on CPU cores. The closed-form projections
+#: (``wccn``, ``lda``) and every clustering algorithm are CPU work, so a variant that does not fit
+#: a contrastive map stays on the CPU classes.
 GPU_PROJECTIONS = ("contrastive",)
 
 
@@ -1051,12 +1037,11 @@ def parse_args() -> argparse.Namespace:
                              "pure-text run that keeps the three-part directory name every "
                              "by_defense figure draws; 'contrastive_time' fits a contrastive "
                              "projection on the first half of the timeline and fuses elapsed "
-                             "time into the edge score, which is the strongest configuration "
-                             "measured (WildChat test BCubed F 0.510 -> 0.562) and lands in the "
-                             "variants family rather than the comparable set. Its time weight is "
-                             "SEARCHED, not set: run_clustering.py tunes it per algorithm on the "
-                             "tuning slice, which is why the directory says `time` and carries no "
-                             "number.")
+                             "time into the edge score, the strongest configuration measured, and "
+                             "lands in the variants family rather than the comparable set. Its "
+                             "time weight is SEARCHED, not set: run_clustering.py tunes it per "
+                             "algorithm on the tuning slice, which is why the directory says "
+                             "`time` and carries no number.")
     parser.add_argument("--algorithms", nargs="+", metavar="NAME",
                         default=list(CLUSTERING_ALGORITHMS),
                         help="Clustering only: algorithms every cell runs (default: "
@@ -1075,10 +1060,7 @@ def parse_args() -> argparse.Namespace:
                         help="Clustering only: also score the whole hyper-parameter grid on the "
                              "test collection, to bound what tuning could have achieved (writes "
                              "oracle_sweep.csv). It is an ORACLE -- never select on it. Off by "
-                             "default, matching the runner: it roughly doubles the search cost, "
-                             "and the swe-chat runs on disk were produced without it while the "
-                             "WildChat ones had it, which is one of the inconsistencies this "
-                             "launcher exists to end.")
+                             "default, matching the runner: it roughly doubles the search cost.")
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR,
                         help="Directory holding the parquets, passed straight to the runner "
                              "(default: data/hf, NOT data/dist -- see the module docstring).")
@@ -1112,14 +1094,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xgboost-device", default="auto", choices=["cpu", "cuda", "auto"],
                         help="Passed to the runner for xgboost cells only. Default 'auto': use "
                              "the GPU histogram builder when the wheel has CUDA and a device is "
-                             "visible (xgboost probes with a two-row fit), else the CPU one. "
-                             "Measured 17x on the shape these cells have (1,000 documents x "
-                             "3,072 features, 81 authors: 22.1 s CPU against 1.29 s on one "
-                             "A100). Note this overrides the runner's own 'cpu' default, and the "
-                             "reason for that default applies here too: the GPU builder sums "
-                             "gradients in a different order and can pick different splits, so a "
-                             "batch's xgboost numbers depend on whether a GPU was free. Pass "
-                             "'cpu' when a cell has to reproduce one run on a different machine.")
+                             "visible (xgboost probes with a two-row fit), else the CPU one. Note "
+                             "this overrides the runner's own 'cpu' default, and the reason for "
+                             "that default applies here too: the GPU builder sums gradients in a "
+                             "different order and can pick different splits, so a batch's xgboost "
+                             "numbers depend on whether a GPU was free. Pass 'cpu' when a cell has "
+                             "to reproduce one run on a different machine.")
     parser.add_argument("--stop-on-error", action="store_true",
                         help="Abort the batch at the first failing cell (default: carry on and "
                              "report the failures at the end).")

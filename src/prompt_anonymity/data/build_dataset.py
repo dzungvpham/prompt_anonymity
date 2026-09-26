@@ -2,11 +2,9 @@
 
 Each source is built **independently** through the same shared stages and written to its own
 parquet file, so they are separate HuggingFace splits (``wildchat``, ``swe_chat``, ``sharechat``)
-of one dataset rather than a single combined file. Building per source is exactly equivalent to
-the old combined run: the only cross-source coupling was boilerplate dedup, and no affix is shared
-*solely* across sources, so the split changes the **layout, not the data**.
+of one dataset rather than a single combined file.
 
-Pipeline per source (identical treatment for all three, except the source-specific steps noted
+Pipeline per source (identical treatment for all three except the source-specific steps noted
 below; see the per-module docstrings for detail):
 
     load one source (raw turns; WildChat: drop programmatic clients; SWE-chat: keep only
@@ -31,11 +29,10 @@ response in between, very long, or a value that recurs often); see
 :func:`dedup_consecutive_turns`. WildChat needs no such step -- its turns strictly alternate
 with the model's replies, so it has no consecutive-duplicate-turn artifacts.
 
-The language stage is likewise per-source (see ``prompt_anonymity/data/language_detection.py``): SWE-chat is fully
-re-detected because its upstream labels are unreliable, while WildChat keeps its trusted upstream
-primary and has only a *secondary* language detected (it ships one language per conversation). That
-WildChat secondary pass used to be a separate follow-up script run against the built parquet; it is
-a stage of this build now, so one command produces the finished files.
+The language stage is likewise per-source (see ``prompt_anonymity/data/language_detection.py``):
+SWE-chat is fully re-detected because its upstream labels are unreliable, while WildChat keeps its
+trusted upstream primary and has only a *secondary* language detected (it ships one language per
+conversation).
 
 One row = one document (a WildChat conversation or a SWE-chat session), with the user turns
 stored as a **list** (``turns``, cleaned/scrubbed) rather than a delimiter-joined string, so
@@ -47,30 +44,24 @@ filter, not a length filter).
 Design choices worth knowing:
 
 * **WildChat inclusion.** Every browser-sent conversation on the studied models
-  (:data:`prompt_anonymity.data.sources_wildchat.WILDCHAT_MODELS`) is kept. The models are pooled with no roles
-  attached -- none is the "known" side and none the "unknown" side -- and the old "identity used
-  >=2 distinct models" rule is dropped, so single-model users are retained. Conversations posted
-  by HTTP clients rather than typed into a browser are dropped at load time (``--keep-
-  programmatic-clients`` disables this); the only per-author floor is ``--min-docs`` (default 2),
-  since attribution/clustering needs >=2 documents per author. Set ``--min-docs 1`` to include
-  single-document authors.
+  (:data:`prompt_anonymity.data.sources_wildchat.WILDCHAT_MODELS`) is kept, pooled with no "known"
+  or "unknown" role attached. Conversations posted by HTTP clients rather than typed into a browser
+  are dropped at load time (``--keep-programmatic-clients`` disables this); the only per-author
+  floor is ``--min-docs`` (default 2), since attribution/clustering needs >=2 documents per author.
 * **Relay authors are dropped.** A relay posts many different people's messages under one request
   fingerprint, making that ``author_id`` a mixture rather than an author. Two kinds are removed:
-  those whose client is programmatic (caught by the load-time filter above, including one whose
-  hand-built ``User-Agent:...`` header gave it away) and those that reach the API through a
-  browser but inject chat scaffolding into every prompt (:func:`drop_relay_authors`;
-  ``--keep-relay-authors`` disables it). This is the one content-based *author* filter in the
-  build -- no document is ever dropped for its content alone.
+  those whose client is programmatic (caught by the load-time filter above) and those that reach
+  the API through a browser but inject chat scaffolding into every prompt
+  (:func:`drop_relay_authors`; ``--keep-relay-authors`` disables it). This is the one
+  content-based *author* filter in the build -- no document is ever dropped for its content alone.
 * **Consistency.** Both sources are cleaned by the same scrubber and deduplicated by the same
   rule, so ``source`` does not leak through surface tokens.
-* **No split assigned.** The dataset no longer ships a ``split_role`` column; the known/unknown
-  linkage split is being redesigned (e.g. SWE-chat by day rather than by last session) and will
-  be assigned downstream, not here.
+* **No split assigned.** The dataset ships no ``split_role`` column; the known/unknown linkage
+  split is assigned downstream, not here.
 
 Cleaning is CPU-bound (regex over long pasted texts), so it is parallelized across processes
 with ``--workers``, defaulting to the CPUs this job may actually use (see
-:mod:`prompt_anonymity.resources` -- on a shared cluster that is well below the machine's
-core count).
+:mod:`prompt_anonymity.resources`).
 
 **Where the data comes from and goes.** Neither location is hard-coded: each source's raw
 upstream data is resolved by :func:`prompt_anonymity.data.config.raw_path` -- a local copy if one
@@ -119,25 +110,21 @@ FINAL_COLUMNS = [
 ]
 
 # Every final column except the ``turns`` list and the ``num_turns`` count is a nullable string, and
-# some come out all-``None`` for a given source (WildChat has no ``agent``; most documents have no
-# ``language_secondary``). An all-``None`` column would serialize as the Arrow ``null`` type, and a
-# ``null`` column cannot cast to its sibling split's ``string`` -- the one thing that breaks loading
-# the two parquets as a single HuggingFace dataset. So these are written with an explicit Arrow
-# ``string`` type, identical across both splits: it is the lighter, HF-native flavor (``string`` and
-# ``large_string`` interoperate across splits regardless). See :func:`_with_arrow_string_columns`.
+# some come out all-``None`` for a given source (WildChat has no ``agent``). An all-``None`` column
+# would serialize as the Arrow ``null`` type, which cannot cast to a sibling split's ``string`` --
+# the one thing that breaks loading the splits as a single HuggingFace dataset. So these are
+# written with an explicit Arrow ``string`` type. See :func:`_with_arrow_string_columns`.
 STRING_COLUMNS = tuple(c for c in FINAL_COLUMNS if c not in ("turns", "num_turns"))
 
 #: The sources, named the way every CLI, config key, split, parquet and results directory in the
 #: project names them. HuggingFace split names must match ``^\w+$`` (no hyphens), which is why
-#: this corpus is ``swe_chat`` and not ``swe-chat``: one spelling, so a ``--source`` value, a
-#: ``[sources.*]`` table, ``swe_chat.parquet`` and ``swe_chat_base_..._nearest_neighbor/`` all say
-#: the same word. There is no source -> split mapping any more; the source name *is* the split.
+#: this corpus is ``swe_chat`` and not ``swe-chat``. There is no source -> split mapping; the
+#: source name *is* the split.
 #:
 #: **The ``source`` column is a different string and deliberately still ``swe-chat``.** That value
 #: is data, not a name: :func:`~prompt_anonymity.data.identity.hash_author_id` hashes it into
 #: every ``author_id`` (which is also prefixed with it, ``swe-chat-<16 hex>``), so respelling it
-#: would silently change every id in the published dataset, in every feature parquet, and in
-#: every results CSV already computed. The adapters set it themselves
+#: would silently change every id already published. The adapters set it themselves
 #: (:mod:`~prompt_anonymity.data.sources_swe_chat`), so it does not follow this constant.
 #: ``sharechat`` was added after that lesson and spells its column the same as its name.
 SOURCES = ("wildchat", "swe_chat", "sharechat")
@@ -147,20 +134,16 @@ SOURCES = ("wildchat", "swe_chat", "sharechat")
 #: :func:`filter_min_docs`, no :func:`drop_relay_authors`, and dedup runs the unidentified variant
 #: (:func:`run_dedup_unidentified`).
 #:
-#: ShareChat is the only one. It is a corpus of *shared conversation links*, and a share link
-#: identifies the conversation, not the person -- two links may or may not be the same author and
-#: the upstream data cannot say. Inventing one author per link would have been convenient (every
-#: groupby keeps working) but it asserts something unverified, so the column stays null and the
-#: split is what it honestly is: a pool of documents with **no known author**, which is exactly what
-#: an out-of-set / distractor population for an open-set attack needs to be.
+#: ShareChat is the only one: it is a corpus of *shared conversation links*, and a share link
+#: identifies the conversation, not the person. Inventing one author per link would have been
+#: convenient but asserts something unverified, so the split is what it honestly is: a pool of
+#: documents with **no known author**, exactly what an out-of-set / distractor population needs.
 UNIDENTIFIED_SOURCES = frozenset({"sharechat"})
 
 # Rows per parquet row group. A row group is the smallest unit a reader can skip to, so writing
-# one giant group forces any consumer to materialize the whole file: pyarrow's default (1024*1024
-# rows) put all of WildChat in a single 1.09 GiB group, which the HuggingFace dataset viewer
-# refuses to scan (its per-read limit is 300 MB). WildChat's conversations average ~6 KB, so 5000
-# rows is a ~30 MB group -- comfortably inside the viewer's budget with room for the long tail,
-# and still large enough that per-group metadata and compression ratios stay negligible.
+# one giant group forces any consumer to materialize the whole file -- pyarrow's default put all
+# of WildChat in one group too large for the HuggingFace dataset viewer to scan. This size keeps
+# each group comfortably within the viewer's per-read budget.
 PARQUET_ROW_GROUP_SIZE = 5000
 
 # Consecutive-duplicate turn dedup (SWE-chat only). A user turn that exactly repeats the one
@@ -288,10 +271,8 @@ def drop_empty_turns(frame: pd.DataFrame) -> pd.DataFrame:
     (:func:`~prompt_anonymity.data.sources_sharechat.strip_upstream_redactions`) empties any turn
     that was *entirely* redacted -- a message that was nothing but a name or a phone number. Such
     a turn carries no text but still counts toward ``num_turns``, so it would report a length the
-    document does not have. Measured on the raw ShareChat conversations that is 1.4% of turns,
-    against 0.003% in WildChat and 0 in SWE-chat, which is why this runs for ShareChat alone:
-    those two have no redaction stage to empty a turn, and applying it to them would rewrite
-    already-published documents for a handful of rows.
+    document does not have. This runs for ShareChat alone: the other two sources have no redaction
+    stage to empty a turn, and applying it to them would rewrite already-published documents.
 
     Documents are never dropped here; one left with no turns at all is removed immediately after
     by :func:`drop_empty_documents`.
@@ -471,8 +452,7 @@ def filter_min_docs(frame: pd.DataFrame, min_docs: int) -> pd.DataFrame:
     return frame[sizes >= min_docs].reset_index(drop=True)
 
 
-# Chat scaffolding that only a *program* puts in a prompt. Two forms, both rare enough (0.14% of
-# WildChat documents) to be near-unambiguous:
+# Chat scaffolding that only a *program* puts in a prompt. Two forms, both rare and near-unambiguous:
 #   (a) the text ends on a dangling speaker label ("... Assistant:") -- the client is asking the
 #       model to complete the next turn, a completion-style API call. Nobody types this into a
 #       chat box and hits send.
@@ -511,9 +491,8 @@ def drop_relay_authors(frame: pd.DataFrame, *, min_scaffold_docs: int = MIN_SCAF
 
     The conjunction is what makes this safe, and it is deliberately *not* volume-dependent: it
     fires on an author with as few as two documents, where behavioural statistics (language
-    spread, activity hours, turn counts) have no power at all. The corpus-wide rate of
-    all-single-turn authors is 13%, so the second condition is real evidence rather than the base
-    rate, and each condition alone is far too broad to use by itself.
+    spread, activity hours, turn counts) have no power at all. Each condition alone is far too
+    broad to use by itself.
 
     Requiring *both* also spares the genuine edge case: one person using a custom front-end that
     injects a system prompt. They trip the scaffolding test, but their conversations have
@@ -654,24 +633,19 @@ def build_source(
     # (a third empty, some CJK mislabeled English), so we re-detect it with Lingua and fall back to
     # upstream only where the detector abstains; WildChat's and ShareChat's are trusted, so they
     # just split the existing list into the two columns -- a schema update, not a relabel of the
-    # primary. ShareChat's labels were checked against Lingua on a 2,000-conversation sample across
-    # all five platforms and agreed 98.7% of the time, which is why it gets WildChat's policy and
-    # not SWE-chat's.
+    # primary.
     frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe_chat"))
     print(f"[{source}] languages: {lang_stats['n_lingua']:,} by detector, "
           f"{lang_stats['n_fallback']:,} from upstream, {lang_stats['n_default']:,} defaulted to English")
 
     # WildChat labels one language per conversation, so the split above leaves it no secondary; it
     # is detected here, keeping the trusted primary (SWE-chat already got its secondary from the
-    # re-detection). Single-process and Lingua-bound -- a few minutes on the full WildChat corpus.
+    # re-detection).
     #
     # ShareChat labels *per message*, so the split above does hand it an upstream secondary -- and
     # this pass deliberately overwrites it. That upstream signal is per-message detection on short
-    # messages and it shows: 5.8% of conversations have turns labelled with different languages,
-    # and the lists include things like ('English', 'Latin', 'Malayalam') -- exactly the "a rare
-    # confusable steals a short span" failure that `observed_language_detector`'s restricted
-    # candidate set exists to prevent. The vetted pass puts it at 1.6%, in line with WildChat's
-    # 0.9%, on plausible pairs.
+    # messages, which lets a rare confusable steal a short span; `observed_language_detector`'s
+    # restricted candidate set exists to prevent exactly that.
     if source in ("wildchat", "sharechat"):
         frame, _ = add_secondary_languages(
             frame, threshold=secondary_threshold,

@@ -23,10 +23,9 @@ BASELINE-Random. Two more are added here for this project:
 
 ``metadata_labels``
     Partition by observable metadata -- language, model provider -- with no text at all. This one
-    is specific to this project and it is load-bearing: StyloMetrix separates English from Russian
-    at 0.984 AUROC *within* a single corpus, so an attack on a corpus that is 44.9% English and
-    22.1% Russian can score on language alone. Anything a metadata partition already achieves is
-    not evidence about writing style.
+    is specific to this project and it is load-bearing: a stylometric featurizer can separate
+    languages almost perfectly, so an attack on a multilingual corpus can score well on language
+    alone. Anything a metadata partition already achieves is not evidence about writing style.
 """
 
 from __future__ import annotations

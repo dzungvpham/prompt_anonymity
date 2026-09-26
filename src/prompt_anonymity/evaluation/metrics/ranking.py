@@ -8,16 +8,15 @@ a single :func:`true_author_ranks` call feeds the whole family cheaply.
 These answer two questions the top-k tables in :mod:`prompt_anonymity.evaluation.metrics.accuracy` cannot:
 
 * **How close was the attack overall?** ``top_k_accuracy`` samples the ranking at a handful of
-  cutoffs. :func:`ranking_summary` reports the mean reciprocal rank and the mean percentile
-  rank, both of which use the whole ranking, and :func:`cmc_curve` traces every cutoff at once.
-  The percentile rank matters when comparing experiments whose candidate pools differ in size:
-  "top-10 of 81 candidates" and "top-10 of 124" are not the same achievement, but their
-  percentile ranks are directly comparable.
+  cutoffs. :func:`ranking_summary` reports the mean reciprocal rank and the mean percentile rank,
+  both of which use the whole ranking, and :func:`cmc_curve` traces every cutoff at once. The
+  percentile rank matters when comparing experiments whose candidate pools differ in size, since
+  it is comparable across pool sizes where a raw top-k count isn't.
 * **Is the attack re-identifying *users*, or just the users who write a lot?** Document-weighted
-  (micro) accuracy is dominated by prolific authors -- in one SWE-chat window a single author
-  owns 184 of 819 documents. The ``macro_`` functions average over authors instead, and
-  :func:`per_author_ranking` returns the whole distribution, which is the honest way to state a
-  privacy result: not "26% of documents" but "how many users are at serious risk, and how badly".
+  (micro) accuracy is dominated by prolific authors. The ``macro_`` functions average over authors
+  instead, and :func:`per_author_ranking` returns the whole distribution, which is the honest way
+  to state a privacy result: not a share of documents but how many users are at serious risk, and
+  how badly.
 
 Score orientation
 -----------------
@@ -58,11 +57,10 @@ def true_author_ranks(scores, candidate_authors, true_authors) -> np.ndarray:
 
     Notes
     -----
-    Only the true author's rank is computed, never the full ranking. Sorting each row would
-    build an ``(n_documents, n_candidates)`` rank matrix -- 6 GB at 50,000 documents over 15,000
-    candidates -- and then discard all but one entry per row. Counting how many candidates beat
-    the true author gives the identical number (ties included, see below) in a single pass, which
-    is both faster and bounded by one boolean array rather than a float64 one.
+    Only the true author's rank is computed, never the full ranking: sorting each row would build
+    an ``(n_documents, n_candidates)`` rank matrix and then discard all but one entry per row.
+    Counting how many candidates beat the true author gives the identical number (ties included)
+    in a single pass over a boolean array instead.
     """
     scores = np.asarray(scores)
     if not np.issubdtype(scores.dtype, np.floating):
@@ -279,10 +277,8 @@ def macro_f1_score(true_authors, predicted_authors) -> float:
 def per_author_ranking(ranks, true_authors, top_ks=(1, 5, 10)) -> pd.DataFrame:
     """Per-author breakdown of the ranking: the risk distribution behind the averages.
 
-    An average accuracy hides which users are actually exposed. In practice the risk is highly
-    unequal -- on SWE-chat most target users are never attributed correctly even once while a
-    few are attributed nearly always -- and that distribution, not its mean, is what a privacy
-    claim should rest on.
+    An average accuracy hides which users are actually exposed -- risk tends to be highly unequal
+    across authors, and that distribution, not its mean, is what a privacy claim should rest on.
 
     Returns one row per distinct author in ``true_authors``, sorted most-exposed first, with
     columns ``author``, ``n_documents``, ``best_rank`` (their single most-identifiable

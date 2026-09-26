@@ -25,11 +25,9 @@ rows. If the reasons complain that names were removed, that the voice changed, o
 said more than it needed to, the rubric is not holding and the numbers should not be trusted yet.
 
 Judging runs through one of two :data:`JUDGE_BACKENDS`, both a concurrent fan-out over an
-OpenAI-compatible API: ``deepseek`` (the default --
-:class:`~prompt_anonymity.evaluation.utility._deepseek.DeepSeekJudge`, hosted and billed) or
-``local`` (:class:`~prompt_anonymity.evaluation.utility._vllm_judge.VLLMJudge`, a self-hosted vLLM
-server, free). The backend changes where a request goes and what it costs; the rubric, input format
-and parser are shared.
+OpenAI-compatible API: ``deepseek`` (the default -- hosted and billed) or ``local`` (a self-hosted
+vLLM server, free). The backend changes where a request goes and what it costs; the rubric, input
+format and parser are shared.
 Every verdict is cached by the package's content-addressed
 :class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/utility/conversation_judge``,
 and conversations the defense left untouched short-circuit to 5 with no API call, so scoring
@@ -116,20 +114,16 @@ CONVERSATION_JUDGE_SYSTEM_PROMPT = load_judge_prompt()
 #: of the cache key, so a swap re-caches cleanly instead of mixing two models' scores in one number.
 DEFAULT_CONVERSATION_JUDGE_MODEL = DEEPSEEK_DEFAULT_MODEL
 
-#: Reasoning budget for the judge, ``"low"`` since 2026-08-11 (on request, following DeepSeek's
-#: thinking-mode guide). Part of the cache key. **On this deployment "low" turns reasoning on**,
-#: because it was off without the field entirely -- see
-#: :data:`~._deepseek.DEFAULT_REASONING_EFFORT` for the probe behind that and for why the level is
-#: only a coarse dial here.
+#: Reasoning budget for the judge. Part of the cache key. **On this deployment "low" turns
+#: reasoning on**, since it is off entirely without the field -- see
+#: :data:`~._deepseek.DEFAULT_REASONING_EFFORT`.
 DEFAULT_JUDGE_REASONING_EFFORT = DEFAULT_REASONING_EFFORT
 
-#: Sampling controls, both 1.0 since 2026-08-11 (on request). **Neither does anything while
-#: reasoning is on** -- the API accepts them for compatibility and ignores them -- so 1.0 is the
-#: neutral value rather than a claim about determinism. The previous 0.0 was chosen as a
-#: reproducibility lever, and under thinking mode it was not one: **the response cache is now the
-#: only thing that makes a re-run reproducible**, and two uncached runs of the same conversation
-#: can disagree. Both stay in the cache key so a run under different settings does not silently
-#: blend into one at the defaults.
+#: Sampling controls. **Neither does anything while reasoning is on** -- the API accepts them for
+#: compatibility and ignores them -- so these are the neutral values rather than a claim about
+#: determinism. **The response cache is the only thing that makes a re-run reproducible**; two
+#: uncached runs of the same conversation can disagree. Both stay in the cache key so a run under
+#: different settings does not silently blend into one at the defaults.
 DEFAULT_JUDGE_TEMPERATURE = DEFAULT_TEMPERATURE
 DEFAULT_JUDGE_TOP_P = DEFAULT_TOP_P
 
@@ -151,12 +145,11 @@ _VALID_SCORES = (1, 2, 3, 4, 5)
 #: ``judge_reasoning`` column; they replace the model's hidden thinking (the local judge runs with
 #: ``reasoning_effort="none"``).
 #:
-#: **Why a schema, and why thinking is off, measured 2026-09-25 on Qwen3.8-27B** over
-#: swe-chat/openanonymity. Without a schema, 15 of 86 replies were unparseable and some more
-#: "parsed" by accident: the model drifted to prose on a **1-10** scale and a bare-digit fallback
-#: read a stray ``Turn 1`` as a score of 1. With a schema but thinking *on*, 12 of 13 "1" scores had
-#: a hidden trace ending "I'd rate this a 9/10" -- the enum cut ``10`` to its first digit. Written
-#: reasoning next to a restated scale puts the scale where the model is writing.
+#: **Why a schema, and why thinking is off.** Without a schema, an unconstrained reply drifts to
+#: prose on the wrong scale and becomes hard to parse reliably. With a schema but thinking left on,
+#: the model's hidden reasoning can land on a different scale (e.g. reasoning "9/10") than the
+#: constrained output enum allows, silently truncating it. Written reasoning next to a restated
+#: scale puts the scale where the model is actually writing.
 #:
 #: **Constrained decoding does not show the schema to the model** -- it only masks tokens -- so a
 #: ``description`` alone is never read. :data:`JUDGE_OUTPUT_INSTRUCTION` appends the schema to the
@@ -295,8 +288,7 @@ USABLE_SCORE_THRESHOLD = 4
 
 #: Manual logic version for the conversation-judge cache; bump to force a full recompute. Since
 #: :meth:`UtilityMetric.logic_classes` is empty, this is the *only* automatic invalidation lever
-#: besides :meth:`params`. ``"3"`` marks the move to DeepSeek over the OpenAI-compatible API
-#: (``"2"`` was the Anthropic Foundry judge, ``"1"`` OpenRouter).
+#: besides :meth:`params`.
 CONVERSATION_UTILITY_VERSION = "3"
 
 #: The labeled-field fallback for a reply whose JSON did not parse. ``(?!\d)`` so a ``"Score": 10``
@@ -310,10 +302,8 @@ def _judge_input(original: str, defended: str, max_chars: int | None = None) -> 
     (:func:`~._parsing.render_turn_pairs`), ``<turn_k><original>...</original>
     <modified>...</modified></turn_k>``.
 
-    Paired in code since 2026-09-25; before, the judge got two separate
-    ``<original_conversation>`` / ``<modified_conversation>`` blocks with ``[Turn i]`` labels and
-    had to align them itself. The rubric's turn-by-turn procedure (invariant 4) reads each pair
-    directly.
+    Paired in code rather than left for the judge to align, so the rubric's turn-by-turn procedure
+    (invariant 4) can read each pair directly.
 
     **The defended side is tagged ``<modified>``, not "defended".** Nothing the judge reads names
     what produced the rewrite -- see the rubric file's first invariant. The parameter keeps the
@@ -333,12 +323,9 @@ def _original_turns_intact(original: str, defended: str) -> bool:
 
     Such a conversation has lost nothing the original conveyed, so it scores 5 without asking the
     judge: added turns are outside the judgement (rubric invariant 3), and an added turn cannot
-    reach back and change an earlier one (invariant 4). Decided in code rather than by the rubric
-    because the judge does not hold that line against an adversarial addition -- measured
-    2026-09-25 on swe-chat/embad_summary, where all 50 sampled conversations are exactly this case
-    (every original turn identical, one turn appended claiming the text above is void) and a
-    Qwen3.8-27B judge under the turn-by-turn rubric still scored 25 of them 2, conceding "the
-    original request is technically present" and then calling the context "hijacked".
+    reach back and change an earlier one (invariant 4). Decided in code rather than by the rubric,
+    because a judge does not reliably hold that line against an adversarial addition that claims
+    the earlier turns are void.
     """
     original_turns = split_turns(original)
     return split_turns(defended)[:len(original_turns)] == original_turns
@@ -390,9 +377,8 @@ def _parse_score(raw: str) -> ParsedVerdict:
     * A score outside 1-5 is **discarded, not clamped**. A reply of ``0`` or ``10`` means the judge
       ignored the rubric; clamping it to a valid value would invent a data point that no judge
       actually produced.
-    * **There is no bare-digit fallback any more** (there was until 2026-09-25). With the input
-      structured as ``<turn_k>`` and replies discussing turns by number, a free digit is far more
-      often a turn index than a score -- it once read a stray "Turn 1" as a verdict of 1. An
+    * **There is no bare-digit fallback.** With the input structured as ``<turn_k>`` and replies
+      discussing turns by number, a free digit is far more often a turn index than a score. An
       unlabeled reply is reported as unparsed, which is visible, rather than guessed.
     """
     text = strip_code_fence(raw)

@@ -1,17 +1,16 @@
 r"""Cut a small, reproducible working subset out of a built split.
 
 The leave-one-out defense (:mod:`prompt_anonymity.defenses.loo_unlink`) is roughly quadratic in span
-count per document and re-scores after every edit, and the budget sweep multiplies that by the number
-of operating points. Running it against all 172,509 WildChat documents is not a thing to attempt
-before the method is known to work at all, so the whole v1 build happens on a subset sized for
-iteration speed rather than for statistical power.
+count per document and re-scores after every edit, and the budget sweep multiplies that further.
+Running it against the full corpus is not a thing to attempt before the method is known to work at
+all, so the whole v1 build happens on a subset sized for iteration speed rather than statistical
+power.
 
 This is **not** a second dataset build. It reads the split
 :mod:`prompt_anonymity.data.build_dataset` already wrote, filters and samples it, and writes a
 parquet with the identical schema -- so ``compute_features``, ``apply_defenses``,
-``run_experiment.py`` and ``eval_utility.py`` all read it exactly like the split it came from.
-Re-running the 4.8M-row source build to get 1,000 documents would be hours of work to reproduce rows
-that are already on disk.
+``run_experiment.py`` and ``eval_utility.py`` all read it exactly like the split it came from,
+without re-running the source build to reproduce rows already on disk.
 
 Two filters, in this order:
 
@@ -66,8 +65,7 @@ READ_BATCH_ROWS = 5000
 #: defense a 1-document reference and a linkage score that is mostly noise.
 DEFAULT_K_MIN = 5
 
-#: Default number of authors kept. ~200 authors x >=5 documents is ~1,000 documents, comparable to
-#: SWE-chat's 4,334 / 157 and small enough that one budget point is minutes rather than hours.
+#: Default number of authors kept, sized so one budget point runs in minutes rather than hours.
 DEFAULT_N_AUTHORS = 200
 
 #: The project's standard RNG seed (``run_experiment.py --seed``), used here so the subset draw and
@@ -77,13 +75,9 @@ DEFAULT_SEED = 47
 #: Appended where ``--max-chars`` cut inside a turn, so a truncated document is visibly truncated.
 TRUNCATION_MARK = " [...truncated]"
 
-#: Characters per document for ``--max-chars``, when it is passed without a value.
-#:
-#: Sized against the window the local defenses serve, not picked round. ``afr`` allows a document
-#: 28,672 tokens (``AFR_MAX_MODEL_LEN`` minus the reply and the prompt wrapper). At ~4 characters
-#: per token that is ~114,000 characters, but WildChat is multilingual and CJK runs closer to 1-2
-#: characters per token, so a corpus-wide character cap has to assume the dense case. 60,000 leaves
-#: headroom at ~2 characters/token and still keeps all but the extreme tail intact.
+#: Characters per document for ``--max-chars``, when it is passed without a value. Sized against the
+#: window the local defenses serve (``afr``'s context budget), assuming the dense CJK case of
+#: ~2 characters/token rather than English's ~4, so it still fits the multilingual corpus.
 DEFAULT_MAX_CHARS = 60_000
 
 #: Where the committed copy of the manifest goes. ``data/`` is gitignored, so the manifest beside the
@@ -328,8 +322,8 @@ def main() -> None:
             f"with 'python -m prompt_anonymity.data.download'."
         )
 
-    # Pass 1: the join keys only. Two columns of a 172,509-row split is megabytes; the same read
-    # with `turns` is gigabytes, and the filters below do not need a single character of text.
+    # Pass 1: the join keys only. The `turns` column is gigabytes and the filters below don't
+    # need a single character of text, so it's never read here.
     print(f"reading {source_path}")
     index = pq.read_table(source_path, columns=["doc_id", "author_id"]).to_pandas()
     authors = select_authors(index, k_min=args.k_min, n_authors=n_authors, seed=args.seed)

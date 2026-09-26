@@ -1,7 +1,6 @@
 """Everything that turns an attack's or a defense's output into a number.
 
-This is the scoring half of the package: the attacks and defenses produce artifacts, and
-everything here measures them. Three layers, from stateless functions up to whole evaluation axes:
+The attacks and defenses produce artifacts; everything here measures them. Three layers:
 
 ``evaluation.metrics``
     Stateless scoring of one score matrix -- top-k accuracy and the chance baseline
@@ -11,23 +10,15 @@ everything here measures them. Three layers, from stateless functions up to whol
     (:mod:`~prompt_anonymity.evaluation.metrics.retrieval`).
 
 :class:`LinkageRanking` / :func:`headline_accuracy`
-    Rank once, reuse the ranking. The metrics above each re-derive what they need from a score
-    matrix; this pair does the expensive part once and serves several tables from it.
+    Rank once, reuse the ranking, instead of each metric re-deriving it from the score matrix.
 
 ``evaluation.utility``
-    The **other axis**. Everything above asks whether an attack can re-identify an author --
-    how well a defense hid someone. That subpackage asks what the defense cost: whether the
-    rewritten text still says what the original said. See its own docstring for the metrics.
+    The other axis: not whether an attack can re-identify an author, but what a defense cost --
+    whether the rewritten text still says what the original said.
 
-**``evaluation.utility`` is deliberately not imported here.** Its metrics reach for heavy
-optional dependencies -- an API client, and for the local scorers ``torch`` and
-``transformers`` -- and ``experiments/run_experiment.py`` imports this package on every run
-without ever touching them. Import it explicitly (``from prompt_anonymity.evaluation import
-utility``) and it will load what that particular metric needs, when it needs it.
-
-This package absorbed two former top-level packages on 2026-08-11: ``prompt_anonymity.metrics``
-(now ``evaluation.metrics``) and ``prompt_anonymity.utility`` (now ``evaluation.utility``).
-Anything on disk or in a note referring to those paths predates the move.
+**``evaluation.utility`` is deliberately not imported here.** Its metrics reach for heavy optional
+dependencies (an API client, ``torch``/``transformers``) that ``run_experiment.py`` should not have
+to load on every run. Import it explicitly (``from prompt_anonymity.evaluation import utility``).
 """
 
 from __future__ import annotations

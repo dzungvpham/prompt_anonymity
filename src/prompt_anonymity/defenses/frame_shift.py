@@ -20,9 +20,8 @@ exercise, a municipal zoning board's minutes -- with the user's actual request e
 Two properties follow, and both are the mechanism:
 
 * **The framing is shared boilerplate.** Everyone who draws framing #7 emits the same kind of
-  Regency vocabulary, so the frame is collision material at the scale of whole paragraphs -- the
-  ``collision_seeding`` hypothesis moved from the character-n-gram channel (spelling, punctuation)
-  to the topical and register channel, which is where the embedding features actually live.
+  Regency vocabulary, so the frame is collision material at the scale of whole paragraphs, in the
+  topical/register channel rather than ``collision_seeding``'s character-n-gram one.
 * **The framing outweighs the author.** Scene scaffolding is most of the output's tokens, and none of
   it is text the author wrote or chose, so per-author lexical and syntactic habits are diluted.
 
@@ -37,41 +36,27 @@ time a defense sees them -- so a document-level frame cannot be looked up inside
 :meth:`FrameShiftDefense._rewrite_side` resolves each row's frame up front and caches it under the
 composed source ``<<frame:key>>\n<turn>`` (:func:`encode_framed_source`). That keeps the cache's
 dedup correct (two rows collapse only when frame *and* text match), keeps the output a pure function
-of the source the way the cache assumes, and makes a re-seed self-invalidating.
-
-The cost of that is real and worth knowing before launching a run: because the frame joins the dedup
-key, identical turns in different documents are no longer computed once. ``apply_defenses``'s
-"distinct non-blank" workload line therefore *undercounts* the call count for ``frame_shift`` (it is
-exact for ``frame_shift_single``); this defense prints its own count before the first request.
+of the source the way the cache assumes, and makes a re-seed self-invalidating. One consequence: since
+the frame joins the dedup key, an identical turn in two documents is no longer deduped across them, so
+the workload this defense prints before its first request is its own count, not the generic one.
 
 Rewrites run on a hosted model through OpenRouter, reusing the package's
 :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` client, so an
 ``OPENROUTER_API_KEY`` in a ``.env`` is required.
 
-**What this costs, and where the cost actually is.** Not in the corpus text -- in the *per-call fixed
-prompt*. The rewrite contract below is ~1,420 tokens and is resent on every call, which at WildChat
-scale (172,509 documents x ~6 turns, less the ~9.6% of turns under
-:data:`~._backends.MIN_DEFEND_CHARS`) is ~936,000 calls carrying ~1.33 **billion** tokens of
-identical boilerplate: about 90% of all input tokens, and more than half the bill. Corpus text is a
-rounding error beside it. Three consequences worth knowing before launching a run:
+**Cost is dominated by the per-call fixed prompt, not the corpus text.** The rewrite contract below is
+resent on every call, so at corpus scale it is the large majority of billed tokens. Levers, in order:
 
-* **Prefix caching is the main lever.** The system prompt is byte-identical and first in every
-  request, which is the case automatic prefix caching exists for, and the default model prices a
-  cache read at 1/5 of a fresh one. Estimated WildChat total: **~$180 uncached, ~$95 if the prefix
-  caches**. Do not take that on faith -- ``--preview`` makes real calls, so read the reported usage
-  back and confirm cached tokens are actually being counted before assuming the lower figure.
-* **A cheaper model is the second lever, and it is measurable.** This is contract-following, not
-  reasoning, so it does not obviously need a capable model -- but "obviously" is not evidence. The
-  spread on this workload is real (~$15 to ~$260 for the same corpus), and what separates a usable
-  cheap model from an unusable one is not price but whether it *restates* the prompt rather than
-  wrapping it, and whether it leaves code alone. Both are measured by :func:`frame_quality`, which
-  ``--preview --models a,b,c`` reports over identical inputs. Pick with that, not with a guess.
-* **Trimming the contract is the third lever, and it is not free.** The two worked examples are
-  ~534 of those 1,420 tokens; dropping them saves real money and is exactly the kind of edit that
-  quietly degrades rule 2 compliance (the model starts quoting the user's wording back). Measure
+* **Prefix caching.** The system prompt is byte-identical and first in every request, which is what
+  automatic prefix caching is for. Don't take the discount on faith -- ``--preview`` makes real calls,
+  so read the reported usage back and confirm cached tokens are actually being counted.
+* **Model choice.** This is contract-following, not reasoning, so a cheap model can work -- but what
+  separates a usable one from an unusable one is not price, it's whether it *restates* the prompt
+  rather than wrapping it, and whether it leaves code alone. :func:`frame_quality`, reported by
+  ``--preview --models a,b,c``, measures that instead of guessing.
+* **Trimming the contract.** The worked examples cost real tokens but also anchor rule compliance;
+  dropping them saves money and risks the model starting to quote the user's wording back. Measure
   with ``--preview`` before and after, never blind.
-* **SWE-chat is cheap** -- ~$2-3 at the same shape, because it is 4,334 documents. Run that arm
-  first.
 
 Run it::
 
@@ -105,11 +90,10 @@ from ._backends import (
 )
 from ._keying import keyed_rng
 
-#: The rewriter model, an OpenRouter chat model id. DeepSeek's flash tier is the default because this
-#: job's cost is dominated by *completion* tokens -- a framed prompt is several times longer than the
-#: turn it wraps -- and at $0.08/M in, $0.18/M out it has the cheapest output price among models that
-#: still follow a multi-rule rewrite contract. Its 1M context also means a long turn never needs
-#: splitting. Part of the cache key, so a swap re-caches.
+#: The rewriter model, an OpenRouter chat model id. Defaults to a cheap model that still follows the
+#: multi-rule rewrite contract and has a long enough context that a turn never needs splitting; cost
+#: here is dominated by completion tokens since a framed prompt is much longer than the turn it wraps.
+#: Part of the cache key, so a swap re-caches.
 FRAME_SHIFT_MODEL = os.environ.get("FRAME_SHIFT_MODEL", "deepseek/deepseek-v4-flash-0731")
 #: Master seed for the frame assignment. Changing it reshuffles which document gets which frame, and
 #: (since the frame is part of the cache source) invalidates the cache by itself.
@@ -573,21 +557,15 @@ def _word_ngrams(text: str, n: int = REUSE_NGRAM) -> set[tuple[str, ...]]:
 def frame_quality(original: str, framed: str) -> dict:
     """Mechanical checks on one rewrite, for :func:`_preview` to aggregate.
 
-    These are the three contract rules that can be measured rather than eyeballed, and between them
-    they catch the failures that actually matter:
+    The three contract rules that can be measured rather than eyeballed:
 
     * ``code_kept`` -- rule 3. Every fenced block and inline-backtick span in the original must
-      appear byte-identical in the rewrite. A model that "helpfully" reformats code has broken the
-      utility of the whole corpus, silently.
-    * ``reuse`` -- rule 2, and the one the defense lives or dies by. The share of the original's
-      8-word sequences that survive verbatim into the rewrite. Text carried over unchanged carries
-      the author's identity with it, so a model that wraps the prompt in a frame without restating
-      it has produced something that *looks* defended and is not. Lower is better; near 0 is right.
-    * ``expansion`` -- the frame has to outweigh the request to dilute it. A ratio near 1 means the
+      appear byte-identical in the rewrite; a model that reformats code has broken the corpus.
+    * ``reuse`` -- rule 2, the one the defense lives or dies by. Share of the original's 8-word
+      sequences that survive verbatim into the rewrite -- text carried over unchanged carries the
+      author's identity with it, so lower is better and near 0 is right.
+    * ``expansion`` -- the frame has to outweigh the request to dilute it; a ratio near 1 means the
       model wrote a one-line wrapper instead of a scene.
-
-    A high ``reuse`` is the failure mode to watch for in a cheap model: wrapping is easy, restating
-    while preserving every technical token is the part that needs capability.
     """
     spans = CODE_SPANS.findall(original)
     grams = _word_ngrams(original)
@@ -621,11 +599,9 @@ def output_budget(text: str, *, ratio: float = FRAME_SHIFT_OUTPUT_RATIO,
 class _FrameShiftBackend:
     """OpenRouter rewriter: one request per (frame, turn), fanned out across a thread pool.
 
-    Wraps :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` rather than reimplementing
-    the HTTP layer -- it already has the lazily-read key, the full-jitter backoff on transient
-    failures, the fail-fast on non-retryable 4xx with the response body attached, and the
-    order-preserving batch pool. What this adds is the per-request framing, a length-proportional
-    token budget, and the fallback accounting.
+    Wraps :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` for the HTTP layer
+    (auth, retries, batching) and adds the per-request framing, a length-proportional token budget,
+    and fallback accounting.
     """
 
     def __init__(self, model: str = FRAME_SHIFT_MODEL,
@@ -761,13 +737,10 @@ class FrameShiftDefense(PerTurnBatchRewriteDefense):
     def _rewrite_side(self, label: str, texts, cache, ids=None) -> np.ndarray:
         """Resolve each row's frame, then cache under the composed ``<<frame:key>>\\n<turn>`` source.
 
-        The frame has to be resolved *here* rather than inside the producer because this is the last
-        place the row ids exist: :meth:`~prompt_anonymity.caching.IndexedRowCache.apply` passes its
-        producer only the distinct missing source strings. And it is the ids that carry the document
-        -- ``apply_defenses`` has already exploded documents into per-turn rows keyed ``<doc_id>#<n>``
-        by the time a defense runs, so the row's own text says nothing about which document it is
-        from. With no ids at all (a loader that supplies none), each row is its own document, which
-        degrades to a per-row frame rather than failing.
+        Resolved here rather than inside the producer because this is the last place the row ids
+        exist -- the cache's producer sees only the missing source strings, and it's the id that says
+        which document a turn belongs to. With no ids supplied, each row is treated as its own
+        document instead of failing.
         """
         texts = [str(t) for t in texts]
         row_ids = [str(i) for i in ids] if ids is not None else [str(i) for i in range(len(texts))]
@@ -780,12 +753,9 @@ class FrameShiftDefense(PerTurnBatchRewriteDefense):
     def _defend_framed(self, sources: list[str]) -> list[str]:
         """Rewrite the cache-missing composed sources: split into turns, batch, re-join.
 
-        Mirrors :func:`~prompt_anonymity.defenses._backends.defend_conversations_per_turn` -- dedup
-        the eligible turns, one backend call, re-group and re-join -- except that the dedup key is
-        the ``(frame, turn)`` pair rather than the turn, since the same words under two frames are
-        two different rewrites. In the ``apply_defenses`` path a "conversation" here is already a
-        single turn, so the split is a no-op; the split is what makes the defense also correct when
-        applied to whole conversation cells.
+        Mirrors :func:`~prompt_anonymity.defenses._backends.defend_conversations_per_turn`, except the
+        dedup key is the ``(frame, turn)`` pair rather than the turn alone, since the same words under
+        two frames are two different rewrites.
         """
         threshold = max(1, self.min_defend_chars or 1)
         decoded = [decode_framed_source(source) for source in sources]
@@ -819,10 +789,8 @@ class FrameShiftDefense(PerTurnBatchRewriteDefense):
     def _announce(self, distinct_jobs: int, rows: int) -> None:
         """Report the real call count once, before the first request.
 
-        ``apply_defenses``'s workload line counts distinct *turns*, which undercounts this defense:
-        the frame joins the dedup key, so one turn appearing under three frames is three paid calls.
-        Seeing the true number before the money is spent is the difference between noticing a
-        mis-scoped run and paying for it.
+        ``apply_defenses``'s workload line counts distinct turns, which undercounts this defense since
+        the frame joins the dedup key -- one turn under three frames is three paid calls.
         """
         if self._announced:
             return
@@ -1021,11 +989,9 @@ def _selftest() -> None:
 
 # --- preview -----------------------------------------------------------------
 
-#: Eligible turns :func:`_preview` takes from any ONE document. A preview's job is to show what the
-#: rewrites look like, and a second turn from the same document under the same frame shows almost
-#: nothing a first one did not -- while SWE-chat documents are agent sessions that can carry dozens
-#: to hundreds of user turns, so "all turns of 3 documents" is an unbounded and expensive sample that
-#: looks like a hang. Breadth across documents (and so across frames) is what is informative here.
+#: Eligible turns :func:`_preview` takes from any ONE document. A second turn under the same frame
+#: shows little a first one didn't, and some documents carry hundreds of turns, so this caps the
+#: sample instead of taking every turn; breadth across documents (and so frames) is what's informative.
 PREVIEW_TURNS_PER_DOC = 2
 #: Hard ceiling on preview rewrites per model, whatever ``--limit`` says. This is a paid endpoint and
 #: a preview is meant to cost cents.
@@ -1037,13 +1003,9 @@ def _preview(source: str, dist_dir, limit: int, defense: FrameShiftDefense,
              max_jobs: int = PREVIEW_MAX_JOBS) -> None:
     """Rewrite a handful of real documents and print before/after, optionally across several models.
 
-    This is the step that catches a bad system prompt -- or a model too small for the contract -- for
-    cents instead of for the price of a corpus. It prints the rewrites to read, and the measurable
-    part of the contract (:func:`frame_quality`) to compare.
-
-    With several ``models`` it becomes a bake-off on identical inputs, which is the only honest way
-    to pick the cheapest model that can still do the job: sticker price is knowable in advance,
-    whether a model restates a prompt without mangling its code is not.
+    Catches a bad system prompt or a model too small for the contract before running it on a full
+    corpus. With several ``models`` it's a bake-off on identical inputs, scored by
+    :func:`frame_quality`.
     """
     doc_ids, turn_lists = _load_documents(source, dist_dir, limit)
     if not doc_ids:

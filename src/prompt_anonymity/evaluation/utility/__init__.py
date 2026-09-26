@@ -5,45 +5,37 @@ to get. This subpackage measures that -- the utility axis complementing the priv
 attacks measure -- with three metrics, split by what they cost:
 
 ``conversation`` (:mod:`.prompt_judge`) -- **paid**
-    A judge reads the original and defended conversations **whole, side by side** and scores 1-5 --
-    1 unusable, 5 all nuance preserved. Judging the conversation as a unit is what lets it see
-    cross-turn breakage (dropped turns, back-references that no longer resolve) that a per-turn
-    predicate structurally cannot, and the 1-5 scale is what lets it *rank* defenses rather than
-    bucketing everything that mostly works. It judges the prompts rather than the answers, so it
-    does not verify that a model still answers well. One API request per conversation.
+    A judge reads the original and defended conversations whole, side by side, and scores 1-5
+    (1 unusable, 5 all nuance preserved). Judging as a whole conversation catches cross-turn
+    breakage a per-turn predicate can't see. One API request per conversation.
 
 ``semantic`` (:mod:`.semantic`) -- free, local, GPU-shaped
-    Multilingual NLI entailment and BERTScore-recall, both run in the recall direction so that
-    material the rewrite *adds* cannot cost points. No API, so it covers a whole split where the
-    judge realistically covers a sample.
+    Multilingual NLI entailment and BERTScore-recall, both run in the recall direction so material
+    the rewrite *adds* cannot cost points. Cheap enough to cover a whole split.
 
 ``fluency`` (:mod:`.fluency`) -- free, local, GPU-shaped
-    Perplexity of the rewrite over perplexity of the original: is the output still well-formed
-    text, independent of whether it kept the content?
+    Perplexity of the rewrite over perplexity of the original: is the output still well-formed,
+    independent of whether it kept the content?
 
 **The intended workflow is to combine them**: score the whole corpus with the two local metrics,
-score a sample with the judge, and correlate -- which turns the paid judge from *the* measurement
-into a calibration set for the free ones. :mod:`experiments.eval_utility` supports exactly that,
-merging every metric's per-conversation scores into one file per (source, defense).
+score a sample with the judge, and correlate -- turning the paid judge into a calibration set for
+the free ones. :mod:`experiments.eval_utility` merges every metric's per-conversation scores into
+one file per (source, defense).
 
-Judging runs on **DeepSeek** (:mod:`._deepseek`) by default, reached through the ``openai``
-library against its OpenAI-compatible endpoint; ``DEEPSEEK_BASE_URL`` and ``DEEPSEEK_API_KEY`` come
-from the ``.env``. ``judge_backend="local"`` sends the same rubric to a self-hosted vLLM server
-instead (:mod:`._vllm_judge`), at no cost. Every call is cached with the package's content-addressed
-:class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/utility``, so re-runs and
-text shared across defenses cost nothing, and conversations a defense left unchanged short-circuit
-with no API call at all. The local metrics deliberately do **not** cache: a miss there is
-GPU-minutes rather than a re-billed request. Scoring pairs a defended split with its pre-defense
-``reference``, so the flow is ``defend -> eval_utility(defended, reference=original)`` -- which is
-what :mod:`experiments.eval_utility` does over the parquet pair
+Judging runs on **DeepSeek** (:mod:`._deepseek`) by default via its OpenAI-compatible endpoint
+(``DEEPSEEK_BASE_URL`` / ``DEEPSEEK_API_KEY`` from ``.env``); ``judge_backend="local"`` sends the
+same rubric to a self-hosted vLLM server instead (:mod:`._vllm_judge`), at no cost. Every judge
+call is cached under ``<cache_dir>/utility`` (:class:`~prompt_anonymity.caching.TransformCache`),
+and a conversation a defense left unchanged short-circuits with no API call. The local metrics
+deliberately do **not** cache -- a miss there is GPU-minutes, not a re-billed request. Scoring
+pairs a defended split with its pre-defense ``reference``: ``defend -> eval_utility(defended,
+reference=original)``, which is what :mod:`experiments.eval_utility` does over the parquet pair
 :mod:`prompt_anonymity.data.apply_defenses` writes.
 
 Writing a new metric: subclass :class:`~prompt_anonymity.evaluation.utility.base.UtilityMetric`, add
 a lowercase wrapper, declare which of its result columns are scores
 (:attr:`~prompt_anonymity.evaluation.utility.base.UtilityResult.score_columns`), and register it in
-:data:`UTILITY_METRICS`; :func:`eval_utility` then reaches it by name and the driver merges its
-columns into the score file without knowing anything else about it. See :mod:`.base` for the
-contract (and for why cache invalidation is opt-in here rather than source-driven).
+:data:`UTILITY_METRICS`. See :mod:`.base` for the contract.
 
 Example
 -------
@@ -74,12 +66,9 @@ from .prompt_judge import (
 
 # Registry: metric name -> "module:attribute", resolved on demand by `get_utility`.
 #
-# The values are import paths rather than the callables themselves, which is a departure from the
-# package's other registries (DEFENSES, FEATURIZERS, ATTRIBUTION_ATTACKS all hold real objects).
-# The reason is import cost: `semantic` and `fluency` pull in torch and transformers, and
-# `experiments/eval_utility.py` imports this package to read `sorted(UTILITY_METRICS)` for its
-# --metric choices before it knows which metric was asked for. Holding the callables would mean a
-# deep-learning stack loading on every run, including one that only wants the API judge.
+# Import paths rather than the callables themselves (unlike DEFENSES/FEATURIZERS/
+# ATTRIBUTION_ATTACKS): `semantic` and `fluency` pull in torch and transformers, and this module is
+# imported just to read `sorted(UTILITY_METRICS)` before any metric is chosen.
 UTILITY_METRICS = {
     "conversation": "prompt_judge:conversation_utility",  # 1-5 LLM judge over the whole conversation
     "semantic": "semantic:semantic_utility",              # local multilingual NLI + BERTScore-recall

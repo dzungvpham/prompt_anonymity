@@ -18,14 +18,13 @@ construction, absent from any known side.
 Two ShareChat-specific stages have no analogue in the other adapters:
 
 * **Upstream redaction markers are removed** (:func:`strip_upstream_redactions`). ShareChat was
-  de-identified with Microsoft Presidio before release, which left ``<REDACTED>`` in ~30% of user
-  turns (plus a smaller number of ``<DATE_TIME>``). Neither WildChat nor SWE-chat carries such a
-  token, so leaving it in would make ShareChat separable from them on a literal string -- fatal
-  here, because this is the out-of-set pool an open-set detector is measured against, and it would
-  be detecting the *corpus* rather than a stranger. The markers are deleted and the surrounding
-  text kept. ShareChat's third Presidio placeholder, ``<URL>``, is **kept**: it is already this
-  project's own placeholder for the same thing (:data:`~prompt_anonymity.data.text_cleaning.URL_PLACEHOLDER`),
-  so it is indistinguishable from what our scrubber would have written.
+  de-identified with Microsoft Presidio before release, which left ``<REDACTED>`` and
+  ``<DATE_TIME>`` tokens in user turns. Neither WildChat nor SWE-chat carries such a token, so
+  leaving it in would make ShareChat separable from them on a literal string -- fatal here, since
+  this is the out-of-set pool an open-set detector is measured against, and it would be detecting
+  the *corpus* rather than a stranger. The markers are deleted and the surrounding text kept.
+  ShareChat's third Presidio placeholder, ``<URL>``, is **kept**: it is already this project's own
+  placeholder for the same thing (:data:`~prompt_anonymity.data.text_cleaning.URL_PLACEHOLDER`).
 * **Timestamps are per-platform** (:data:`PLATFORM_TIME_COLUMNS`). Each platform exports a
   different time field -- some per message, some per conversation, some in a human-readable format,
   and Claude none at all -- so there is one rule per platform rather than one shared column.
@@ -72,18 +71,12 @@ UPSTREAM_REDACTION_TOKENS = ("<REDACTED>", "<DATE_TIME>")
 _REDACTION_RE = re.compile("|".join(re.escape(t) for t in UPSTREAM_REDACTION_TOKENS))
 
 #: Values that appear in a platform's ``model`` column but are not model ids. Two kinds:
-#:
-#: * **conversation-role markers** -- Grok labels its own rows ``human`` / ``ASSISTANT``;
-#: * **ChatGPT export field names that leaked into the value**: ``default_model_slug`` (700,836
-#:   rows), ``requested_model_slug`` (6,565) and ``parent_id`` (4) are keys of the ChatGPT share
-#:   JSON, not models. The first also carries real meaning -- "the account's default was used" --
-#:   but it does not name which model that was.
-#:
-#: A conversation whose model column holds nothing else falls back to the platform name, which
-#: says the same thing plainly. Kept as an explicit list rather than a shape rule (e.g. "contains
-#: an underscore"): ChatGPT's own ``gpt4t_1`` is a real model id with an underscore in it, so a
-#: rule would have eaten it. The full raw vocabulary of all five platforms was enumerated when
-#: this was written, so this list is closed rather than a guess.
+#: **conversation-role markers** (Grok labels its own rows ``human`` / ``ASSISTANT``), and
+#: **ChatGPT export field names that leaked into the value** (``default_model_slug``,
+#: ``requested_model_slug``, ``parent_id`` -- keys of the ChatGPT share JSON, not models).
+#: A conversation whose model column holds nothing else falls back to the platform name.
+#: Kept as an explicit list rather than a shape rule, since a real model id like
+#: ``gpt4t_1`` also contains an underscore.
 NON_MODEL_VALUES = frozenset({
     "human", "assistant", "model", "user", "llm", "none", "nan", "",
     "default_model_slug", "requested_model_slug", "parent_id",
@@ -92,21 +85,19 @@ NON_MODEL_VALUES = frozenset({
 #: platform -> ``(granularity, column, fallback_column)`` for the conversation's time span.
 #:
 #: ``"message"`` means the column carries a per-message time, so the conversation's span is the
-#: min and max over its **user** messages (the same rule SWE-chat uses); ``"conversation"`` means
-#: one value describes the whole conversation, which then serves as both ends. ``None`` means the
-#: platform exports no usable time at all.
+#: min and max over its **user** messages; ``"conversation"`` means one value describes the whole
+#: conversation, serving as both ends. ``None`` means the platform exports no usable time at all.
 #:
 #: The choice per platform, where more than one column was available:
 #:
-#: * **chatgpt** -- ``message_create_time`` (per message, ``ts:<unix seconds>``) over
-#:   ``create_time`` (one value per conversation), because a per-message time gives a real span;
-#:   ``create_time`` is the fallback for the ~1% of user messages that carry no time of their own.
-#: * **grok** -- ``message_create_time`` over ``last_updated``, for the same reason. Grok's
-#:   ``last_updated`` is constant per conversation and records when the *share page* was last
-#:   touched, not when the conversation happened.
+#: * **chatgpt** -- ``message_create_time`` (per message) over ``create_time`` (per conversation,
+#:   used as fallback when a message carries no time of its own), since a per-message time gives a
+#:   real span.
+#: * **grok** -- ``message_create_time`` over ``last_updated``, for the same reason: Grok's
+#:   ``last_updated`` records when the *share page* was last touched, not when the conversation
+#:   happened.
 #: * **gemini** -- ``created_at`` over ``published_at``: the first is when the conversation was
-#:   held, the second when the user chose to share it, which can be days later and is an act of
-#:   publishing rather than of chatting.
+#:   held, the second when the user chose to share it.
 #: * **perplexity** -- ``last_updated`` is the only time column, and it is a **date with no
 #:   time of day**, so these documents are ordered to the day and no finer.
 #: * **claude** -- no time column exists; both ends are ``None``.
@@ -118,26 +109,20 @@ PLATFORM_TIME_COLUMNS = {
     "perplexity": ("conversation", "last_updated", None),
 }
 
-#: Rows per chunk when streaming a platform CSV. ShareChat's CSVs reach 2.3 GB and the assistant
-#: replies are ~8x the user prompts by volume, so each chunk is filtered to user rows before
-#: anything is retained -- this bounds peak memory by the *user* text rather than by the file.
+#: Rows per chunk when streaming a platform CSV. Each chunk is filtered to user rows before
+#: anything is retained, bounding peak memory by the *user* text rather than by the file (the
+#: assistant replies dominate the raw CSVs by volume).
 READ_CHUNK_ROWS = 200_000
 
 #: ChatGPT writes its per-message time as ``ts:<unix seconds>.<fraction>``.
 _UNIX_TS_RE = re.compile(r"^\s*ts:")
 
 #: Timestamps outside this window are treated as corrupt and discarded (the document becomes
-#: undated) rather than published as-is. The lower bound is just before ChatGPT's public launch,
-#: the earliest moment any of these five products could have been used; the upper is the pinned
-#: ShareChat revision's own publication date, since a scraped conversation cannot postdate the
-#: scrape. Both are constants rather than "now", so a rebuild is reproducible.
-#:
-#: This exists because ChatGPT's ``message_create_time`` carries a handful of corrupt unix values
-#: -- 33 of its 483,894 user messages land between 2059 and 2282, one of them far enough out to
-#: overflow a nanosecond timestamp outright. Every other column of every other platform parses
-#: entirely inside the window. A bad value is nulled rather than clamped: it tells us nothing
-#: about the real time, and a document dated 2282 would sit at the end of every chronological
-#: ordering forever.
+#: undated) rather than published as-is. The lower bound is just before ChatGPT's public launch;
+#: the upper is the pinned ShareChat revision's own publication date, since a scraped conversation
+#: cannot postdate the scrape. Both are constants rather than "now", so a rebuild is reproducible.
+#: A bad value is nulled rather than clamped -- it tells us nothing about the real time, and a
+#: corrupt far-future date would sit at the end of every chronological ordering forever.
 PLAUSIBLE_TIME_WINDOW = ("2022-11-01", "2026-05-06")
 
 
@@ -149,10 +134,9 @@ def strip_upstream_redactions(text: str) -> str:
     :func:`~prompt_anonymity.data.text_cleaning.scrub_identifiers`, which every source runs through.
 
     The token is removed rather than translated into this project's placeholder vocabulary because
-    ``<REDACTED>`` stands for a *union* of entity types (names, phone numbers, credit cards,
-    addresses) that no single placeholder of ours means, and because neither other corpus redacts
-    those categories at all -- a WildChat prompt containing a person's name keeps it. Deleting
-    therefore makes ShareChat's text more like the others', not less.
+    ``<REDACTED>`` stands for a *union* of entity types that no single placeholder of ours means,
+    and neither other corpus redacts those categories at all. Deleting it makes ShareChat's text
+    more like the others', not less.
     """
     if not isinstance(text, str):
         return ""
@@ -162,11 +146,9 @@ def strip_upstream_redactions(text: str) -> str:
 def _share_slug(url: str) -> str:
     """The conversation's id within its platform: the share URL's last path segment.
 
-    Query strings and fragments are dropped first (Perplexity appends ``?s=u``). The result is the
-    upstream's own identifier, passed through the way the other adapters pass through WildChat's
-    ``conversation_hash`` and SWE-chat's ``session_id``. Its shape varies by platform -- a UUID, a
-    12-hex token, or a topic slug with an id appended -- and the rare collision between two
-    different URLs is resolved by ``build_dataset``'s ``_uniquify_doc_ids``.
+    Query strings and fragments are dropped first (Perplexity appends ``?s=u``). Its shape varies
+    by platform -- a UUID, a hex token, or a topic slug with an id appended -- and a rare collision
+    between two different URLs is resolved by ``build_dataset``'s ``_uniquify_doc_ids``.
     """
     return re.sub(r"[?#].*$", "", str(url)).rstrip("/").rsplit("/", 1)[-1]
 

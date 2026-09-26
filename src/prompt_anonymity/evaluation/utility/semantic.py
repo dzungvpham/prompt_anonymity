@@ -1,62 +1,49 @@
 """Semantic preservation without a judge: multilingual NLI entailment and BERTScore-recall.
 
-The conversation judge (:mod:`.prompt_judge`) is the accurate measurement and the expensive one --
-one API call per conversation, so a full corpus is a bill and a rubric change re-buys it. This
-metric is the complement: local models, no API, so it runs over **every** document in a split.
-The intended workflow is to score the whole corpus here, score a sample with the judge, and
-correlate the two -- which turns the judge from *the* measurement into a calibration set for a
-free one.
+The conversation judge (:mod:`.prompt_judge`) is the accurate measurement but the expensive one --
+one API call per conversation. This metric is the complement: local models, no API, so it can run
+over every document in a split. The intended workflow is to score the whole corpus here, score a
+sample with the judge, and correlate the two, turning the judge into a calibration set for the
+free metric.
 
 Two scores, both deliberately **recall-oriented**.
 
 ``entailment``
     Multilingual NLI with **premise = the rewrite, hypothesis = the original**, reported as
-    ``P(entailment)``. Read it as: *does the rewritten text still support everything the original
-    said?*
+    ``P(entailment)``: does the rewritten text still support everything the original said?
 
     **This is the opposite direction from PAN's "soundness"**, which asks whether the obfuscated
     text is entailed *by* the original -- a precision check that fires when a rewrite adds
-    unsupported content. That is the wrong test here by an explicit project decision: material the
-    rewrite invents is outside the judgement (see ``conversation_judge.yaml``'s third invariant),
-    and only dropped or altered content counts. Running it this way round encodes that rule in the
-    metric's structure rather than asking a model to remember it.
+    unsupported content. That's the wrong test here: material the rewrite invents is outside the
+    judgement (see ``conversation_judge.yaml``'s third invariant), so only dropped or altered
+    content should count, and running it this direction encodes that in the metric itself.
 
 ``bertscore_recall``
-    Greedy-matched cosine similarity over contextual token embeddings, in the recall direction:
-    for each *original* token, its best match anywhere in the rewrite. Extra tokens in the rewrite
-    are never visited, so additions cannot cost points -- the same rule again, from the other side.
-    (Precision is what would penalise them, which is exactly why it is not reported.)
+    Greedy-matched cosine similarity over contextual token embeddings, in the recall direction: for
+    each *original* token, its best match anywhere in the rewrite. Extra tokens in the rewrite are
+    never visited, so additions cannot cost points.
 
-**Why two scores and not one.** They fail differently. NLI is sensitive to negation, dropped
-constraints and changed requirements but is trained on short sentence pairs and degrades on long
-technical turns; BERTScore is robust to length and phrasing but is a similarity measure, and the
-style-transfer literature is clear that similarity alone *cannot separate a change of style from a
-change of content* -- it marks down a rewrite the harder the style shift, which is precisely the
-failure mode a style defense would produce. Neither is trustworthy alone; together, a defense that
-scores well on both is preserving content, and a split between them is worth looking at by hand.
+**Why two scores and not one.** They fail differently. NLI is sensitive to negation and dropped
+constraints but degrades on long technical turns; BERTScore is robust to length but is a pure
+similarity measure, so it marks a rewrite down for a style shift as much as for a content loss.
+Together, a defense that scores well on both is preserving content, and a split between them is
+worth inspecting by hand.
 
-**Raw BERTScore is not interpretable on its own**, because unrelated text in the same language
-still scores high. So the run also computes a **corpus-local baseline** -- the same score over
-deliberately mismatched pairs -- and reports ``bertscore_rescaled = (raw - baseline) /
-(1 - baseline)``, which puts "no better than an unrelated conversation" at 0 and "identical" at 1.
-The baseline is a property of the corpus being scored, so it is reported alongside every number
-rather than being folded in silently: two runs over different splits are not comparable on the
-rescaled figure unless their baselines match.
+**Raw BERTScore is not interpretable on its own**, since unrelated text in the same language still
+scores high. The run also computes a **corpus-local baseline** over deliberately mismatched pairs
+and reports ``bertscore_rescaled = (raw - baseline) / (1 - baseline)``, putting "no better than an
+unrelated conversation" at 0 and "identical" at 1. The baseline is corpus-specific, so rescaled
+scores from different splits aren't comparable unless their baselines match.
 
 **Scoring is per turn where the structure allows it.** Per-turn defenses preserve turn count, so
-turn *i* of the original is compared against turn *i* of the rewrite and the results are combined
-weighted by original turn length. That keeps each NLI pair inside the model's 512-token window
-instead of truncating a long conversation to its first turns, and it localises a loss to the turn
-that caused it. When a defense did not preserve the turn count, the conversation falls back to a
-single whole-cell comparison and the ``aligned`` column records that.
+turn *i* of the original is compared against turn *i* of the rewrite, weighted by original turn
+length. That keeps each NLI pair inside the model's token window and localises a loss to the turn
+that caused it. A defense that doesn't preserve turn count falls back to a single whole-cell
+comparison, recorded in the ``aligned`` column.
 
-**Results are not cached, unlike the LLM judge's.** A cache exists on the base class and these
-metrics deliberately do not use it: a cache miss here is GPU-minutes, not a re-billed API call, so
-the argument that justifies caching paid verdicts does not carry over. The cost of that choice is
-**resumability**, and it has a concrete limit -- 50 conversations take well under a minute on an
-A16, so a full swe-chat split (4,334) is minutes, but WildChat (172,509) is hours and will not fit
-one ``--qos=short`` allocation. Shard it by passing a subset, or add caching, before running the
-larger corpus.
+**Results are not cached, unlike the LLM judge's.** A miss here is GPU-minutes, not a re-billed API
+call, so caching paid verdicts is not the same argument. The cost is resumability: shard a large
+split into a subset per run rather than scoring it in one long job.
 """
 
 from __future__ import annotations
@@ -83,10 +70,10 @@ NLI_MODEL_ENV = "UTILITY_NLI_MODEL"
 DEFAULT_EMBED_MODEL = "xlm-roberta-large"
 EMBED_MODEL_ENV = "UTILITY_EMBED_MODEL"
 
-#: Which transformer layer to take token embeddings from. BERTScore does not use the final layer --
-#: it is too task-specialised -- but a tuned intermediate one, and 17 is the layer the reference
-#: implementation selects for XLM-R large. Exposed because it is the single knob that most changes
-#: the absolute numbers (which is also why the baseline below matters).
+#: Which transformer layer to take token embeddings from. BERTScore uses a tuned intermediate
+#: layer rather than the (too task-specialised) final one; 17 is the reference implementation's
+#: choice for XLM-R large. The single knob that most changes the absolute numbers, which is also
+#: why the corpus-local baseline matters.
 DEFAULT_EMBED_LAYER = 17
 
 #: Token cap per NLI pair and per embedded text. 512 is mDeBERTa's window; turns longer than this
@@ -157,9 +144,8 @@ class _Scorer:
         not a neutral loss of precision here: it cuts the premise and the hypothesis at *different*
         points in the content, so the surviving rewrite may genuinely not contain the surviving
         original, and the model correctly reports low entailment for a comparison that was never
-        made. Measured on swe-chat, entailment correlates -0.40 (Spearman) with document length
-        while BERTScore recall correlates only -0.12 -- so a long-document corpus needs this column
-        read before its entailment figure is believed.
+        made. Entailment is far more sensitive to this than BERTScore recall, so a long-document
+        corpus needs this column read before its entailment figure is believed.
         """
         flags: list[bool] = []
         for premise, hypothesis in zip(premises, hypotheses):

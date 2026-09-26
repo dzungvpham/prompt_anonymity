@@ -67,17 +67,14 @@ def render_turns(text, *, label: bool = False, drop_blank: bool = False,
     text : str
         The conversation cell.
     label : bool, default False
-        Prefix each turn with ``[Turn i]`` (1-based). The conversation judge used this until
-        2026-09-25 and now reads :func:`render_turn_pairs` instead, which pairs the two versions
-        turn by turn rather than numbering each on its own.
+        Prefix each turn with ``[Turn i]`` (1-based). Superseded by :func:`render_turn_pairs` for
+        the conversation judge, which pairs the two versions turn by turn instead.
     drop_blank : bool, default False
-        Drop whitespace-only turns. **Defaults off on purpose**: with both flags off this function
-        is byte-for-byte the plain ``"\\n".join(split_turns(text))``, which is what a caller
-        rendering turns individually wants -- a blank turn there is a real (empty) rewrite worth
-        seeing, not noise. Turn it on when rendering a whole conversation, where a blank turn is a
-        delimiter artifact that would skew the ``[Turn i]`` numbering. Note the rendered text is
-        the cache key for paid judge replies, so flipping either default silently orphans every
-        entry already on disk.
+        Drop whitespace-only turns. Off by default so the plain (unlabeled) rendering is exactly
+        ``"\\n".join(split_turns(text))`` -- a blank turn there is a real, empty rewrite worth
+        seeing. Turn it on when rendering a whole conversation, where a blank turn is a delimiter
+        artifact that would skew the ``[Turn i]`` numbering. The rendered text is the cache key for
+        paid judge replies, so changing either default orphans cached entries.
     max_chars : int, optional
         Truncate the result to this many characters, appending :data:`TRUNCATION_MARKER`. Applied
         per rendered side by the caller, so a truncated comparison stays fair.
@@ -106,9 +103,8 @@ def render_turn_pairs(original, modified, *, max_chars: int | None = None) -> st
         ...
         </conversation>
 
-    Pairing is done here, by position, rather than asked of the judge. The defenses rewrite a
-    conversation one user turn at a time, so position *is* the correspondence; handing the judge
-    two separate conversations made it re-derive that alignment, and made the numbering fragile.
+    Pairing is done here, by position, rather than asked of the judge: defenses rewrite a
+    conversation one user turn at a time, so position *is* the correspondence.
 
     * **An absent side is an empty element**: ``<original></original>`` marks a turn that exists
       only in the modified version (an addition), ``<modified></modified>`` an original turn with

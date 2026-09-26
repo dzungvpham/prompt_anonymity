@@ -14,18 +14,18 @@ judgement a same-author decision needs when a corpus mixes languages, lengths an
 Interacting the pair first (``|a - b|`` and ``a * b``, the standard sentence-pair encoding) and
 putting a network on top removes the constraint at a cost of one forward pass per candidate edge.
 
-That cost is affordable only because the candidate set is already narrow. Scoring all pairs is
-9.3e8 forward passes on WildChat's quarter; scoring the ``k``-nearest-neighbour graph's edges is
-~2e6. So this is deliberately a **re-ranker over an existing graph**, never a way to build one --
-the embedding still decides what is considered, and the network only decides what survives.
+That cost is affordable only because the candidate set is already narrow: scoring all pairs in a
+corpus is infeasible, but scoring the ``k``-nearest-neighbour graph's edges is not. So this is
+deliberately a **re-ranker over an existing graph**, never a way to build one -- the embedding
+still decides what is considered, and the network only decides what survives.
 
 The same shape as :mod:`.projection`, and the same rule about labels
 --------------------------------------------------------------------
 Fitted on the labelled history slice, applied blind. Negatives are mined from the history graph's
 own edges rather than drawn at random, because a random pair of documents is trivially separable
-at this prevalence (0.13% of WildChat pairs share an author) and a model trained on those learns
-nothing about the decisions it will actually be asked to make. Both halves of that mining use
-history labels only.
+(same-author pairs are rare in an unlabelled corpus) and a model trained on those learns nothing
+about the decisions it will actually be asked to make. Both halves of that mining use history
+labels only.
 
 The output is a probability, so ``1 - p`` is used as the graph distance. That keeps every consumer
 unchanged -- the threshold sweeps, the algorithms, the frontier -- and it makes the edge weight
@@ -71,8 +71,7 @@ def mine_training_pairs(embeddings: np.ndarray, author_ids: np.ndarray, *,
     """``(left, right, label)`` for training, with negatives mined from the neighbour graph.
 
     Positives are every within-author pair, capped per author so that one prolific writer does not
-    supply most of the training set -- WildChat's heaviest history author has enough documents to
-    contribute more pairs on their own than a thousand median authors combined.
+    supply most of the training set.
 
     Negatives come from each document's own nearest neighbours that turn out to be somebody else.
     They are the pairs this scorer exists to reject: a random negative is separable by topic alone
@@ -140,10 +139,10 @@ class EdgeScorer:
         **Returns the logit by default, not the probability, and that is load-bearing.** A sigmoid
         is monotone, so in exact arithmetic the two rank edges identically -- but in float32
         ``sigmoid(x)`` rounds to exactly 1.0 above about x = 17, and a confident model puts a large
-        share of its true edges there. Measured on WildChat's tuning slice, scoring in probability
-        space left 138 of 556 frontier rows at a distance of exactly 0.0: a tied block that the
-        edge-budget prefix then admits in arbitrary order, which welded 52% of the collection into
-        one cluster and cost ~0.11 of BCubed F. The logit keeps every one of those edges distinct.
+        share of its true edges there. Scoring in probability space then ties a large block of the
+        highest-confidence edges at distance 0.0, and the edge-budget prefix admits a tied block in
+        arbitrary order -- which can weld unrelated clusters together. The logit keeps every edge
+        distinct.
 
         ``as_logit=False`` returns the calibrated probability, which is what to use when the number
         itself is wanted (a report, a threshold with a meaning) rather than an ordering.
