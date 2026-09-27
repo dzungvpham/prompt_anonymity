@@ -10,13 +10,11 @@ document within a shortlisted author. Both get the same arithmetic from
 Why this exists rather than a direct :func:`scipy.spatial.distance.cdist` call
 ------------------------------------------------------------------------------
 ``cdist``'s cosine is a naive C loop over pairs that also forces float64. Normalising both sides
-once and handing the product to BLAS is the same arithmetic roughly 150x faster -- measured 115 s
-against 0.77 s on 2,000 x 20,000 x 3,072 inputs, agreeing to 6e-8. At the scales this project now
-runs at that is the difference between two minutes and four hours.
+once and handing the product to BLAS computes the same arithmetic far faster at scale.
 
-The blocking matters just as much. A 50,000 x 100,000 float64 distance matrix is 40 GB, which no
-single allocation on a memory-limited job is going to survive; yielding row blocks lets the caller
-reduce each one and drop it. Metrics other than cosine fall back to
+The blocking matters just as much: a full pairwise distance matrix at this project's scale would
+be tens of gigabytes, too large for a single allocation on a memory-limited job. Yielding row
+blocks lets the caller reduce each one and drop it. Metrics other than cosine fall back to
 :func:`sklearn.metrics.pairwise_distances_chunked`, which is BLAS-backed for ``"euclidean"`` and
 blocks a per-block ``cdist`` for everything else -- so even an exotic metric gets the memory
 bound, just not the speed.

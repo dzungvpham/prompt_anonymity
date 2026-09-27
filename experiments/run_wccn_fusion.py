@@ -1,15 +1,9 @@
 """Controlled feature x attack matrix for the WCCN-fusion result, in one reproducible runner.
 
-Consolidates what had grown into ~8 near-duplicate scratch scripts (one per source x feature-set
-combination, several with copy-pasted fusion logic) discovered while chasing one question: does
-Gemini + {char n-gram, StyloMetrix, POS n-gram} fusion help, and does the answer depend on which
-attack scores the fused vectors? It did -- fusion looked null or negative on WildChat under
-``logistic_sgd`` (the only classifier attack feasible at WildChat's author count, see
-``run_all_experiments.py``'s documented 20.4 GB logit-matrix constraint) but showed a real,
-significant MRR gain under WCCN, which has no such constraint and is independently the strongest
-single-feature attack on both corpora. One script that takes the feature set and attack as
-arguments, rather than one file per combination, is what makes that comparison reproducible
-instead of re-derived by hand each time.
+Tests whether Gemini + {char n-gram, StyloMetrix, POS n-gram} fusion helps, and whether the answer
+depends on which attack scores the fused vectors -- WCCN and ``logistic_sgd`` answer differently,
+and one script that takes the feature set and attack as arguments (rather than one file per
+combination) is what makes that comparison reproducible instead of re-derived by hand each time.
 
 Two feature kinds, two safety stories
 --------------------------------------

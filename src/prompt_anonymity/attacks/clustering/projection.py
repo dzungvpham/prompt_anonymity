@@ -13,11 +13,10 @@ one place it can help without turning linkability back into identifiability:
 
 Why this and not a better clustering algorithm
 -----------------------------------------------
-Measured on WildChat's tuning slice, ``connected``'s neighbour graph carries same-author edges at
-roughly a third precision, and the giant cluster it produces is not a chain through a handful of
-bad edges but a large region at that precision throughout. No cut of such a graph recovers the
-partition, because the ordering of the edges is what is wrong. Every transform here changes that
-ordering; nothing here changes how the graph is cut.
+An unweighted neighbour graph's giant-cluster failure is not a chain through a handful of bad
+edges -- it is a large region of consistently mediocre precision, so no cut of such a graph
+recovers the partition, because the ordering of the edges is what is wrong. Every transform here
+changes that ordering; nothing here changes how the graph is cut.
 
 The three, in increasing order of what they assume
 --------------------------------------------------
@@ -52,10 +51,9 @@ from ..common import inverse_sqrt, unit_rows
 #: dropped from every fit here; they are still clustered like anything else.
 MIN_DOCUMENTS_PER_AUTHOR = 2
 
-#: Rows per chunk when accumulating a ``d x d`` scatter matrix. At 3,072 dimensions a full
-#: float64 copy of WildChat's history side is 2.1 GB, and the covariance accumulation wants
-#: another; chunking holds the peak to this many rows instead, at no cost in accuracy since the
-#: accumulator is float64 throughout.
+#: Rows per chunk when accumulating a ``d x d`` scatter matrix. A full float64 copy of a large
+#: embedding side plus the covariance accumulation can be gigabytes; chunking holds the peak to
+#: this many rows instead, at no cost in accuracy since the accumulator is float64 throughout.
 SCATTER_CHUNK = 8192
 
 
@@ -104,9 +102,9 @@ def _author_codes(author_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 #: Scatter matrices memoised by the content of what they were computed from. Both closed-form
 #: fitters sweep a hyper-parameter (``shrinkage``, ``n_components``) that is applied *after* the
-#: accumulation, so without this a six-point sweep pays the 1.6 TFLOP pass six times for six
-#: identical results. Keyed by digest rather than by object identity because the caller slices a
-#: fresh array out of the corpus on every run.
+#: accumulation, so without this a sweep would repeat the same expensive pass for identical
+#: results. Keyed by digest rather than by object identity because the caller slices a fresh array
+#: out of the corpus on every run.
 _SCATTER_CACHE: dict[str, tuple[np.ndarray, np.ndarray, int]] = {}
 
 
@@ -177,9 +175,9 @@ def fit_wccn(embeddings: np.ndarray, author_ids: np.ndarray, *,
     form for "discount the nuisance".
 
     ``shrinkage`` pulls the estimate toward a scaled identity. It is not optional at these shapes:
-    3,072 dimensions estimated from 86,255 documents is only a 28:1 ratio, and the smallest
-    eigenvalues of such an estimate are badly biased downward -- exactly the ones the inverse
-    square root then multiplies up. Sweep it; the useful range is wide.
+    a high-dimensional covariance estimated from a modest document count has badly biased-downward
+    smallest eigenvalues -- exactly the ones the inverse square root then multiplies up. Sweep it;
+    the useful range is wide.
     """
     codes, usable = _author_codes(author_ids)
     embeddings = np.asarray(embeddings, dtype=np.float32)[usable]
@@ -198,10 +196,10 @@ def fit_lda(embeddings: np.ndarray, author_ids: np.ndarray, *, n_components: int
     with ``W^{-1/2}``, take the top eigenvectors of the whitened between-author scatter, and
     compose -- rather than inverting ``W`` and eigendecomposing a non-symmetric product.
 
-    This is :func:`fit_wccn` plus a rank truncation, and the truncation is the point: the whitened
-    space has 3,072 directions and only the leading few hundred carry any author separation, so
-    keeping all of them means the distance is mostly noise that has been amplified to unit
-    variance. ``n_components`` is the one real knob and it wants sweeping.
+    This is :func:`fit_wccn` plus a rank truncation, and the truncation is the point: only a
+    fraction of the whitened space's directions carry any author separation, so keeping all of
+    them means the distance is mostly noise that has been amplified to unit variance.
+    ``n_components`` is the one real knob and it wants sweeping.
     """
     codes, usable = _author_codes(author_ids)
     embeddings = np.asarray(embeddings, dtype=np.float32)[usable]
@@ -248,11 +246,11 @@ def fit_contrastive(embeddings: np.ndarray, author_ids: np.ndarray, *, n_compone
     for it.
 
     Two deliberate limits. **The default is a single linear map**, not a network: the attacker is
-    re-weighting an embedding somebody else trained, and 3,072 x 512 is already 1.6M parameters
-    from ~13,000 authors. ``hidden > 0`` adds one ReLU layer for the comparison, and it is a
-    comparison worth making rather than an obvious upgrade. **Negatives are in-batch only**, which
-    with 1,024 documents per step is a 1,023-way problem -- far harder than the pairwise one and
-    cheap, but it does mean the loss never sees the full 7,867-author field the attack faces.
+    re-weighting an embedding somebody else trained, and the parameter count is already large
+    relative to the author count available to fit it on. ``hidden > 0`` adds one ReLU layer for
+    the comparison, and it is a comparison worth making rather than an obvious upgrade.
+    **Negatives are in-batch only**, which is a much harder and cheaper problem than the pairwise
+    one, but it does mean the loss never sees the full candidate field the attack faces.
 
     Returns a :class:`LinearProjection` when ``hidden == 0``. A hidden layer is not a linear map,
     so that variant returns its collapsed first layer and warns -- it is for measuring whether
@@ -293,13 +291,12 @@ def fit_contrastive(embeddings: np.ndarray, author_ids: np.ndarray, *, n_compone
     started = time.perf_counter()
     neighbor_authors = None
     for step in range(steps):
-        # Hard negatives. With random batches, 511 of the 512 negatives are authors the model
-        # already separates easily, so almost every step's gradient comes from the handful it does
-        # not -- and the attack's actual failure mode is confusing *similar* authors. Building the
-        # batch out of one seed author and its nearest neighbours in the current projected space
-        # makes every negative a near-miss. The neighbour table is refreshed every
-        # ``hard_negatives`` steps rather than every step, because it moves slowly and rebuilding
-        # it is a 13,694 x 13,694 matmul.
+        # Hard negatives. With random batches, almost all negatives are authors the model already
+        # separates easily, so most of the gradient comes from wasted comparisons -- and the
+        # attack's actual failure mode is confusing *similar* authors. Building the batch out of one
+        # seed author and its nearest neighbours in the current projected space makes every negative
+        # a near-miss. The neighbour table is refreshed periodically rather than every step, since
+        # it moves slowly and rebuilding it is an expensive matmul.
         if hard_negatives and step % hard_negatives == 0:
             centroids = _author_centroids(model, features, starts, counts, device)
             width = min(batch_authors, n_authors)

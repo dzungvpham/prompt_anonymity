@@ -10,16 +10,14 @@ from ..common import class_means, inverse_sqrt, within_class_covariance
 class PLDA:
     """Two-covariance (Gaussian) PLDA: the score is a same-author log-likelihood ratio.
 
-    Included because it is the principled answer to the failure that motivated all this: a
-    distance answers "how close?", while a likelihood ratio answers "how much more likely is
-    this document under *this author* than under the population?" -- which is comparable across
-    documents and accounts for how many documents each author was enrolled with (1 to 325 here).
+    A distance answers "how close?", while a likelihood ratio answers "how much more likely is
+    this document under *this author* than under the population?" -- comparable across documents,
+    and it accounts for how many documents each author was enrolled with.
 
-    Both covariances are estimated on the known side and simultaneously diagonalised, so within-
-    author variance becomes 1 and between-author variance becomes ``psi`` per dimension and the
-    ratio has a closed diagonal form. It underperforms the logistic model on this data -- the
-    Gaussian assumption is a poor fit for StyloMetrix ratios on 300-character documents -- but it
-    is the right starting point if the features ever improve.
+    Both covariances are estimated on the known side and simultaneously diagonalised, so
+    within-author variance becomes 1 and between-author variance becomes ``psi`` per dimension,
+    giving the ratio a closed diagonal form. The Gaussian assumption underperforms a discriminative
+    classifier on features that aren't well-modeled by it, but it's the principled starting point.
     """
 
     name = "plda"

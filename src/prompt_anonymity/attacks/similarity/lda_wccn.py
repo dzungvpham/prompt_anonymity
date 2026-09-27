@@ -1,15 +1,11 @@
 """LDA dimensionality reduction, then WCCN whitening inside that reduced subspace.
 
-:class:`~.lda.LDACentroid` and :class:`~.whitened_centroid.WhitenedCentroid` are both tested here
-as *competing* attacks -- alternatives, never chained. The speaker-verification literature this
-project's WCCN was drawn from treats them differently: for embeddings that aren't already
-end-to-end discriminative, "LDA followed by WCCN" is the standard strong combination, not LDA
-*or* WCCN alone (see e.g. arXiv:2204.03965, "Scoring of Large-Margin Embeddings for Speaker
-Verification: Cosine or PLDA?", and the WCCN+cosine / LDA+PLDA comparisons in fused-system
-speaker-verification papers). LDA maximises between-author over within-author scatter and
-discards directions with no author signal at all; WCCN's within-class whitening then equalises
-what noise remains *inside that already-denoised space*, rather than fighting the full,
-un-reduced embedding's noise directly.
+:class:`~.lda.LDACentroid` and :class:`~.whitened_centroid.WhitenedCentroid` are tested elsewhere
+as *competing* attacks. Here they're chained instead: the speaker-verification literature treats
+"LDA followed by WCCN" as the standard strong combination for embeddings that aren't already
+end-to-end discriminative. LDA maximises between-author over within-author scatter and discards
+directions with no author signal; WCCN's whitening then equalises what noise remains *inside that
+already-denoised space*, rather than fighting the full embedding's noise directly.
 """
 
 from __future__ import annotations
@@ -26,10 +22,9 @@ class LDAWCCN:
 
     ``n_components`` is a ceiling on the LDA subspace, same contract as
     :class:`~.lda.LDACentroid`: clamped to ``n_authors - 1`` rather than raised, so a sweep over
-    differently sized author pools doesn't fail on the small ones for a reason unrelated to the
-    setting itself. ``shrinkage`` is WCCN's own knob, applied to the covariance estimate inside
-    the LDA subspace rather than the original embedding space -- likely a different optimum than
-    plain WCCN's, since the subspace is lower-dimensional and already between-author-denoised.
+    differently sized author pools doesn't fail on the small ones. ``shrinkage`` is WCCN's own
+    knob, applied to the covariance estimate inside the LDA subspace rather than the original
+    embedding space.
     """
 
     name = "lda_wccn"

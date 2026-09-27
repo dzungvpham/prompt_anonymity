@@ -1,15 +1,14 @@
 """Style-convergence rewrite defense: rewrite every prompt into one fixed, neutral style.
 
-Threat model: a user's own writing style fingerprints them across queries. This defense rewrites
-each user turn into ONE fixed target style (:data:`REWRITE_PROMPT_HEADER`) with a local instruct
-model, so turns written by different people converge to a shared, hard-to-link stylometric identity
-while their content is preserved. The featurize stage re-derives features from the rewritten text.
+Rewrites each user turn into one fixed target style (:data:`REWRITE_PROMPT_HEADER`) with a local
+instruct model, so different authors' turns converge toward a shared, hard-to-link stylometric
+identity while content is preserved. The featurize stage re-derives features from the rewritten
+text.
 
-The model is toggleable so the defense can be upgraded to a newer instruct model without touching
-code: pass ``model_id`` (vLLM path) / ``gguf_repo``+``gguf_file`` (llama.cpp path), or set the
-``QWEN_HF_REPO`` / ``QWEN_BACKEND`` env vars. The active model is part of :meth:`params`, so
-swapping it invalidates the cache automatically. Two backends: ``vllm`` (bf16, batched -- the right
-tool on an A100/H100) and ``llama_cpp`` (a 4-bit GGUF for a laptop/phone).
+The model is swappable without touching code: pass ``model_id`` (vLLM) / ``gguf_repo``+``gguf_file``
+(llama.cpp), or set ``QWEN_HF_REPO`` / ``QWEN_BACKEND``. The active model is part of :meth:`params`,
+so swapping it invalidates the cache. Two backends: ``vllm`` (batched, for a real GPU) and
+``llama_cpp`` (a 4-bit GGUF for a laptop/phone).
 """
 
 from __future__ import annotations
@@ -38,25 +37,22 @@ Rules:
 - Do NOT substitute technical terms, domain verbs, or proper nouns for synonyms. Normalize register and grammar only, never denotation.
 - Do NOT answer, explain, or comment on the message. Output ONLY the rewritten message and nothing else."""
 
-# Default backend + models. vLLM is the cluster path (bf16, continuous batching); llama.cpp runs a
-# 4-bit GGUF on a laptop/phone. Both default to Qwen2.5-3B-Instruct and are env/arg-overridable.
+# Default backend + models, both env/arg-overridable.
 DEFAULT_BACKEND = os.environ.get("QWEN_BACKEND", "vllm").lower()  # "vllm" | "llama_cpp"
 DEFAULT_VLLM_MODEL = os.environ.get("QWEN_HF_REPO", "Qwen/Qwen2.5-3B-Instruct")
 DEFAULT_GGUF_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
 DEFAULT_GGUF_FILE = "qwen2.5-3b-instruct-q4_k_m.gguf"
 
-# vLLM knobs (env-tunable, matching the DS_env sandbox).
+# vLLM knobs.
 _VLLM_DTYPE = os.environ.get("QWEN_VLLM_DTYPE", "bfloat16")
 _VLLM_GPU_MEM_UTIL = float(os.environ.get("QWEN_VLLM_GPU_MEM_UTIL", "0.90"))
 _VLLM_MAX_MODEL_LEN = int(os.environ.get("QWEN_VLLM_MAX_MODEL_LEN", "4096"))
-# Skip vLLM's nvcc-dependent startup compile (torch.compile + CUDA-graph capture) on a node without
-# the CUDA toolkit; a bit slower at decode but runs with only the runtime the wheel bundles.
+# Skips vLLM's CUDA-toolkit-dependent startup compile on a node without it.
 _VLLM_ENFORCE_EAGER = os.environ.get("QWEN_VLLM_ENFORCE_EAGER", "0") == "1"
 
 
 class _QwenGGUFRewriter:
-    """On-device 4-bit Qwen GGUF backend (llama-cpp-python; CPU-friendly, GPU-offloaded when
-    available). Decodes one prompt at a time, so :meth:`rewrite_batch` loops."""
+    """On-device 4-bit Qwen GGUF backend (llama-cpp-python). Decodes one prompt at a time."""
 
     def __init__(self, repo_id, filename, system_prompt, n_ctx=4096, max_tokens=1024):
         from llama_cpp import Llama
@@ -64,8 +60,7 @@ class _QwenGGUFRewriter:
         self.system_prompt = system_prompt
         self.max_tokens = max_tokens
         print(f"Loading Qwen GGUF '{repo_id}/{filename}' (4-bit, llama.cpp) for rewrite...")
-        # n_gpu_layers=-1 offloads all layers to the GPU when llama-cpp-python was built with CUDA
-        # (a harmless no-op otherwise); the single biggest speed lever on a GPU box.
+        # n_gpu_layers=-1 offloads all layers to the GPU when built with CUDA (no-op otherwise).
         self.llm = Llama.from_pretrained(
             repo_id=repo_id, filename=filename, n_ctx=n_ctx,
             n_threads=None, n_gpu_layers=-1, verbose=False,
@@ -74,7 +69,6 @@ class _QwenGGUFRewriter:
     def rewrite_batch(self, texts: list[str]) -> list[str]:
         out = []
         for text in texts:
-            # temperature=0 -> greedy/deterministic, so re-runs and cache hits are reproducible.
             resp = self.llm.create_chat_completion(
                 messages=[
                     {"role": "system", "content": self.system_prompt},
@@ -87,26 +81,19 @@ class _QwenGGUFRewriter:
 
 
 class _QwenVLLMRewriter:
-    """Cluster-optimized Qwen backend using vLLM (continuous batching + PagedAttention). Runs the
-    whole batch of turns through one shared system prompt, so an A100/H100 stays saturated."""
+    """vLLM-backed Qwen backend. Runs a whole batch of turns through one shared system prompt."""
 
     def __init__(self, model_id, system_prompt, max_tokens=1024):
         from ._backends import (configure_cuda_toolkit, local_checkpoint, resolve_model_path,
                                 shared_checkpoint)
 
-        # MUST precede the vLLM import below: vLLM reads its environment at import time, and this
-        # is what sets VLLM_USE_FLASHINFER_SAMPLER=0. Without it the FlashInfer sampler JITs during
-        # `warmup_kernels` -> `worker_sample_tokens` and kills engine startup on a node with no CUDA
-        # toolkit. Every other vLLM-backed defense here already does this; this one did not, which
-        # is exactly how it failed.
+        # Must precede the vLLM import: vLLM reads its environment at import time.
         configure_cuda_toolkit()
 
         from vllm import LLM, SamplingParams
 
-        # Resolved before vLLM sees it. `model_id` is a REPO ID by default, and vLLM cannot tell a
-        # repo id from a path that does not exist -- it fetches either. On a cluster that already
-        # mirrors these weights that is ~6 GB downloaded into $HF_HOME for nothing, so prefer
-        # /datasets/ai and refuse rather than download. Same resolution as afr and loo_unlink.
+        # Resolved before vLLM sees it, so a repo id that's already mirrored locally doesn't
+        # trigger a download.
         if model_id and model_id != DEFAULT_VLLM_MODEL:
             path = resolve_model_path(shared_checkpoint(model_id) or model_id)
             print(f"[qwen_rewrite] checkpoint: {path}")
@@ -147,8 +134,7 @@ class QwenRewriteDefense(PerTurnBatchRewriteDefense):
     system_prompt : str
         The convergence-target instructions; defaults to :data:`REWRITE_PROMPT_HEADER`.
 
-    The backend is built lazily on first use, so a fully-cached run loads no model. The active model
-    is reported by :meth:`params`, so switching models invalidates the cache automatically.
+    The backend is built lazily on first use, so a fully-cached run loads no model.
     """
 
     name = "qwen_rewrite"
@@ -169,9 +155,8 @@ class QwenRewriteDefense(PerTurnBatchRewriteDefense):
         return self.model_id if self.backend == "vllm" else f"{self.gguf_repo}/{self.gguf_file}"
 
     def params(self) -> dict:
-        # Everything that determines the rewrite goes in the cache key. The system prompt is a
-        # module constant (not part of the class source the logic hash covers), so include it
-        # verbatim: editing REWRITE_PROMPT_HEADER or passing a custom prompt then re-caches.
+        # System prompt is a module constant, not part of the logic hash, so it's included here
+        # to make an edit re-cache.
         return {
             "backend": self.backend,
             "model": self._active_model(),

@@ -36,11 +36,10 @@ The frontier, and why the sweep is over an edge budget
 -------------------------------------------------------
 Threshold-and-connect is single-linkage cut at a height, so a sweep over ``distance_threshold`` is
 a sweep over *how many of the candidate edges are kept*. Sweeping the budget directly instead of
-the threshold has three advantages and no cost: rescored distances are on incomparable scales (CSLS
-distances are routinely negative), so a shared threshold grid would mean different things to
-different variants; the budget is what actually determines the partition; and the whole frontier
-for one graph comes from a single sort plus one connected-components pass per budget, which is
-what makes a sweep this wide affordable.
+the threshold has two advantages: rescored distances are on incomparable scales (CSLS distances
+are routinely negative), so a shared threshold grid would mean different things to different
+variants; and the whole frontier for one graph comes from a single sort plus one
+connected-components pass per budget, which is what makes a sweep this wide affordable.
 
 The stages
 ----------
@@ -129,18 +128,13 @@ SLICES = {"history": (0.00, 0.50), "eval": (0.50, 0.75), "test": (0.75, 1.00)}
 #: be promoted, and every ``--k-caps`` value is a column slice of one build.
 GRAPH_WIDTH = 100
 
-#: Per-document neighbour caps swept. ``connected``'s tuned value on this corpus is 2, and the
-#: interesting range is entirely below 10 -- but the wide end is kept because a rescored graph has
-#: no reason to share the cosine graph's optimum, which is the hypothesis under test.
+#: Per-document neighbour caps swept. The wide end is kept because a rescored graph has no reason
+#: to share the cosine graph's optimum, which is the hypothesis under test.
 DEFAULT_K_CAPS = (1, 2, 3, 5, 10, 25, 50)
 
 #: Edge budgets, as a geometric grid over the number of candidate edges kept. Fine enough that the
 #: BCubed F peak is located to well under its bootstrap width, coarse enough that a full sweep is
 #: minutes. The frontier is smooth in this parameter, so nothing is hiding between grid points.
-#: Raised from 48 after the first sweep: at 48 the four grid points bracketing the peak spanned
-#: 37k-110k edges and 0.07 of BCubed F, which locates a maximum far too loosely to rank two
-#: methods against each other. The whole sweep is ~3 s per (rescoring, locality), so resolution
-#: here is close to free.
 BUDGET_STEPS = 160
 
 
@@ -369,11 +363,8 @@ def sweep_algorithms(graph, author_codes: np.ndarray, n_authors: int, projection
     from prompt_anonymity.evaluation.metrics.clustering import expand_noise
 
     # Thresholds as QUANTILES of this graph's own edge distances, never absolute numbers. A
-    # learned projection changes the scale entirely -- WildChat's single-linkage optimum is at
-    # distance 0.13 under cosine and 0.39 after the contrastive fit -- so an absolute grid tuned in
-    # one space tests a different, and usually useless, part of the other. The first pass here did
-    # exactly that and scored average linkage at 0.336 with a grid whose whole range sat below the
-    # useful threshold.
+    # learned projection changes the scale entirely, so an absolute grid tuned in one space tests
+    # a different, and usually useless, part of the other.
     _, _, all_distances = graph.edges()
     all_distances = np.sort(all_distances[np.isfinite(all_distances)])
     def at_quantile(q: float) -> float:
@@ -388,8 +379,7 @@ def sweep_algorithms(graph, author_codes: np.ndarray, n_authors: int, projection
         for min_cluster_size in (2, 3, 5):
             configurations.append(("hdbscan", HDBSCANClustering(
                 neighbors=k_cap, min_cluster_size=min_cluster_size)))
-        # The single-linkage optimum sits near the 4-8% quantile of the candidate edges on both
-        # spaces measured, so the link stage brackets that and the merge stage runs below it.
+        # The link stage brackets the single-linkage optimum and the merge stage runs below it.
         for link_quantile in (0.04, 0.06, 0.10, 0.20):
             for cut_quantile in (0.005, 0.01, 0.02, 0.04, 0.06):
                 if cut_quantile >= link_quantile:
@@ -398,8 +388,7 @@ def sweep_algorithms(graph, author_codes: np.ndarray, n_authors: int, projection
                     neighbors=k_cap, link_threshold=at_quantile(link_quantile),
                     distance_threshold=at_quantile(cut_quantile),
                     # The whole point of this method is splitting the giant component, so it must
-                    # be big enough to hold WildChat's. 30,000^2 float64 is 7.2 GB, which fits the
-                    # 32 GB job; leaving the default would silently pass the blob through whole.
+                    # be sized to actually hold one; the default would silently pass it through whole.
                     max_component=30_000)))
 
     rows = []
@@ -666,10 +655,9 @@ def time_candidate_rows(graph, frame, features, author_codes, n_authors, project
 
     **This is the one idea here that can raise recall rather than trade it.** Every other method
     re-ranks or filters a candidate set fixed by cosine k-NN, so a pair the embedding never
-    proposed can never be linked however good the scoring gets -- and the loss decomposition says
-    the reachable precision headroom runs out at F = 0.677 while recall sits at 0.511. Two
-    conversations by one person four minutes apart but about different subjects are exactly the
-    pair cosine will not propose and timing will.
+    proposed can never be linked however good the scoring gets. Two conversations by one person
+    four minutes apart but about different subjects are exactly the pair cosine will not propose
+    and timing will.
 
     The cost is that the candidate set grows with strangers: this corpus averages a document every
     three minutes, so a document's temporal neighbours are mostly other people. That is what the
@@ -817,12 +805,11 @@ def pair_model_rows(graph, eval_frame, history_graph, history_frame, author_code
                     projection_name, k_caps, normalize: bool = False):
     """Fit a same-author model on history candidate edges, apply it to the eval graph's.
 
-    The diagnostic measured five signals on the candidate edges and every one of them carries
-    something: cosine 0.77 AUROC, time gap 0.76, shared neighbours 0.72, reciprocal rank 0.65,
-    same-language 0.53. Only two have ever been mixed here, by a hand-tuned scalar weight. This
-    asks whether a model that sees all of them, with their interactions, does better -- and it is
-    the honest way to combine them, because the mixing is fitted on labelled history rather than
-    chosen against the slice the result is reported on.
+    Several pairwise signals on the candidate edges each carry some information, but only two have
+    ever been mixed here, by a hand-tuned scalar weight. This asks whether a model that sees all of
+    them, with their interactions, does better -- and it is the honest way to combine them, because
+    the mixing is fitted on labelled history rather than chosen against the slice the result is
+    reported on.
 
     Distinct from the failed :mod:`~prompt_anonymity.attacks.clustering.edge_scoring`
     cross-encoder, which read the two 1,024-dimensional vectors and had 2M parameters to overfit
@@ -926,15 +913,12 @@ def parse_args() -> argparse.Namespace:
                              "distance distribution; 1.0 is unconstrained (the control).")
     parser.add_argument("--per-language-threshold", action="store_true",
                         help="Standardise edge scores within each language pair before the budget "
-                             "cut, so one global budget becomes a language-adaptive threshold. "
-                             "Motivated by the error analysis: at one shared operating point "
-                             "Korean is over-merged (P 0.37, R 0.90) and Russian under-merged "
-                             "(P 0.76, R 0.37), so no single cut is right for both.")
+                             "cut, so one global budget becomes a language-adaptive threshold: a "
+                             "shared cut can over-merge one language while under-merging another.")
     parser.add_argument("--pair-model-normalize", action="store_true",
                         help="Replace each pair feature by its within-collection quantile before "
-                             "fitting and applying. The history side is twice the size of the "
-                             "collection under attack and its k-NN graph is correspondingly "
-                             "denser (edge precision 0.299 against 0.35), so absolute features "
+                             "fitting and applying. The history side's k-NN graph is a different "
+                             "density from the collection under attack's, so absolute features "
                              "like the raw cosine and the neighbourhood radius do not mean the "
                              "same thing on both; a quantile does.")
     parser.add_argument("--ensemble-projections", nargs="*", type=Path, default=[],

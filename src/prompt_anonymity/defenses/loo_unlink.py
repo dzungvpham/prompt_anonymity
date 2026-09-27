@@ -32,9 +32,9 @@ Everything in the loop is local
 Scoring uses :class:`~prompt_anonymity.features.harrier.HarrierFeaturizer` (local, offline); the
 rewrite, the answers and the rating all run on one local vLLM engine
 (:data:`MODEL_ENV_VAR` -> ``models.toml [loo_unlink]``). Nothing here calls a metered API, which is
-the only reason the loop is affordable: it is roughly quadratic in span count, and the budget sweep
-multiplies that by the number of operating points. The paid channels (Gemini embeddings, the DeepSeek
-judge) grade the finished text afterwards and never touch this file.
+the only reason the loop is affordable given it is roughly quadratic in span count and the budget
+sweep multiplies that by the number of operating points. The paid channels (Gemini embeddings, the
+DeepSeek judge) grade the finished text afterwards and never touch this file.
 
 Two departures from the design spec, both deliberate
 ----------------------------------------------------
@@ -54,8 +54,7 @@ Sharding
 ``shardable = False``. Linkage is measured against the author's other documents, and
 ``apply_defenses --num-shards`` splits by *document*, so a shard holds an arbitrary subset of each
 author -- the baseline would be computed against a truncated author and would differ from shard to
-shard. ``apply_defenses`` refuses a sharded run for this defense. The subset this is built for
-(~1,000 documents) does not need sharding; checkpointing every
+shard. ``apply_defenses`` refuses a sharded run for this defense; checkpointing every
 :data:`DEFAULT_CHECKPOINT_EVERY` documents is what makes a preempted job resumable instead.
 
 Command line::
@@ -411,11 +410,8 @@ class _LocalBackend:
 
             from vllm import LLM, SamplingParams
 
-            # Through `local_checkpoint`, not the old `model_path` + `resolve_model_path` pair:
-            # models.toml names this model by REPO ID, and `resolve_model_path` only maps a
-            # HuggingFace *cache directory* to its snapshot -- it never looks at /datasets/ai. So
-            # the old line handed vLLM a bare repo id and silently downloaded ~6 GB on a cluster
-            # that already mirrors the weights. Same resolution `afr` uses.
+            # `local_checkpoint` prefers an already-mirrored copy of the weights over letting vLLM
+            # silently download the repo id, same resolution `afr` uses.
             if self.model:
                 path = resolve_model_path(shared_checkpoint(self.model) or self.model)
                 print(f"[loo_unlink] generator checkpoint: {path}")

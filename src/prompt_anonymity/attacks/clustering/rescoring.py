@@ -191,10 +191,9 @@ def shared_neighbors(graph: NeighborGraph, locality: int = DEFAULT_LOCALITY) -> 
     across random impostor sets and feature subsets; here the k-nearest-neighbour lists play the
     part of the impostor draw, at no extra distance computation.
 
-    Measured on WildChat's tuning slice, the raw overlap count separates same-author from
-    different-author candidate edges at AUROC **0.72** against cosine's 0.77 -- weaker on its own,
-    but computed from the graph's *structure* rather than its weights, so what it adds is not what
-    cosine already knows.
+    The raw overlap count separates same-author from different-author candidate edges somewhat
+    worse than cosine on its own, but it is computed from the graph's *structure* rather than its
+    weights, so what it adds is not what cosine already knows.
 
     Ties are broken by the original distance, which matters more here than for any other transform
     in this module: the overlap is a small integer (0..k), so a pure overlap ordering would leave
@@ -225,12 +224,11 @@ def zscore_distances(graph: NeighborGraph, reference_mean: np.ndarray,
     ``d'(A, B) = max( (d - mu_A)/sigma_A , (d - mu_B)/sigma_B )``.
 
     This is Kocher's SPATIUM rule (PAN 2017 runner-up, and second at PAN 2016), which asks whether
-    a distance is small *relative to the distances that document has to everything else* -- and it
-    is a materially different question from the one :func:`csls` asks. CSLS subtracts a **local**
-    mean, over the ten nearest neighbours, so it measures local density; this subtracts the
-    **global** mean and divides by the global standard deviation, so it measures how unusual the
-    pair is for those two documents. The local version was measured here and lost (0.467 against
-    0.516); the global one had not been tried.
+    a distance is small *relative to the distances that document has to everything else* -- a
+    materially different question from the one :func:`csls` asks. CSLS subtracts a **local** mean,
+    over the nearest neighbours, so it measures local density; this subtracts the **global** mean
+    and divides by the global standard deviation, so it measures how unusual the pair is for those
+    two documents specifically.
 
     ``max`` of the two directions rather than the mean, because SPATIUM requires the evidence to
     hold from both endpoints -- its "at least two of four hints" rule is a conjunction, and taking
@@ -249,11 +247,10 @@ def global_distance_moments(embeddings: np.ndarray, metric: str = "cosine",
                             sample: int = 4096, seed: int = 20260814) -> tuple:
     """``(mean, std)`` of each document's distance to the whole collection, from a random sample.
 
-    SPATIUM computes these over every other document, which is free on a 50-document PAN problem
-    and 1.9 billion pairs here. A random sample of the collection estimates the same two moments
-    to a standard error of ``sigma/sqrt(sample)`` -- at 4,096 that is under 2% of one standard
-    deviation, far below the resolution any threshold sweep can use. The sample is shared across
-    all rows and seeded, so the transform is deterministic.
+    SPATIUM computes these over every other document, which is free on a small PAN problem but
+    infeasible at real corpus scale. A random sample of the collection estimates the same two
+    moments to a standard error that is far below the resolution any threshold sweep can use. The
+    sample is shared across all rows and seeded, so the transform is deterministic.
     """
     from ..similarity.kernel import blocked_distances
 
@@ -271,11 +268,11 @@ def global_distance_moments(embeddings: np.ndarray, metric: str = "cosine",
     return mean, np.sqrt(np.maximum(total_square / count - mean ** 2, 0.0))
 
 
-#: Fraction of each tail :func:`winsor_bounds` clips, in percent. 0.1% of a ~50,000-edge graph is
-#: ~50 edges per side -- enough to be immune to a single outlier (the failure that ruled out plain
-#: min-max) while clipping far less than a 3-sigma rule does on a skewed variable. Measured on
-#: swe-chat, a 3-sigma clip takes 0.9% off cosine's NEAR tail, where the strongest same-author
-#: evidence lives; a quantile clips the same fraction whatever the skew.
+#: Fraction of each tail :func:`winsor_bounds` clips, in percent. Small enough to be immune to a
+#: single outlier (the failure that ruled out plain min-max) while clipping far less than a
+#: standard-deviation rule does on a skewed variable -- a quantile clips the same fraction of each
+#: tail whatever the skew, where a sigma-based clip eats disproportionately into whichever tail is
+#: shorter.
 WINSOR_PERCENTILE = 0.1
 
 def winsor_bounds(graph: NeighborGraph, seconds: np.ndarray | None
@@ -286,15 +283,11 @@ def winsor_bounds(graph: NeighborGraph, seconds: np.ndarray | None
 
     **Called per graph -- the collection under attack is bracketed by its own quantiles, not the
     tuning slice's.** Fixing the bracket on the tuning slice is the more obviously consistent
-    choice (the weight is selected under one scoring function and deployed with it) and it was the
-    first implementation, but it loses on both counts that were measured. A bracket clips at a
-    fixed *value*, so when the two slices' distributions move it puts real mass on the clip:
-    swe-chat's tuning slice ends at 372.9 h against the test collection's 643.5 h, which pinned
-    **14.4% of the test collection's time gaps** to exactly 1.0 -- not a tail but a seventh of the
-    edges collapsed into one tied value. Per-graph brackets removed that for +0.016 mean BCubed F
-    on ``all`` and +0.004 on ``unseen``, and **the selected weight did not change in any of the ten
-    (scope x algorithm) cells** -- the search runs on the tuning graph either way, so this changes
-    only how the winner is deployed.
+    choice (the weight is selected under one scoring function and deployed with it), but a bracket
+    clips at a fixed *value*, so when the two slices' distributions differ it can pin a large share
+    of the deployed collection's edges to one tied clip value instead of a genuine tail. Per-graph
+    brackets remove that failure without changing which weight the search selects, since the search
+    still runs on the tuning graph either way -- this only changes how the winner is deployed.
 
     It also matches what the rest of the package already does: :func:`~.algorithms.edge_quantile`
     sets every threshold from the quantiles of *the graph being clustered*. Reading no labels, only
@@ -379,24 +372,21 @@ def temporal_fusion(graph: NeighborGraph, seconds: np.ndarray | None, weight: fl
     the agglomerative methods accept it (``sklearn``'s ``distance_threshold`` refuses a negative
     radius) without an offset or a rank transform.
 
-    Two properties the earlier formulas lacked, in the order they were arrived at:
+    Two properties the earlier formula lacked, in the order they were arrived at:
 
     * **Bounded.** The original standardised each term (``z(d)``, ``z(log1p(hours))``), which put
-      roughly half the fused edges below zero and killed ``average_linkage`` and
-      ``componentwise_agglomerative`` outright -- and since the search raises when every
-      configuration fails, it took the whole cell with it, finished results included.
+      a large share of fused edges below zero and broke the agglomerative methods, whose distance
+      threshold cannot accept a negative radius.
     * **Equal range by construction.** Both terms span exactly ``[0, 1]``, so ``w`` means what it
-      says and the balance point (:func:`balanced_time_weight`) lands near 0.3 rather than having
-      to be discovered. An exponential CDF (``1 - exp(-x/s)``, the intermediate attempt) is bounded
-      too, but its spread depends on the shape of each variable, which is why it needed the balance
-      measured and why its grid sat in the wrong place.
+      says and the balance point (:func:`balanced_time_weight`) can be computed rather than
+      discovered by search. An exponential CDF (the intermediate attempt) is bounded too, but its
+      spread depends on the shape of each variable, so its balance point still had to be measured.
 
     The cost is ties: everything past a bound collapses to one value. That is deliberate and it
     lands where it can be afforded -- clipping a fixed *fraction* rather than a fixed number of
-    standard deviations is what keeps it off the near tail. A 3-sigma rule would take **0.9% off
-    cosine's near side**, where the strongest same-author evidence is, because candidate-edge
-    cosine distances are left-skewed (skew -0.63); the quantile clips 0.1% per side whatever the
-    skew.
+    standard deviations keeps it off the near tail, since candidate-edge cosine distances are
+    left-skewed and a sigma-based clip would eat into exactly the near side where the strongest
+    same-author evidence lives.
 
     **At ``weight = 0`` this is the pure-text attack, and it is still applied.** There is no
     short-circuit back to the raw cosine graph: ``w = 0`` is a value of the same formula, not a
@@ -408,22 +398,16 @@ def temporal_fusion(graph: NeighborGraph, seconds: np.ndarray | None, weight: fl
     For the three threshold methods that changes nothing: the map is monotone in ``d`` and a
     quantile threshold reads only the order. ``leiden`` and ``hdbscan`` do read magnitudes -- the
     first weights edges ``1 - d``, the second computes stabilities from ``1/d`` -- so for those two
-    it is a real change. Measured on swe-chat's ``plain`` runs, leiden **gains** (BCubed F 0.5331
-    raw cosine -> 0.5883 on ``all``, 0.7154 -> 0.7629 on ``unseen``) and hdbscan loses a little
-    (0.3307 -> 0.3272, 0.6926 -> 0.6793).
+    fusion is a real change rather than a relabelling.
 
     **Timing is attacker-visible metadata, not a leak.** An anonymised log carries timestamps; this
-    project already scores ``baseline_language_primary`` and ``baseline_model_owner`` as metadata
-    partitions for the same reason. What it changes is the *claim*: a result with ``weight > 0``
-    says writing style **and session structure** link a user, not style alone.
+    project already scores metadata partitions (language, model provider) for the same reason. What
+    it changes is the *claim*: a result with ``weight > 0`` says writing style **and session
+    structure** link a user, not style alone.
 
-    **What it is worth, and where it is not.** On swe-chat's ``all`` scope the fusion never hurts:
-    +0.000, +0.012, +0.114, +0.103, +0.014 BCubed F over the same run's ``w = 0`` arm across the
-    five algorithms. On ``unseen`` it is negative for every algorithm (mean -0.098), and that is a
-    **weight-selection** failure rather than a fusion one -- the tuning slice ranks the candidate
-    weights almost independently of the test collection (Spearman +0.057 over the grid, measured
-    across ten cells), and on ``unseen`` it picks 0.657 where the test optimum is near 0.05. Read
-    any ``unseen`` timing result with that in mind, and see :func:`balanced_time_weight`.
+    **The weight-selection tuning slice does not always transfer to the deployed collection**,
+    particularly for authors absent from the known side -- see :func:`balanced_time_weight` and read
+    an ``unseen``-scope timing result with that caveat in mind.
     """
     finite = np.isfinite(graph.distances)
     if not finite.any():

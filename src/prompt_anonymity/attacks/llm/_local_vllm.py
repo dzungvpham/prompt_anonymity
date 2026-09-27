@@ -1,30 +1,27 @@
 """A local vLLM judge behind the same interface as :class:`._openrouter.OpenRouterChat`.
 
-The listwise reranker (:mod:`.listwise_llm_rerank`) asks a judge to order five shortlisted authors
-and justify each position. This client runs that judge **locally** -- Qwen3.8-27B by default, the
-same checkpoint AFR's agent uses -- and is called the way AFR calls it
-(:meth:`prompt_anonymity.defenses.afr` ``_engine`` / ``chat_pairs``): one offline ``vllm.LLM``
-built lazily, then batched ``engine.chat(conversations, SamplingParams, use_tqdm=False)``. The
-attack cannot tell it from the API clients: ``complete`` / ``complete_batch`` / ``complete_stream``
-and the reply counters are the same.
+The listwise reranker (:mod:`.listwise_llm_rerank`) asks a judge to order shortlisted authors and
+justify each position. This client runs that judge **locally**, called the way AFR calls its own
+agent model: one offline ``vllm.LLM`` built lazily, then batched
+``engine.chat(conversations, SamplingParams, use_tqdm=False)``. The attack cannot tell it from the
+API clients -- ``complete`` / ``complete_batch`` / ``complete_stream`` and the reply counters match.
 
 Thinking is ON
 --------------
-AFR leaves the chat template's default alone; this judge asks for thinking explicitly with
-``chat_template_kwargs={"enable_thinking": True}`` (EmBad passes the same switch set to ``False``).
-The reply then carries the model's reasoning ahead of a ``</think>`` marker, and **only the text
-after it is returned** -- see :func:`split_thinking`. That is not cosmetic: the ranking parser slices
-from the first ``{`` to the last ``}``, so a brace anywhere in the thinking would corrupt the JSON.
+This judge asks for thinking explicitly with ``chat_template_kwargs={"enable_thinking": True}``.
+The reply carries the model's reasoning ahead of a ``</think>`` marker, and **only the text after it
+is returned** -- see :func:`split_thinking`. That matters because the ranking parser slices from the
+first ``{`` to the last ``}``, so a brace anywhere in the thinking would corrupt the JSON.
 
 Sampling follows Qwen's published thinking-mode settings (:data:`THINKING_SAMPLING`) rather than
-AFR's greedy decoding: greedy decoding with thinking on is prone to repetition loops that run to the
-token limit. Verdicts are cached by prompt text, so a re-run still reproduces what was judged.
+greedy decoding, which is prone to repetition loops with thinking on. Verdicts are cached by prompt
+text, so a re-run still reproduces what was judged.
 
-Serving knobs (environment, outside the cache key -- they change where the model runs, not what it
-is asked): ``RERANK_QWEN_GPU_MEM_UTIL`` (0.90; nothing else shares the card, unlike AFR's Harrier),
-``RERANK_QWEN_MAX_MODEL_LEN`` (32768), ``RERANK_QWEN_MAX_NUM_SEQS`` (128 -- **required** for this
-hybrid Mamba/attention checkpoint, whose default of 256 does not start; see ``afr.AFR_MAX_NUM_SEQS``),
-``RERANK_QWEN_CHUNK`` (prompts per ``chat()`` call in :meth:`LocalVLLMChat.complete_stream`).
+Serving knobs live in the environment, outside the cache key (they change where the model runs, not
+what it is asked): ``RERANK_QWEN_GPU_MEM_UTIL``, ``RERANK_QWEN_MAX_MODEL_LEN``,
+``RERANK_QWEN_MAX_NUM_SEQS`` (this hybrid Mamba/attention checkpoint needs a smaller value than the
+default to start), ``RERANK_QWEN_CHUNK`` (prompts per ``chat()`` call in
+:meth:`LocalVLLMChat.complete_stream`).
 
 ``vllm``/``torch`` are imported lazily, so importing this module costs nothing.
 """

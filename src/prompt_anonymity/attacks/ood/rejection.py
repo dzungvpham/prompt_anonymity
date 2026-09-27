@@ -8,7 +8,7 @@ contains the evidence, if it is read the right way.
 The catch is that raw scores are not comparable across documents. A short, generic document
 scores low against *every* candidate and a distinctive one scores high against all of them, so
 thresholding a raw maximum mostly measures document length. Normalising within a document
-(:func:`cohort_normalize`) fixes that, and is worth about 0.09 of DIR@10% on swe-chat.
+(:func:`cohort_normalize`) fixes that.
 
 Score the resulting decision with :mod:`prompt_anonymity.evaluation.metrics.detection`.
 """
@@ -26,16 +26,13 @@ def _cohort_statistics(scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     ``run_experiment.py --language-aware``, which drops authors who never wrote in the
     document's language -- marks the authors a document was never allowed to match by scoring
     them ``-inf``. Those entries are excluded from both statistics instead of dragging the mean
-    to ``-inf``, so a document's cohort is the set of authors it actually competed over. With no
-    filter every entry is finite and this is the plain per-row mean and standard deviation.
+    to ``-inf``, so a document's cohort is the set of authors it actually competed over.
 
-    Computed in row blocks for the same reason as
-    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence`: the direct expression needs a full
-    float64 copy of the score matrix -- 8 GB at 50,000 documents against 20,000 authors -- to
-    return two numbers per document.
+    Computed in row blocks to avoid a full float64 copy of the score matrix, the same reason as
+    :func:`prompt_anonymity.evaluation.metrics.max_softmax_confidence`.
 
-    A document with *no* eligible candidate at all yields ``nan`` for both (and numpy's
-    all-NaN-slice warning); callers are expected to guarantee at least one candidate per row.
+    A document with *no* eligible candidate at all yields ``nan`` for both; callers are expected
+    to guarantee at least one candidate per row.
     """
     mean = np.empty(len(scores))
     deviation = np.empty(len(scores))
@@ -130,10 +127,9 @@ class LearnedRejector:
     Fitted entirely on known documents; ``score`` returns P(out-of-set).
 
     .. note::
-       Kept as a **documented negative result**, not a recommendation. On swe-chat it overfits
-       the simulation and loses to the plain cohort-normalised score (DIR@10% 0.055 vs 0.106):
-       the shape of an out-of-set score vector differs between a simulation with 83 candidate
-       authors and a real window with 124, and the extra parameters latch onto that difference.
+       Kept as a **documented negative result**, not a recommendation: it tends to overfit the
+       simulation and lose to the plain cohort-normalised score, since the shape of an
+       out-of-set score vector differs between the simulation and a real window of different size.
     """
 
     def __init__(self, C: float = 1.0):

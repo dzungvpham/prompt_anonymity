@@ -8,31 +8,15 @@ Why the sklearn path stops working
 ----------------------------------
 ``LogisticRegression``'s multinomial loss materialises the full ``[n_documents x n_authors]``
 matrix of logits **and** the matrix of probabilities, both in float64, on every lbfgs iteration.
-That is fine at swe-chat's 124 authors and fatal at WildChat's:
-
-===============  ==========  ==========  =================  ==========================
-known config     documents   authors     logit matrix       measured / projected fit
-===============  ==========  ==========  =================  ==========================
-swe-chat 0075    3,250       124         3 MB               2 s
-wildchat 0025    43,127      7,456       2.6 GB             ~30 min, ~8 GB peak
-wildchat 0075    129,382     19,711      20.4 GB            ~4 h, >40 GB peak
-===============  ==========  ==========  =================  ==========================
-
-The 20.4 GB is one array of two that are live at once, against a 16 GB job cap, so the largest
-configuration does not merely run slowly -- it cannot run at all. Measured scaling behind the
-projection, on wildchat StyloMetrix with the author pool subsampled: 26 s at 250 authors, 34 s at
-500, 64 s at 1,000, 158 s at 2,000, i.e. the per-iteration cost tracks ``n_documents x n_authors``
-once the fixed overhead is paid, and both factors grow together as the known side widens.
+That's affordable with a small author pool but grows with both document and author count until it
+exceeds memory outright on a corpus with tens of thousands of authors.
 
 What this does instead
 ----------------------
-Minibatching bounds the logit matrix at ``[batch_size x n_authors]`` regardless of corpus size --
-646 MB at the default 8,192 rows against 19,711 authors, in float32 -- and puts the two matrix
-products (``X W`` forward, ``X^T dZ`` backward) somewhere they are cheap. On one A100 the whole
-fit is a couple of minutes where lbfgs projects to hours, because 2 TFLOP per epoch is a few
-tenths of a second of tensor-core time and nothing about the shape is awkward for a GPU: the
-weight matrix is ``[n_features + 1 x n_authors]``, 15 MB at WildChat's largest pool, so the model
-and its optimiser state fit in a corner of any card.
+Minibatching bounds the logit matrix at ``[batch_size x n_authors]`` regardless of corpus size,
+and puts the two matrix products (``X W`` forward, ``X^T dZ`` backward) on a GPU where that shape
+is cheap. The weight matrix itself is small enough to fit on any card even at a very large author
+pool, so only the per-batch logits need bounding.
 
 The objective is written to be the *same function* sklearn minimises, so ``C`` means what it means
 there and :data:`~run_experiment.HYPERPARAMETER_SPACES` transfers unchanged::
@@ -41,9 +25,9 @@ there and :data:`~run_experiment.HYPERPARAMETER_SPACES` transfers unchanged::
 
 with the intercept unregularised, and ``weight_i`` from ``class_weight="balanced"`` as
 ``n_documents / (n_authors * count(y_i))``. It is optimised rather than solved, so it lands *near*
-sklearn's optimum rather than on it -- see :meth:`MinibatchLogisticAttribution.fit` for the
-measured agreement and for why this is registered under a name of its own rather than swapped in
-behind ``logistic``.
+sklearn's optimum rather than on it -- see :meth:`MinibatchLogisticAttribution.fit` and the note in
+:class:`MinibatchLogisticAttribution` on why this is registered under a name of its own rather
+than swapped in behind ``logistic``.
 """
 
 from __future__ import annotations
@@ -53,8 +37,7 @@ from contextlib import contextmanager
 import numpy as np
 
 #: Rows scored per pass in :meth:`MinibatchLogisticAttribution.score`. Bounds the device-side
-#: logit block (rows x n_authors x 4 B, 646 MB at the default against 19,711 authors); the output
-#: matrix is preallocated whole on the host, because that one is the caller's documented cost.
+#: logit block; the output matrix is preallocated whole on the host instead.
 SCORE_ROW_BATCH = 8192
 
 
@@ -87,10 +70,8 @@ class MinibatchLogisticAttribution:
         document counts in as the informative prior they partly are.
     steps
         Total gradient steps. **The budget is in steps rather than epochs**, and that is not
-        cosmetic: an epoch is one step on swe-chat (2,992 known documents, under a single batch)
-        and sixteen on WildChat's largest known side, so an epoch budget silently means two
-        different amounts of optimisation on the two corpora -- measured, 60 "epochs" reproduced
-        the exact fit's predictions 78.8% of the time on swe-chat against 98.5% at 300 steps.
+        cosmetic: what an "epoch" means depends on corpus size relative to the batch size, so an
+        epoch budget would silently spend a different amount of optimisation on different corpora.
         A fit costs ``steps x batch_size x n_features x n_authors`` and nothing else, so this is
         also the only dial that changes what a fit costs.
     batch_size
@@ -104,20 +85,15 @@ class MinibatchLogisticAttribution:
         large for the wide columns and far too small for the narrow ones.
     device
         ``"auto"`` (default) uses CUDA when a device is visible, else the CPU. The CPU path works
-        and is what the swe-chat validation below was run on; it is roughly two orders of
-        magnitude slower on a WildChat-sized pool.
+        but is substantially slower on a large author pool.
     tf32
-        Let CUDA run the two matrix products on Ampere-or-later tensor cores (default: on).
-        **This is the single largest speed lever here**, because a fit is essentially one matmul
-        chain and nothing else: PyTorch ships with ``allow_tf32 = False`` for matmul, which leaves
-        those units idle -- ~4.5 fp32 TFLOPS against ~9 TF32 on an A16, and 19.5 against 156 on an
-        A100. It costs mantissa bits (10 against 23), which is why it is a named parameter rather
-        than something switched on silently -- but measured on WildChat's ``known0075`` (129,382
-        documents, 19,711 authors, one A16) it is **1.47x faster** (217.5 s -> 147.7 s) and the
-        numbers do not move: top-1 0.1440 against 0.1441, **99.91% identical predictions**, final
-        loss agreeing to four significant figures. Hence the default. Ignored on the CPU, and set
-        and restored around the fit rather than left mutated, since it is process-global state
-        this class does not own.
+        Let CUDA run the two matrix products on Ampere-or-later tensor cores (default: on). This
+        is the single largest speed lever here, since a fit is essentially one matmul chain and
+        nothing else, and PyTorch otherwise leaves those units idle. It costs mantissa bits, which
+        is why it is a named parameter rather than something switched on silently, but the loss of
+        precision does not move the fitted model's predictions in practice. Ignored on the CPU,
+        and set and restored around the fit rather than left mutated, since it is process-global
+        state this class does not own.
     seed
         Seeds the minibatch shuffling.
     """
@@ -164,25 +140,13 @@ class MinibatchLogisticAttribution:
     def fit(self, embeddings, labels):
         """Fit the softmax over the known authors.
 
-        **Measured agreement with the exact fit**, swe-chat / StyloMetrix / standardized, both
-        attacks run through ``run_experiment.py`` at matched settings, over all six known
-        configurations: closed-set top-1 within **0.002** everywhere (0.2564 against 0.2576 at
-        ``known0075``, 0.3965 against 0.3965 at ``known5075``) and out-of-set detection AUROC
-        within **0.011**. At the estimator level on ``known0075``, identical top-1 to four
-        decimals from 300 steps upward, agreeing with lbfgs on 98.5% of individual predictions at
-        300 steps and 99.3% at 1,000, against lbfgs's 28.4 s. The residual disagreement is
-        documents whose top two authors are near-tied and does not shrink with a longer budget:
-        10,000 steps agrees no better than 1,000. Insensitive to ``learning_rate`` over 0.02-0.1,
-        all three landing on the same top-1 and the same final loss to four decimals.
+        Agrees closely with the exact (lbfgs) fit on corpora small enough to run both, both in
+        closed-set accuracy and in out-of-set detection AUROC; residual disagreement is
+        concentrated in documents whose top two authors are near-tied, and does not shrink with a
+        longer step budget past a point.
 
-        **``C`` is the one setting that does matter, and the default is not the best value.**
-        Swept on WildChat ``known0075`` (19,711 authors): top-1 runs 0.0977 at C = 0.002, 0.1231
-        at 0.01, 0.1394 at 0.05, **0.1440 at 0.2**, 0.1387 at the C = 1.0 default and 0.1322 at
-        5.0 -- a clean unimodal curve whose peak sits below 1.0, the same direction the search
-        picks for :class:`LogisticAttribution` on swe-chat (C = 0.11 in four of six
-        configurations, never 1.0). The default costs ~0.005 of top-1 there, so an untuned run is
-        a mild floor rather than a wrong answer. Note 0.1440 is an *oracle* figure, read off the
-        test set; ``--tune`` picks on the known side and can only do as well or worse.
+        ``C`` is the one setting that matters most and the default is not necessarily the best
+        value for a given corpus -- it is worth tuning (``--tune``) rather than trusted as-is.
         """
         torch = self._torch()
         device = self._resolve_device(torch)
@@ -241,9 +205,8 @@ class MinibatchLogisticAttribution:
     def score(self, embeddings):
         """Author logits for each document, ``[n_documents x n_authors]`` float32 on the host.
 
-        Built in row blocks straight into a preallocated host array. The result is the caller's
-        documented memory cost -- 3.4 GB at WildChat's largest configuration -- and there is no
-        reason for a second copy of it to exist on the device at the same time.
+        Built in row blocks straight into a preallocated host array, so there is never a second
+        full copy of the score matrix live on the device at the same time.
         """
         torch = self._torch()
         embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)

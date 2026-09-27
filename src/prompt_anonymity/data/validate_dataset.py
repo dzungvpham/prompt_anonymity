@@ -29,12 +29,10 @@ from .sources_swe_chat import HUMAN_TURN_MAX_LEN, is_scaffolding_turn
 # explicit list of the files this module expects to find.
 SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat", "sharechat")}
 
-#: source -> the value its ``source`` **column** holds, which is *not* always the source's name:
-#: ``swe_chat`` is stored as ``"swe-chat"``. That string is data rather than a name --
-#: :func:`~prompt_anonymity.data.identity.hash_author_id` hashes it into every ``author_id`` and
-#: prefixes it there (``swe-chat-<16 hex>``) -- so it did not follow the rename of the CLI/split
-#: spelling, and respelling it now would change every id in the published dataset. The two checks
-#: below therefore compare the column against *this*, not against the key.
+#: source -> the value its ``source`` **column** holds, which is not always the source's name:
+#: ``swe_chat`` is stored as ``"swe-chat"``, hashed into every ``author_id``
+#: (:func:`~prompt_anonymity.data.identity.hash_author_id`), so respelling it would change every
+#: published id. The checks below compare the column against this, not against the key.
 SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat", "sharechat": "sharechat"}
 EXPECTED_COLUMNS = [
     "doc_id", "source", "author_id",
@@ -178,10 +176,8 @@ def main(dist: str | Path | None = None) -> int:
           longest_swe < HUMAN_TURN_MAX_LEN, f"longest={longest_swe}")
 
     # ShareChat anti-leak invariant: ShareChat was de-identified upstream with Presidio, whose
-    # <REDACTED> / <DATE_TIME> markers no other corpus carries -- so a survivor would be a literal
-    # string that separates this split from the other two. That matters more here than anywhere
-    # else, because ShareChat is the out-of-set pool an open-set detector is scored against: it
-    # would be detecting the corpus, not a stranger. See sources_sharechat.strip_upstream_redactions.
+    # <REDACTED>/<DATE_TIME> markers no other corpus carries, so a survivor would let a detector
+    # separate this split from the others by a literal string rather than by content.
     share_turns = "\n".join(joined[df["source"] == "sharechat"])
     for token in UPSTREAM_REDACTION_TOKENS:
         check(f"ShareChat: no upstream {token} markers survive", token not in share_turns)

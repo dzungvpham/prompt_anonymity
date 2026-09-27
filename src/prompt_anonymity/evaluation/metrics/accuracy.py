@@ -3,12 +3,11 @@
 These stateless metrics consume the distance matrix produced by an attack (e.g.
 :class:`prompt_anonymity.attacks.NearestNeighbor`) together with the identity
 labels of the known and unknown conversations, and report how often the attack
-re-identifies the correct user. They reproduce the ``conv_acc``, ``id_acc`` and
-``random_id`` quantities computed in the WildChat and SWE-chat analyses.
+re-identifies the correct user.
 
-For repeated evaluation on many sub-pools of candidate users (e.g. a pool-size sweep),
-prefer :class:`prompt_anonymity.evaluation.LinkageRanking`, which ranks once and reuses
-the ranking instead of re-sorting on every call.
+For repeated evaluation on many sub-pools of candidate users, prefer
+:class:`prompt_anonymity.evaluation.LinkageRanking`, which ranks once and reuses the ranking
+instead of re-sorting on every call.
 
 Glossary
 --------

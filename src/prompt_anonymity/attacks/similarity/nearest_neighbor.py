@@ -14,11 +14,11 @@ class NearestNeighbor:
     Note what the author-level aggregation buys: ranking *authors* by their nearest document is
     exactly the ranking :class:`~prompt_anonymity.evaluation.LinkageRanking` already derives for
     ``id_acc``, but it also makes ``conv_acc`` mean "the true author is among the top k
-    **authors**" rather than "among the authors of the top k **documents**". The latter is a
-    harder question at the same k -- the 5 nearest documents cover only ~4 distinct authors on
-    swe-chat, and the 10 nearest only ~7 -- so this aggregation is what makes top-k comparable
-    across methods, and it is why the LLM rerankers in :mod:`prompt_anonymity.attacks.llm`
-    shortlist authors through this class rather than shortlisting documents directly.
+    **authors**" rather than "among the authors of the top k **documents**" -- a harder question
+    at the same k, since the nearest documents tend to repeat authors. This aggregation is what
+    makes top-k comparable across methods, and it is why the LLM rerankers in
+    :mod:`prompt_anonymity.attacks.llm` shortlist authors through this class rather than
+    shortlisting documents directly.
 
     ``linkage="max"`` (the default, meaning maximum similarity / minimum distance) is the
     nearest-neighbour attack proper; ``"mean"`` averages over all of an author's documents.
@@ -34,13 +34,8 @@ class NearestNeighbor:
 
     * **The per-author reduction is one pass, not a Python loop.** :meth:`fit` groups the known
       side by author so ``ufunc.reduceat`` aggregates every author in a single sweep of each
-      block. The loop it replaces rebuilt an ``n_known`` boolean mask once per author -- 15,000
-      times over at the scales this now runs at.
+      block, instead of rebuilding a boolean mask per author.
     * **Mean linkage never touches the blocks at all** (see :meth:`fit`).
-
-    End to end at 50,000 unknown x 100,000 known x 3,072 dimensions over 15,000 authors: about
-    two minutes on 36 CPU cores for ``linkage="max"`` and 13 seconds for ``linkage="mean"``,
-    against roughly four hours for the ``cdist`` formulation this replaced.
     """
 
     name = "nearest_neighbor"
@@ -70,15 +65,11 @@ class NearestNeighbor:
 
         if self._uses_cosine and self.linkage == "mean":
             # Cosine distance is affine in the second vector, so averaging it over an author's
-            # documents commutes with the dot product:
-            #     mean_j (1 - x.y_j) = 1 - x.(mean_j y_j)
-            # One centroid per author therefore reproduces mean linkage *exactly* while shrinking
-            # the known side from n_known vectors to n_authors.
+            # documents commutes with the dot product: one centroid per author reproduces mean
+            # linkage exactly while shrinking the known side to n_authors vectors.
             #
-            # The centroid is deliberately left un-normalised, which is the whole difference from
-            # CentroidCosine: its length records how tightly the author's documents cluster, so a
-            # diffuse author is penalised. Re-normalising here would change the top-1 pick on a
-            # non-trivial fraction of documents.
+            # The centroid is deliberately left un-normalised -- unlike CentroidCosine, its length
+            # records how tightly the author's documents cluster, penalising a diffuse author.
             known_unit = unit_rows(self._known)
             self._centroids = (np.add.reduceat(known_unit, self._starts, axis=0)
                                / self._counts[:, None])

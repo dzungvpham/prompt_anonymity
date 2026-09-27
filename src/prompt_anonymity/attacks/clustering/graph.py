@@ -1,22 +1,19 @@
 """The k-nearest-neighbour graph every clustering attack is built on.
 
 A clustering attack has to compare a document against *every other document*, not against a few
-thousand author summaries, so the pairwise matrix it would like to hold is ``n x n``: 1.9 billion
-entries on WildChat's 43,127-document test quarter, 7.4 GB at float32 and 14.8 at float64, against
-a 16 GB job cap. Nothing in this package ever materialises it.
+thousand author summaries, so the pairwise matrix it would like to hold is ``n x n`` -- too large
+to fit in memory at real corpus scale. Nothing in this package ever materialises it.
 
 Instead each document keeps only its ``k`` nearest neighbours, which is all any of the clustering
 algorithms actually reads -- HDBSCAN needs core distances and a minimum spanning tree, Leiden
 needs a graph, agglomerative linkage needs a connectivity structure. The full matrix is streamed
 one row block at a time through
-:func:`~prompt_anonymity.attacks.similarity.kernel.blocked_distances` (the project's one distance
-implementation, BLAS-backed and ~150x faster than ``cdist`` on cosine) and each block is reduced
-to its top ``k`` and dropped.
+:func:`~prompt_anonymity.attacks.similarity.kernel.blocked_distances` (the project's one BLAS-backed
+distance implementation) and each block is reduced to its top ``k`` and dropped.
 
 **The neighbours are exact, not approximate.** An ANN index would trade recall for time, and a
 missed neighbour is a false negative in precisely the hard cases that separate one clustering
-method from another. Measured cost of doing it exactly, on this machine's login node with no GPU:
-19 s for k=50 over 43,127 x 196 StyloMetrix vectors.
+method from another.
 
 **Choosing k is a real experimental parameter, not an implementation detail.** It caps what any
 graph-based method can link: two documents that are not neighbours can only ever be co-clustered

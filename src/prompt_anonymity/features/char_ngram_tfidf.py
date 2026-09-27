@@ -1,49 +1,34 @@
 """Character n-gram TF-IDF, fitted on the attacker's known side and nowhere else.
 
-Character n-grams are the long-standing workhorse of authorship attribution: they capture
-sub-word habits -- spelling, punctuation, spacing, casing, morphology -- that word- and POS-level
-features miss. The closest precedent at this project's scale is Koppel, Schler & Argamon,
-"Authorship attribution in the wild" (LRE 2011): character 4-grams, TF-IDF weighting and cosine
-similarity over ~10,000 blog authors, with no dimensionality reduction. This is that
+Character n-grams capture sub-word habits -- spelling, punctuation, spacing, casing, morphology --
+that word- and POS-level features miss. This follows Koppel, Schler & Argamon's "Authorship
+attribution in the wild" (LRE 2011): character 4-grams, TF-IDF weighting, cosine similarity, no
+dimensionality reduction.
+
+**Why this is not a** :class:`~prompt_anonymity.features.base.Featurizer`. Every other feature is
+a per-document function, computed once offline into a parquet. TF-IDF is *fitted*: which n-grams
+are kept and how each is weighted are statistics of a corpus, so fitting on the whole split would
+let held-out test documents shape the feature space the attacker compares them in. Instead
+``experiments/run_experiment.py`` fits it **per known configuration**, on that configuration's
+known documents only (and again per tuning fold), so no scored document influences its own
 representation.
 
-**Why this is not a** :class:`~prompt_anonymity.features.base.Featurizer`. Every other feature
-is a per-document function, so it is computed once, offline, into a parquet the runner reads.
-TF-IDF is *fitted*: which n-grams are kept and how each is weighted are statistics of a corpus.
-Fitting them on the whole split -- which is what the earlier SVD-based featurizer did -- lets the
-held-out test documents shape the feature space the attacker compares them in. Here the fit is
-done by ``experiments/run_experiment.py`` **per known configuration**, on that configuration's
-known documents only, and again on each tuning fold's training block, so no document the attack
-is scored on influences its own representation.
+The work splits in two so the fitted part stays cheap to repeat:
 
-The work is split in two so that the fitted part is cheap enough to repeat that often:
+1. :meth:`CharNgramTfidf.count` -- raw counts of every distinct character n-gram, computed once
+   per run; a document's count depends only on itself.
+2. :class:`KnownSideTfidf` -- the fitted part: keep the ``max_features`` most frequent n-grams
+   *on the fitted rows*, weight by IDF over those rows, L2-normalise.
 
-1. :meth:`CharNgramTfidf.count` -- **raw counts** of every distinct character n-gram in every
-   document, computed once per run. A count depends on its own document only.
-2. :class:`KnownSideTfidf` -- the fitted part: keep the ``max_features`` n-grams most frequent
-   *on the rows it is fitted on*, weight them by inverse document frequency over those rows, and
-   L2-normalise each document. A column slice and two vector products on a sparse matrix.
+The count vocabulary spans the whole split, which is not a leak: an n-gram absent from the known
+side has known-side frequency zero and can never be selected or weighted.
 
-The count vocabulary does span the whole split, and that is not a leak: an n-gram seen only in
-unknown documents has a known-side frequency of zero, so it can never be selected and never
-receives a weight. Selecting from the whole split's vocabulary is therefore exactly equivalent to
-fitting ``sklearn.feature_extraction.text.TfidfVectorizer(analyzer="char", ngram_range=(n, n),
-lowercase=False, max_features=...)`` on the known documents and transforming the rest (up to the
-order of n-grams tied at the ``max_features`` boundary, which sklearn does not fix either).
-
-Choices worth knowing before comparing numbers:
-
-* ``analyzer="char"``, not ``"char_wb"``: n-grams run across word boundaries, so spacing and
-  punctuation between words (``", th"``, ``") {"``) are features. They are much of the stylistic
-  signal, and ``char_wb`` pads each word with spaces and cannot see them.
-* **Case is kept** (``lowercase=False``): capitalisation is a writing habit, not noise.
-* **No SVD.** A projection keeps the directions of largest variance, which are largely topic, and
-  can discard exactly the rare-but-idiosyncratic n-grams that identify a writer.
-* **Rows are L2-normalised**, sklearn's TF-IDF default. It makes every document count equally in
-  an author centroid and keeps long documents from dominating a fit.
-* The output is **already scaled**, so the runner does not z-score it: a per-column z-score
-  divides every column by its own spread, which cancels the IDF weighting outright (IDF *is* a
-  per-column scale). See ``run_experiment.py``'s ``--standardize``.
+Notable choices: ``analyzer="char"`` (not ``"char_wb"``) so n-grams run across word boundaries,
+capturing inter-word spacing/punctuation; case is kept (capitalisation is a writing habit, not
+noise); no SVD, since a variance-maximizing projection tends to discard the rare, idiosyncratic
+n-grams that identify a writer; rows are L2-normalised. The output is **already scaled**, so the
+runner must not z-score it -- a per-column z-score would cancel the IDF weighting (see
+``run_experiment.py``'s ``--standardize``).
 """
 
 from __future__ import annotations
@@ -58,14 +43,11 @@ from sklearn.preprocessing import normalize
 class KnownSideTfidf(BaseEstimator, TransformerMixin):
     """TF-IDF over a precomputed n-gram count matrix, fitted only on the rows given to :meth:`fit`.
 
-    ``max_features`` columns are kept -- the n-grams with the largest total count over the fitted
-    rows, which is the selection rule of sklearn's ``TfidfVectorizer(max_features=...)``. Each is
-    weighted by sklearn's smoothed inverse document frequency, ``ln((1 + n) / (1 + df)) + 1``,
-    over the same rows; raw counts are the term frequency. :meth:`transform` returns a dense
-    ``float32`` ``[n_documents x max_features]`` array with unit-L2 rows (a document containing
-    none of the kept n-grams stays all zero).
+    Keeps the ``max_features`` n-grams with the largest total count over the fitted rows, weighted
+    by smoothed IDF over those rows. :meth:`transform` returns a dense ``float32``
+    ``[n_documents x max_features]`` array with unit-L2 rows.
 
-    Being a plain sklearn transformer, a fresh copy can be fitted per tuning fold with
+    A plain sklearn transformer, so a fresh copy can be fitted per tuning fold with
     :func:`sklearn.base.clone`.
     """
 
@@ -77,8 +59,7 @@ class KnownSideTfidf(BaseEstimator, TransformerMixin):
         counts = sp.csr_matrix(counts)
         total_counts = np.asarray(counts.sum(axis=0)).ravel()
         present = np.flatnonzero(total_counts)
-        # Most frequent first; a stable sort breaks ties by column index, so a refit on the same
-        # rows always keeps the same columns.
+        # Stable sort so a refit on the same rows always keeps the same columns.
         order = present[np.argsort(-total_counts[present], kind="stable")]
         self.columns_ = np.sort(order[:self.max_features])
         kept = counts[:, self.columns_]

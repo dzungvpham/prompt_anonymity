@@ -1,33 +1,27 @@
 """Claude on Microsoft Foundry, behind the same interface as :class:`._openrouter.OpenRouterChat`.
 
-The listwise Sonnet reranker (:mod:`.listwise_llm_rerank`) was built on OpenRouter, but the project's
-Sonnet 5 access is a **Foundry deployment** reached through the Anthropic SDK's
+The project's Sonnet 5 access is a **Foundry deployment** reached through the Anthropic SDK's
 :class:`~anthropic.AnthropicFoundry` client. :class:`FoundryChat` subclasses ``OpenRouterChat`` and
 replaces only the transport -- the constructor and :meth:`FoundryChat.complete` -- so the thread
-pool, the streaming generator the verdict cache consumes, and the cost/reasoning counters are all
-inherited unchanged. The attack cannot tell the two clients apart.
+pool, streaming and cost/reasoning counters are all inherited unchanged.
 
 Reasoning
 ---------
 Sonnet 5 reasons through **adaptive thinking**: ``thinking={"type": "adaptive"}`` plus
 ``output_config={"effort": ...}``. A fixed ``budget_tokens`` and the sampling controls
-(``temperature``/``top_p``) are rejected with a 400, so neither is sent. Thinking arrives as
-``thinking`` blocks in the response content -- with empty text by default, since the display mode
-defaults to omitted, but the blocks are there -- and that is what the reasoning counter counts. The
-API reports no separate thinking-token figure, so ``total_reasoning_tokens`` stays 0 here; the
-evidence is the block count.
+(``temperature``/``top_p``) are rejected with a 400, so neither is sent. The API reports no
+separate thinking-token figure, so ``total_reasoning_tokens`` stays 0; the reasoning counter
+instead tracks whether a ``thinking`` block appeared at all.
 
 Thinking and the visible answer share ``max_tokens``. A reply cut off there parses as nothing and
-silently degrades that row to the distance order, so the caller should budget generously (you pay
-only for tokens produced) and :attr:`FoundryChat.n_truncated` records every one that still hits it.
+silently degrades that row to the distance order, so budget generously and watch
+:attr:`FoundryChat.n_truncated`.
 
 Credentials
 -----------
 :data:`FOUNDRY_API_KEY_ENV` and :data:`FOUNDRY_ENDPOINT_ENV`, from the environment or the project's
-``.env``. **Both are required**: with the key alone the SDK would post an Azure key to Anthropic's own
-API and fail in a way that reads like a bad key rather than a misrouted request (the lesson recorded
-beside :class:`prompt_anonymity.defenses.embad.HostedMutator`, the other Foundry caller, whose
-credential lookup this one copies).
+``.env``. **Both are required**: with the key alone the SDK would post an Azure key to Anthropic's
+own API and fail in a way that reads like a bad key rather than a misrouted request.
 
 ``anthropic`` and ``python-dotenv`` are imported lazily, so importing this module costs nothing.
 """
@@ -50,10 +44,9 @@ FOUNDRY_ENDPOINT_ENV = "FOUNDRY_ENDPOINT"
 #: not an Anthropic model id** -- on Foundry the ``model`` field names the deployment.
 DEFAULT_FOUNDRY_MODEL = "claude-sonnet-5-2"
 
-#: Dollars per million (input, output) tokens. Claude on Microsoft Foundry bills at standard
-#: Anthropic API rates; same figures as ``embad.HOSTED_MUTATOR_RATES``. Hardcoded and able to go
-#: stale -- tokens are the record, dollars are derived -- and a deployment missing from this table
-#: reports ``nan`` rather than a confident zero.
+#: Dollars per million (input, output) tokens, standard Anthropic API rates. Hardcoded and able to
+#: go stale -- tokens are the record, dollars are derived -- and a deployment missing from this
+#: table reports ``nan`` rather than a confident zero.
 FOUNDRY_RATES = {
     "claude-sonnet-5-2": (2.00, 10.00),
     "claude-sonnet-5": (2.00, 10.00),

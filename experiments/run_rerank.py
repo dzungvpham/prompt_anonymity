@@ -38,9 +38,9 @@ style says so in it, and no aggregate will.
 
 Cost
 ----
-The LLM arm is real money: roughly $0.01-0.015 per unknown document at ``--top-k 10``, half that at
-5. Verdicts are cached by prompt text, so start with a small ``--limit``, read the reasons, and
-raise it once the rubric looks right -- re-running only judges what is new. ``--no-wait`` submits
+The LLM arm is real money. Verdicts are cached by prompt text, so start with a small ``--limit``,
+read the reasons, and raise it once the rubric looks right -- re-running only judges what is new.
+``--no-wait`` submits
 the batches and stops, which is what a login node wants: re-run the same command tomorrow to
 collect, resuming the same batches rather than paying for them twice.
 
@@ -164,10 +164,10 @@ def parse_args() -> argparse.Namespace:
 def document_texts(source: str, data_dir, defense: str | None, doc_ids, max_chars: int) -> np.ndarray:
     """Conversation text for ``doc_ids``, truncated to ``max_chars`` as it is read.
 
-    ``turns`` is ~98% of the WildChat parquet -- several GiB once pandas has turned it into Python
-    strings -- and a reranker reads the first few hundred characters of each document and nothing
-    else. Truncating on the way in is therefore the difference between a few hundred MB and a job
-    the scheduler kills, and it costs nothing: the attacks slice to ``snippet_chars`` anyway.
+    ``turns`` is most of the parquet once pandas has turned it into Python strings, while a
+    reranker reads only the first few hundred characters of each document. Truncating on the way
+    in avoids materializing the rest, and costs nothing: the attacks slice to ``snippet_chars``
+    anyway.
 
     Positions are row indices into the *split parquet*, while the frame the caller holds has been
     filtered, sorted and re-indexed, so the mapping is rebuilt here from the same file the text is
@@ -229,9 +229,7 @@ def shortlist_ceiling(detail: pd.DataFrame, ranks, base_ranks, in_set, top_k: in
     **ties**. A true author tied with two others around position ``top_k`` gets an averaged rank of
     exactly ``top_k`` and counts as a baseline hit, while ``argpartition`` can only shortlist some of
     the tied authors -- and if it leaves the true one out, the rerank correctly pushes it below the
-    shortlist. That once failed a whole SWE-chat run on one document (0.719 vs 0.720), with the
-    fold-back doing exactly what it should. Such rows are counted as ``n_boundary_ties`` rather
-    than treated as a leak.
+    shortlist. Such rows are counted as ``n_boundary_ties`` rather than treated as a leak.
 
     Returns ``(ceiling, n_boundary_ties, n_violations)``: the top-``top_k`` accuracy the rerank must
     equal, the rows where ties made the baseline differ from the shortlist, and the rows that

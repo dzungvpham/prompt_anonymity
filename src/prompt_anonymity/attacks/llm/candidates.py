@@ -10,9 +10,8 @@ The question being asked is "who wrote this?", so the candidate set has to be a 
 Taking the k nearest *conversations* instead answers a different question and answers it badly:
 
 * **The shortlist silently shrinks.** One prolific author can own many of the k nearest
-  documents, so a k-document shortlist covers fewer than k candidates -- measured on swe-chat,
-  the 5 nearest documents cover ~4 distinct authors and the 10 nearest only ~7. The judge is
-  handed duplicates of the same person instead of alternatives.
+  documents, so a k-document shortlist covers fewer than k candidates. The judge is handed
+  duplicates of the same person instead of alternatives.
 * **The judge's ballot does not match the metric being reported.** Top-k accuracy is scored over
   authors, so a document shortlist makes the reranker optimise one thing and the metric measure
   another.

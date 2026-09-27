@@ -35,7 +35,7 @@ half that reads what the build wrote. One subpackage each:
     it hid. Driven by ``experiments/eval_utility.py``.
 
     Absorbed the former top-level ``prompt_anonymity.metrics`` and ``prompt_anonymity.utility``
-    packages on 2026-08-11; those paths no longer exist.
+    packages; those paths no longer exist.
 
 :class:`prompt_anonymity.core.AttackData` is the hand-off object between a defense and the text
 it rewrites; it is what ``data.apply_defenses`` hands each defense.

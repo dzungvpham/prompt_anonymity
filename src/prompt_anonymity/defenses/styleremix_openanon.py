@@ -2,27 +2,23 @@
 
 Chains the two rewrite backends into one defense: StyleRemix restyles every prompt toward the fixed
 :data:`~prompt_anonymity.defenses.styleremix.STYLEREMIX_SLIDERS` target style, then the
-OpenAnonymity scrubber redacts identifiers and de-identifies residual style. Both stages run PER
-TURN. Order rationale: style-convergence first, identifier redaction LAST, so OA's
-``[PERSON_1]``/``[ORG_1]`` placeholders survive intact rather than being reworded by StyleRemix.
+OpenAnonymity scrubber redacts identifiers and de-identifies residual style, both per turn.
+Style-convergence runs first and identifier redaction last, so OA's ``[PERSON_1]``/``[ORG_1]``
+placeholders survive intact rather than being reworded by StyleRemix.
 
-Granularity: both stages are per turn, so every user turn is defended on its own and the turn
-structure (and count) is preserved end to end. That keeps the defended conversation aligned
-turn-for-turn with the original -- which is what per-turn utility scoring needs -- and lets
-StyleRemix reuse the standalone StyleRemix defense's per-turn cache. This defense's own cache holds
-the stage-2 result keyed per conversation (by the *styled* text, so a stage-1 change re-caches
-stage 2), and OA fragments any oversized turn so no length cap is needed.
+Both stages are per turn, so turn structure and count are preserved end to end -- which keeps the
+defended conversation aligned turn-for-turn with the original, as per-turn utility scoring needs.
+StyleRemix reuses its own standalone per-turn cache; this defense's own cache holds the stage-2
+result keyed by the *styled* text, so a stage-1 change re-caches stage 2.
 
-Sequencing: the stages are not concurrent. Stage 1 restyles the entire dataset, then its vLLM engine
-is shut down and the GPU handed to stage 2, which loads the scrubber and works from stage 1's
-output. Both models are large (Llama-3-8B and gpt-oss-120b) and each vLLM engine reserves a fixed
-fraction of the device for its lifetime, so overlapping them would mean splitting the GPU between
-two models that are never used at the same moment.
+The stages run strictly in sequence, never concurrently: stage 1 restyles the whole dataset, its
+vLLM engine is shut down, and only then does stage 2 load the scrubber. Both models are large and
+each vLLM engine reserves a fixed fraction of the device for its lifetime, so running them at once
+would mean splitting one GPU between two models never used at the same moment.
 
-Not a simple per-text rewrite, so it implements :meth:`__call__`/:meth:`transform` directly and
-composes the two backends rather than subclassing the text-rewrite spine. Bump :attr:`version` when
-the OpenAnonymity backend's behavior changes (its source is not in this class's hash; a StyleRemix
-change re-caches automatically because it alters the stage-1 text that keys stage 2).
+Not a simple per-text rewrite, so it implements :meth:`__call__`/:meth:`transform` directly rather
+than subclassing the text-rewrite spine. Bump :attr:`version` when the OpenAnonymity backend's
+behavior changes (its source is not in this class's hash).
 """
 
 from __future__ import annotations
@@ -59,23 +55,21 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
         self.base_model = base_model
         self.oa_model = oa_model
         self.oa_system_prompt = oa_system_prompt
-        #: Redact through OpenRouter rather than a local 120B checkpoint -- see
-        #: :data:`~.openanonymity.OPENANON_API_MODEL`. It also removes this defense's one genuinely
-        #: awkward resource requirement: stage 1 and stage 2 no longer both need the same big GPU,
-        #: since the redactor is now a network call.
+        #: Redact through OpenRouter rather than a local checkpoint -- see
+        #: :data:`~.openanonymity.OPENANON_API_MODEL`. Also sidesteps needing one big GPU for both
+        #: stages, since the redactor becomes a network call.
         self.oa_api_model = oa_api_model if oa_api_model is not None else OPENANON_API_MODEL
         self._redactor = None
 
     def params(self) -> dict:
-        # Stage 2 is keyed by the styled conversation text, so a slider/base-model change re-caches
-        # automatically; include them anyway for reproducibility, plus the OA model + prompt (whose
-        # source this class's hash does not cover) so an OA swap re-caches.
+        # Included for reproducibility and so an OA model/prompt swap re-caches stage 2 (their
+        # source isn't covered by this class's logic hash).
         base = {
             "sliders": self.sliders, "base_model": self.base_model,
             "oa_model": self.oa_model, "oa_system_prompt": self.oa_system_prompt,
         }
-        # Only when set, so existing local caches keep hitting. Different weights answer, so an API
-        # run and a local run must not share an entry.
+        # Only included when set, so an API run and a local run (different weights) don't share a
+        # cache entry, while existing local caches keep hitting.
         return {**base, "oa_api_model": self.oa_api_model} if self.oa_api_model else base
 
     def _get_redactor(self):
@@ -86,11 +80,9 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
         return self._redactor
 
     def __call__(self, data: AttackData, *, cache_dir) -> AttackData:
-        # The two stages run STRICTLY IN SEQUENCE, and only one model is resident at a time. Stage 1
-        # restyles the whole dataset and its engine is then shut down, handing the GPU to stage 2,
-        # which scrubs the restyled text. That ordering is the definition of the defense -- stage 2
-        # reads stage 1's output, not the original -- and running the models concurrently would need
-        # their memory fractions to sum under 1.0, which neither 8B + 120B nor the defaults allow.
+        # Strictly sequential: stage 1 restyles the whole dataset and its engine is shut down before
+        # stage 2 loads and scrubs the restyled text. Stage 2 reads stage 1's output, not the
+        # original, so this ordering is the definition of the defense.
         restyle = StyleRemixDefense(sliders=self.sliders, base_model=self.base_model)
         restyle.rewrite_known = self.rewrite_known
         try:
@@ -129,11 +121,9 @@ class StyleRemixOpenAnonymityDefense(CachedDefense):
         return replace(data, **changes)
 
     def _redact_side(self, label: str, texts, cache: IndexedRowCache, ids=None) -> np.ndarray:
-        # Scrub each styled conversation PER TURN (split on TURN_DELIM -> scrub the distinct turns in
-        # bulk -> re-join), so turn structure is preserved, cached per conversation by the originating
-        # dataset's row id (SWE-chat session_id, WildChat idx). The OpenAnonymity backend token-chunks
-        # any oversized turn, so no length cap is needed (matching the other per-turn defenses; the
-        # featurize stage truncates later).
+        # Scrub each styled conversation per turn (split on TURN_DELIM, scrub the distinct turns in
+        # bulk, re-join), cached per conversation by the originating dataset's row id. The
+        # OpenAnonymity backend token-chunks any oversized turn, so no length cap is needed here.
         redactor = self._get_redactor()
 
         def scrub_per_turn(conversations):

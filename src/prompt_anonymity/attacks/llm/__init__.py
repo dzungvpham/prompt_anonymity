@@ -1,12 +1,12 @@
 """LLM-assisted attacks: a cheap vector attack shortlists, a language model reorders.
 
-Both attacks here are **rerankers**. A vector attack proposes the most likely authors, and a
-language-model judge reads the actual conversation text and reorders the shortlist. The judge
-only ever sees a handful of candidates per document, which is what makes the cost bearable and
-also what bounds the gain: a reranker can only fix what its shortlist contains.
+All attacks here are **rerankers**: a vector attack proposes the most likely authors, then a
+language-model judge reads the actual conversation text and reorders the shortlist. Seeing only a
+handful of candidates per document keeps the cost bearable but also bounds the gain -- a reranker
+can only fix what its shortlist contains.
 
 The shortlist is over **authors**, built by :mod:`prompt_anonymity.attacks.llm.candidates` --
-see that module for why shortlisting conversations instead quietly answers a different question.
+see that module for why shortlisting conversations instead answers a different question.
 
 =========================  ==================================================================
 attack                     how the reranker is asked
@@ -18,10 +18,10 @@ attack                     how the reranker is asked
 =========================  ==================================================================
 
 All four gate on the base attack's best/second-best author margin, so the reranker is spent only on
-the rows where the vectors were close to a coin flip, and all four leave shortlist membership
-untouched. What differs is how much of the order they may rewrite. The first two promote a single
-winner, so only top-1 can move; the two ``listwise_*`` attacks rewrite the whole shortlist, so
-top-1 through top-(k-1) move and only top-k stays pinned to the base attack -- see
+rows where the vectors were close to a coin flip, and all four leave shortlist membership untouched.
+What differs is how much of the order they may rewrite: the first two promote a single winner, so
+only top-1 can move; the two ``listwise_*`` attacks rewrite the whole shortlist, so top-1 through
+top-(k-1) move and only top-k stays pinned to the base attack -- see
 :mod:`prompt_anonymity.attacks.llm.listwise`, which holds the shortlist presentation and fold-back
 they share.
 

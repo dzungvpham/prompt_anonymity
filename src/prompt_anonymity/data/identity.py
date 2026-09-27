@@ -63,19 +63,12 @@ def wildchat_identity(hashed_ip: str | None, accept_language: str | None, device
 # ---------------------------------------------------------------------------
 # Programmatic clients
 #
-# A large share of WildChat traffic never came from a person at a keyboard: it was posted by
-# code. On the three studied models, 9.0% of conversations carry an HTTP-library user-agent
-# (``gradio_client`` alone is 7.5%), and among the identities that survive the >=2-documents
-# floor -- the only ones an authorship study can use -- the share is far higher still, because
-# one script generates thousands of conversations under a single request fingerprint while a
-# person generates a handful.
-#
-# These are poison for authorship work, and not primarily because the *text* is synthetic --
-# ``gradio_client`` traffic is often real humans typing into a HuggingFace Space. The problem is
-# that one ``author_id`` then conflates *many* humans: a relay bot forwarding a Discord channel's
-# requests looks like one extraordinarily prolific, stylistically incoherent author. Content
-# heuristics do not catch this; the client string does, which is why the filter lives here at the
-# identity layer rather than in the text pipeline.
+# A meaningful share of WildChat traffic never came from a person at a keyboard: it was posted by
+# code, often at high volume under a single request fingerprint. This is poison for authorship
+# work not primarily because the text is synthetic -- a relay bot forwarding many humans' requests
+# looks like one extraordinarily prolific, stylistically incoherent author, and one ``author_id``
+# then conflates many real people. Content heuristics do not catch this; the client string does,
+# which is why the filter lives here at the identity layer rather than in the text pipeline.
 # ---------------------------------------------------------------------------
 
 # Clients the user-agent parser *does* name, but which are HTTP libraries, headless automation, or
@@ -90,19 +83,13 @@ PROGRAMMATIC_CLIENT_NAMES = frozenset({
 
 # Library / automation / crawler tokens matched against the *raw* user-agent string. This is the
 # belt to the device map's braces: it catches a programmatic client whose user-agent is missing
-# from the map (the map covers every user-agent in the current snapshot, but a rebuilt or extended
-# snapshot may add one) without waiting for the map to be regenerated. Word-bounded so a token
-# cannot fire on a substring of a device or browser name.
+# from the map without waiting for the map to be regenerated. Word-bounded so a token cannot fire
+# on a substring of a device or browser name.
 
 # A user-agent that begins with an HTTP *header name* was assembled by hand -- the client wrote
 # ``{"User-Agent": "User-Agent:Mozilla/5.0 ..."}``, prepending the field name to its own value.
-# No browser emits this. It is worth a rule of its own because the one client doing it in WildChat
-# is a high-volume relay whose forged Chrome string otherwise passes every other check: 62,365
-# conversations under a single request fingerprint, spanning 71 primary languages, every one of
-# them a single turn, active around the clock for 276 days. See the "Programmatic clients" note --
-# this is the identity-conflation failure in its purest form, and the malformed header is the only
-# metadata that betrays it. Measured across all 3,199,860 conversations of the raw snapshot, this
-# pattern matches exactly one user-agent string from exactly one IP: no collateral.
+# No browser emits this; it is the malformed-header signature of a relay client whose forged
+# Chrome string otherwise passes every other check.
 _MALFORMED_UA_RE = re.compile(
     r"^\s*(?:user-?agent|accept(?:-language|-encoding)?|host|referer|connection)\s*[:=]", re.I
 )
@@ -128,11 +115,10 @@ def is_programmatic_user_agent(user_agent: str | None, ua_map: dict[str, str]) -
     parses to a recognizable interactive browser. Three ways to fail, in order:
 
     1. **No user-agent at all, or a malformed one.** Every real browser sends one; an empty field
-       is a bare HTTP request (0.6% of the three-model slice). A value starting with ``{`` is a
-       client that dumped its whole header dict into the field, and one beginning with a header
-       *name* (``User-Agent:Mozilla/5.0 ...``, :data:`_MALFORMED_UA_RE`) is one that prepended the
-       field name to its own value -- neither is a browser signature. The second case is what
-       exposes WildChat's largest relay identity, whose forged Chrome string is otherwise clean.
+       is a bare HTTP request. A value starting with ``{`` is a client that dumped its whole header
+       dict into the field, and one beginning with a header *name*
+       (``User-Agent:Mozilla/5.0 ...``, :data:`_MALFORMED_UA_RE`) is one that prepended the field
+       name to its own value -- neither is a browser signature.
     2. **A library/automation token in the raw string** -- ``httpx``, ``gradio_client``,
        ``okhttp``, ``HeadlessChrome``, ... (:data:`_PROGRAMMATIC_UA_RE`). Independent of the
        device map, so it still fires on a user-agent the map has never seen.

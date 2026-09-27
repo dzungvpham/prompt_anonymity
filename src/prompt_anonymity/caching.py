@@ -222,15 +222,14 @@ class TransformCache:
     def apply_batch(self, items, batch_transform, *, key=str) -> list:
         """Like :meth:`apply`, but computes all cache-missing items in a single batched call.
 
-        ``batch_transform(missing_items)`` must return one JSON-serializable output per input,
-        in order. Use this for transforms that are far cheaper in bulk -- e.g. a featurizer
-        running spaCy's ``pipe`` over many texts at once -- so only the uncached items hit the
-        expensive path. Duplicate missing items within the batch are computed once.
+        ``batch_transform(missing_items)`` must return one JSON-serializable output per input, in
+        order. Use this when the transform is far cheaper in bulk (e.g. a featurizer running
+        spaCy's ``pipe`` over many texts at once). Duplicate missing items are computed once.
 
-        **Nothing is persisted until the call returns**, so a process killed partway through has
-        bought nothing and the next run starts over. That is the right trade for a transform
-        whose batched call IS the unit of work (submitting to a batch API), and the wrong one for
-        a long run of independently expensive items -- use :meth:`apply_streaming` for those.
+        **Nothing is persisted until the call returns**, so a process killed partway through
+        buys nothing. Fine when the batched call itself is the unit of work (a batch API
+        submission); use :meth:`apply_streaming` instead for a long run of independently
+        expensive items.
 
         Parameters
         ----------
@@ -241,12 +240,6 @@ class TransformCache:
             to it. Called at most once; not called at all when everything is cached.
         key : callable, default ``str``
             Maps an item to its content-addressed cache key (see :meth:`apply`).
-
-        Notes
-        -----
-        ``self.misses`` is the number of distinct items actually computed; ``self.hits`` is the
-        rest (items already on disk, and later duplicates of an item computed in this batch).
-        This matches :meth:`apply`, where the first write of a repeated item makes the rest hits.
         """
         self.hits = 0
         self.misses = 0
@@ -301,17 +294,14 @@ class TransformCache:
                         on_progress=None) -> list:
         """Like :meth:`apply_batch`, but **persists results as they arrive** rather than at the end.
 
-        This is the method for a long run of independently expensive items: an hour of GPU on a
-        preemptible partition, or a thousand paid API calls. :meth:`apply_batch` writes nothing
-        until its transform returns, so a job killed at 90% -- preempted, requeued, out of wall
-        clock -- has bought nothing and the next run starts from zero. Here, everything already
-        yielded is on disk, so the next run resumes from it.
+        Use this for a long run of independently expensive items (hours of GPU work, many paid
+        API calls): a killed or preempted run resumes from whatever was already flushed instead
+        of starting over.
 
         ``stream_transform(missing_items)`` yields ``(index, output)`` pairs, where ``index``
-        positions the output in ``missing_items``. **Completion order, not input order**, which is
-        what lets a concurrent transform keep every worker busy and still report each result the
-        moment it lands -- see
-        :meth:`prompt_anonymity.attacks.llm._openrouter.OpenRouterChat.complete_stream`.
+        positions the output in ``missing_items``, in **completion order** rather than input
+        order -- so a concurrent transform can report each result as it lands while keeping every
+        worker busy.
 
         Parameters
         ----------
@@ -325,20 +315,16 @@ class TransformCache:
         key : callable, default ``str``
             Maps an item to its content-addressed cache key (see :meth:`apply`).
         flush_every : int, default ``1``
-            How many results to hold before writing them. ``1`` writes each one as it arrives --
-            the right setting when an item is expensive enough that losing one matters, e.g. a
-            paid API call. A small number above 1 suits a fast local transform, where the work at
-            risk is seconds and the writes may as well be amortized.
+            How many results to hold before writing them. ``1`` is right when losing an item is
+            expensive (a paid API call); a higher number amortizes writes for a cheap transform.
         on_progress : callable or None
             Called as ``on_progress(done, total)`` after each flush, counting *distinct missing
-            items*. A run of this shape returns nothing until it finishes, so without this there
-            is no way to tell a slow job from a hung one.
+            items* -- otherwise there is no way to tell a slow job from a hung one.
 
         Notes
         -----
         ``self.hits`` / ``self.misses`` follow :meth:`apply_batch`. An index out of range, or a
-        transform that ends early, raises rather than returning a hole: a missing output would
-        otherwise surface much later as a confusing ``KeyError`` on the assembled list.
+        transform that ends early, raises rather than silently returning a hole.
         """
         self.hits = 0
         self.misses = 0
@@ -489,11 +475,9 @@ class IndexedRowCache:
             ``idx``), used as the cache key and written to the table's ``id`` column. Defaults to
             each row's position when the loader carries no ids.
         checkpoint_every : int, optional
-            When set, compute the distinct missing sources in batches of this size and flush the
-            completed rows to disk after each batch, so a long producer (e.g. DP-MLM, hours of
-            per-word work) is crash-safe and RESUMABLE: a killed run re-run picks up where it left
-            off because the already-written rows come back as hits. ``None`` (default) keeps the
-            original single-compute, single-write behaviour.
+            When set, compute the distinct missing sources in batches of this size and flush
+            completed rows to disk after each batch, so a long producer is crash-safe and
+            resumable. ``None`` (default) keeps the single-compute, single-write behaviour.
         """
         sources = [str(s) for s in sources]
         ids = [str(i) for i in ids] if ids is not None else [str(i) for i in range(len(sources))]

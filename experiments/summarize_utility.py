@@ -20,9 +20,8 @@ Four decisions, each load-bearing:
 2. **Intervals come from a cluster bootstrap over users**, not conversations: one user's
    conversations share tasks and style, so they are correlated, and resampling conversations would
    understate the noise (the attribution figures resample users for the same reason). Percentile
-   intervals, ``--replicates`` draws, seeded. No finite-population correction is applied, so with a
-   sample that is a large share of the split the intervals are conservative (at 1,000 of 4,334 the
-   correction would narrow them by ~12%).
+   intervals, ``--replicates`` draws, seeded. No finite-population correction is applied, so the
+   intervals are conservative when the sample is a large share of the split.
 3. **Unchanged and turns-intact conversations stay in** as the 5s they are: they are part of the
    population, and dropping them would bias every mean down. Rows with no score (skipped as too
    long, or unparsed) are excluded and counted.

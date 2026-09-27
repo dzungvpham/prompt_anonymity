@@ -1,42 +1,31 @@
 """Nearest-neighbor linkage reranked by an LLM-as-a-judge.
 
-Plain :class:`~prompt_anonymity.attacks.NearestNeighbor` usually lands the true
-author somewhere in an unknown conversation's top-K nearest known rows, but is much weaker
-at picking *which* of those K is actually correct -- exactly the top-1 vs. top-K accuracy
-gap. This attack keeps the embedding distance's top-K membership but reranks *within* it:
-for each unknown conversation it shows an LLM judge the unknown text plus its top-K known
-candidates and asks which candidate was written by the same author, purely from writing
-style. The judge's pick is promoted to rank 1.
+Plain :class:`~prompt_anonymity.attacks.NearestNeighbor` usually lands the true author
+somewhere in an unknown conversation's top-K nearest known rows, but is weaker at picking
+which of those K is actually correct. This attack keeps the embedding distance's top-K
+membership but reranks within it: for each unknown conversation it shows an LLM judge the
+unknown text plus its top-K known candidates and asks which candidate was written by the same
+author, from writing style alone. The judge's pick is promoted to rank 1.
 
-Because only the within-top-K order changes -- which known rows land in the top-K (and hence
-top-K/top-2K accuracy) is left exactly as the distance metric found it -- this isolates
-whatever extra signal the LLM adds on top of the embedding distance at rank 1. At
-``top_k=5`` the top-5 and top-10 accuracies are identical to the underlying
-nearest-neighbor attack by construction; only top-1 can move.
+Only the within-top-K order changes -- top-K membership is left exactly as the distance metric
+found it, so this isolates whatever extra signal the LLM adds on top of the embedding distance
+at rank 1; only top-1 can move.
 
-The judge runs on OpenRouter (default ``anthropic/claude-sonnet-5``, through this package's
-shared client -- :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`)
-and its one-digit verdicts are cached with the package's content-addressed
-:class:`~prompt_anonymity.caching.TransformCache` under ``<cache_dir>/attacks``, keyed by the
-prompt text and namespaced by the judge model / prompt / presentation params, so re-runs and
-a re-swept ambiguity gate cost no API calls. A fully-cached run makes no request and needs no
-key.
+The judge runs on OpenRouter through this package's shared
+:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` client, and its verdicts are
+cached by prompt text and presentation params, so a re-swept ambiguity gate costs no API calls.
 
-Two knobs port the research finding that a naive rerank can *underperform* the distance
-baseline, and bound that downside:
+Two knobs guard against a naive rerank underperforming the distance baseline:
 
-* **Candidate shuffling** (``shuffle_candidates``, on by default). LLM judges over-pick the
-  last option shown (position/recency bias); feeding candidates in distance-rank order then
-  systematically promotes the distance metric's *worst* top-K candidate. Each row's K
-  candidates are shown in a seeded (reproducible) random order and the judge's positional
-  pick is mapped back to the real known row, decoupling presented slot from distance rank.
+* **Candidate shuffling** (``shuffle_candidates``, on by default). LLM judges have a
+  position/recency bias; feeding candidates in distance-rank order would let that bias
+  systematically promote the metric's worst top-K candidate. Each row's K candidates are shown
+  in a seeded random order and the judge's positional pick is mapped back to the real known row.
 * **Ambiguity gate** (``margin_quantile``). The rerank is applied only on rows whose top-1
-  vs. top-2 distance margin is at or below this quantile of all rows' margins -- the closest
-  calls, where the distance metric was least sure. Confident rows keep their own #1, bounding
-  the judge to where it can actually help. ``1.0`` (default) reranks every row; smaller values
-  restrict it to the closest calls. Every row is still *judged* (so the cache is complete),
-  only the *application* is gated -- retuning ``margin_quantile`` therefore needs no new API
-  calls.
+  vs. top-2 distance margin is at or below this quantile -- the closest calls, where the
+  distance metric was least sure. Confident rows keep their own #1. Every row is still judged
+  (so the cache is complete); only the application is gated, so retuning the quantile needs no
+  new API calls.
 """
 
 from __future__ import annotations
@@ -70,15 +59,13 @@ JUDGE_SYSTEM_PROMPT_TEMPLATE = (
     "punctuation, no explanation."
 )
 
-#: Default OpenRouter judge model -- Claude Sonnet. Point it at any OpenRouter chat model
-#: (e.g. ``openai/gpt-4o``, the answer-utility judge, or a ``qwen/`` id) to retarget; it is
-#: part of the cache key, so a swap re-caches automatically.
+#: Default OpenRouter judge model. Any OpenRouter chat model id works; it is part of the cache
+#: key, so a swap re-caches automatically.
 DEFAULT_JUDGE_MODEL = "anthropic/claude-sonnet-5"
 
 #: How many of the distance metric's nearest candidates the judge reranks per unknown row.
 DEFAULT_TOP_K = 5
-#: Chars of each conversation shown to the judge, per text -- enough style signal while
-#: keeping one query + K candidates + instructions comfortably inside a chat context.
+#: Chars of each conversation shown to the judge, per text.
 DEFAULT_SNIPPET_CHARS = 800
 #: Output budget: the judge only ever needs to emit one digit.
 DEFAULT_JUDGE_MAX_TOKENS = 8
@@ -175,11 +162,8 @@ class EuclideanLLMJudgeAttack:
         return self._client.complete_batch(prompts)
 
     def _cache(self, cache_dir, n_candidates: int) -> TransformCache:
-        # Keyed by prompt text; namespaced by the judge model + rubric + presentation params so
-        # any change that alters the prompts (or the model) re-caches. margin_quantile is
-        # deliberately NOT in the key: it only gates which cached verdicts get applied, never
-        # the prompts, so re-sweeping it is free. The class source + version guard against
-        # silent logic drift (see caching.py).
+        # margin_quantile is deliberately not in the key: it only gates which cached verdicts
+        # get applied, never the prompts, so re-sweeping it is free.
         return TransformCache(
             Path(cache_dir) / "attacks", "euclidean_llm_judge",
             logic_hash([OpenRouterChat, EuclideanLLMJudgeAttack], version=JUDGE_VERSION),
@@ -215,9 +199,8 @@ class EuclideanLLMJudgeAttack:
         known_texts = [str(t) for t in np.asarray(data.known_texts)]
         unknown_texts = [str(t) for t in np.asarray(data.unknown_texts)]
 
-        # Shortlist the most likely AUTHORS, each represented by their own document nearest to
-        # this unknown one. See prompt_anonymity.attacks.llm.candidates for why the unit is the
-        # author rather than the conversation.
+        # Shortlist the most likely authors, each represented by their own document nearest to
+        # this unknown one (see attacks.llm.candidates for why the unit is the author).
         candidates = author_candidates(
             data.known_embeddings, data.known_labels, data.unknown_embeddings,
             top_k=self.top_k, metric=data.metric,
@@ -232,17 +215,15 @@ class EuclideanLLMJudgeAttack:
         author_idx = candidates.author_index   # (n, k) author columns, slot 0 = best author
         row_max = scores.max(axis=1)           # == the best author's score
 
-        # Per-row best vs second-best AUTHOR margin (>= 0; small = the two leading candidates are
-        # near-tied = ambiguous). gate_thresh is that margin's `margin_quantile` quantile, so
-        # ~that fraction of the closest calls pass.
+        # Per-row best vs second-best author margin (small = ambiguous). gate_thresh is that
+        # margin's `margin_quantile` quantile, so ~that fraction of the closest calls pass.
         margins = candidates.margin
         gate_thresh = np.quantile(margins, self.margin_quantile)
 
-        # Presentation order of each row's K candidates. Shuffling (seeded -> reproducible, so the
-        # cache stays stable) decouples the slot a candidate is shown in from its distance rank,
-        # cancelling the judge's position/recency bias. present[i] = the real known indices in the
-        # order the judge sees them, so a positional pick maps straight back through it; perms[i]
-        # = the corresponding distance ranks (0 = nearest), the signal axis.
+        # Presentation order of each row's K candidates. Shuffling decouples the slot a candidate
+        # is shown in from its distance rank, cancelling the judge's position bias. present[i] =
+        # the real known indices in the order the judge sees them; perms[i] = the corresponding
+        # distance ranks (0 = nearest).
         rng = np.random.default_rng(self.seed)
         if self.shuffle_candidates:
             perms = [rng.permutation(k) for _ in range(n)]
@@ -280,18 +261,13 @@ class EuclideanLLMJudgeAttack:
                 boosted[i, present_authors[i][choice - 1]] = row_max[i] + 1.0
                 applied += 1
             else:
-                # Forced choice: a refusal / invalid digit commits to the BEST candidate (slot 0,
-                # already this row's #1) instead of skipping the rerank. So the row never worsens
-                # vs. the embedding baseline, but no gated row is left unresolved.
+                # A refusal / invalid digit commits to the best candidate (already this row's
+                # #1) instead of skipping the rerank, so the row never worsens vs. the baseline.
                 boosted[i, author_idx[i, 0]] = row_max[i] + 1.0
                 applied += 1
                 forced += 1
 
         if self.verbose:
-            # Position axis (presented slot): with shuffling on, ~uniform => position bias
-            # cancelled. Signal axis (distance rank of the pick, 0 = nearest): mass on 0-1 means
-            # the judge lands on the true-author-heavy nearest neighbours; a flat spread means no
-            # style signal beyond the embedding.
             pos_dist = {p: choices.count(p) for p in range(k + 1)}
             rank_picks = [int(perms[i][c - 1]) for i, c in enumerate(choices) if 1 <= c <= k]
             rank_dist = {r: rank_picks.count(r) for r in range(k)}

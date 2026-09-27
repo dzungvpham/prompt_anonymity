@@ -1,9 +1,8 @@
 """Where the dataset build reads its raw sources and writes its outputs.
 
-The build scripts used to carry one machine's absolute paths as module constants, which meant
-nobody else could run them. Locations now come from here instead: a small TOML file plus
-environment overrides, with **downloading the raw source from HuggingFace as the fallback**, so a
-fresh clone can rebuild the dataset without editing anything.
+Locations come from a small TOML file plus environment overrides, with downloading the raw source
+from HuggingFace as the fallback, so a fresh clone can rebuild the dataset without editing
+anything.
 
 Two things are configured:
 

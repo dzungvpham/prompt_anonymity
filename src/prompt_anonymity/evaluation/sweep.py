@@ -1,10 +1,7 @@
 """The headline top-k table, built on :class:`LinkageRanking`.
 
-This module also held ``pool_size_sweep``, which re-scored the ranking against random sub-pools of
-the identities to show how accuracy depends on the number of candidates. It was removed on
-2026-08-04 with its only caller, the fixed-split experiment runner. The measurement itself did not
-go: ``experiments/plot_results.py`` computes the same curve in closed form (``subpool_weights``)
-straight from a run's CMC, which needs no sampling and no re-ranking.
+``pool_size_sweep`` (accuracy vs. candidate-pool size) used to live here; it's now computed in
+closed form from a run's CMC by ``experiments/plot_results.py`` instead.
 """
 
 from __future__ import annotations

@@ -28,9 +28,9 @@ from huggingface_hub import HfApi, snapshot_download
 
 from .config import hf_dir
 
-# Default dataset repo. The destination is the project's ``data/hf/`` -- resolved at call time
-# (:func:`prompt_anonymity.data.config.data_dir`) rather than from this file's location, since
-# the code lives in the installed package and the outputs live in the working copy.
+# Default dataset repo. The destination resolves at call time (config.data_dir), not from this
+# file's location, since the code lives in the installed package and the outputs live in the
+# working copy.
 REPO_ID = "pavidu/PromptAnonBench"
 
 # HuggingFace's own bookkeeping inside ``local_dir`` (download metadata + locks). It is not repo

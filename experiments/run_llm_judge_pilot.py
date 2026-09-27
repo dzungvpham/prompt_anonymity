@@ -1,44 +1,22 @@
-"""Pilot: does an LLM judge help on top of the new best deterministic attack?
+"""Pilot: does an LLM judge help on top of the best deterministic attack (WCCN)?
 
-Everything up to this point (run_wccn_fusion.py) established Gemini + char n-gram + POS n-gram
-(or + LUAR), scored via WCCN, as the strongest deterministic attack on both corpora. The open
-question this answers: on the small slice of documents where that attack is LEAST confident --
-the smallest top-1/top-2 margin, by WCCN's OWN score -- does a constrained LLM judge recover any
-of them?
+On the small slice of documents where WCCN is LEAST confident -- the smallest top-1/top-2 margin,
+by WCCN's own score -- does a constrained LLM judge recover any of them?
 
-**Corrected from an earlier version of this script**, which built its shortlist and "before"
-baseline from ``author_candidates()`` over WCCN-*projected* embeddings -- a nearest-known-
-*document* search in the whitened space -- rather than from ``WhitenedCentroid.score()``, the
-actual author-*centroid* score the rest of this project reports. The two are not the same
-attack: a single document can sit far from its author's own centroid, so the earlier pilot's
-"before" numbers ran a few points below the real WCCN baseline and its shortlist could differ
-from WCCN's own top-k. Concretely, that version's ambiguity gate, top-5 authors and reported
-"before" score all came from::
-
-    proj_known, proj_unknown = wccn.project(k_feat), wccn.project(u_feat_in)
-    candidates = author_candidates(proj_known, known_labels, proj_unknown, top_k=5, metric="cosine")
-
-instead of::
-
-    base_scores = wccn.score(u_feat_in)
-
-This version does the latter throughout: authors are shortlisted by ``base_scores`` directly,
-and only the *evidence text* per shortlisted author (which of their own known documents to show
-the judge) still uses a nearest-document search in the whitened space -- restricted to that
-author's own rows, which is a sensible way to pick a representative document once the author is
-already chosen on the real WCCN score, not a way to choose the author.
+Authors are shortlisted by ``WhitenedCentroid.score()`` (the real author-centroid score the rest
+of the project reports), not by a nearest-known-*document* search over projected embeddings --
+those are different attacks, since a single document can sit far from its own author's centroid.
+Only the *evidence text* per shortlisted author (which known document to show the judge) uses a
+nearest-document search, restricted to that author's own rows, since picking a representative
+document is a different question from choosing the author.
 
 Scoped deliberately small and cheap: only ``--n-ambiguous`` documents per window are judged (=
 API calls per window), not every document in the window.
 
 Every judge variant (plain / majority-vote / feature-grounded) is built from ONE shared shortlist
 and evidence-selection pass (:func:`wccn_shortlist`) and ONE shared judge-calling core
-(:func:`run_judge_once`) -- they differ only in the prompt-building function and, for majority
-vote, in how many times :func:`run_judge_once` is called. This replaces three previously
-separate, partially-duplicated implementations (one leaning on
-:class:`~prompt_anonymity.attacks.llm.euclidean_llm_judge.EuclideanLLMJudgeAttack`'s own
-internal shortlist, two reimplementing it ad hoc), which is also what let the shortlist mismatch
-above go unnoticed in two of the three variants but not the third.
+(:func:`run_judge_once`); they differ only in the prompt-building function and, for majority
+vote, in how many times :func:`run_judge_once` is called.
 """
 from __future__ import annotations
 
@@ -95,10 +73,9 @@ FEATURE_GROUNDED_SYSTEM_PROMPT_TEMPLATE = (
 
 
 def quick_style_stats(text: str) -> dict[str, float]:
-    """A handful of cheap, human-interpretable style statistics -- the SALA-style grounding
-    (arXiv:2602.23079). Deliberately not StyloMetrix (197 opaque-coded dims meant for a
-    classifier, not for reading in a prompt): these five are simple enough that a judge can
-    sanity-check them against the text it's also shown."""
+    """A handful of cheap, human-interpretable style statistics -- the SALA-style grounding.
+    Deliberately not StyloMetrix (opaque-coded dims meant for a classifier, not for reading in a
+    prompt): these five are simple enough that a judge can sanity-check them against the text."""
     words = text.split() or [""]
     n_words = len(words)
     sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()] or [text]
@@ -174,13 +151,8 @@ def wccn_shortlist(base_scores_subset: np.ndarray, candidate_authors: np.ndarray
 def _batch_with_retry(fn, max_attempts: int = 8, wait_seconds: float = 150.0):
     """Retry ``fn()`` on OpenRouter's HTTP 402 "in-flight budget exhausted" -- a transient,
     account-wide concurrency cap, not the ordinary "out of credits" 402 and not retried by
-    :meth:`OpenRouterChat.complete`, which treats every non-429 4xx as permanent.
-
-    ``OpenRouterChat.complete_batch`` itself only runs 8 requests at a time
-    (``max_workers``, its default), so a single call here isn't what trips this -- it's the
-    account-wide budget, which on a shared API key can also be consumed by other concurrent
-    usage on the same key (this project has multiple collaborators). One 130s wait was not
-    always enough in practice; this budgets for several.
+    :meth:`OpenRouterChat.complete`, which treats every non-429 4xx as permanent. The budget is
+    account-wide, so it can also be tripped by other concurrent usage on a shared API key.
     """
     for attempt in range(max_attempts):
         try:
@@ -267,12 +239,9 @@ def recall_at_k(ranks: np.ndarray, true_authors: np.ndarray, k: int) -> tuple[fl
     """``(micro, macro)`` recall@k -- the oracle top-1 ceiling for a reranker restricted to
     WCCN's own top-k, at document weight and at the project's actual headline weight.
 
-    ``macro_top_k_accuracy`` already averages per-author accuracy before averaging over
-    authors; the earlier version of this reported only the micro (document-weighted) figure
-    next to a macro headline metric (``macro_conv_acc1``), which is the wrong ceiling for that
-    number -- a corpus with a few authors carrying many documents can have a much higher micro
-    than macro recall, so the printed "oracle ceiling" overstated how much headroom the macro
-    metric actually had.
+    Both are reported because a corpus with a few authors carrying many documents can have a
+    much higher micro than macro recall, so a micro-only ceiling would misstate how much
+    headroom the macro headline metric (``macro_conv_acc1``) actually has.
     """
     micro = float((ranks <= k).mean())
     macro = macro_top_k_accuracy(ranks, true_authors, k=k)

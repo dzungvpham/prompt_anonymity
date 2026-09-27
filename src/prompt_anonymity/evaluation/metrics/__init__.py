@@ -2,34 +2,28 @@
 
 Five families, each answering a different question about the same attack. The first four consume a
 **score matrix** (documents x candidate authors, higher = more likely) rather than a distance
-matrix, which is the orientation an attribution model produces; negate a distance matrix to move
-between them. The fifth consumes a partition instead, because it scores a different threat model.
+matrix; negate a distance matrix to get one. The fifth consumes a partition instead, since it scores
+a different threat model.
 
 :mod:`~prompt_anonymity.evaluation.metrics.accuracy` -- *how often is the attack right?*
-    ``top_k_accuracy`` at the conversation and identity levels, and ``random_guessing_accuracy``
-    for the matching chance baseline, so the difference is the adversary's advantage.
+    ``top_k_accuracy`` at the conversation and identity levels, plus the chance baseline.
 
 :mod:`~prompt_anonymity.evaluation.metrics.ranking` -- *how close was it when it was wrong, and to whom?*
-    Rank-based summaries that use the whole ranking instead of a few cutoffs (``mrr``, mean
-    percentile rank, the full ``cmc_curve``), plus the author-averaged views that keep a handful
-    of prolific users from deciding the headline (``macro_top_k_accuracy``, ``macro_f1_score``,
-    ``per_author_ranking``).
+    Rank-based summaries over the whole ranking (``mrr``, mean percentile rank, ``cmc_curve``), plus
+    author-averaged views that keep a few prolific users from deciding the headline.
 
 :mod:`~prompt_anonymity.evaluation.metrics.retrieval` -- *can the attacker find everything one user wrote?*
     The same scores read column-wise, with each known author as a query: average precision and
-    R-precision per author. A different threat model from identification, and the direction in
-    which mean average precision is not degenerate.
+    R-precision per author. A different threat model from identification.
 
 :mod:`~prompt_anonymity.evaluation.metrics.detection` -- *is this document's author known at all?*
     Open-set / verification metrics for the reject option: AUROC, equal error rate, DIR@FAR,
     PAN's c@1, and calibration of the reported confidence.
 
 :mod:`~prompt_anonymity.evaluation.metrics.clustering` -- *which of these share an author?*
-    The odd one out, and deliberately so: it scores a **partition** of anonymous documents rather
-    than a ranking of named candidates, because it measures *linkability* rather than
-    identifiability. BCubed precision/recall/F as defined by PAN 2016, the link-ranking view, the
-    degenerate baselines that make those numbers readable, and the exposure measures that say what
-    a partition is worth to an attacker.
+    Scores a **partition** of anonymous documents rather than a ranking of named candidates, since
+    it measures *linkability* rather than identifiability: BCubed precision/recall/F, the
+    link-ranking view, degenerate baselines, and exposure measures.
 """
 
 from .accuracy import random_guessing_accuracy, top_k_accuracy

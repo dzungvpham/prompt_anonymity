@@ -41,11 +41,10 @@ def max_softmax_confidence(scores) -> np.ndarray:
     posterior, which is precisely why :func:`calibration_metrics` is worth running before
     treating it as one.
 
-    Computed in row blocks, because the obvious ``softmax(scores).max(axis=1)`` needs two full
-    float64 copies of the score matrix to return one number per document -- over 10 GB at
-    86,000 documents against 7,500 authors, which is enough to lose a 16 GB job. Only the top
-    probability is wanted, and it has a closed form that never materialises the rest:
-    ``max_j softmax(s)_j = 1 / sum_j exp(s_j - max_j s)``.
+    Computed in row blocks: the obvious ``softmax(scores).max(axis=1)`` needs two full float64
+    copies of the score matrix to return one number per document, which can be too much memory at
+    corpus scale. Only the top probability is wanted, and it has a closed form that never
+    materialises the rest: ``max_j softmax(s)_j = 1 / sum_j exp(s_j - max_j s)``.
     """
     scores = np.asarray(scores)
     if scores.ndim != 2:

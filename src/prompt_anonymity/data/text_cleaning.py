@@ -2,31 +2,20 @@
 
 Both sources (WildChat, SWE-chat) run their user prompts through the *same* two
 functions here, so the cleaned ``text`` field is processed identically regardless of
-origin. This matters methodologically: if one source were scrubbed and the other left
-raw, the ``source`` label would leak through surface tokens (a classifier could split
-the two on the presence of ``<URL>`` vs a real URL), contaminating both authorship
-attribution and clustering. One scrubber, one placeholder vocabulary, applied to both.
+origin -- otherwise the ``source`` label would leak through surface tokens (e.g. a real
+URL vs a scrubbed ``<URL>``), contaminating both attribution and clustering.
 
 Two stages, kept separate so callers can choose how much to apply:
 
 * :func:`normalize_whitespace` -- structural tidy-up that *preserves* newlines and
-  indentation (which are themselves stylometric signal). Used for both the faithful
-  ``text_original`` (newline normalization only) and as the first step of ``text``.
-* :func:`scrub_identifiers` -- replaces explicit identifiers (URLs, emails, IP
-  addresses, file paths, and -- when known -- repository and user tokens) with fixed
-  ``<PLACEHOLDER>`` sentinels. This is both the privacy pass for public release and the
-  operationalization of the project's thesis: what remains after explicit identifiers
-  are gone is *writing style*, and the experiments test whether style alone re-links
-  users. Its ``mask_ids`` flag additionally scrubs two identifier classes common in
-  agentic/terminal logs -- opaque ids (UUIDs and hex hashes / git commit SHAs) to
-  ``<ID>``, and shell login strings (``user@host`` with a bare, dotless hostname) to
-  ``<HOST>``. It defaults off; only SWE-chat enables it for now (WildChat is untouched).
-
-The identifier regexes are adapted from the original ``swe-chat/preprocess.py`` scrubber
-so the SWE-chat text keeps the exact treatment it had before, now applied to WildChat as
-well. The one deliberate change: the old scrubber collapsed *all* whitespace to single
-spaces as a final step; we drop that, because destroying newline/indentation structure
-throws away style signal we want to keep.
+  indentation, since those are themselves stylometric signal.
+* :func:`scrub_identifiers` -- replaces explicit identifiers (URLs, emails, IPs, file
+  paths, and -- when known -- repository/user tokens) with fixed ``<PLACEHOLDER>``
+  sentinels. This is the privacy pass, and it is also what makes the project's thesis
+  testable: what remains once explicit identifiers are gone is *writing style*. Its
+  ``mask_ids`` flag additionally scrubs opaque ids (UUIDs, hex hashes, commit SHAs) to
+  ``<ID>`` and shell login strings (``user@host``) to ``<HOST>`` -- common in agentic
+  logs, so only SWE-chat enables it for now.
 """
 
 from __future__ import annotations
@@ -53,15 +42,11 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 # Dotted IPv4 not glued to a word char on either side (so version strings like
 # "v1.2.3.4" embedded in a token are left alone, but a bare "192.168.0.1" is caught).
 IPV4_RE = re.compile(r"(?<!\w)(?:\d{1,3}\.){3}\d{1,3}(?!\w)")
-# Filepaths: windows, unix-absolute, tilde-home, and relative paths that are clearly paths.
-# A slash path must carry **at least two ``/`` delimiters** (e.g. ``/a/b``) so bare
-# slash-commands (``/init``, ``/commit``) and XML-ish closing tags (``</command-name>``,
-# ``</system_instruction>``) -- which have a single slash -- are left intact rather than
-# mangled to ``<PATH>``. Two single-slash forms are still unambiguously paths and kept: a
-# ``~/...`` home path (the ``~`` disambiguates) and a ``dir/file.ext`` relative path (the
-# extension disambiguates); prose like "and/or" is spared by both the >=2-slash rule and these.
-# (?<!\w): match a path even when wrapped in `backticks`/"quotes"/(parens)/<tags>, but NOT a
-# bare mid-word slash like "and/or" (where the slash follows a word char).
+# Filepaths: windows, unix-absolute, tilde-home, and relative paths. A slash path needs
+# **>= 2 ``/`` delimiters** so single-slash things like ``/init`` or ``</tag>`` are left
+# alone; a ``~/...`` home path or a ``dir/file.ext`` relative path is unambiguous even
+# with one slash. ``(?<!\w)`` lets a path be wrapped in quotes/parens/tags without also
+# catching a mid-word slash like "and/or".
 PATH_RE = re.compile(
     r"""(?<!\w)(?:
           [A-Za-z]:\\[^\s]+                       # C:\Users\...             (windows)
@@ -72,16 +57,10 @@ PATH_RE = re.compile(
     )""",
     re.VERBOSE,
 )
-# Slash-separated *numbers* are dates ("3/22/2023", "27/03/2023", "2023/03/22", "12/25/22"),
-# fractions, ratios, or numeric ranges ("3/22/2023-3/25/2023") -- never a filesystem path. They
-# would otherwise be swallowed by the >=3-segment relative-path branch of :data:`PATH_RE`, which
-# gutted date-heavy prose (a pasted schedule became "<PATH> 2:00 pm ... <PATH> 7:00 PM"). Matching
-# on *shape* rather than on one field order spares every ordering -- MM/DD/YYYY, DD/MM/YYYY,
-# YYYY/MM/DD -- and any digit widths, without having to guess which field is the month.
-# Digits joined by ``/ - . :`` only, and the token must *start* with a digit -- so an absolute
-# path, a home path, or a drive path ("/12/34", "~/12/34", "C:\12\34") fails this test and is
-# still scrubbed as the path it is. Anything with a non-numeric segment ("2023/03/22/notes.txt")
-# likewise fails and stays <PATH>.
+# Slash-separated *numbers* are dates, fractions, ratios or ranges -- never a filesystem
+# path -- but would otherwise be swallowed by :data:`PATH_RE`'s relative-path branch.
+# Matching on shape (digits joined by ``/ - . :``, starting with a digit) rather than one
+# field order spares every date ordering without guessing which field is the month.
 _NUMERIC_TOKEN_RE = re.compile(r"^\d+(?:[/\-.:]\d+)+$")
 
 # --- opaque-id patterns (only applied when scrub_identifiers(mask_ids=True)) -----------
@@ -89,19 +68,16 @@ _NUMERIC_TOKEN_RE = re.compile(r"^\d+(?:[/\-.:]\d+)+$")
 UUID_RE = re.compile(
     r"(?<![\w-])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![\w-])"
 )
-# A bare hex run of >= 7 chars -- a git short/long SHA or an MD5/SHA-1/SHA-256 digest. The
-# regex only bounds the run; :func:`_looks_like_hash` decides whether it is really an id, so
-# that all-letter hex words ("decade", "deadbeef") and plain decimal numbers ("1400000") are
-# left alone. Bounded by ``(?<![\w-])``/``(?![\w-])`` so only standalone tokens match, never a
-# hex-looking slice of a larger word.
+# A bare hex run of >= 7 chars -- a git short/long SHA or an MD5/SHA-1/SHA-256 digest. This
+# regex only bounds the run; :func:`_looks_like_hash` decides whether it's really an id, so
+# all-letter hex words ("decade") and plain decimal numbers are left alone.
 _HEX_RUN_RE = re.compile(r"(?<![\w-])[0-9a-fA-F]{7,}(?![\w-])")
 # Hex-valid strings that are recognized technical *names*, not identifiers -- never masked.
 _HEX_NOT_IDS = {"ed25519"}
 # Shell login strings copy-pasted from a terminal prompt: ``user@host`` where ``host`` is a
-# bare machine name with no dot (``nickdejesus@MacBook-Pro-6``, ``ubuntu@ip-172-31-28-78``).
-# A dotted ``user@host.tld`` is caught earlier as <EMAIL>; this is the dotless remainder. The
-# local part forbids ``/`` and the host must start with a letter and not be a lone version tag,
-# so dependency/action refs (``actions/checkout@v4``, ``react@^1.2.3``, ``pkg@5``) are spared.
+# bare, dotless machine name (a dotted ``user@host.tld`` is already caught as <EMAIL>). The
+# host must start with a letter and not be a lone version tag, so dependency/action refs
+# (``actions/checkout@v4``, ``pkg@5``) are spared.
 _HOST_CHANNEL_RE = r"(?:v\d|main|master|latest|stable|beta|alpha|next|canary|nightly|edge|release|dev|prod|staging|HEAD|head)"
 USER_HOST_RE = re.compile(
     rf"(?<![\w/@.\-])"                       # left: not glued to word/slash/@/dot/hyphen
@@ -134,10 +110,9 @@ def normalize_whitespace(text: str) -> str:
 
     Converts CRLF/CR to LF, strips trailing spaces/tabs at line ends, and collapses runs
     of 3+ newlines to a single blank line. Newlines, indentation, and intra-line spacing
-    are otherwise preserved, because those patterns are part of a user's writing style.
-    Also unescapes the literal two-character sequence ``\\n`` that the legacy WildChat CSV
-    used in place of real newlines (harmless when reading from the raw parquet, which
-    already has real newlines).
+    are otherwise preserved, since those are part of a user's writing style. Also
+    unescapes the literal ``\\n`` two-character sequence the legacy WildChat CSV used in
+    place of real newlines.
     """
     if not isinstance(text, str):
         return ""
@@ -159,12 +134,10 @@ def _scrub_known_token(text: str, token: str, placeholder: str, *, min_len: int 
 def _tokens_longest_first(tokens) -> list[str]:
     """Deduplicate known-identifier ``tokens`` and order them longest first (ties alphabetically).
 
-    Scrubbing order is significant and must not vary between processes. For a repo slug like
-    ``foo/foo-new-map``, replacing the owner token ``foo`` first leaves ``<REPO> -new-map`` (the
-    trailing ``-new-map`` survives, still identifying), while replacing the longer ``foo-new-map``
-    first yields a clean ``<REPO>``. Iterating these tokens as a ``set`` made the choice depend on
-    per-process string-hash randomization, so the same input could clean differently from run to
-    run. Longest first is both deterministic and the more specific -- hence safer -- match.
+    Order matters: for a repo slug like ``foo/foo-new-map``, replacing the owner token
+    ``foo`` first leaves ``<REPO> -new-map`` still identifying, while replacing the longer
+    ``foo-new-map`` first yields a clean ``<REPO>``. Longest-first is deterministic and the
+    more specific match.
     """
     return sorted({t for t in tokens if t}, key=lambda t: (-len(t), t))
 
@@ -172,10 +145,9 @@ def _tokens_longest_first(tokens) -> list[str]:
 def _looks_like_hash(tok: str) -> bool:
     """True if a bare hex run should be treated as an opaque id (hash / commit SHA).
 
-    A run of >= 32 hex chars is never a word or a plain integer, so it always qualifies. A
-    shorter run (7..31) qualifies only if it mixes a hex *letter* (a-f) and a *digit* -- this
-    spares English words spelled from a-f only (``decade``, ``deadbeef``) and plain decimal
-    numbers (``1400000``), which do not both-mix. Recognized hex-valid names (``ed25519``) are
+    A run of >= 32 hex chars always qualifies. A shorter run (7..31) qualifies only if it
+    mixes a hex *letter* (a-f) and a *digit*, sparing English words spelled from a-f only
+    (``decade``) and plain decimal numbers. Recognized hex-valid names (``ed25519``) are
     always kept.
     """
     if tok.lower() in _HEX_NOT_IDS:
@@ -214,23 +186,17 @@ def scrub_identifiers(
     """Replace explicit identifiers in ``text`` with fixed placeholder sentinels.
 
     Generic patterns scrubbed on every source: URLs -> ``<URL>``, emails -> ``<EMAIL>``,
-    IPv4 addresses -> ``<IP>``, file paths -> ``<PATH>`` (this also removes usernames
-    hiding inside home paths, and deliberately spares date-shaped numeric tokens such as
-    ``3/22/2023`` -- see :func:`_mask_paths`). When the source knows per-document identifiers, they are
-    scrubbed too: ``repo_id`` (an ``owner/repo`` slug, plus its owner and repo-name
-    tokens) -> ``<REPO>``, and ``user_id`` (plus the local-part of an email-style id)
-    -> ``<USER>``. WildChat has no such per-document tokens and passes ``None`` for both.
+    IPv4 addresses -> ``<IP>``, file paths -> ``<PATH>`` (see :func:`_mask_paths`). When
+    known, per-document identifiers are scrubbed too: ``repo_id`` (an ``owner/repo`` slug
+    plus its tokens) -> ``<REPO>``, and ``user_id`` -> ``<USER>``. WildChat has no such
+    tokens and passes ``None`` for both.
 
     ``mask_ids`` turns on two extra scrubs for identifier-heavy agentic/terminal logs
-    (SWE-chat enables it; WildChat leaves it off for now): shell login strings
-    ``user@host`` with a bare dotless hostname -> ``<HOST>``, and opaque ids -- UUIDs and
-    hash-like hex runs (git commit SHAs, MD5/SHA digests) -> ``<ID>`` (see
-    :func:`_looks_like_hash` for what counts, and what is deliberately spared).
+    (SWE-chat only, for now): shell login strings -> ``<HOST>``, and opaque ids -- UUIDs
+    and hash-like hex runs -> ``<ID>`` (see :func:`_looks_like_hash`).
 
-    Whitespace/newline structure is preserved (unlike the legacy scrubber, which
-    collapsed it); run :func:`normalize_whitespace` first if you also want structural
-    tidy-up. Runs of spaces introduced by substitution are squeezed to a single space,
-    but newlines are never touched.
+    Whitespace/newline structure is preserved; run :func:`normalize_whitespace` first for
+    structural tidy-up too.
     """
     if not isinstance(text, str):
         return ""
@@ -256,10 +222,8 @@ def scrub_identifiers(
         for tok in _tokens_longest_first([uid, uid.split("@")[0]]):
             t = _scrub_known_token(t, tok, USER_PLACEHOLDER)
 
-    # Squeeze inline runs of spaces/tabs left by the substitutions (e.g. " <URL> " padding),
-    # but keep line-leading indentation -- indentation is itself an authorship signal. The
-    # (?<=\S) anchor only collapses runs that follow a non-space char, so leading whitespace
-    # (preceded by a newline or start of text) is preserved. Newlines are never touched.
+    # Squeeze inline runs of spaces/tabs left by substitution, but keep line-leading
+    # indentation intact -- it's itself an authorship signal.
     t = re.sub(r"(?<=\S)[ \t]{2,}", " ", t)
     t = _TRAILING_WS_RE.sub("", t)
     return t.strip()

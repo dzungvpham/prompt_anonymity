@@ -15,51 +15,39 @@ Documents are ordered by ``ended_at``. The **last 25% is the collection under at
 
 The known side is used for **hyper-parameter selection only** -- never to enrol an author, and
 never read at attack time. Specifically, tuning runs on the *last quarter of the known side*
-(positions 50-75%), not on all of it, and that is the load-bearing choice in this script:
-
-    Every parameter here is an **absolute** quantity whose optimum is set by the *shape* of the
-    problem instance. ``min_cluster_size`` is a document count. ``distance_threshold`` is a
-    radius, and how many strangers fall inside it depends on how crowded the space is. Leiden's
-    ``resolution`` trades against a null model carrying the graph's total edge weight. The whole
-    known side is 3x the size of the test quarter and a different shape (measured: 129,382
-    documents at r = 0.152 against 43,127 at r = 0.166, singleton-baseline F 0.264 against 0.285),
-    so a threshold tuned there is tuned for a denser space and transfers as an under-linking one.
-    The final quarter of the known side is the same size, adjacent in time, and the closest
-    available match -- which turns "match the simulation to the target" into a slice rather than a
-    resampling procedure.
+(positions 50-75%), not on all of it, because every parameter here is an **absolute** quantity
+whose optimum is set by the *shape* of the problem instance (``min_cluster_size`` is a document
+count; ``distance_threshold`` is a radius whose meaning depends on how crowded the space is). The
+whole known side is a different shape from the test quarter, so a threshold tuned there transfers
+as an under-linking one; the final quarter of the known side is the same size, adjacent in time,
+and the closest available match.
 
 Two author scopes (``--scopes``), and why their scores must not be differenced
 ------------------------------------------------------------------------------
-The two slices hold disjoint *documents*, but not disjoint *authors*: 21.3% of WildChat's
-test-quarter authors and 62.7% of swe-chat's also wrote on the known side (36.7% and 82.1% of the
-documents). Nothing enrols them -- no author is ever a label here -- but the hyper-parameters were
-chosen with their documents visible, and ``--projection`` is *fitted* on them, so a run that scores
-only the whole collection cannot say whether its result depends on people the attacker held labels
-for. So the collection is attacked twice, and both scopes land in ``clustering_results.csv`` under
-a ``scope`` column:
+The two slices hold disjoint *documents*, but not disjoint *authors*: some test-quarter authors
+also wrote on the known side. Nothing enrols them -- no author is ever a label here -- but the
+hyper-parameters were chosen with their documents visible, and ``--projection`` is *fitted* on
+them, so a run that scores only the whole collection cannot say whether its result depends on
+people the attacker held labels for. So the collection is attacked twice, and both scopes land in
+``clustering_results.csv`` under a ``scope`` column:
 
 ``all``      the test quarter whole. The threat model, and the number every figure draws.
 ``unseen``   only the documents whose author never appears in the known side ``[0, 0.75)``. The
              tuning slice is restricted the same way against the history that precedes *it*
-             (``[0, 0.50)``), so it stays a simulation of the instance being attacked: measured,
-             26,936 documents against the test collection's 27,308 on WildChat, 184 against 178 on
-             swe-chat.
+             (``[0, 0.50)``), so it stays a simulation of the instance being attacked.
 
 Each scope is a complete run -- its own neighbour graphs, its own search, its own baselines -- and
 that is the point: **one scope's BCubed F may not be compared with the other's**. Restricting to
-unseen authors changes the *shape* of the problem, which the section above says is exactly what
-sets every parameter's optimum (``authors_per_document`` moves 0.166 -> 0.207 on WildChat, 0.059 ->
-0.124 on swe-chat). Sharper still, the restriction is not independent of the answer: the corpus
-keeps only authors with at least two documents in total, so an author absent from the known side
-must have **at least two in the test quarter**. The ``unseen`` collection therefore contains no
-single-document authors at all *by construction* -- 0.0% against 7.5% of the full quarter's
-authors on WildChat -- and singletons are the documents no method can link. That alone lifts the
-singleton baseline from F = 0.285 to 0.343 on WildChat and 0.112 to 0.220 on swe-chat. Read each
-scope against **its own** baseline rows, which is why they are recomputed per scope rather than
-shared.
+unseen authors changes the *shape* of the problem. Sharper still, the restriction is not
+independent of the answer: the corpus keeps only authors with at least two documents in total, so
+an author absent from the known side must have **at least two in the test quarter**. The
+``unseen`` collection therefore contains no single-document authors at all *by construction*, and
+singletons are the documents no method can link -- that alone lifts the singleton baseline. Read
+each scope against **its own** baseline rows, which is why they are recomputed per scope rather
+than shared.
 
-``unseen`` is small on swe-chat -- 178 documents from 22 authors -- and should be read as an
-indication rather than a measurement there.
+``unseen`` is small on swe-chat and should be read as an indication rather than a measurement
+there.
 
 Did tuning help? Two references, neither of them the tuned number itself
 -----------------------------------------------------------------------
@@ -67,9 +55,7 @@ Did tuning help? Two references, neither of them the tuned number itself
 weak evidence alone, since the defaults are a choice made in this repo and bad ones would flatter
 tuning for free. ``--oracle-sweep`` re-runs the whole grid on the **test** collection, giving the
 median (what an arbitrary reasonable configuration scores) and the best (what a perfect chooser
-would have reached). Both are **oracles**: nothing may select a configuration on them. Measured on
-swe-chat, the median is the honest reference and tuning is worth +0.05 to +0.34 against it, while
-against the defaults it looks worth +0.42 -- the difference is entirely how bad a default is.
+would have reached). Both are **oracles**: nothing may select a configuration on them.
 
 ``--diagnostics``: measuring the problem rather than the attack
 ---------------------------------------------------------------
@@ -78,25 +64,20 @@ wrote what, and whether the algorithm assembled that knowledge correctly. ``--di
 the algorithm-free half, which needs no clustering run at all and is the cheap first look at a new
 corpus or feature:
 
-* **Same-author verification AUC** over every pair, streamed into a fixed histogram (9.3e8 pairs on
-  WildChat, 3 MB of counters). Prevalence-free, hence the only figure here comparable *across*
-  corpora -- and prevalence-blind, hence optimistic, so it is reported next to average precision
-  and the prevalence itself. StyloMetrix on WildChat is the case that makes the point: AUC 0.712
-  with AP 0.0047 describe the same scores.
+* **Same-author verification AUC** over every pair, streamed into a fixed histogram. Prevalence-free,
+  hence the only figure here comparable *across* corpora -- and prevalence-blind, hence optimistic,
+  so it is reported next to average precision and the prevalence itself.
 * **Neighbour-graph quality per k** -- edge precision, hit rate and neighbour recall against their
   own chance references, plus the connected-component structure. This is what explains a tuned
-  ``neighbors=2``: at k=100 the graph is a single component on both corpora, so a loose method
-  chains the whole corpus into one cluster.
-* **A within-language control** on edge precision. StyloMetrix separates English from Russian at
-  0.984 AUROC *within* one corpus, so on a corpus that is 44.9% English and 22.1% Russian a result
-  that a language partition matches is not evidence about writing style.
+  low neighbour count: at a high k the graph becomes a single component, so a loose method chains
+  the whole corpus into one cluster.
+* **A within-language control** on edge precision, since a strong within-corpus language separator
+  can make a result that merely matches a language partition look like evidence about writing style.
 * **Authorship-link ranking** (PAN's second subtask) -- AP, R-precision and P@10 over the graph's
   edges, which separates the quality of the similarity from the quality of the algorithm.
 
-This was a separate script (``clustering_diagnostics.py``) until it was folded in here, because it
-duplicated the reference partitions -- two implementations of a number that appears as a line on
-every figure, which had already drifted by 1.9e-4 on the seeded random baseline. The baselines now
-have one implementation (:func:`run_baselines`) and this file has one definition of the split.
+The reference partitions (baselines) have one implementation (:func:`run_baselines`) and this file
+has one definition of the split, so the diagnostics and the attack always agree on both.
 
 Run (from the repo root)::
 
@@ -127,9 +108,9 @@ before ``--scopes`` existed is still read the same way:
 
 The directory is **not** under ``experiments/results/``, whose four-part names are a contract
 ``plot_results.py`` parses and whose ``rolling_results.csv`` schema is built for ranking attacks.
-That file does read *this* directory, though: since 2026-08-13 it draws the clustering figures
-too, into ``experiments/plots/<dataset>/clustering/``, so there is still exactly one script that
-draws every figure in the project. This one writes CSVs and stops, like every other runner.
+That file does read *this* directory though, drawing the clustering figures into
+``experiments/plots/<dataset>/clustering/``, so there is still exactly one script that draws every
+figure in the project. This one writes CSVs and stops, like every other runner.
 """
 
 from __future__ import annotations
@@ -215,10 +196,8 @@ PROJECTION_FIT_FRACTION = 0.50
 NEIGHBOR_COUNTS = (1, 2, 3, 5, 10, 20, 50, 100)
 
 #: Bins the pairwise-score histogram is accumulated into. Cosine distance is bounded on [0, 2], so
-#: this is a resolution of 1e-5, and it is why a 9.3e8-pair AUC costs 3 MB rather than 7.4 GB.
-#: Measured against ``sklearn.metrics`` on samples of the size the bins see, binning costs
-#: |AUC error| < 2.6e-6 and |AP error| < 2.0e-5. 20,000 bins was the first choice and was raised:
-#: it held AUC to 1.2e-5 but let AP drift to 2.3e-4, and the extra 3 MB is free.
+#: this gives a fine resolution while keeping an all-pairs AUC/AP cheap in memory (a fixed-size
+#: histogram rather than one entry per pair).
 SCORE_BINS = 200_000
 
 #: Cosine distance's exact upper bound. Any other metric has its range estimated from a sample.
@@ -229,8 +208,7 @@ DIAGNOSTIC_SEED = 20260812
 
 #: Largest ``k`` any configuration may ask for. The graph is built once at this width and every
 #: configuration truncates it, so a sweep over ``neighbors`` costs one build rather than one per
-#: value -- and the build is by far the expensive part (measured: 19 s at 196 dimensions, minutes
-#: at 3,072).
+#: value -- and the build is by far the expensive part.
 MAX_NEIGHBORS = 50
 
 #: Metadata partitions scored alongside the real attacks. Whatever these reach is available to an
@@ -244,8 +222,7 @@ TEST_AUTHOR_SCOPES = ("all", "unseen")
 
 #: Below this many documents a scope is skipped with a note rather than attacked. A collection of a
 #: handful of documents is not a clustering problem, and on a small corpus an author restriction is
-#: exactly the thing that produces one -- swe-chat's ``unseen`` collection is already only 178
-#: documents from 22 authors.
+#: exactly the thing that produces one.
 MIN_SCOPE_DOCUMENTS = 10
 
 #: Multipliers laid around the *balanced* weight to make ``--tune-time-weight``'s grid.
@@ -253,9 +230,7 @@ MIN_SCOPE_DOCUMENTS = 10
 #: The grid is derived per run rather than fixed, because the weight where the two terms of
 #: ``temporal_fusion`` contribute equally is a property of the corpus, not a constant:
 #: :func:`~prompt_anonymity.attacks.clustering.rescoring.balanced_time_weight` reads it off the
-#: tuning graph, and this brackets it geometrically. A fixed linear grid cannot do that -- on
-#: swe-chat the balance sits near 0.1, so a grid starting at 0.2 would have had every candidate
-#: past the point where timing already dominates the text.
+#: tuning graph, and this brackets it geometrically.
 #:
 #: **0.0 is always in the grid** -- the pure-text control, so an algorithm that gains nothing from
 #: session structure can decline the fusion rather than being forced into it. The top is clipped
@@ -347,9 +322,8 @@ def scope_positions(authors: np.ndarray, scope: str) -> tuple[np.ndarray, np.nda
     The mirror is not exact, and the asymmetry is worth knowing: the test collection is at the end
     of the corpus, so "absent from everything before it" also means "at least two documents inside
     it" (the corpus keeps no author with fewer than two documents overall). The tuning slice has a
-    future its authors can write in, so it keeps a few single-document authors -- 4.9% of them on
-    WildChat, against 0.0% in the test collection. Measured, the two instances still match closely:
-    singleton-baseline F 0.365 against 0.343 on WildChat, 0.178 against 0.220 on swe-chat.
+    future its authors can write in, so it keeps a few single-document authors that the test
+    collection cannot -- the two instances still match closely in practice.
     """
     tuning_window, test_window = slice_bounds(len(authors))
     tuning = np.arange(tuning_window.start, tuning_window.stop)
@@ -368,8 +342,8 @@ def take_rows(matrix: np.ndarray, positions: np.ndarray) -> np.ndarray:
     """``matrix[positions]``, as a **view** when the positions are one contiguous run.
 
     Fancy indexing always copies, and the ``all`` scope's positions are a whole slice -- so the
-    plain spelling would copy 530 MB of WildChat's Gemini matrix to hand back something already in
-    memory, on a run whose peak is what decides whether it survives the job's memory cap.
+    plain spelling would copy a large matrix to hand back something already in memory, on a run
+    whose peak is what decides whether it survives the job's memory cap.
     """
     if len(positions) and positions[-1] - positions[0] == len(positions) - 1:
         return matrix[positions[0]:positions[-1] + 1]
@@ -387,9 +361,8 @@ def collection_shape(authors: np.ndarray) -> dict:
     """Properties of the clustering problem itself, before any attack.
 
     ``authors_per_document`` is the one that governs the rest: it decides how strong the singleton
-    baseline is, and it is why PAN's collections (0.5-0.9) and these corpora (0.166 and 0.059) sit
-    in different regimes -- PAN's BASELINE-Singleton scores 0.821 and is "very hard to beat", ours
-    scores 0.285 and 0.112.
+    baseline is, and this project's corpora sit in a much sparser regime than PAN's own collections,
+    which is why the singleton baseline is far lower here.
     """
     values, sizes = np.unique(authors, return_counts=True)
     per_document = sizes[np.unique(authors, return_inverse=True)[1].ravel()]
@@ -406,9 +379,8 @@ def collection_shape(authors: np.ndarray) -> dict:
         "share_docs_linkable": float((per_document >= 2).mean()),
         "n_true_links": n_true_links,
         # Probability that two documents drawn at random share an author. Every edge-precision and
-        # link-ranking figure is read against this, and it moves by a factor of 67 between the two
-        # corpora (0.087 on swe-chat, 0.0013 on WildChat), so an unreferenced "edge precision 0.15"
-        # says nothing at all.
+        # link-ranking figure is read against this -- it varies a great deal across corpora, so an
+        # unreferenced "edge precision 0.15" says nothing at all on its own.
         "random_link_precision": n_true_links / (n * (n - 1) / 2),
     }
 
@@ -416,8 +388,8 @@ def collection_shape(authors: np.ndarray) -> dict:
 def random_neighbor_references(authors: np.ndarray, k: int) -> dict:
     """What ``k`` neighbours drawn at random would score. Closed form, no sampling.
 
-    Without these, ``hit_at_k`` cannot be compared across corpora: k=100 is a tenth of swe-chat's
-    collection and a four-hundredth of WildChat's, so the same value means very different things.
+    Without these, ``hit_at_k`` cannot be compared across corpora: the same k is a much larger
+    fraction of a small collection than a large one, so the same raw value means different things.
     """
     n = len(authors)
     _, codes = np.unique(np.asarray(authors), return_inverse=True)
@@ -438,11 +410,10 @@ def within_language_chance(authors: np.ndarray, languages: np.ndarray) -> float:
     """P(same author | same language) for a random pair -- the language-controlled reference.
 
     The plain chance reference asks how often two documents from the whole collection share an
-    author, which flatters any similarity that is partly a language detector. StyloMetrix is
-    exactly that: it runs an *English* spaCy pipeline over every document whatever language it is
-    in, and separates English from Russian at 0.984 AUROC within a single corpus. So the honest
-    question is not "is an edge better than a random pair?" but "is a within-language edge better
-    than a random *within-language* pair?".
+    author, which flatters any similarity that is partly a language detector -- StyloMetrix is
+    exactly that, since it runs an *English* spaCy pipeline over every document whatever language
+    it is in. So the honest question is not "is an edge better than a random pair?" but "is a
+    within-language edge better than a random *within-language* pair?".
     """
     frame = pd.DataFrame({"author": np.asarray(authors), "language": np.asarray(languages)})
     same_author = total = 0.0
@@ -544,10 +515,9 @@ def verification_diagnostics(embeddings: np.ndarray, authors: np.ndarray, metric
     themselves rank below the strangers.
 
     ``verification_auc_macro`` is a correction rather than a refinement. Same-author pairs grow
-    quadratically in an author's document count, so WildChat's most prolific test-quarter user
-    (509 documents) contributes 129,286 pairs -- **11% of every true link in the collection** --
-    and the pair-weighted AUC is substantially a statement about a handful of people. Measured, the
-    two differ by 0.06 on WildChat/Gemini (0.867 against 0.926).
+    quadratically in an author's document count, so a single prolific author's documents can
+    contribute a large share of every true link in the collection, making the pair-weighted AUC
+    substantially a statement about a handful of people rather than about the population.
 
     One streamed pass over the full pairwise matrix, never materialised. The macro half sorts each
     row, which is the more expensive part. **This is a second pass, after the neighbour graph's**;
@@ -787,9 +757,8 @@ def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
     # was chosen under has to be the transform the test collection is scored with.
     tuning = next(c for c in collections if c.role == "tuning")
     # Per graph, deliberately: each collection is bracketed by its OWN quantiles rather than
-    # inheriting the tuning slice's, for the reasons `winsor_bounds` documents (a fixed bracket
-    # pinned 14.4% of the test collection's time gaps to the clip, and the selected weight is
-    # unaffected either way because the search only ever sees the tuning graph).
+    # inheriting the tuning slice's, for the reasons `winsor_bounds` documents. The selected weight
+    # is unaffected either way, because the search only ever sees the tuning graph.
     for collection in collections:
         collection.fusion_scales = winsor_bounds(collection.graph, collection.seconds)
     if seconds is None:
@@ -937,11 +906,8 @@ def run_algorithm(algorithm: str, test: Collection, test_authors: np.ndarray,
         "fusion_time_bounds_hours": ("" if test.fusion_scales is None
                                      else describe_bounds(test.fusion_scales[1])),
         "tuning_bcubed_f": tuned_score,
-        # Named for its sign, because the old name (`tuning_transfer_gap`) did not carry one and
-        # was misread: POSITIVE means the tuning slice scored HIGHER than the test collection, i.e.
-        # tuning where the labels are visible was optimistic. Measured +0.005 to +0.025 on all nine
-        # WildChat (defense x algorithm) combinations, and negative on swe-chat, where the final
-        # quarter is simply an easier instance than the one before it.
+        # Named for its sign: POSITIVE means the tuning slice scored HIGHER than the test
+        # collection, i.e. tuning where the labels are visible was optimistic.
         "tuning_optimism": float("nan"),                     # filled below, needs the test score
         "seconds_tuning": tuning_seconds,
         "seconds_attack": attack_seconds,
@@ -997,11 +963,10 @@ def run_baselines(collection: Collection) -> list[dict]:
     """The reference partitions for one collection, scored through the same path as the attacks.
 
     **Recomputed per scope, never shared.** A baseline is a property of the collection it is
-    computed on, and the two scopes are different collections: the singleton partition alone moves
-    from F = 0.285 to 0.343 on WildChat, because restricting to authors the attacker has no history
-    for also removes every author with a single document (see the module docstring). Sharing one
-    set of baseline rows would put the ``unseen`` attack's F against a line drawn for a different
-    problem.
+    computed on, and the two scopes are different collections: restricting to authors the attacker
+    has no history for also removes every author with a single document (see the module
+    docstring), which moves the singleton partition's score on its own. Sharing one set of
+    baseline rows would put the ``unseen`` attack's F against a line drawn for a different problem.
     """
     frame, authors, graph = collection.frame, collection.authors, collection.graph
     rows = []

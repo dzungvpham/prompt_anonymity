@@ -9,10 +9,9 @@ so it can gate a submission:
     python experiments/check_dpmlm_slicing.py && sbatch experiments/run_dpmlm_wildchat.sbatch
 
 Background: sampling in :mod:`~prompt_anonymity.defenses.dp_mlm` materializes
-``[positions x vocab]`` in float32 plus a softmax of the same shape, per conversation. On WildChat,
-whose longest turn is ~104k words, that is a ~19 GB allocation and it OOM'd a full run three hours
-in. ``DPMLM_SAMPLE_SLICE`` now caps the rows per sampling call and turns longer than it are
-streamed in waves, which bounds peak memory by the wave instead of by the turn.
+``[positions x vocab]`` in float32 plus a softmax of the same shape, per conversation -- a long
+enough turn can OOM. ``DPMLM_SAMPLE_SLICE`` caps the rows per sampling call and turns longer than
+it are streamed in waves, which bounds peak memory by the wave instead of by the turn.
 
 The three properties that has to have, and that this checks:
 
@@ -38,8 +37,8 @@ import sys
 from prompt_anonymity.defenses.dp_mlm import DPMLM_SAMPLE_SLICE, DPMLMDefense
 
 SENTENCE = "the quick brown fox jumps over the lazy dog"
-SHORT = " ".join([SENTENCE] * 30)    # ~270 words: below any threshold tested here
-LONG = " ".join([SENTENCE] * 300)    # ~2,700 words: streams in ~20 waves at slice=64
+SHORT = " ".join([SENTENCE] * 30)    # below any threshold tested here
+LONG = " ".join([SENTENCE] * 300)    # long enough to force streaming at slice=64
 
 
 def main() -> int:

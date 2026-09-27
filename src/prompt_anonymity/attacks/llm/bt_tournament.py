@@ -2,34 +2,29 @@
 
 Port of *Algorithm 1: LLM-based confidence sorting* from "Large-scale online deanonymization
 with LLMs" (arXiv 2602.16800), applied per unknown conversation. Where
-:class:`~prompt_anonymity.attacks.EuclideanLLMJudgeAttack` asks the judge ONE K-way forced
+:class:`~prompt_anonymity.attacks.EuclideanLLMJudgeAttack` asks the judge one K-way forced
 choice per unknown row, this ranks each row's top-K nearest known candidates with a
-Bradley-Terry / Swiss-system TOURNAMENT of *pairwise* comparisons: candidates carry online
+Bradley-Terry / Swiss-system tournament of pairwise comparisons: candidates carry online
 Elo-style ratings, each round pairs similarly-rated candidates, the judge picks the more
 plausible same-author match, and the ratings update. After ``rounds`` rounds the candidates
 are reranked by rating.
 
-Like the K-way judge, only the WITHIN-top-K order changes -- top-K membership (and hence
-top-K / top-2K accuracy) is left exactly as the distance metric found it -- so at ``top_k=5``
-top-5 and top-10 are identical to the underlying nearest-neighbor attack and only top-1 can
-move. This makes it directly comparable to :class:`EuclideanLLMJudgeAttack`; the difference is
-how the within-top-K order is decided (a rating tournament vs. a single forced choice).
+Only the within-top-K order changes -- top-K membership is left exactly as the distance metric
+found it, so only top-1 can move. That makes it directly comparable to
+:class:`EuclideanLLMJudgeAttack`; the difference is how the within-top-K order is decided (a
+rating tournament vs. a single forced choice).
 
-The judge runs on OpenRouter (default ``anthropic/claude-sonnet-5``, through the same
-:class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat` client) and its one-digit
-pairwise verdicts are cached with :class:`~prompt_anonymity.caching.TransformCache` under
-``<cache_dir>/attacks``, keyed by the prompt text -- so a Swiss *rematch* of the same pair
-(same presentation) is free on re-encounter, and a fully-cached run makes no API call.
+The judge runs on OpenRouter through :class:`~prompt_anonymity.attacks.llm._openrouter.OpenRouterChat`
+and its verdicts are cached by prompt text, so a Swiss rematch of the same pair is free on
+re-encounter and a fully-cached run makes no API call.
 
-Rounds are SEQUENTIAL (round *r*'s pairings depend on round *r-1*'s ratings), but within a
-round every active row contributes its comparisons to ONE batched judge call, so the judge
-runs in large batches and each round is cached and crash-safe.
+Rounds are sequential (round *r*'s pairings depend on round *r-1*'s ratings), but within a
+round every active row's comparisons go into one batched judge call.
 
 Ambiguity gate (``margin_quantile``): only rows whose top-1/top-2 distance margin is at or
 below the quantile are tournamented; confident rows keep the distance metric's order. Unlike
-the K-way judge's gate (which judges every row and gates only the boost *application*, so
-re-sweeping is free), this gates *execution* -- it skips the API calls for confident rows --
-so a lower quantile is cheaper but re-widening it later needs fresh comparisons.
+the K-way judge's gate, which judges every row and gates only the boost's application, this
+gates execution -- it skips the API calls for confident rows.
 """
 
 from __future__ import annotations
@@ -67,8 +62,7 @@ DEFAULT_JUDGE_MODEL = "anthropic/claude-sonnet-5"
 
 #: How many nearest candidates enter each unknown row's tournament.
 DEFAULT_TOP_K = 5
-#: N in Algorithm 1: Swiss rounds. With K=5 each round plays 2 matches (+1 bye), so a candidate
-#: plays up to N matches; 4 settles the top-1 without excess API calls.
+#: N in Algorithm 1: Swiss rounds.
 DEFAULT_ROUNDS = 4
 #: Online Bradley-Terry (Elo-style) step, in logistic units: ``r += elo_k * (S - E)``,
 #: ``E = sigmoid(r_a - r_b)``. Larger = ratings move faster (decisive, noisier).
@@ -152,10 +146,9 @@ class BradleyTerryTournamentAttack:
         return self._client.complete_batch(prompts)
 
     def _cache(self, cache_dir) -> TransformCache:
-        # Keyed by prompt text; namespaced by the judge model + rubric + presentation params so a
-        # change that alters the prompts (or the model) re-caches. elo_k / rounds are NOT in the
-        # key: they only steer which pairs meet, and a given pair's prompt text is identical
-        # regardless, so a Swiss rematch hits the cache across settings.
+        # elo_k / rounds are deliberately not in the key: they only steer which pairs meet, and a
+        # given pair's prompt text is identical regardless, so a Swiss rematch hits the cache
+        # across settings.
         return TransformCache(
             Path(cache_dir) / "attacks", "bt_tournament",
             logic_hash([OpenRouterChat, BradleyTerryTournamentAttack], version=JUDGE_VERSION),
@@ -188,9 +181,8 @@ class BradleyTerryTournamentAttack:
         known_texts = [str(t) for t in np.asarray(data.known_texts)]
         unknown_texts = [str(t) for t in np.asarray(data.unknown_texts)]
 
-        # Shortlist the most likely AUTHORS, each represented by their own document nearest to
-        # this unknown one. See prompt_anonymity.attacks.llm.candidates for why the unit is the
-        # author rather than the conversation.
+        # Shortlist the most likely authors, each represented by their own document nearest to
+        # this unknown one (see attacks.llm.candidates for why the unit is the author).
         candidates = author_candidates(
             data.known_embeddings, data.known_labels, data.unknown_embeddings,
             top_k=self.top_k, metric=data.metric,
@@ -210,10 +202,8 @@ class BradleyTerryTournamentAttack:
         gate_thresh = np.quantile(margins, self.margin_quantile)
         active_rows = np.where(margins <= gate_thresh)[0]
 
-        # BT ratings, (n, k), in logistic units. Seed a TINY author-rank prior (best slot highest)
-        # so round-1 Swiss pairing is deterministic (best vs 2nd-best, 3rd vs 4th, ...) while
-        # being small enough that a single upset (step ~elo_k) flips it -- the tournament, not
-        # the prior, decides.
+        # BT ratings, (n, k), in logistic units. Seeded with a tiny author-rank prior so round-1
+        # Swiss pairing is deterministic, but small enough that a single upset flips it.
         ratings = np.tile(((k - 1 - np.arange(k)) * 1e-3).astype(float), (n, 1))
 
         rng = np.random.default_rng(self.seed)  # seeds 1-vs-2 presentation flips; reproducible
@@ -226,11 +216,10 @@ class BradleyTerryTournamentAttack:
             # (row, slot_shown_as_1, slot_shown_as_2) for prompts[t].
             prompts, meta = [], []
             for i in active_rows:
-                slot_order = np.argsort(-ratings[i], kind="stable")  # best-rated first; ties keep dist order
-                for p in range(0, k - 1, 2):                         # adjacent pairs; odd last slot = bye
+                slot_order = np.argsort(-ratings[i], kind="stable")  # best-rated first
+                for p in range(0, k - 1, 2):                         # adjacent pairs; odd slot = bye
                     a, b = int(slot_order[p]), int(slot_order[p + 1])
-                    # Randomize which candidate is shown as 1 vs 2 to cancel the judge's position
-                    # bias (same rationale as EuclideanLLMJudgeAttack's candidate shuffle).
+                    # Randomize presentation order to cancel the judge's position bias.
                     first, second = (b, a) if rng.integers(2) else (a, b)
                     prompts.append(_pairwise_judge_prompt(
                         unknown_texts[int(i)][: self.snippet_chars],

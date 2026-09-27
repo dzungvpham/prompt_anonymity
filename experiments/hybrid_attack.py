@@ -21,15 +21,12 @@ closest literatures, and what each predicts:
 ``clustering -> identification``
     **Set-based / transductive recognition.** In speaker recognition this is diarization feeding
     speaker ID: cluster the segments, pool the embeddings, identify the *cluster* rather than the
-    segment, and the pooled decision is better than any of its parts because averaging suppresses
-    per-segment noise. In image retrieval it is **average query expansion** (Chum et al., "Total
-    Recall", ICCV 2007): re-issue the query as the mean of its own top results.
+    segment. In image retrieval it is **average query expansion** (Chum et al., "Total Recall",
+    ICCV 2007): re-issue the query as the mean of its own top results.
     **Their warning is the load-bearing one for us.** Chum et al. found that query expansion
     *without* spatial verification performs **worse than no expansion at all** -- pooling over an
-    impure set injects a wrong document's evidence into a right one's decision. Our clustering
-    runs at BCubed precision ~0.6 with a documented giant cluster, so the prediction going in is:
-    helps on small pure clusters, catastrophic if applied to everything. Hence the size gate below,
-    which is our stand-in for their spatial verification.
+    impure set injects a wrong document's evidence into a right one's decision. Hence the size
+    gate below, which is our stand-in for their spatial verification.
 
 ``identification -> clustering``
     **Semi-supervised / constrained clustering** (must-link constraints) and **collective entity
@@ -44,7 +41,7 @@ closest literatures, and what each predicts:
     **Generalized Category Discovery** (Vaze et al., CVPR 2022) is our exact problem statement in
     another vocabulary: given a labelled set of known categories and an unlabelled set holding
     *both* known and novel categories, classify the known and discover the novel. Our known side is
-    the labelled set, our test quarter is the unlabelled one, and 79% of its authors are novel.
+    the labelled set, our test quarter is the unlabelled one, and most of its authors are novel.
 
 ``the re-ID analogue``
     Person re-identification does both. **k-reciprocal re-ranking** (Zhong et al., CVPR 2017)
@@ -60,13 +57,12 @@ One split, shared by both attacks and identical to the two existing families: th
 ``[0, 0.75)``, the collection under attack is the final quarter.
 
 **Direction A, ``cluster -> identify``.** Every document's score row is standardised across
-authors (the cohort normalisation ``accept_score`` already uses, so that documents with different
-overall similarity are comparable), the rows are averaged within each cluster, and every member of
-the cluster takes the pooled argmax. Swept over a **maximum cluster size**: a cluster larger than
-the gate is left alone and its documents keep their own answers. ``gate = 1`` is the attack alone
-and is asserted to reproduce it exactly. The **oracle** row pools by the true author partition,
-which bounds what a perfect clustering could buy and separates "the idea is wrong" from "the
-clustering is not good enough yet".
+authors (the cohort normalisation ``accept_score`` already uses), the rows are averaged within
+each cluster, and every member of the cluster takes the pooled argmax. Swept over a **maximum
+cluster size**: a cluster larger than the gate is left alone and its documents keep their own
+answers. ``gate = 1`` is the attack alone and is asserted to reproduce it exactly. The **oracle**
+row pools by the true author partition, which bounds what a perfect clustering could buy and
+separates "the idea is wrong" from "the clustering is not good enough yet".
 
 **The reported gain is itself oracle-gated, and has to be quoted that way.** The winning gate is
 chosen by reading top-1 off the collection under attack, so it is what a *perfect* chooser of the
@@ -186,8 +182,7 @@ SUMMARY_TOP_KS = (5, 10, 20)
 
 #: Documents ranked per block in :func:`ranks_of_true_author`. Ranking materialises a
 #: ``[block x n_authors]`` slab plus the two boolean masks :func:`true_author_ranks` compares with,
-#: so this is the knob that keeps a WildChat run (19,711 authors) inside the 16 GB cap: 1,024 rows
-#: is ~80 MB of float32 against the 3.4 GB the whole score matrix would cost.
+#: so this bounds a large run's memory against the whole score matrix's.
 RANK_BLOCK = 1_024
 
 
@@ -216,10 +211,8 @@ def row_standardise(scores: np.ndarray) -> np.ndarray:
     centre = scores.mean(axis=1, keepdims=True)
     spread = scores.std(axis=1, keepdims=True)
     np.copyto(spread, 1.0, where=(spread == 0))
-    # In place, on purpose. The caller owns this array (it is what `.score()` just returned) and it
-    # is 3.4 GB on WildChat's 43,127 x 19,711 -- the expression `(scores - centre) / spread` would
-    # hold two more of it at once, which is the difference between running and being OOM-killed
-    # under this project's 16 GB cap.
+    # In place, on purpose: the caller owns this array, and `(scores - centre) / spread` would hold
+    # extra copies of a matrix that can be large enough to matter under this project's memory cap.
     np.subtract(scores, centre, out=scores)
     np.divide(scores, spread, out=scores)
     return scores
@@ -232,8 +225,7 @@ def ranks_of_true_author(matrix: np.ndarray, rows: np.ndarray, true_authors: np.
     ``matrix[rows[i]]`` is the row document *i* is ranked in: its **own** row of the score matrix
     for the unpooled arm (``rows`` is then just the document's index), or its **cluster's** pooled
     row for a pooled one. One function therefore serves both arms, and neither ever builds a second
-    ``[n_documents x n_authors]`` matrix -- on WildChat that is 3.4 GB, and the gather
-    ``matrix[rows]`` would be exactly that.
+    full ``[n_documents x n_authors]`` matrix, which the gather ``matrix[rows]`` would be.
 
     Ties are averaged, because :func:`true_author_ranks` averages them: a document tied with one
     other candidate for the best score gets rank 1.5, so it is *not* a top-1 hit under ``rank <= 1``
@@ -260,19 +252,17 @@ def pooled_outcomes(scores: np.ndarray, clusters: np.ndarray, gates, evaluated: 
     ``gate`` caps the cluster size that is allowed to pool: members of a larger cluster keep their
     own row. That is this script's stand-in for the spatial verification Chum et al. found to be
     the difference between query expansion helping and hurting -- an impure pool does not merely
-    fail to help, it overwrites correct answers with the majority's wrong one, and on these corpora
-    the largest cluster is a third of the collection.
+    fail to help, it overwrites correct answers with the majority's wrong one.
 
     The per-cluster mean is computed **once** and every gate then only chooses which clusters may
     write their answer back, because the pooled answer for a cluster does not depend on the gate --
     only whether it is used does. The same holds for the *ranking*, which is what makes the full CMC
     curve affordable at all: a document's rank under pooling is fixed by its cluster, so the pooled
-    rows are ranked once rather than once per gate. Sweeping fifteen gates the naive way would
-    re-sort and re-reduce a 3.4 GB matrix fifteen times, and rank against it fifteen more.
+    rows are ranked once rather than once per gate.
 
     One ``np.add.reduceat`` over the cluster-sorted matrix rather than a loop of masks, the same
-    contiguous-block trick ``attacks/common.group_by_author`` uses: the mask form would rebuild a
-    43,127 x 19,711 boolean per cluster.
+    contiguous-block trick ``attacks/common.group_by_author`` uses, since the mask form would
+    rebuild a large boolean array per cluster.
 
     ``evaluated`` is the boolean mask of documents that have a correct answer at all -- the in-set
     ones. Predictions are returned for **every** document (the caller masks them, as
@@ -395,9 +385,8 @@ def cmc_table(ranks: np.ndarray, authors_of: np.ndarray, n_candidates: int) -> p
         a random guesser that many attempts. **Never read the identity curve against the document
         baseline**; that gap is mostly the author's document count.
 
-    Both curves are built from one histogram of the ranks rather than a pass per k (19,711 of them
-    on WildChat), and the identity baseline is grouped by distinct document count, of which there
-    are a few dozen where there are thousands of authors.
+    Both curves are built from one histogram of the ranks rather than a pass per k, and the identity
+    baseline is grouped by distinct document count rather than per author.
     """
     ranks = np.asarray(ranks, dtype=float)
     document = cmc_curve(ranks, n_candidates)
@@ -552,11 +541,9 @@ def main() -> None:
     # **Each attack gets the feature space its own runner gives it, and they differ.**
     # `run_experiment.py` z-scores on known-side statistics by default; `run_clustering.py` does
     # not, it only fills NaNs. Forcing one space on both would make every delta below partly a
-    # preprocessing effect -- measured, standardising moves the swe-chat clustering baseline from
-    # F 0.564 to 0.642, which is larger than any result here. So the attribution side is
-    # standardised, the graph is built on the raw vectors, and both arms are then exactly the
-    # arms their families publish (asserted against them in the module docstring's terms: the
-    # `attack_alone` row reproduces that family's `closed_set_top1` to the digit).
+    # preprocessing effect, so the attribution side is standardised, the graph is built on the raw
+    # vectors, and both arms are then exactly the arms their families publish (asserted against
+    # them: the `attack_alone` row reproduces that family's `closed_set_top1` to the digit).
     attack_known, attack_test = embeddings[known], embeddings[test]
     if args.standardize:
         attack_known, attack_test = standardize(attack_known, attack_test)
@@ -632,8 +619,8 @@ def main() -> None:
     in_set_labels = test_labels[in_set]
     # The unpooled arm, computed once here rather than inside each partition's sweep: it is what
     # every gate falls back to, it is the `attack_alone` reference row, and neither the argmax nor
-    # the ranking depends on the partition -- so deriving it per partition would cost three extra
-    # passes over a matrix that is 3.4 GB on WildChat.
+    # the ranking depends on the partition -- so deriving it per partition would cost extra passes
+    # over a large matrix for no reason.
     plain_choice = scores.argmax(axis=1)
     plain_ranks = ranks_of_true_author(scores, np.flatnonzero(in_set), in_set_labels,
                                        fitted.authors)

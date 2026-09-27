@@ -1,10 +1,6 @@
 """Unified near-duplicate / boilerplate removal, applied identically to both sources.
 
-The two original pipelines deduped slightly differently: WildChat (``wildchat/filter.py``)
-removed affixes shared across *different* identities and capped repeats within an identity,
-keying on the *first turn*; SWE-chat (``data/swe_chat.py``) dropped per-identity exact and affix
-duplicates keying on the *whole* text, with no cross-identity step and no cap. This module
-reconciles them into one policy, run over the whole cleaned corpus:
+One dedup policy, run over the whole cleaned corpus:
 
 1. **Within-identity exact duplicates** -- identical cleaned ``text`` from the same author
    collapses to its earliest occurrence (no information in a verbatim repeat).
@@ -33,16 +29,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-# Leading/trailing slice length. Both legacy pipelines used 50; 100 is deliberately more
-# conservative, because the window has to reach past a template's boilerplate opening into the
-# variable payload before two documents stop colliding. At 50 chars, two people who merely began
-# with the same standard idiom ("#include <bits/stdc++.h>\nusing namespace std;\nbool") collided
-# and *both* lost their document; doubling the window makes an accidental collision far less
-# likely while still catching the pasted preambles the rule exists for.
+# Leading/trailing slice length: long enough to reach past a boilerplate opening into the variable
+# payload before two unrelated documents can collide on it.
 MIN_AFFIX_LEN = 100
-# Per-identity cap on documents sharing an affix: keep the earliest two, drop the rest. Two is
-# enough to preserve a habitual opening as genuine style signal (one document alone could not
-# establish it as a habit) without letting one author's repeated template dominate their profile.
+# Per-identity cap on documents sharing an affix: keeps a couple of instances of a habitual opening
+# as genuine style signal without letting one author's repeated template dominate their profile.
 MAX_PER_AFFIX = 2
 
 

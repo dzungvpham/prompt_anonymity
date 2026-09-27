@@ -9,14 +9,13 @@ model -- rather than the value of "a reranker", which is what a comparison again
 distance baseline alone would actually be measuring.
 
 The expectation going in is not obvious in either direction. jina-reranker-v3.5 is a 0.6B listwise
-model (Qwen3-0.6B backbone, "last but not late" interface: query and all candidates scored in one
-forward pass, ~63.2 nDCG@10 on BEIR) trained for *relevance* -- topical match between a query and a
-document. Authorship attribution asks the opposite question: two texts by one author are usually
-about different things, and two texts on one topic are usually by different people. A retrieval
-reranker may therefore score the shortlist confidently and in exactly the wrong direction, which
-would make it a strong negative control; or its 0.6B of language modelling may pick up stylistic
-regularity anyway, which would make most of the LLM's bill unnecessary. The detail table's
-``distance_rank`` column is what settles it.
+model (Qwen3-0.6B backbone, query and all candidates scored in one forward pass) trained for
+*relevance* -- topical match between a query and a document. Authorship attribution asks the
+opposite question: two texts by one author are usually about different things, and two texts on one
+topic are usually by different people. A retrieval reranker may therefore score the shortlist
+confidently and in exactly the wrong direction, which would make it a strong negative control; or
+its language modelling may pick up stylistic regularity anyway, which would make most of the LLM's
+bill unnecessary. The detail table's ``distance_rank`` column is what settles it.
 
 No reasons here
 ---------------

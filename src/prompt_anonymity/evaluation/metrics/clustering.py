@@ -37,8 +37,8 @@ function of the ``(cluster x author)`` count table ``n_ca`` and the two margins,
     sum_i |C_i n A_i| / |C_i|  =  sum_c sum_a n_ca^2 / |C_c|
 
 and likewise for recall. So :class:`ClusterContingency` is built once in ``O(n)`` and everything
-reads off it. Nothing here materialises a pairwise matrix; at WildChat's 43,127-document test
-quarter that would be 1.9 billion pairs, and the closed forms below are exact.
+reads off it. Nothing here materialises a pairwise matrix -- infeasible at corpus scale -- and the
+closed forms below are exact.
 
 Noise is expanded, never dropped
 --------------------------------
@@ -89,9 +89,9 @@ class ClusterContingency:
     """The ``(cluster x author)`` count table in sparse triplet form, plus both margins.
 
     Held as three aligned arrays over the **occupied** cells only (``pair_cluster[j]``,
-    ``pair_author[j]``, ``pair_counts[j]``), because the dense table would be
-    ``n_clusters x n_authors`` -- 3.1e8 cells on WildChat's test quarter -- while the number of
-    occupied cells is at most the number of documents.
+    ``pair_author[j]``, ``pair_counts[j]``), because the dense ``n_clusters x n_authors`` table is
+    infeasible at corpus scale while the number of occupied cells is at most the number of
+    documents.
 
     Attributes
     ----------
@@ -298,9 +298,9 @@ def clustering_summary(cluster_labels: np.ndarray, author_labels: np.ndarray,
         **``any_link_rate`` and ``amplification`` are recall-side and must never be quoted bare.**
         Neither looks at what *else* is in the cluster, so both are maximised by merging
         everything: the one-cluster partition attains ``any_link_rate`` exactly -- its ceiling is
-        ``linkable_author_rate``, the share of authors with two or more documents (0.881 on
-        swe-chat, 0.925 on WildChat) -- and drives ``amplification`` to its maximum too. They are
-        the right *privacy* quantities, but they describe an attack only alongside
+        ``linkable_author_rate``, the share of authors with two or more documents -- and drives
+        ``amplification`` to its maximum too. They are the right *privacy* quantities, but they
+        describe an attack only alongside
         ``bcubed_precision``. The ceilings are therefore returned next to them
         (``any_link_ceiling``, ``amplification_ceiling``) so a reader of one row cannot miss them,
         exactly as ``singleton_rate`` guards the precision side against the mirror-image trick.
@@ -309,11 +309,9 @@ def clustering_summary(cluster_labels: np.ndarray, author_labels: np.ndarray,
         all singletons scores ``bcubed_precision`` 1.0 while linking nothing, so precision without
         this number beside it is not interpretable.
     ``largest_cluster_share``
-        The opposite failure, and the one a headline F-score hides most easily. Measured on
-        WildChat, the best-scoring method (connected components, BCubed F 0.487) welds **30.9% of
-        the corpus into a single cluster** while 21% of documents sit alone -- so that F is a
-        mixture of a giant meaningless blob, a mass of untouched singletons, and genuinely good
-        mid-size clusters, and the average describes none of the three. Chaining is single
+        The opposite failure, and the one a headline F-score hides most easily: a good-looking F
+        can be a mixture of a giant meaningless blob, a mass of untouched singletons, and
+        genuinely good mid-size clusters, describing none of the three. Chaining is single
         linkage's classic failure and it does not announce itself in precision, recall or F.
     ``linked_bcubed_*``
         BCubed recomputed over the documents the attack actually placed with somebody else. This
@@ -441,30 +439,28 @@ def auc_from_histogram(positive_counts: np.ndarray, negative_counts: np.ndarray)
 
     Two properties make it the right companion to BCubed rather than a replacement:
 
-    * **It is prevalence-free**, so it is comparable across corpora. Same-author pairs are 8.7% of
-      swe-chat's test pairs and 0.13% of WildChat's -- a 67-fold difference that makes every
-      precision-like number incomparable between them, and leaves AUC untouched.
-    * **It is prevalence-blind, which is the same fact seen as a hazard.** At 0.13% prevalence an
-      AUC of 0.95 is entirely compatible with a useless attack: the 5% of stranger pairs ranked
-      above a given true pair still outnumber the true pairs 350:1. So a high AUC is *necessary*
-      for a clustering attack to work and nowhere near sufficient, and it must be read next to
+    * **It is prevalence-free**, so it is comparable across corpora with very different
+      same-author-pair rates, where every precision-like number is not.
+    * **It is prevalence-blind, which is the same fact seen as a hazard.** At low prevalence a
+      high AUC is entirely compatible with a useless attack, since stranger pairs still vastly
+      outnumber true pairs even after most are ranked below it. So a high AUC is *necessary* for a
+      clustering attack to work and nowhere near sufficient, and it must be read next to
       :func:`average_precision_from_histogram` and the prevalence itself.
 
     Parameters
     ----------
     positive_counts, negative_counts : np.ndarray
         Same-author and different-author pair counts per score bin, in **ascending distance**
-        order -- bin 0 is the most similar. Binning is what makes this affordable: WildChat's test
-        quarter holds 9.3e8 pairs, which cannot be held or sorted, but streaming them into a fixed
-        histogram costs one pass and a few kilobytes.
+        order -- bin 0 is the most similar. Binning is what makes this affordable: the full pair
+        count at corpus scale cannot be held or sorted, but streaming pairs into a fixed histogram
+        costs one pass and a few kilobytes.
 
     Notes
     -----
     Ties inside a bin are split evenly, which is the standard convention and makes the result
     exact for a score that is genuinely discrete. For continuous scores the bin width sets the
-    resolution: measured against :func:`sklearn.metrics.roc_auc_score` over 100 random samples at
-    the driver's 200,000-bin grid, the error is below **2.6e-6** -- four orders of magnitude under
-    any difference being compared here.
+    resolution; verified against :func:`sklearn.metrics.roc_auc_score` to well below any
+    difference being compared here.
     """
     positive_counts = np.asarray(positive_counts, dtype=np.float64)
     negative_counts = np.asarray(negative_counts, dtype=np.float64)
@@ -506,12 +502,11 @@ def average_precision_from_histogram(positive_counts: np.ndarray,
 def singleton_baseline(author_labels: np.ndarray) -> BCubedScores:
     """The all-singletons partition, in closed form -- the line every result has to clear.
 
-    Every document alone, so precision is 1.0 by construction and recall is
-    ``mean_i 1/|A_i|``. PAN 2016 reports this as BASELINE-Singleton and calls it "very hard to
-    beat", which it is *in their regime*: their collections run at roughly 0.5-0.9 authors per
-    document, putting the baseline at F = 0.821. It is much weaker on chat logs, where a user
-    contributes many conversations -- which is precisely what makes these corpora a usable
-    testbed for the task.
+    Every document alone, so precision is 1.0 by construction and recall is ``mean_i 1/|A_i|``.
+    PAN 2016 reports this as BASELINE-Singleton and calls it "very hard to beat", which is true
+    only in their regime, where each collection has few documents per author. It is much weaker on
+    chat logs, where a user contributes many conversations -- which is precisely what makes these
+    corpora a usable testbed for the task.
     """
     author_labels = np.asarray(author_labels).ravel()
     _, sizes = np.unique(author_labels, return_counts=True)

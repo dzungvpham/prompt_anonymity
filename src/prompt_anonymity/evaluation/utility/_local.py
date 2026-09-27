@@ -1,22 +1,11 @@
 """Shared plumbing for the utility metrics that run a model locally rather than calling an API.
 
-:mod:`.prompt_judge` sends conversations to a hosted judge. The metrics here --
-:mod:`.semantic` and :mod:`.fluency` -- instead load a checkpoint and score on the machine they
-run on, which changes what the surrounding code has to care about:
-
-* **Cost becomes GPU time, not dollars.** A judge run is bounded by a bill; these are bounded by
-  a SLURM allocation. Caching still pays (a re-run of a 172k-document corpus is hours), but a
-  cache miss is recoverable rather than re-billed, so ``logic_classes()`` staying empty matters
-  less here than it does for the judge.
-* **Checkpoints are machine-specific paths.** Both metrics resolve their models through the same
-  ``$ENV_VAR`` → ``models.toml`` → hub-repo-id ladder the vLLM defenses use
-  (:func:`~prompt_anonymity.defenses._backends.model_path`), so a cluster mirror is configured in
-  one place and a fresh clone still works by downloading.
-* **They are multilingual by requirement, not by preference.** The corpora are not English-only --
-  swe-chat carries Chinese conversations, and StyleRemix has been observed *translating* a turn
-  into English. An English-only scorer would read that as catastrophic content loss when the
-  conversation-level judge correctly calls it faithful, so every default checkpoint below is a
-  multilingual one and swapping in an English model is a real methodological choice.
+:mod:`.prompt_judge` sends conversations to a hosted judge. The metrics here -- :mod:`.semantic`
+and :mod:`.fluency` -- instead load a checkpoint and score on the machine they run on: cost is GPU
+time rather than dollars, so a cache miss is recoverable rather than re-billed. Both resolve their
+checkpoints through the same ``$ENV_VAR`` -> ``models.toml`` -> hub-repo-id ladder the vLLM defenses
+use (:func:`~prompt_anonymity.defenses._backends.model_path`), and both default to multilingual
+checkpoints since the corpora are not English-only.
 
 ``torch`` and ``transformers`` are imported lazily, inside the functions that need them, so that
 importing :mod:`prompt_anonymity.evaluation.utility` -- which ``experiments/eval_utility.py`` does
@@ -46,12 +35,7 @@ def select_device(prefer: str | None = None) -> str:
 
 
 def torch_dtype(device: str):
-    """Half precision on GPU, float32 on CPU.
-
-    Scoring is inference-only and the numbers here are read to two or three decimals, so fp16 on
-    the GPU costs nothing that matters and roughly halves both memory and time. CPU fp16 is
-    emulated and slower than fp32, hence the split.
-    """
+    """Half precision on GPU, float32 on CPU (CPU fp16 is emulated and slower than fp32)."""
     import torch
 
     return torch.float16 if device == "cuda" else torch.float32

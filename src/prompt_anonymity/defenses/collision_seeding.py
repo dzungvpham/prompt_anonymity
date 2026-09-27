@@ -5,33 +5,27 @@ Every other defense in this package removes signal -- push each author toward on
 additive counterpart. It picks a small set of unusual-but-natural writing quirks and gives the *same*
 quirk to a group of otherwise-unrelated authors, so an attacker who latches onto the quirk lands on a
 **group** rather than a person. The goal is not to make an author unrecognizable; it is to make them
-confusable with the ~N/K others who share their profile.
+confusable with the others who share their profile.
 
 Three properties make this work, and each is easy to get wrong:
 
-**1. Profiles, not independent markers.** If each author drew markers independently, ``M`` markers
-with ``s`` per author would give ``C(M, s)`` distinct signatures -- at M=40, s=4 that is ~91,000, far
-more than the author count, so every author would get a *unique* fingerprint and the defense would
-make attribution strictly easier. A fixed codebook of ``K`` profiles caps the number of distinct
-signatures at ``K`` by construction. ``K`` is the real privacy knob: expected collision group is
-``N/K`` authors. The failure mode is available as an ablation (``independent=True``) precisely
-because it is instructive.
+**1. Profiles, not independent markers.** Drawing markers independently per author would give each
+author a near-unique fingerprint (more distinct combinations than authors), making attribution
+easier rather than harder. A fixed codebook of ``K`` profiles caps the number of distinct signatures
+at ``K`` by construction -- the real privacy knob, since the expected collision group is
+``n_authors / K``. That failure mode is available as an ablation (``independent=True``).
 
-**2. Inconsistency.** A marker applied to 100% of an author's documents is a *cleaner* signal than
-any real habit -- perfectly reliable, and visibly synthetic. Real quirks are inconsistent: people
-misspell a word most of the time, not always. So each (author, marker) pair draws its own rate from
-``U[rate_min, rate_max]`` (default 40-70%), and the coin is flipped per document. Varying the rate
-per author matters as much as the rate itself: a fixed 55% across all authors would make "55%"
-the tell instead. With ~10 documents per author, an attacker's estimate of the rate has standard
-error ~0.157 against a prior standard deviation of only ~0.087, so the rate is essentially
-unidentifiable at this corpus's documents-per-author.
+**2. Inconsistency.** A marker applied to 100% of an author's documents is a cleaner signal than any
+real habit -- perfectly reliable, and visibly synthetic. Real quirks are inconsistent, so each
+(author, marker) pair draws its own rate from ``U[rate_min, rate_max]`` (default 40-70%), coin-flipped
+per document. Varying the rate per author matters as much as the rate itself: a fixed rate across all
+authors would make the rate itself the tell.
 
 **3. Natural base rates.** A marker that appears *nowhere* in the corpus naturally becomes a perfect
 group indicator -- no background noise to hide in. Run ``--audit`` before fixing a marker set and
-drop the zero-base-rate ones. Several whitespace/layout quirks fail this test on this corpus because
+drop the zero-base-rate ones; some whitespace/layout quirks fail this because
 :func:`~prompt_anonymity.data.text_cleaning.normalize_whitespace` and ``scrub_identifiers`` already
-squeezed those patterns out at build time (runs of 3+ newlines are collapsed; runs of 2+ spaces after
-a non-space are squeezed), so e.g. "double space after a period" has a base rate of exactly zero.
+squeeze those patterns out at build time.
 
 Two structural facts about this pipeline shape the implementation:
 
@@ -39,22 +33,17 @@ Two structural facts about this pipeline shape the implementation:
 strings* and maps results back by source text. Every other defense is a pure function of its text, so
 that has never mattered; this one is a function of ``(text, author_id, doc_id)``, and routing it
 through the cache would hand two authors who both wrote "thanks!" the same output -- destroying
-exactly the property the defense exists to create. Since the transform is pure Python string work
-(microseconds per turn, versus GPU-hours for ``dp_mlm``), the cache buys nothing here. This class
-subclasses :class:`~prompt_anonymity.defenses.base.CachedDefense` for the registry contract and
-overrides :meth:`transform` directly, ignoring the cache -- the same escape hatch
-:mod:`~prompt_anonymity.defenses.styleremix_openanon` uses. Reproducibility comes from seeded
-determinism instead of from disk.
+exactly the property the defense exists to create. This class subclasses
+:class:`~prompt_anonymity.defenses.base.CachedDefense` for the registry contract but overrides
+:meth:`transform` directly, ignoring the cache. Reproducibility comes from seeded determinism instead
+of disk.
 
 **No global author view.** ``apply_defenses --num-shards`` gives each SLURM task every N-th
 *document*, so no task ever sees all of an author's work or the full author list; a
 shuffle-and-partition assignment could not agree across shards. Every decision here is therefore a
-pure function of a keyed hash of ``(seed, author_id, marker_key, doc_id)``. Shard layout is
+pure function of a keyed hash of ``(seed, author_id, marker_key, doc_id)``, so shard layout is
 irrelevant, re-runs are bit-identical, and the assignment manifest can be rebuilt offline from the
-author list alone, without re-running the defense.
-
-Stdlib only -- no new dependency. ``pandas``/``pyarrow`` are imported lazily inside the CLI helpers
-so importing this module (which the registry does at package import) stays cheap.
+author list alone.
 
 Command line::
 
@@ -80,40 +69,36 @@ from ._keying import keyed_rng as _rng
 from .base import CachedDefense
 
 # Separator between a document id and a turn's position, forming a turn's cache id
-# (``<doc_id>#<n>``). This is ``prompt_anonymity.data.apply_defenses.TURN_ID_SEPARATOR``, redefined
-# here rather than imported: `data` imports `defenses`, so importing it back would be circular.
-# `--selftest` asserts the two still agree.
+# (``<doc_id>#<n>``). Redefined from ``data.apply_defenses.TURN_ID_SEPARATOR`` rather than imported
+# to avoid a circular import (`data` imports `defenses`); `--selftest` checks the two agree.
 TURN_ID_SEPARATOR = "#"
 
-#: Probability that a first-turn-only marker (an opener or a closer) also fires on one of a
-#: document's *other* turns. Openers and closers belong at the edges of a conversation -- prepending
-#: "quick question --" to all 14 turns of a session would read as tampering, not habit -- but a
-#: person who opens with "hey," does sometimes do it twice in a session. Applied per turn.
+#: Probability that an opener/closer marker also fires on a turn other than its edge turn. Applying
+#: it to every turn of a session would read as tampering rather than habit, but a person who opens
+#: with "hey," does sometimes do it twice.
 EDGE_MARKER_REPEAT_PROB = 0.35
 
 #: Share of *letters* in a turn that must be Latin-script before universal (non-trigger-dependent)
-#: markers are allowed to fire. WildChat is multilingual, and English quirks pasted onto Chinese or
-#: Russian text would be a glaring artifact rather than camouflage. Trigger-dependent markers
-#: self-gate: English trigger words simply do not occur in non-English text.
+#: markers are allowed to fire, so English quirks aren't pasted onto Chinese or Russian text.
+#: Trigger-dependent markers self-gate: English trigger words don't occur in non-English text.
 DEFAULT_MIN_LATIN_RATIO = 0.6
 
 
 # --- deterministic randomness ------------------------------------------------
 #
-# ``_rng`` is :func:`prompt_anonymity.defenses._keying.keyed_rng`, imported above under the short
-# local name every draw in this module uses. Every stochastic decision here goes through it, which
-# is what makes the whole defense a pure function of ``(seed, author_id, marker_key, doc_id)``.
+# ``_rng`` is :func:`prompt_anonymity.defenses._keying.keyed_rng`. Every stochastic decision here
+# goes through it, which is what makes the whole defense a pure function of
+# ``(seed, author_id, marker_key, doc_id)``.
 
 
 # --- protected spans ---------------------------------------------------------
 
-#: Spans a marker must never touch. Corrupting these is the main utility risk, and it is
-#: concentrated in SWE-chat, whose prompts are largely code and terminal output. Note that the build
-#: stage has already replaced URLs/emails/paths/hashes with ``<URL>``/``<PATH>``/``<ID>``-style
-#: placeholders (see :func:`~prompt_anonymity.data.text_cleaning.scrub_identifiers`), so those
-#: placeholders are what mostly needs protecting -- lowercasing ``<URL>`` to ``<url>`` would corrupt
-#: a sentinel the rest of the pipeline matches on. The residual URL and path patterns stay as a
-#: belt-and-braces guard for text that reached here unscrubbed.
+#: Spans a marker must never touch -- the main utility risk on corpora whose prompts are largely
+#: code and terminal output. The build stage has already replaced URLs/emails/paths/hashes with
+#: ``<URL>``/``<PATH>``/``<ID>``-style placeholders (see
+#: :func:`~prompt_anonymity.data.text_cleaning.scrub_identifiers`), so those placeholders are what
+#: mostly needs protecting; the residual URL and path patterns are a belt-and-braces guard for text
+#: that reached here unscrubbed.
 _PROTECTED_RE = re.compile(
     r"```.*?```"           # fenced code block (DOTALL: spans lines)
     r"|~~~.*?~~~"          # alternate fence
@@ -172,30 +157,28 @@ class Marker:
     Attributes
     ----------
     key : str
-        Stable identifier. It is part of the RNG seed for rate and coin draws, so **renaming a key
+        Stable identifier; part of the RNG seed for rate and coin draws, so **renaming a key
         silently reassigns every author's rate for it**. Treat keys as append-only.
     pool : str
         Which class-pool this marker is drawn from when profiles are built. Mutually exclusive
         markers (``ellipsis_2dot``/``ellipsis_4dot``, ``bullet_star``/``bullet_dash``,
-        ``dialect_uk``/``dialect_us``) share a pool, so a profile can never contain both -- pool
-        membership *is* the conflict rule (see :func:`build_profiles`).
+        ``dialect_uk``/``dialect_us``) share a pool, so a profile can never contain both (see
+        :func:`build_profiles`).
     universal : bool
-        True when the marker fires on essentially any English text. Every profile is built to hold
-        at least one, so no author ends up undefended just because their documents happen to contain
-        none of the trigger words.
+        True when the marker fires on essentially any English text. Every profile holds at least
+        one, so no author is undefended just because their documents contain none of the triggers.
     whole_text : bool
         True for openers/closers, which apply to the whole turn (prepend/append). Everything else is
         applied per free segment, so it cannot reach inside a code block.
     edge : str
-        ``"first"`` for openers, ``"last"`` for closers, ``""`` otherwise. An edge marker fires on
-        its edge turn of the document, and elsewhere only with
-        :data:`EDGE_MARKER_REPEAT_PROB`.
+        ``"first"`` for openers, ``"last"`` for closers, ``""`` otherwise. Fires on its edge turn of
+        the document, and elsewhere only with :data:`EDGE_MARKER_REPEAT_PROB`.
     apply : callable
         ``(text, rng) -> text``. **Must return the input unchanged when no trigger is present** --
         that is how the caller distinguishes an *eligible* document from an *applied* one.
     detect : str
-        Regex matching this marker's signature in text, used by ``--audit`` to measure the quirk's
-        natural base rate in the undefended corpus. Empty means "not auditable".
+        Regex matching this marker's signature, used by ``--audit`` to measure its natural base rate
+        in the undefended corpus. Empty means "not auditable".
     """
 
     key: str
@@ -261,11 +244,10 @@ def word_swap_group(pairs: tuple[tuple[str, str], ...], *, key: str, pool: str) 
 def _edge_is_free(text: str, edge: str) -> bool:
     """Whether the turn's first (or last) segment is ordinary prose rather than a protected span.
 
-    Openers and closers are the only markers applied to the whole turn rather than per free segment,
-    so they are the only ones that could land *against* a protected span. Prepending
-    ``"quick question -- "`` to a turn that opens with a fenced code block would push the fence off
-    the line start and stop it rendering as code -- a formatting corruption, not a writing habit. So
-    an edge marker declines a turn whose relevant edge is not free prose.
+    Openers/closers apply to the whole turn rather than per free segment, so they're the only
+    markers that could land against a protected span -- e.g. prepending text to a turn that opens
+    with a fenced code block would push the fence off the line start and break its rendering. An
+    edge marker declines a turn whose relevant edge is not free prose.
     """
     segments = split_protected(text)
     if not segments:
@@ -309,10 +291,9 @@ _SENTENCE_KEEP_RE = re.compile(r"((?<=[.!?])\s+)")
 def _decapitalize(text: str) -> str:
     """Lowercase the first word when a hedge has been pushed in front of it.
 
-    Someone who writes "honestly, the build is broken" does not then capitalize "The" -- leaving it
-    capitalized is the giveaway that something was inserted mechanically. Applied only to an
-    ordinary Capitalized word: ``I`` and all-caps tokens (``API``, ``SQL``) keep their case, since
-    lowercasing those would be a different and much more visible edit.
+    Leaving it capitalized would be the giveaway that something was inserted mechanically. Applied
+    only to an ordinary Capitalized word: ``I`` and all-caps tokens (``API``, ``SQL``) keep their
+    case, since lowercasing those would be a much more visible edit.
     """
     head = text.split(" ", 1)[0].rstrip(".,;:!?")
     if not head or head == "I" or not head[:1].isupper() or head[1:] != head[1:].lower():
@@ -324,8 +305,7 @@ def hedge(word: str, *, key: str) -> Marker:
     """A discourse filler inserted at one sentence boundary per turn (``honestly``, ``tbh``).
 
     One insertion per turn, at a position drawn from ``rng`` -- inserting into every sentence would
-    be a caricature rather than a habit. Only sentences long enough to carry a hedge are eligible,
-    so it never lands on a one-word line.
+    be a caricature. Only sentences long enough to carry a hedge are eligible.
     """
     detect = rf"(?<!\w){re.escape(word)}(?!\w)"
 
@@ -444,9 +424,9 @@ def _build_markers() -> dict[str, Marker]:
     ]:
         markers.append(word_swap(trigger, replacement, key=f"ms_{replacement}"))
 
-    # B. Transposition typos -- trigger-dependent, low natural rate, expect the audit to thin these.
-    # "from"->"form" and "for"->"fro" are deliberately excluded: both produce a different real word,
-    # so they change meaning rather than reading as a slip.
+    # B. Transposition typos -- trigger-dependent, low natural rate.
+    # "from"->"form" and "for"->"fro" are excluded: both produce a different real word, so they
+    # change meaning rather than reading as a slip.
     for trigger, replacement in [
         ("the", "teh"), ("and", "adn"), ("that", "taht"), ("with", "wiht"),
         ("this", "tihs"), ("just", "jsut"), ("what", "waht"), ("because", "becuase"),
@@ -501,8 +481,7 @@ def _build_markers() -> dict[str, Marker]:
                       detect=r"(?<!\w)(api|sql|json|http|css|html)(?!\w)"),
     ]
 
-    # F. Layout quirks -- universal. Expect `blank_line_sentences` to fail the base-rate audit on
-    # this corpus: normalize_whitespace collapses 3+ newlines, so the pattern is rare by construction.
+    # F. Layout quirks -- universal.
     markers += [
         _regex_marker(r"(?m)^(\s*)-(?=\s)", r"\1*", key="bullet_star", pool="layout",
                       detect=r"(?m)^\s*\*\s"),
@@ -558,9 +537,9 @@ def _build_markers() -> dict[str, Marker]:
 MARKERS: dict[str, Marker] = _build_markers()
 
 #: Pools a profile draws from, one marker each. Grouping mutually exclusive habits into one pool is
-#: what prevents a profile from containing e.g. both ellipsis styles. The first four are drawn
-#: always; ``dialect`` is drawn only sometimes (see :data:`DIALECT_PROBABILITY`) because a dialect
-#: flip is the most visible -- and the most contradiction-prone -- marker in the inventory.
+#: what prevents a profile from containing e.g. both ellipsis styles. These four are drawn always;
+#: ``dialect`` is drawn only sometimes (see :data:`DIALECT_PROBABILITY`) because it's the most
+#: visible and most contradiction-prone marker in the inventory.
 PROFILE_POOLS: tuple[tuple[str, ...], ...] = (
     ("misspelling", "transposition", "abbreviation"),   # a trigger-dependent lexical habit
     ("punctuation",),                                   # a punctuation habit
@@ -572,15 +551,13 @@ PROFILE_POOLS: tuple[tuple[str, ...], ...] = (
 #: and capped at one per profile by pool structure.
 DIALECT_PROBABILITY = 0.4
 
-#: The markers that survived ``--audit`` on **SWE-chat** (4,334 documents / 157 authors), i.e. those
-#: whose quirk occurs naturally but not universally (base rate in ``(0, 0.25]``) and whose trigger
-#: appears in at least 5% of documents. 47 of the inventory's 98.
+#: The markers that survived ``--audit`` on SWE-chat: those whose quirk occurs naturally but not
+#: universally (base rate in ``(0, 0.25]``) and whose trigger appears in at least 5% of documents.
 #:
-#: **This set is corpus-specific and must not be reused for WildChat.** SWE-chat prose is short and
-#: technical, so every one of the 30 lexical misspellings failed for lack of coverage -- words like
-#: "definitely", "separate" and "environment" barely appear -- leaving the lexical slot to
-#: transposition typos and abbreviations. WildChat's longer prose should revive that class and drop
-#: others, so re-run the audit and add a ``WILDCHAT_MARKERS`` beside this one::
+#: **This set is corpus-specific and must not be reused for WildChat.** SWE-chat's short, technical
+#: prose starves most lexical misspellings of coverage, leaving that slot to transposition typos and
+#: abbreviations; WildChat's longer prose should revive that class and drop others. Re-run the audit
+#: and add a ``WILDCHAT_MARKERS`` beside this one::
 #:
 #:     python -m prompt_anonymity.defenses.collision_seeding --audit --source wildchat
 #:
@@ -598,13 +575,9 @@ SWE_CHAT_MARKERS: tuple[str, ...] = (
 )
 
 #: Number of profiles when ``independent=True`` is *not* used. The privacy knob: expected collision
-#: group is ``n_authors / n_profiles``.
-#:
-#: Note this is a *large* K for a small corpus. On SWE-chat's 157 authors it makes groups of ~13 and
-#: hands an attacker log2(12) = 3.58 bits of the 7.29 that identify an author -- and collision
-#: seeding is purely additive, so it never removes the natural style they would use to separate the
-#: 13. Whether that trade pays off is what the K sweep measures (``_k4`` gives 2.00 bits and groups
-#: of ~39); do not assume the default is on the right side of it.
+#: group is ``n_authors / n_profiles``. Collision seeding is purely additive, so it never removes the
+#: natural style an attacker could use to separate a group -- the K sweep (``_k4``, ``_k24``) is what
+#: measures whether a given group size actually pays off; don't assume this default does.
 DEFAULT_N_PROFILES = 12
 
 #: Expected markers per author in the ``independent=True`` ablation, matched to the codebook's
@@ -616,15 +589,13 @@ def build_profiles(marker_keys: tuple[str, ...], *, n_profiles: int, seed) -> tu
     """Construct the profile codebook: ``n_profiles`` marker bundles, deterministically.
 
     Built rather than hardcoded so that cutting markers after an ``--audit`` reshapes the codebook
-    automatically instead of silently leaving dangling keys. One marker is drawn per entry of
-    :data:`PROFILE_POOLS`, plus a dialect marker with probability :data:`DIALECT_PROBABILITY`, so
-    every profile mixes classes -- a plausible *person*, not a list of tics -- and holds at least
-    three universal markers, guaranteeing coverage for an author whose documents contain none of the
-    trigger words.
+    automatically. One marker is drawn per entry of :data:`PROFILE_POOLS`, plus a dialect marker with
+    probability :data:`DIALECT_PROBABILITY`, so every profile mixes classes -- a plausible *person*,
+    not a list of tics -- and holds enough universal markers to cover an author whose documents
+    contain none of the trigger words.
 
-    Profiles may share individual markers; that is fine, and mildly helpful, because it blurs the
-    boundary between groups. What must not happen is two *identical* profiles, which would silently
-    halve ``K``; that is checked and raised.
+    Profiles may share individual markers, which is fine and even helps blur the boundary between
+    groups. Two *identical* profiles would silently halve ``K``, so that is checked and raised.
     """
     by_pool: dict[str, list[str]] = {}
     for key in marker_keys:
@@ -686,8 +657,7 @@ class CollisionSeedingDefense(CachedDefense):
         ablation.
     independent : bool
         **Ablation.** Draw markers per author independently instead of from the codebook, producing
-        a near-unique fingerprint per author. Expected to perform *worse than no defense*; included
-        because demonstrating that is the point.
+        a near-unique fingerprint per author -- expected to perform worse than no defense at all.
     marker_keys : tuple of str, optional
         Restrict the inventory (e.g. to what survived ``--audit``). Defaults to everything.
     min_latin_ratio : float
@@ -719,8 +689,8 @@ class CollisionSeedingDefense(CachedDefense):
         )
 
     def params(self) -> dict:
-        # The marker set is hashed rather than listed: it is ~90 keys, and what matters downstream
-        # is only that a different set separates results directories and provenance.
+        # The marker set is hashed rather than listed so a different set separates results
+        # directories and provenance without dumping the whole inventory.
         return {
             "seed": self.seed,
             "n_profiles": self.n_profiles,
@@ -743,8 +713,8 @@ class CollisionSeedingDefense(CachedDefense):
         """The marker keys this author carries."""
         if not self.independent:
             return self.profiles[self.profile_index(author_id)]
-        # Ablation: independent Bernoulli per marker, tuned to the codebook's typical dose so the
-        # two arms differ in structure rather than in how much text is touched.
+        # Ablation: independent Bernoulli per marker, tuned to the codebook's typical dose so this
+        # arm differs from the default in structure rather than in how much text is touched.
         probability = min(1.0, INDEPENDENT_MARKERS_PER_AUTHOR / max(1, len(self.marker_keys)))
         return tuple(
             key for key in self.marker_keys
@@ -782,8 +752,7 @@ class CollisionSeedingDefense(CachedDefense):
             if not self._applies_to_document(author_id, marker.key, doc_id):
                 continue
             # An edge marker is scheduled for the document but acts only on its edge turn (plus the
-            # occasional repeat), so counting it as scheduled on every turn would make its hit rate
-            # look artificially poor.
+            # occasional repeat); counting it as scheduled on every turn would deflate its hit rate.
             if marker.edge and not self._fires_on_turn(marker, author_id, doc_id, turn_index,
                                                        last_turn_index):
                 continue
@@ -800,9 +769,7 @@ class CollisionSeedingDefense(CachedDefense):
                        last_turn_index: int) -> bool:
         """Edge markers belong at the edges: an opener on turn 0, a closer on the last turn.
 
-        Elsewhere they fire only with :data:`EDGE_MARKER_REPEAT_PROB` -- prepending "quick question"
-        to all 14 turns of a session would read as tampering, but a person who opens with "hey,"
-        does sometimes do it twice.
+        Elsewhere they fire only with :data:`EDGE_MARKER_REPEAT_PROB`.
         """
         at_edge = turn_index == 0 if marker.edge == "first" else turn_index == last_turn_index
         if at_edge:
@@ -816,12 +783,10 @@ class CollisionSeedingDefense(CachedDefense):
         ``apply_defenses`` hands the whole corpus in on the unknown side, one row per turn, with
         ``unknown_labels`` carrying ``author_id`` and ``unknown_ids`` carrying ``<doc_id>#<n>``.
 
-        **Invariant: a document must arrive whole.** Everything else here keys on ``author_id`` and
-        ``doc_id`` alone, but a closer fires on a document's *last* turn, which can only be derived
-        from the batch. ``select_shard`` slices the document frame (``documents.iloc[i::n]``), so
-        every turn of a document always travels together and the derived last index is stable across
-        any shard layout. The ``--selftest`` shard-invariance check is what would catch a future
-        change to turn-level sharding.
+        **Invariant: a document must arrive whole.** A closer fires on a document's *last* turn,
+        which can only be derived from the batch, so every turn of a document must travel together
+        (``select_shard`` slices the document frame, not the turn stream, so this holds across any
+        shard layout). ``--selftest``'s shard-invariance check guards this.
         """
         if data.unknown_texts is None:
             raise ValueError(f"defense {self.name!r} needs unknown_texts; load the dataset with text.")
@@ -861,10 +826,9 @@ class CollisionSeedingDefense(CachedDefense):
         """Print realized coverage per marker: the check that a marker is not silently never firing.
 
         Two numbers matter. ``rate`` is scheduled documents over assigned documents -- it should sit
-        inside ``[rate_min, rate_max]``, and a value outside it means the coin is wrong. ``hit`` is
-        changed turns over scheduled turns -- it measures *trigger availability*, so a marker with a
-        healthy rate but a near-zero hit is trigger-starved on this corpus and should be cut. That is
-        what ``--audit`` predicts ahead of time; this confirms it after the fact.
+        inside ``[rate_min, rate_max]``. ``hit`` is changed turns over scheduled turns, measuring
+        trigger availability: a healthy rate but near-zero hit means the marker is trigger-starved
+        on this corpus and should be cut (which is what ``--audit`` predicts ahead of time).
         """
         profiles = "independent" if self.independent else f"{len(self.profiles)} profiles"
         print(f"[{self.name}] {n_documents:,} documents / {n_turns:,} turns; {profiles}")
@@ -901,8 +865,7 @@ def collision_manifest(author_ids, defense: CollisionSeedingDefense):
 
     Because every decision is a pure function of the author id, nothing has to survive the defense
     run: the analysis joins against this. Used by the within-group confusion metric, which asks what
-    fraction of *misattributed* documents were assigned to an author sharing the true author's
-    profile (chance is ``1/K``).
+    fraction of misattributed documents landed on an author sharing the true author's profile.
     """
     import pandas as pd
 
@@ -922,17 +885,14 @@ def collision_manifest(author_ids, defense: CollisionSeedingDefense):
 
 #: A marker whose quirk never appears naturally has no background to hide in: any author carrying it
 #: is instantly separable from everyone who does not, and a human reader would spot it as synthetic.
-#: Several layout markers fail this on purpose-built corpora -- ``normalize_whitespace`` collapses
-#: runs of 3+ newlines and ``scrub_identifiers`` squeezes runs of 2+ spaces, so those patterns are
-#: absent by construction.
+#: Several layout markers fail this on purpose-built corpora, whose text-cleaning stage already
+#: squeezes those patterns out by construction.
 MIN_BASE_RATE = 0.0
 
 #: The mirror of :data:`MIN_BASE_RATE`, and just as necessary. A quirk a large share of the corpus
-#: *already* has cannot make a group cohesive, because everyone outside the group has it too: it
-#: carries no signal to collide on, while still costing naturalness and utility. Measured on
-#: SWE-chat, ``no_terminal_period`` (55% of documents already end without one) and
-#: ``line_break_sentences`` (52%) are majority behaviour rather than quirks. 0.25 is set to catch
-#: those without touching the genuinely-uncommon-but-present band (10-22%) the design wants.
+#: already has cannot make a group cohesive, because everyone outside the group has it too: it
+#: carries no signal to collide on, while still costing naturalness and utility -- e.g. a habit that
+#: is already majority behaviour on the corpus rather than a genuine quirk.
 MAX_BASE_RATE = 0.25
 
 #: A marker whose trigger appears in too few documents cannot cover an author even when assigned.
@@ -942,12 +902,12 @@ MIN_TRIGGER_RATE = 0.05
 def audit_markers(documents: list[str], *, marker_keys=None) -> list[dict]:
     """Measure each marker's natural base rate and trigger coverage on a corpus.
 
-    ``base_rate`` -- share of documents where the quirk *already* occurs, i.e. the background noise a
+    ``base_rate`` -- share of documents where the quirk already occurs, i.e. the background noise a
     seeded marker would blend into. ``trigger_rate`` -- share of documents the marker would actually
-    change if applied, i.e. how much coverage it can give an author who carries it.
+    change if applied, i.e. how much coverage it gives an author who carries it.
 
-    Run this before fixing a marker set: the two rates are what
-    :func:`surviving_markers` cuts on, and both are corpus-specific.
+    Run this before fixing a marker set: both rates are corpus-specific, and :func:`surviving_markers`
+    cuts on them.
     """
     keys = tuple(marker_keys) if marker_keys else tuple(sorted(MARKERS))
     total = max(1, len(documents))
@@ -981,11 +941,10 @@ def surviving_markers(rows: list[dict], *, min_base_rate: float = MIN_BASE_RATE,
                       min_trigger_rate: float = MIN_TRIGGER_RATE) -> tuple[str, ...]:
     """Marker keys that clear all three audit thresholds, sorted.
 
-    The base rate has to land in a *band*, not just above a floor. Too low (default: seen zero
-    times) and the quirk has no background to hide in, so it is a perfect group indicator. Too high
-    (default: more than a quarter of documents) and it is the corpus norm rather than a quirk, so it
-    cannot distinguish a group from everyone else. The floor is a strict inequality -- a quirk seen
-    even once is kept -- while the ceiling is inclusive.
+    The base rate has to land in a *band*, not just above a floor. Too low and the quirk has no
+    background to hide in, so it's a perfect group indicator; too high and it's the corpus norm
+    rather than a quirk, so it can't distinguish a group from everyone else. The floor is a strict
+    inequality -- a quirk seen even once is kept -- while the ceiling is inclusive.
     """
     return tuple(sorted(
         row["marker"] for row in rows
@@ -997,8 +956,7 @@ def surviving_markers(rows: list[dict], *, min_base_rate: float = MIN_BASE_RATE,
 def _load_documents(source: str, dist_dir=None, limit=None) -> tuple[list[str], list[str]]:
     """``(document_texts, author_ids)`` from a built split, one string of joined turns per document.
 
-    Imports are local: this module is imported by the defense registry at package import, and
-    ``data.config`` would be a circular import at module level (``data`` imports ``defenses``).
+    Imports are local to avoid a circular import at module level (``data`` imports ``defenses``).
     """
     import pyarrow.parquet as pq
 
@@ -1041,12 +999,10 @@ def _selftest() -> None:
     check("deterministic across calls", first == again)
 
     # 3. Shard invariance: a turn's rewrite must not depend on which other rows shared the batch.
-    #    Sharded exactly as the pipeline does -- `select_shard` slices the *document* frame
-    #    (`documents.iloc[i::n]`), so every turn of a document always travels together. That is a
-    #    real invariant this defense depends on, not an incidental one: a closer fires on a
-    #    document's LAST turn, which is only knowable from the whole document. Splitting a document
-    #    across shards would change its output, so if `apply_defenses` ever shards by turn, this
-    #    check is what should fail.
+    #    Sharded exactly as the pipeline does -- `select_shard` slices the *document* frame, so
+    #    every turn of a document always travels together. A closer fires on a document's LAST turn,
+    #    which is only knowable from the whole document, so this is a real invariant the defense
+    #    depends on, not an incidental one.
     n_documents, turns_per_document = 20, 3
     texts, authors, ids, documents = [], [], [], []
     for d in range(n_documents):

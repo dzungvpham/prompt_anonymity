@@ -1,18 +1,14 @@
 """POS n-gram TF-IDF featurizer for stylometric linkage.
 
 Part-of-speech tag sequences capture syntactic habits (clause structure, word-order preferences)
-that are largely orthogonal to the sub-word signal char n-grams capture. This featurizer expects
-each input string to already be a space-joined POS tag sequence (see the ``pos_tag_precompute``
-scripts, which cache one such string per document keyed by ``doc_id``) and fits a word-level
-TfidfVectorizer over POS n-grams, reduced to a fixed-length dense vector via SVD -- the same
-architecture as :class:`~prompt_anonymity.features.char_ngram_tfidf.CharNgramTfidfFeaturizer`.
+largely orthogonal to the sub-word signal char n-grams capture. Expects each input string to
+already be a space-joined POS tag sequence, and fits a word-level TfidfVectorizer over POS
+n-grams, reduced to a fixed-length dense vector via SVD.
 
 Deliberately **not** registered in :data:`~prompt_anonymity.features.FEATURIZERS`: a TF-IDF
-vectorizer fits on the first batch it sees, so a corpus-wide pass through
-``compute_features`` (as ``char_ngram_tfidf`` also gets, see its ``UNSHARDABLE_FEATURES`` entry)
-would fit vocabulary against every document at once, including ones after any given known/unknown
-split boundary -- leaking future vocabulary into the attacker's own known-side representation.
-Callers must construct a fresh instance and fit it on the known slice only, per window.
+vectorizer fits on the first batch it sees, so a corpus-wide precompute pass would leak
+vocabulary from documents on both sides of any known/unknown split. Callers must construct a
+fresh instance and fit it on the known slice only, per window.
 """
 
 from __future__ import annotations
@@ -50,10 +46,8 @@ class POSNgramTfidfFeaturizer(Featurizer):
     def featurize(self, texts) -> np.ndarray:
         """``texts`` are space-joined POS tag sequences, one per document.
 
-        First call fits the vectorizer and SVD (intended to be the known-side call); every
-        subsequent call on the same instance only transforms, so a fresh instance per
-        known/unknown split is what keeps this leakage-safe -- callers must not reuse one
-        instance across splits.
+        First call fits the vectorizer and SVD (intended to be the known-side call); every later
+        call only transforms. Reuse one instance per split only -- not across splits.
         """
         texts = [t or "" for t in texts]
 

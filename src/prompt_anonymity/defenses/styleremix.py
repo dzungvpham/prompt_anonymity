@@ -15,60 +15,50 @@ Serving: merge once, then vLLM
 ------------------------------
 
 vLLM applies **one** LoRA per request and has no equivalent of PEFT's ``add_weighted_adapter``, so
-the weighted composition that *is* StyleRemix cannot happen at request time. It does not need to:
+the weighted composition that *is* StyleRemix cannot happen at request time. It doesn't need to:
 our slider configuration is fixed by design, so the merge is done **once, offline**
-(:func:`build_merged_adapter`) into a single adapter that vLLM then serves for every prompt. The
-merged adapter is cached on disk and keyed by the slider configuration, so it is built on the first
-run and reused thereafter.
+(:func:`build_merged_adapter`) into a single adapter that vLLM then serves for every prompt, cached
+on disk and keyed by the slider configuration.
 
-(The paper's evasion mode, which redraws weights per document, is therefore *not* expressible on
-this backend -- it would need a fresh merge per document.)
+(The paper's evasion mode, which redraws weights per document, is therefore not expressible on this
+backend -- it would need a fresh merge per document.)
 
 Two details of the released artifacts matter for this:
 
-* The adapters are **r=16, alpha=32**, not the ``r = 32`` the paper's Appendix C.3 reports. The
-  weights win. ``cat`` sums ranks, so a merge of *n* axes has rank ``16n`` -- 32 for the two axes
-  enabled below -- which is what :data:`STYLEREMIX_MAX_LORA_RANK` must cover.
-* Each adapter file is **4.2 GB** rather than the ~50 MB its config implies, because the upstream
-  code resizes the embedding matrix to add a padding token and PEFT then auto-saves
-  ``embed_tokens`` and ``lm_head``. Those tensors are verifiably redundant -- every one of the
-  128,256 original rows is bit-identical to the base model's, the only difference being one
-  untrained pad row -- so the merge drops them (``save_embedding_layers=False``). vLLM could not
-  consume them anyway, and it needs no pad token, since it does not pad inside a sequence.
+* The adapters are **r=16, alpha=32**, not the ``r = 32`` the paper's appendix reports -- ``cat``
+  sums ranks, so a merge of *n* axes has rank ``16n``, which is what
+  :data:`STYLEREMIX_MAX_LORA_RANK` must cover.
+* Each adapter file is far larger than its config implies, because the upstream code resizes the
+  embedding matrix to add a padding token and PEFT auto-saves ``embed_tokens``/``lm_head`` with it.
+  Those tensors are redundant with the base model's, so the merge drops them
+  (``save_embedding_layers=False``); vLLM couldn't consume them anyway.
 
 Fidelity to the upstream implementation
 ---------------------------------------
 
-Matching upstream: the adapter set, the ``### Original: ... ### Rewrite:`` format (which Appendix
-C.3 confirms is also the *training* format), the ``cat`` merge, and stopping the generation before
-it rolls into a new example -- upstream's ``process_output``, which is the only thing stopping a
-base model from running on past the rewrite. Here that is a vLLM ``stop`` string, so generation
-*halts* rather than being trimmed after the fact, and it fires on the example boundary rather than
-on any ``###`` (see :data:`STYLEREMIX_STOP` for why that distinction costs upstream half the content
-of every turn containing a markdown heading).
+Matched to upstream: the adapter set, the ``### Original: ... ### Rewrite:`` format (also the
+training format), the ``cat`` merge, and stopping generation before it rolls into a new example --
+here via a vLLM ``stop`` string on the example boundary itself, rather than any bare ``###`` (which
+would truncate a turn containing a markdown heading; see :data:`STYLEREMIX_STOP`).
 
 Deliberately different, and why:
 
-* **Sampling is upstream's, the seed is not.** Upstream passes ``do_sample=True, top_p=0.95`` and
-  *no* temperature, so it samples at the 0.6 its base model's ``generation_config.json`` supplies --
-  a value stated in neither the repo nor the paper. :data:`STYLEREMIX_TEMPERATURE` and
-  :data:`STYLEREMIX_TOP_P` reproduce that, with a fixed :data:`STYLEREMIX_SEED` added so the run is
-  reproducible: a cached defense whose output cannot be regenerated cannot be resumed or checked.
-  Set ``STYLEREMIX_TEMPERATURE=0`` for greedy decoding.
+* **Sampling is upstream's, the seed is not.** Upstream samples at whatever temperature its base
+  model's ``generation_config.json`` supplies, undocumented in the repo or paper;
+  :data:`STYLEREMIX_TEMPERATURE`/:data:`STYLEREMIX_TOP_P` reproduce that value, with a fixed
+  :data:`STYLEREMIX_SEED` added so a cached run is reproducible and resumable. Set
+  ``STYLEREMIX_TEMPERATURE=0`` for greedy decoding.
 * **Degenerate generations are caught, not kept** (:func:`cut_repetition`). A rewrite that runs far
-  past its input has usually fallen into a loop, and the text before the loop is a fine rewrite, so
-  the loop is cut and the rest kept; if what survives no longer covers the turn, the original is
-  kept instead. Upstream has no such guard, but upstream also never fed the adapters a line of dots.
-* **Long turns are split, not truncated.** The adapters were trained at a 512-token sequence
-  length, and upstream's merge pipeline truncates its input at 256 tokens. Chat turns are routinely
-  longer than either, and silently dropping their tails would make the defended dataset a lie, so a
-  long turn is cut into in-distribution fragments, each rewritten, then rejoined
-  (:data:`STYLEREMIX_INPUT_TOKENS`).
-* **No ``unidecode``.** Upstream ASCII-folds every prompt, which is harmless for its English
-  corpora and destructive for a multilingual one.
+  past its input has usually fallen into a loop; the text before the loop is cut and kept, and if
+  what survives no longer covers the turn, the original is kept instead.
+* **Long turns are split, not truncated.** The adapters were trained at a 512-token sequence length,
+  shorter than a typical chat turn, so a long turn is cut into in-distribution fragments, each
+  rewritten, then rejoined (:data:`STYLEREMIX_INPUT_TOKENS`) rather than silently dropping its tail.
+* **No ``unidecode``.** Upstream ASCII-folds every prompt, which is destructive for a multilingual
+  corpus.
 * Only the *active* adapters are merged, where upstream merges all 16 with zero weights for the
-  inactive ones. The zero-weight blocks contribute nothing, so the delta is identical while the
-  rank stays 16n instead of 256.
+  inactive ones -- the zero-weight blocks contribute nothing, so the delta is identical at a lower
+  merged rank.
 """
 
 from __future__ import annotations
@@ -130,16 +120,11 @@ STYLEREMIX_SLIDERS = {
 STYLEREMIX_PROMPT_TEMPLATE = "### Original: {text}\n ### Rewrite:"
 #: Where a generation must stop: the start of a *new training example*, not any ``###``.
 #:
-#: Upstream cuts at the next bare ``###`` (``process_output``), which is safe for its corpora of
-#: essays and speeches and destructive here: a markdown heading inside a chat turn is a legitimate
-#: ``###``, and stopping there truncates the rewrite mid-turn. Measured on this corpus, turns whose
-#: input contains ``###`` came back at a median 0.58x their input length against 1.24x for the rest,
-#: with 40% of them losing more than half their content.
-#:
-#: The real terminator is the ``<eos>`` the adapters were trained to emit (Appendix C.3: the
-#: training text is ``<bos>### Original:{original} \n ### Rewrite: {rewrite}<eos>``), which vLLM
-#: honours from the tokenizer. These stops are the guard for when the model instead rolls on into a
-#: fresh example, so they match that boundary rather than the heading marker it starts with.
+#: Upstream cuts at the next bare ``###``, which is destructive here: a markdown heading inside a
+#: chat turn is a legitimate ``###``, and stopping there truncates the rewrite mid-turn. The real
+#: terminator is the ``<eos>`` the adapters were trained to emit, which vLLM honours from the
+#: tokenizer; these stops guard the case where the model instead rolls on into a fresh example, so
+#: they match that boundary rather than the heading marker it starts with.
 STYLEREMIX_STOP = ("### Original", "### Rewrite")
 
 #: Input tokens per fragment. The adapters were trained at a 512-token sequence length, so this is
@@ -163,27 +148,25 @@ STYLEREMIX_ADAPTER_DIR = os.environ.get("STYLEREMIX_ADAPTER_DIR", "")
 #: Conversations defended between cache flushes, so a long run resumes where it stopped.
 STYLEREMIX_CHECKPOINT_EVERY = int(os.environ.get("STYLEREMIX_CHECKPOINT_EVERY", "1000"))
 #: Shortest turn worth restyling; below this the model has nothing to work from and invents content
-#: (see :data:`~prompt_anonymity.defenses._backends.MIN_DEFEND_CHARS` for the measurement). Style is
-#: the one thing a 5-character turn does not carry, so skipping it costs the defense almost nothing.
+#: (see :data:`~prompt_anonymity.defenses._backends.MIN_DEFEND_CHARS`). Style is the one thing a
+#: very short turn doesn't carry, so skipping it costs the defense almost nothing.
 STYLEREMIX_MIN_CHARS = int(os.environ.get("STYLEREMIX_MIN_CHARS", str(MIN_DEFEND_CHARS)))
 
 # --- decoding ---
-#: Sampling settings, matching upstream. Upstream passes ``do_sample=True, top_p=0.95`` and no
-#: temperature, so its temperature is whatever Llama-3-8B's ``generation_config.json`` carries --
-#: **0.6** — which is where this default comes from; it is not written down in the repo or the paper.
-#: Set ``STYLEREMIX_TEMPERATURE=0`` for greedy decoding instead.
+#: Sampling settings, matching upstream: no explicit temperature, so it samples at whatever
+#: Llama-3-8B's ``generation_config.json`` carries. Set ``STYLEREMIX_TEMPERATURE=0`` for greedy
+#: decoding instead.
 STYLEREMIX_TEMPERATURE = float(os.environ.get("STYLEREMIX_TEMPERATURE", "0.6"))
 STYLEREMIX_TOP_P = float(os.environ.get("STYLEREMIX_TOP_P", "0.95"))
-#: Sampling seed. Upstream leaves sampling unseeded, so its rewrites are unreproducible; here a
-#: fixed per-request seed makes a re-run reproduce the cache it would have written, which is what
-#: lets an interrupted run resume and a result be checked. Part of the cache key.
+#: Sampling seed. Upstream leaves sampling unseeded; a fixed per-request seed here makes a re-run
+#: reproduce the cache it would have written, so an interrupted run can resume. Part of the cache key.
 STYLEREMIX_SEED = int(os.environ.get("STYLEREMIX_SEED", "0"))
 
 # --- degenerate-output guards ---
 #: A rewrite longer than this multiple of its input is treated as a failure once
-#: :func:`cut_repetition` has had a go at it, and the original text is kept instead. Restyling
-#: changes length (formal register ran ~1.3x on this corpus, and the length axis can lengthen
-#: deliberately), so this is set well clear of legitimate expansion.
+#: :func:`cut_repetition` has had a go at it, and the original text is kept instead. Set well clear
+#: of legitimate expansion (restyling toward a formal register lengthens text, and the length axis
+#: can lengthen it deliberately).
 STYLEREMIX_MAX_EXPANSION = float(os.environ.get("STYLEREMIX_MAX_EXPANSION", "4.0"))
 #: Longest repeating block :func:`cut_repetition` will look for, and how many consecutive copies
 #: count as degenerate rather than deliberate.
@@ -191,17 +174,11 @@ STYLEREMIX_LOOP_PERIOD = int(os.environ.get("STYLEREMIX_LOOP_PERIOD", "120"))
 STYLEREMIX_LOOP_REPEATS = int(os.environ.get("STYLEREMIX_LOOP_REPEATS", "4"))
 #: Least of its input a rewrite must still cover, or the original is kept instead. A rewrite this
 #: much shorter than its input has dropped content rather than restyled it -- either the model
-#: summarised a structured document down to its opening sentence (which is what the adapters do with
-#: markdown specs and compiler dumps, being trained on prose), or a loop cut left a stub.
-#:
-#: 0.5 is set from the corpus, not by taste: restyling to a formal register *expands* text, so
-#: measured over 26,651 rewrites the 1st percentile of the length ratio is 0.52 and the 5th is 0.95.
-#: A floor at 0.5 therefore reverts the outlier tail (~1% of rewrites, whose median ratio is 0.34 --
-#: two thirds of the turn gone) while leaving the legitimate distribution untouched.
+#: summarised a structured document away, or a loop cut left a stub.
 #:
 #: The trade-off is real: a reverted turn is *undefended*, so its author's style survives. That is
-#: the honest failure, and it is counted in the run log. Lower it to defend more turns at the cost
-#: of keeping mangled ones; raise it toward 1.0 only if no shortening slider is enabled, since
+#: the honest failure, and it is counted in the run log. Lower it to defend more turns at the cost of
+#: keeping mangled ones; raise it toward 1.0 only if no shortening slider is enabled, since
 #: ``length_less`` shortens on purpose.
 STYLEREMIX_MIN_RETENTION = float(os.environ.get("STYLEREMIX_MIN_RETENTION", "0.5"))
 
@@ -280,14 +257,12 @@ def build_merged_adapter(base_model: str, adapters: dict, active: dict, out_dir:
     """Merge the active per-axis adapters into one LoRA on disk, and return its directory.
 
     Runs PEFT's own ``add_weighted_adapter(..., combination_type="cat")`` -- the upstream
-    composition, not a reimplementation -- which concatenates the components into a single adapter
-    of rank ``sum(r_i)`` whose delta is ``sum_i weight_i * (alpha_i / r_i) * B_i @ A_i``.
+    composition -- which concatenates the components into a single adapter of rank ``sum(r_i)``.
 
-    Cached: an existing directory is reused, so the (slow, one-off) merge happens on the first run
-    for a given slider configuration and never again. The base model is loaded on **CPU** purely
-    because PEFT needs something to attach the adapters to -- no base weight is read or written by
-    the merge, and no GPU is touched. ``save_embedding_layers=False`` keeps the redundant 4 GB
-    embedding tensors out of the result (see the module docstring).
+    Cached: an existing directory is reused, so the merge happens once per slider configuration. The
+    base model is loaded on **CPU** purely because PEFT needs something to attach the adapters to; no
+    base weight is read or written and no GPU is touched. ``save_embedding_layers=False`` keeps the
+    redundant embedding tensors out of the result (see the module docstring).
     """
     if (out_dir / "adapter_config.json").exists():
         return out_dir
@@ -334,10 +309,9 @@ def cut_repetition(text: str, max_period: int = STYLEREMIX_LOOP_PERIOD,
     """Truncate a degenerate repeated tail, keeping one copy of the repeated block.
 
     A language model that runs out of anything to say falls into a loop -- a character, a phrase or
-    a sentence repeated until the token budget runs out. Observed here on an input that was itself
-    contentless (a line of dots), whose rewrite reached 64,736 characters. The salvageable part is
-    everything *before* the loop, so this finds where the repetition starts and cuts there rather
-    than discarding the whole rewrite.
+    a sentence repeated until the token budget runs out. The salvageable part is everything *before*
+    the loop, so this finds where the repetition starts and cuts there rather than discarding the
+    whole rewrite.
 
     Scans for the earliest position where some block of up to ``max_period`` characters repeats
     ``min_repeats`` times back to back, and cuts after that block's first copy. Returns ``text``
@@ -542,9 +516,7 @@ class StyleRemixDefense(PerTurnBatchRewriteDefense):
     """
 
     name = "styleremix"
-    # 2: backend moved from Transformers to vLLM with a pre-merged adapter, generation is now
-    # stopped at "###" (as upstream post-processes), and long turns are fragmented rather than
-    # truncated. The rewrites differ from version 1's.
+    # 2: backend moved from Transformers to vLLM with a pre-merged adapter; rewrites differ from v1.
     version = "2"
     checkpoint_every = STYLEREMIX_CHECKPOINT_EVERY
     min_defend_chars = STYLEREMIX_MIN_CHARS
@@ -569,17 +541,13 @@ class StyleRemixDefense(PerTurnBatchRewriteDefense):
         self._backend = None
 
     def params(self) -> dict:
-        # What determines the (greedy) rewrite: the base model, the style target, how much text the
-        # model sees per call -- the fragment size changes where a long turn is cut, and so its
-        # rewrite -- and which turns are rewritten at all. Engine knobs (memory fraction, eager
-        # mode) do not change the output.
+        # Everything that determines the rewrite. Engine knobs (memory fraction, eager mode) are
+        # excluded since they don't change the output.
         return {"base_model": self.base_model, "sliders": self.sliders,
                 "input_tokens": self.input_tokens, "max_new_tokens": self.max_new_tokens,
                 "min_defend_chars": self.min_defend_chars, "temperature": self.temperature,
                 "top_p": self.top_p, "seed": self.seed,
-                # These four are module constants, so the class-source hash does not cover them --
-                # without them here, editing a stop string or a guard threshold would silently reuse
-                # rewrites made under the old ones.
+                # These are module constants, not covered by the class-source hash.
                 "stop": list(STYLEREMIX_STOP), "max_expansion": self.max_expansion,
                 "min_retention": self.min_retention}
 

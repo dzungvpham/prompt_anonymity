@@ -1,44 +1,21 @@
 """Small sentence-transformers encoders, used as EmBad's cross-tokenizer surrogate ensemble.
 
 One generic featurizer covering any repository that ships a sentence-transformers config, plus the
-three registered instances built on it. They are handled by a single class because the
-repositories already declare their own pipeline -- pooling, dense projections, normalization -- so
-reimplementing any of it here would only be a way for it to drift from what the model card says.
+three registered instances built on it. A single class handles all of them because each repository
+already declares its own pipeline (pooling, projections, normalization), so reimplementing it here
+would only let it drift from the model card.
 
-Why these three
----------------
+**Why these three.** EmBad's problem is *transfer*: the search steers local encoders while the
+target adversary uses one the defender doesn't have, so an ensemble is only useful if its members
+can disagree the way the target might. ``harrier_270m`` and ``embeddinggemma_300m`` share a
+tokenizer (Gemma 3); ``jina_v5_nano`` uses an unrelated one (EuroBERT). EmBad's actual third member
+is ``harrier`` (the Qwen 3 checkpoint in :mod:`~prompt_anonymity.features.harrier`) -- not
+``harrier_270m`` here, which shares only the product name.
 
-They are deliberately not one family. EmBad's whole problem is *transfer*: the search steers local
-encoders and the adversary uses one the defender does not have, so an ensemble is only worth
-anything if its members disagree in ways the target might.
-
-======================  =================  ==============  =====================================
-\\                        tokenizer          pooling         notes
-======================  =================  ==============  =====================================
-``harrier_270m``        Gemma 3 (262k)     mean + norm     Gemma3TextModel, 640-d
-``embeddinggemma_300m`` Gemma 3 (262k)     mean + 2 dense  Gemma3TextModel, 768-d, task-prefixed
-``jina_v5_nano``        EuroBERT (128k)    custom module   task-conditioned, 768-d
-======================  =================  ==============  =====================================
-
-The first two share a tokenizer exactly; **Jina's vocabulary is unrelated**, with zero ids in
-common. That mattered when EmBad searched over token ids and had to split its members into ones it
-could optimize jointly and ones that could only score text. It searches over natural-language
-passages now (:class:`~prompt_anonymity.defenses.embad.SearchPool`), which every tokenizer reads,
-so the disagreement is only what the ensemble wants it to be: three encoders that can fail
-differently.
-
-**Two of the three EmBad actually uses live here.** Its third member is ``harrier`` -- the 0.6b
-Qwen 3 checkpoint in :mod:`~prompt_anonymity.features.harrier`, not the Gemma-based ``harrier_270m``
-below, which shares the product name and nothing else.
-
-Task conditioning
------------------
-
-These models are task-conditioned and the task rides in a text prefix. All three are set to their
-**clustering** task where they have one, matching the default of
-:mod:`~prompt_anonymity.features.gemini_embedding` -- the adversary's encoder -- so every vector in
-the pipeline describes the same task. The prefix is part of :meth:`render`, so it is inside the
-string the search steers rather than bolted on afterwards.
+**Task conditioning.** These models are task-conditioned via a text prefix. All three are set to
+their **clustering** task where available, matching :mod:`~prompt_anonymity.features.gemini_embedding`
+(the adversary's encoder) so every vector in the pipeline describes the same task. The prefix lives
+inside :meth:`render`, so it's part of the string the search steers.
 """
 
 from __future__ import annotations
@@ -72,10 +49,8 @@ class SentenceTransformerFeaturizer(Featurizer):
     model_kwargs: dict | None = None
 
     def __init__(self, *, max_tokens: int = 2048, batch_size: int = DEFAULT_BATCH_SIZE):
-        #: Truncation window. Defaults to the smallest of the three repositories' own limits so the
-        #: members read the same amount of each document -- an encoder that sees twice as much text
-        #: as its neighbour is not solving the same problem, and the ensemble loss would be summing
-        #: two different questions.
+        #: Truncation window. Kept equal across the ensemble's members so each reads the same
+        #: amount of a document.
         self.max_tokens = int(max_tokens)
         self.batch_size = max(1, int(batch_size))
         self._model = None

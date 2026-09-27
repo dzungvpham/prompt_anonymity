@@ -7,26 +7,21 @@ sits between the two: it takes a built split, runs every conversation through on
 releasing them -- and writes the defended conversations back out as a parquet with the *same
 schema*, so everything downstream can read it exactly like the original split.
 
-Defenses are **not reimplemented here**. The script drives the registered defenses of the
-installed package (``prompt_anonymity.defenses.DEFENSES``) -- the same registry
-``run_experiment.py --defense`` names its already-defended parquet from -- so ``--defense`` accepts
-whatever that registry exposes
-and a newly registered defense becomes available with no change to this file.
+Defenses are **not reimplemented here** -- the script drives the registered defenses of the
+installed package (``prompt_anonymity.defenses.DEFENSES``), so a newly registered defense becomes
+available with no change to this file.
 
 Where the output goes
 ---------------------
 
-The split itself is READ from ``data/hf`` (the downloaded/published mirror, see
-:func:`prompt_anonymity.data.config.hf_dir`) and a defended split is WRITTEN to
-``dist/<split>_<defense>.parquet`` -- ``dist/swe_chat_openanonymity.parquet`` -- carrying the
-split's own schema so anything that reads the original can read it. Keeping writes out of
-``data/hf`` means running this locally never mutates the downloaded mirror.
+The split is READ from ``data/hf`` (the downloaded/published mirror) and a defended split is
+WRITTEN to ``dist/<split>_<defense>.parquet``, carrying the split's own schema. Keeping writes out
+of ``data/hf`` means running this locally never mutates the downloaded mirror.
 
-Note this shares a namespace with the feature files ``compute_features`` writes
-(``dist/swe_chat_stylometrix.parquet``): both are ``<split>_<name>.parquet``, distinguished only by
-whether ``<name>`` is a registered defense or a registered featurizer. The two registries are
-disjoint today. What tells them apart on disk is their columns -- a defended split has ``turns``,
-a feature file has ``doc_id``/``author_id`` plus feature columns.
+This shares a namespace with the feature files ``compute_features`` writes
+(``dist/swe_chat_stylometrix.parquet``): both are ``<split>_<name>.parquet``, distinguished on disk
+by their columns -- a defended split has ``turns``, a feature file has ``doc_id``/``author_id``
+plus feature columns.
 
 To featurize defended text, point ``compute_features`` at the defended file with its ``--defense``
 flag -- and, since that file lives in ``dist/`` rather than ``compute_features``'s own default
@@ -46,46 +41,35 @@ the rewrite, and a document's defended turns line up one-for-one with its origin
 
 The one exception is a defense that *adds* turns rather than rewriting them (``frame_pad``, which
 appends a shared off-topic turn to each document). Such a defense declares ``appends_turns = True``
-and is applied per DOCUMENT rather than through the per-turn path below -- that path structurally
-cannot add a turn, since it must return one output per input row. For those defenses, and only
-those, the defended document has MORE turns than the original.
+and is applied per DOCUMENT rather than through the per-turn path below, which structurally cannot
+add a turn since it must return one output per input row.
 
-There are two ways to be such a defense, and the difference is whether it needs to see the document:
+There are two ways to be such a defense, depending on whether it needs to see the document:
 
-* ``extra_turns(doc_id)`` returns the turns to append. The existing turns are never handed over and
-  are copied through byte-identical (``frame_pad``).
+* ``extra_turns(doc_id)`` returns the turns to append. The existing turns are copied through
+  byte-identical (``frame_pad``).
 * ``rewrite_document(doc_id, turns)`` returns the document's whole new turn list, so it may shorten
-  the existing turns as well as add one (``epi``, which cuts a document to the embedding window so
-  that the turn it appends is actually read).
+  the existing turns as well as add one.
 
 :func:`append_extra_turns` prefers the second when a defense offers it.
 
-That is also the granularity the caching works at: the package's defense machinery caches one row
-per input it is handed (:class:`~prompt_anonymity.caching.IndexedRowCache`, keyed by the id passed
-in and verified against the source text), so handing it turns rather than whole conversations means
-a turn repeated across documents is computed once, and an interrupted run resumes at turn
-granularity instead of re-doing a 422-turn session from the top. Turn ids are ``<doc_id>#<n>``.
-
-This is the only place a defense is applied to text. The removed fixed-split runner used to do it
-inside the run, splitting a WildChat conversation *cell* on the legacy ``\n===\n`` marker to recover
-its turns; the unified dataset stores turns as a real list, so no delimiter is involved here and no
-text can be mistaken for one.
+The defense machinery caches one row per input it is handed
+(:class:`~prompt_anonymity.caching.IndexedRowCache`), so handing it turns rather than whole
+conversations means a turn repeated across documents is computed once, and an interrupted run
+resumes at turn granularity. Turn ids are ``<doc_id>#<n>``.
 
 Cost, caching and re-runs
 -------------------------
 
-Every defense here runs a model on this machine -- ``styleremix``, ``qwen_rewrite``, ``dp_mlm``,
-and ``openanonymity``, which generates once per distinct turn with a local gpt-oss-120b through
-vLLM and so wants a GPU large enough to hold it. The run prints how many documents, turns and
-distinct turns it is about to defend **before** starting, so the scale is visible up front, and
-every defended turn is cached under ``--cache-dir``: a re-run recomputes nothing.
+Every model-backed defense here (``styleremix``, ``qwen_rewrite``, ``dp_mlm``, ``openanonymity``)
+runs locally and wants a GPU large enough to hold its model. The run prints how many documents,
+turns and distinct turns it is about to defend before starting, and every defended turn is cached
+under ``--cache-dir``: a re-run recomputes nothing.
 
 The cache is scoped per split **and per shard layout** -- ``<cache-dir>/defended/<split>[/<i>-of-<n>]``
 -- because the defense cache is one table per side, rewritten whole on each run: two shards sharing
-one table would each drop the other's rows. Two consequences worth knowing: applying the same
-defense to two sources never mixes their caches, and re-running an array with a *different*
-``--num-shards`` recomputes everything. Keep the array size fixed across re-runs, or pay the GPU
-hours again.
+one table would each drop the other's rows. Re-running an array with a *different* ``--num-shards``
+therefore recomputes everything, so keep the array size fixed across re-runs.
 
 Sharding (SLURM job arrays)
 ---------------------------
@@ -94,8 +78,7 @@ Sharding works exactly as in :mod:`~prompt_anonymity.data.compute_features` and 
 implementation: ``--num-shards N --shard-index I`` defends every ``N``-th document, either flag is
 filled in from ``SLURM_ARRAY_TASK_ID`` / ``SLURM_ARRAY_TASK_COUNT`` in an array job, shards land in
 ``dist/shards/``, and the last shard to finish concatenates them into the final split-ordered
-parquet (or ``--merge`` does it on demand). Sharding is what makes WildChat tractable for a slow
-defense, and it bounds the size of each task's cache table as well as its runtime.
+parquet (or ``--merge`` does it on demand).
 
 Run (from the repo root):
 
@@ -138,23 +121,20 @@ from .compute_features import (
 )
 from .config import cache_dir, dist_dir, hf_dir
 
-# The defended file's columns. Just the key, its author, and the rewritten text: everything else in
-# the split (timestamps, language, model, agent) is unchanged by a defense, so copying it would
-# duplicate the split rather than describe the defense. Anything that needs those columns joins back
-# to <split>.parquet on doc_id, which is what `compute_features --defense` does for the language
-# filter.
+# The defended file's columns. Just the key, its author, and the rewritten text -- everything else
+# in the split (timestamps, language, model, agent) is unchanged by a defense, so it stays in
+# <split>.parquet and is joined back on doc_id by whoever needs it.
 DEFENDED_COLUMNS = ["doc_id", "author_id", "turns"]
 
 # Where the per-turn defense cache is rooted under --cache-dir. The defense machinery adds its own
-# ``defenses/<name>/<logic hash>/<params hash>/`` below this; what this level adds is the split (and
-# shard), which that namespace does not carry and which would otherwise collide.
+# ``defenses/<name>/<logic hash>/<params hash>/`` below this; this level adds the split (and shard),
+# which that namespace does not carry.
 CACHE_SUBDIR = "defended"
 
 # Separator between a document id and a turn's position within it, forming the cache key for one
-# turn. Any character absent from the built doc_ids (``sc-<date>-<uuid>`` / ``wc-<...>``) works; '#'
-# is chosen because it reads as a fragment reference and never appears in an id. Defined in
-# `defenses._backends` (imported above, and re-exported here) so a defense can read the doc_id back
-# out of a row id without importing this module, which imports the defense registry.
+# turn. Defined in `defenses._backends` (imported above, and re-exported here) so a defense can
+# read the doc_id back out of a row id without importing this module, which imports the defense
+# registry.
 
 
 # --- input ------------------------------------------------------------------
@@ -163,10 +143,9 @@ def read_turns(source: str, dist_dir: str | Path, positions) -> list[list[str]]:
     """The turn lists of these split row positions, in the order given.
 
     The list-of-turns counterpart of :func:`~prompt_anonymity.data.compute_features.read_texts`,
-    and streaming for the same reason: ``turns`` *is* essentially the whole dataset (WildChat's
-    parquet is 412 MB on disk and several GiB once pandas has made Python lists of strings out of
-    it), while a shard needs 1/N of it. Reading a batch at a time and keeping only the wanted rows
-    makes a task's memory scale with its shard rather than with the corpus.
+    and streaming for the same reason: ``turns`` is essentially the whole dataset, while a shard
+    needs only a fraction of it. Reading a batch at a time and keeping only the wanted rows makes a
+    task's memory scale with its shard rather than with the corpus.
     """
     path = Path(dist_dir) / f"{source}.parquet"
     wanted = {int(position) for position in positions}
@@ -207,13 +186,11 @@ def regroup_turns(defended: list[str], counts: list[int]) -> list[list[str]]:
     """Cut the defended turn stream back into one list per document, using the original counts.
 
     A defense returns one output per input, so every document gets back exactly as many turns as it
-    had -- ``num_turns`` and the turn boundaries are preserved by construction (a turn a defense
-    emptied is still a turn). A length mismatch means a defense broke that contract, which would
-    silently misalign every document after it, so it is raised rather than trimmed.
+    had. A length mismatch means a defense broke that contract, which would silently misalign every
+    document after it, so it is raised rather than trimmed.
 
-    A defense that means to add a turn therefore cannot do it here: it declares ``appends_turns``
-    and is applied by :func:`append_extra_turns` instead, on documents that this function has
-    already put back together.
+    A defense that means to add a turn cannot do it here: it declares ``appends_turns`` and is
+    applied by :func:`append_extra_turns` instead.
     """
     if len(defended) != sum(counts):
         raise ValueError(f"defense returned {len(defended):,} turns for {sum(counts):,} inputs; "
@@ -232,15 +209,12 @@ def defense_cache_dir(cache_root: str | Path, source: str,
                       shard_index: int, num_shards: int) -> Path:
     """Cache directory for this (split, shard) -- the scope the defense's own namespace lacks.
 
-    A defense caches its rows in one table per side, named for the *side* and namespaced only by
-    the defense's name/logic/params (see :class:`~prompt_anonymity.caching.IndexedRowCache`), and
-    rewrites that whole table on each run. Two runs that share a table therefore overwrite each
-    other's rows -- which is precisely what defending two different splits, or two shards of one
-    split in parallel, would do. Giving each its own root keeps them apart.
-
-    The cost is that the shard layout is part of the cache path, so re-running an array with a
-    different ``--num-shards`` starts from an empty cache. That is the deliberate trade: a
-    recomputation is expensive, but silently losing another task's rows is worse.
+    A defense caches its rows in one table per side, namespaced only by the defense's
+    name/logic/params (:class:`~prompt_anonymity.caching.IndexedRowCache`), and rewrites that whole
+    table on each run. Two runs that share a table would overwrite each other's rows -- which is
+    exactly what defending two different splits, or two shards of one split in parallel, would do
+    without this. The cost: re-running an array with a different ``--num-shards`` starts from an
+    empty cache, but that's cheaper than silently losing another task's rows.
     """
     path = Path(cache_root) / CACHE_SUBDIR / source
     if num_shards > 1:
@@ -253,21 +227,18 @@ def as_attack_data(texts: list[str], ids: list[str], authors: list[str],
     """Wrap a stream of turns as the :class:`~prompt_anonymity.core.AttackData` a defense takes.
 
     A defense's input type is the experiment's known/unknown bundle, but a defense only ever reads
-    and rewrites **text** -- features are computed afterwards, by a separate stage (here: a later
-    ``compute_features`` run over the defended parquet). So the bundle handed over carries the
-    turns, their cache ids and their authors, and zero-width embedding matrices: not placeholder
-    vectors, but an explicit statement that no features exist yet.
+    and rewrites **text** -- features are computed afterwards, by a separate stage. So the bundle
+    carries the turns, their cache ids and authors, and zero-width embedding matrices: an explicit
+    statement that no features exist yet, not placeholder vectors.
 
     Everything goes on the *unknown* side, the side a defense rewrites by default (the threat model
     being that the adversary's known conversations are already out). Defending a whole dataset
     normally has no known side, so that side is empty.
 
     ``reference``, when given, is ``(texts, ids, authors)`` of read-only context documents that go
-    on the **known** side -- "labeled reference conversations", which is what that side means. Only
-    an author-sharded run needs it: the task holds a fraction of the split but a defense calibrating
-    against "a median unrelated document" must see the same reference pool as every other shard, or
-    each optimizes to a different target. Nothing on this side is rewritten or returned. It is the
-    same per-turn stream as the unknown side, so the defense rebuilds documents from it identically.
+    on the **known** side. Only an author-sharded run needs it: the task holds a fraction of the
+    split but a defense calibrating against "a median unrelated document" must see the same
+    reference pool as every other shard. Nothing on this side is rewritten or returned.
     """
     n = len(texts)
     ref_texts, ref_ids, ref_authors = reference if reference else ([], [], [])
@@ -286,9 +257,8 @@ def as_attack_data(texts: list[str], ids: list[str], authors: list[str],
 def report_workload(defense: str, n_documents: int, texts: list[str]) -> None:
     """Log the size of the job before any of it runs: documents, turns, distinct turns, characters.
 
-    Distinct turns is the number that matters for a paid or slow defense -- identical turns are
-    computed once (and cached), so it is the real call count for an uncached run -- and seeing it
-    before the first request is the difference between noticing a mis-scoped run and paying for it.
+    Distinct turns is the number that matters for a paid or slow defense: identical turns are
+    computed once, so it's the real call count for an uncached run.
     """
     distinct = len({text for text in texts if text.strip()})
     characters = sum(len(text) for text in texts)
@@ -300,17 +270,14 @@ def report_workload(defense: str, n_documents: int, texts: list[str]) -> None:
 def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str]]:
     """Apply a turn-ADDING defense, document by document.
 
-    The path for a defense that declares ``appends_turns`` (``frame_pad``, ``epi``). It is
-    document-level, so it skips the per-turn machinery entirely -- no flatten, no cache, no backend.
-    That is not just an optimisation: the per-turn path caches one row per input turn and requires
-    one output per input turn, so it can neither express "one more turn" nor gain anything from
-    caching a defense whose transform is a dictionary lookup keyed by ``doc_id``.
+    The path for a defense that declares ``appends_turns`` (``frame_pad``). It is document-level,
+    skipping the per-turn machinery entirely: that path caches and requires one output per input
+    turn, so it can't express "one more turn".
 
     Two hooks, in order of preference (see this module's docstring):
 
     * ``rewrite_document(doc_id, turns)`` -> the document's whole new turn list. A defense that must
-      see the document uses this; it may shorten the existing turns as well as add one, which
-      ``epi`` does to keep its appended turn inside the embedder's window.
+      see the document uses this; it may shorten the existing turns as well as add one.
     * ``extra_turns(doc_id)`` -> the turns to append, with the existing ones copied through
       byte-identical. The defense never sees the document at all.
 
@@ -325,9 +292,8 @@ def append_extra_turns(name: str, defense, doc_ids, turn_lists) -> list[list[str
         padded = [list(turns) + [str(turn) for turn in defense.extra_turns(doc_id)]
                   for doc_id, turns in zip(doc_ids, turn_lists)]
 
-    # Both counts are SIGNED deltas. A defense that only appends makes them both positive; one that
-    # shortens a document to make room for what it appends can drive either negative, and a count of
-    # "turns added" would then read 0 on a document that did gain a turn and lose four.
+    # Both counts are SIGNED deltas: a defense that shortens a document to make room for what it
+    # appends can drive either negative.
     turns_delta = sum(len(new) - len(old) for new, old in zip(padded, turn_lists))
     delta = (sum(len(turn) for turns in padded for turn in turns)
              - sum(len(str(turn)) for turns in turn_lists for turn in turns))
@@ -347,27 +313,16 @@ def append_optimized_turns(defense: str, registered, doc_ids, author_ids, turn_l
                            *, cache_dir) -> list[list[str]]:
     """Apply a turn-ADDING defense that has to READ the document first.
 
-    **Unreached today.** ``embad`` took this path while it searched a trigger per document; since it
-    began fitting ONE universal trigger against a separate optimization corpus it declares
-    ``needs_document = False`` and goes through :func:`append_extra_turns` instead, and no other
-    registered defense declares the pair. Kept rather than deleted because it is the contract a
-    document-reading turn-adder would use, and because the per-document arm in
-    ``experiments/embad_direct_search.py`` is still measured.
+    **Unreached today** -- no registered defense currently declares ``needs_document`` (``embad``
+    used to, before it switched to fitting one universal trigger). Kept as the contract a
+    document-reading turn-adder would use: :func:`append_extra_turns` never shows the defense any
+    text, while the per-turn path in :func:`defend_documents` shows text but structurally cannot add
+    a turn.
 
-    The middle path between the two above, and it exists because the other two each rule out half of
-    what such a defense needs. :func:`append_extra_turns` never shows the defense any text -- a
-    guarantee ``frame_pad`` is built on, since a pad that tracked the topic would reinforce the
-    signal it is meant to bury -- while the per-turn path in :func:`defend_documents` shows text but
-    structurally cannot add a turn, because it must return one output per input row.
-
-    So this hands the defense one row per **document** (id ``doc_id``, source the joined turns) and
-    appends what comes back. Two consequences worth knowing:
-
-    * The cached unit is a document, not a turn, so a turn repeated across documents is optimized
-      once per document rather than once overall -- correct here, since the trigger is optimized
-      against the whole document's embedding and two documents sharing a turn are different problems.
-    * What the defense returns is the **turn to append**, not a rewritten document. That is the one
-      place its row semantics differ from every other defense in the registry.
+    Hands the defense one row per **document** (id ``doc_id``, source the joined turns) and appends
+    what comes back. Two consequences: the cached unit is a document, not a turn, so a repeated turn
+    is optimized once per document rather than once overall; and what the defense returns is the
+    turn to append, not a rewritten document.
     """
     from prompt_anonymity.defenses import apply_defense
 
@@ -403,13 +358,9 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
     registered = get_defense(defense)
     # An author-aware defense measures a document against the author's OTHER documents, and
     # `select_shard` splits by document (interleaved), so a shard holds an arbitrary subset of each
-    # author. `loo_unlink` would compute its linkage baseline against a truncated author; `afr`
-    # would cascade from the wrong documents entirely. Neither failure is visible in the output --
-    # both produce a plausible defended parquet that means something different per shard -- so this
-    # refuses the run rather than trusting the operator to remember.
-    #
-    # `shardable_by = "author"` is the exemption: main() gave that defense whole authors via
-    # `select_author_shard`, which is exact rather than merely tolerable.
+    # author -- silently producing a plausible but wrong defended parquet. Refuse rather than trust
+    # the operator to remember. `shardable_by = "author"` is the exemption: main() gives that
+    # defense whole authors via `select_author_shard`.
     if (num_shards > 1 and not getattr(registered, "shardable", True)
             and getattr(registered, "shardable_by", None) != "author"):
         raise SystemExit(
@@ -418,10 +369,8 @@ def defend_documents(defense: str, doc_ids, author_ids, turn_lists,
             f"--num-shards/--shard-index (or on a smaller --source)."
         )
     # A turn-adding defense works on documents, not on the per-turn stream. Two flavours: one that
-    # never sees the text (`frame_pad`, and `embad` since it began fitting ONE universal trigger on
-    # a separate corpus) and one that has to. NO registered defense takes the second branch today --
-    # it is kept because `needs_document` is the contract a document-reading turn-adder would
-    # declare, not because anything currently declares it.
+    # never sees the text (`frame_pad`) and one that has to (`needs_document`); no registered
+    # defense takes the second branch today, but it's kept as the contract for one that would.
     if getattr(registered, "appends_turns", False):
         if getattr(registered, "needs_document", False):
             return append_optimized_turns(defense, registered, doc_ids, author_ids, turn_lists,
@@ -442,8 +391,8 @@ def reference_pool(defense, registered, documents: pd.DataFrame, source: str,
     """The known-side reference documents a sharded run owes the defense, as a per-turn stream.
 
     Selected over the **whole** ``documents`` frame, before any shard is taken, so every task in the
-    array calibrates against the same "unrelated" -- see ``afr``'s ``reference_pool_ids``. Returns
-    ``None`` for a defense that does not ask for one, which is every defense but ``afr``.
+    array calibrates against the same reference pool. Returns ``None`` for a defense that does not
+    ask for one (every defense but ``afr``).
     """
     chooser = getattr(registered, "reference_pool_ids", None)
     if chooser is None:
@@ -465,12 +414,10 @@ def build_defended_frame(metadata: pd.DataFrame, turn_lists: list[list[str]]) ->
     """The defended documents: ``doc_id``, ``author_id``, and the rewritten ``turns``.
 
     Only what the defense actually produces (see :data:`DEFENDED_COLUMNS`). The split's other
-    columns -- timestamps, language, model, agent -- are untouched by a defense, so they stay in
-    ``<split>.parquet`` and are joined back on ``doc_id`` by whoever needs them; ``num_turns`` is
-    likewise recoverable, since a per-turn rewrite returns one turn per turn
-    (see :func:`regroup_turns`) -- with the exception of a turn-ADDING defense
-    (:func:`append_extra_turns`), whose documents carry more turns than the split records, so read
-    the count from this file rather than from ``<split>.parquet``'s ``num_turns``.
+    columns are untouched by a defense and joined back on ``doc_id`` by whoever needs them.
+    ``num_turns`` is recoverable from a per-turn rewrite, but not from a turn-ADDING defense
+    (:func:`append_extra_turns`), whose documents carry more turns than the split records -- read
+    the count from this file instead.
     """
     frame = metadata.reset_index(drop=True).copy()
     frame["turns"] = pd.Series(turn_lists, dtype=object)
@@ -500,11 +447,9 @@ def report_written(frame: pd.DataFrame, path: Path, kind: str = "defended docume
 def configure_embad(args):
     """Return the defense instance for this run, rebuilding ``embad`` from the ``--embad-*`` flags.
 
-    The registry holds ready-made instances, which is what makes selecting a defense free. ``embad``
-    is the one defense whose behaviour a user is expected to steer from the command line, so its
-    entry is **replaced for this process** with an instance carrying the flags. Everything
-    downstream still resolves it by name through :func:`~prompt_anonymity.defenses.get_defense`, so
-    nothing else has to know this happened.
+    ``embad`` is the one defense whose behaviour a user is expected to steer from the command line,
+    so its registry entry is **replaced for this process** with an instance carrying the flags.
+    Everything downstream still resolves it by name, so nothing else has to know this happened.
 
     A non-embad defense is returned untouched, flags and all -- they are documented as ignored.
     """
@@ -512,12 +457,10 @@ def configure_embad(args):
     if not isinstance(registered, EmBadDefense):
         return registered
 
-    # Keep whatever the registry entry configured, and override only what the user ACTUALLY asked
-    # for on the command line. Two fields are deliberately registry-only, with no flag at all:
-    # `objective`, which is the whole difference between `embad`, `embad_summary` and
-    # `embad_gemini` -- naming the defense is how you choose it, and a flag would let the search's
-    # objective disagree with the filename it writes -- and `aggregation`, which reduces across the
-    # ENSEMBLE's members rather than across documents.
+    # Keep whatever the registry entry configured, override only what the user asked for on the
+    # command line. `objective` and `aggregation` are deliberately registry-only, with no flag: the
+    # objective is the whole difference between the embad variants, and a flag would let the
+    # search's objective disagree with the filename it writes.
     configured = EmBadDefense(
         aggregation=registered.aggregation,
         objective=registered.objective_kind,
@@ -541,9 +484,9 @@ def configure_embad(args):
 def merge_one_source(source: str, args, *, language, dist: Path, out_dir: Path) -> None:
     """Reassemble one split's shards into its final parquet.
 
-    Builds no defense, so no model is loaded and no API key is needed, and reads only the columns
-    the selection needs. Deliberately never resolves sharding: a merge is about what an array
-    already wrote, not about which shard this process would have computed.
+    Builds no defense, so no model is loaded and no API key is needed. Deliberately never resolves
+    sharding: a merge is about what an array already wrote, not about which shard this process
+    would have computed.
     """
     documents = select_documents(
         load_split(source, dist, columns=["doc_id", "language_primary"]),
@@ -562,14 +505,12 @@ def defend_one_source(source: str, args, *, language, dist: Path, cache: Path, o
                       shard_index: int, num_shards: int) -> None:
     """Defend one split, writing ``<split>_<defense>.parquet`` (or this run's shard of it).
 
-    One call is one corpus. With several ``--source`` values the caller loops, which is safe
-    precisely because ``num_shards`` is then guaranteed to be 1 -- every source is defended whole,
-    so no per-source shard layout has to be invented.
+    One call is one corpus. With several ``--source`` values the caller loops, safe because
+    ``num_shards`` is then guaranteed to be 1 -- every source is defended whole.
     """
     merged_path = output_path(out_dir, source, args.defense)
     stem = defended_stem(source, args.defense)
 
-    # Only the columns this needs: the two that are written out, plus the one --language filters on.
     # `turns` is read separately, and only for this shard's rows, since it is the bulk of the split.
     frame = load_split(source, dist, columns=["doc_id", "author_id", "language_primary"])
     documents = select_documents(frame, language=language, limit=args.limit)
@@ -580,8 +521,8 @@ def defend_one_source(source: str, args, *, language, dist: Path, cache: Path, o
 
     doc_order = list(documents["doc_id"])  # split order, for the merge
 
-    # A defense that cascades over an author's timeline gets WHOLE AUTHORS; everything else gets the
-    # row-interleaved split. Both are deterministic given the selection and the shard count.
+    # A defense that cascades over an author's timeline gets WHOLE AUTHORS; everything else gets
+    # the row-interleaved split.
     registered = configure_embad(args)
     by_author = getattr(registered, "shardable_by", None) == "author"
     shard = (select_author_shard(documents, shard_index, num_shards) if by_author
@@ -663,17 +604,15 @@ def main() -> None:
         "Ignored unless --defense is an embad variant. embad searches ONE universal trigger "
         "against a pool of documents from its own optimization corpus -- never from --source -- "
         "and appends that same turn to every defended document. These flags control the search; "
-        "any of them changes the cache key, so a changed flag re-runs it. What the search is "
-        "SCORED AGAINST is not a flag: pick embad (local ensemble), embad_summary (summary "
-        "bottleneck) or embad_gemini (the target encoder, billed) with --defense, so the objective "
-        "and the output filename can never disagree.")
+        "any of them changes the cache key. What the search is SCORED AGAINST is not a flag: pick "
+        "embad (local ensemble), embad_summary (summary bottleneck) or embad_gemini (the target "
+        "encoder, billed) with --defense, so the objective and the output filename can never "
+        "disagree.")
     embad.add_argument("--embad-mutator", default="claude", choices=sorted(MUTATORS),
                        help="who writes the candidate mechanisms -- the search's mutation "
-                            "operator. 'claude' is the hosted model on Microsoft Foundry (needs "
-                            "ANTHROPIC_API_KEY and ANTHROPIC_BASE_URL, no GPU of its own, bills "
-                            "per call, does NOT reproduce); 'local' is Qwen3-1.7B through vLLM "
-                            "(free, seeded, replays exactly). The two land in the same place and "
-                            "differ ~3x in speed (default: claude)")
+                            "operator. 'claude' is a hosted model (bills per call, does not "
+                            "reproduce); 'local' is Qwen3-1.7B through vLLM (free, seeded, "
+                            "replays exactly) (default: claude)")
     embad.add_argument("--embad-search-source", default=DEFAULT_SEARCH_SOURCE,
                        choices=sorted(SOURCES),
                        help=f"corpus the search draws its documents from, independent of --source "
@@ -684,26 +623,22 @@ def main() -> None:
     embad.add_argument("--embad-validation-samples", type=int,
                        default=DEFAULT_VALIDATION_SAMPLES,
                        help=f"held-out documents the winner is CHOSEN on, disjoint from the "
-                            f"search pool; 0 disables the held-out choice and takes the search's "
-                            f"own best (default: {DEFAULT_VALIDATION_SAMPLES})")
+                            f"search pool; 0 takes the search's own best "
+                            f"(default: {DEFAULT_VALIDATION_SAMPLES})")
     embad.add_argument("--embad-generations", type=int, default=DEFAULT_GENERATIONS,
                        help=f"search rounds (default: {DEFAULT_GENERATIONS})")
     embad.add_argument("--embad-topics-per-document", type=int,
                        default=DEFAULT_TOPICS_PER_DOCUMENT,
-                       help=f"decoy subjects each document is scored under per round. Averaged "
-                            f"out per document before any aggregation, so it buys precision "
-                            f"rather than changing what is measured -- and a round costs "
-                            f"candidates x documents x this, which under --defense embad_gemini is "
-                            f"paid embeddings and under embad_summary is 9B-model generations "
-                            f"(default: {DEFAULT_TOPICS_PER_DOCUMENT})")
+                       help=f"decoy subjects each document is scored under per round, averaged out "
+                            f"before aggregation to buy precision rather than change what is "
+                            f"measured (default: {DEFAULT_TOPICS_PER_DOCUMENT})")
     embad.add_argument("--embad-document-aggregation", default="mean", choices=("mean", "worst"),
                        help="how a candidate's per-document cosines become one fitness: 'mean' "
                             "asks for a trigger that works on average, 'worst' for one with no "
                             "bad document (default: mean)")
     embad.add_argument("--embad-search-min-chars", type=int, default=DEFAULT_SEARCH_MIN_CHARS,
-                       help=f"shortest document the search will sample. The default excludes a "
-                            f"degenerate regime -- ShareChat's median document is 156 characters, "
-                            f"where the appended turn is most of the text "
+                       help=f"shortest document the search will sample, excluding a degenerate "
+                            f"regime where the appended turn would be most of the text "
                             f"(default: {DEFAULT_SEARCH_MIN_CHARS})")
     embad.add_argument("--embad-search-max-chars", type=int, default=DEFAULT_SEARCH_MAX_CHARS,
                        help=f"longest document the search will sample "
@@ -716,15 +651,12 @@ def main() -> None:
     # Deduplicated but order-preserving: naming a split twice is a typo, not a request to defend it
     # twice into the same file.
     sources = list(dict.fromkeys(args.source))
-    # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
-    # lives in the installed package, the data does not.
     dist = Path(args.dist_dir) if args.dist_dir else hf_dir()
     cache = Path(args.cache_dir) if args.cache_dir else cache_dir()
     out_dir = Path(args.out_dir) if args.out_dir else dist_dir()
 
-    # --merge only reassembles what an array already computed -- no defense is built, so no model is
-    # loaded and no API key is needed. It never resolves sharding, so it stays usable with or
-    # without the array flags still on the command line.
+    # --merge only reassembles what an array already computed -- no defense is built, so no model
+    # is loaded and no API key is needed.
     if args.merge:
         for source in sources:
             merge_one_source(source, args, language=language, dist=dist, out_dir=out_dir)
@@ -732,7 +664,7 @@ def main() -> None:
 
     shard_index, num_shards = resolve_sharding(args.shard_index, args.num_shards)
     # Checked on the RESOLVED count, not on the flags, so a multi-source run submitted into a SLURM
-    # array is caught too -- `resolve_sharding` fills these in from the environment.
+    # array is caught too.
     if num_shards > 1 and len(sources) > 1:
         p.error(f"--source names {len(sources)} splits and this run is shard {shard_index} of "
                 f"{num_shards}. A shard layout is per-corpus -- WildChat is ~40x swe_chat, so one "

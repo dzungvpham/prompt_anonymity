@@ -12,8 +12,7 @@ The **author grouping** helper is a different kind of sharing, and it crosses fa
 :class:`~prompt_anonymity.attacks.multiclass.RegularizedLeastSquares` both need each author's
 documents laid out contiguously -- one so a single ``ufunc.reduceat`` pass can aggregate every
 author instead of a Python loop that rebuilds an ``n_documents`` boolean mask once per author,
-the other so each author's rank-``n_a`` covariance update is a slice. At 15,000 authors that
-layout is the difference between seconds and minutes.
+the other so each author's rank-``n_a`` covariance update is a slice.
 
 This module imports nothing from the attack packages, which is what lets every one of them
 import it.

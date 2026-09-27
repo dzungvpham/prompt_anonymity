@@ -1,14 +1,10 @@
 r"""Frame pad: leave the prompt alone and bolt a shared, off-topic turn onto the end of it.
 
-:mod:`~prompt_anonymity.defenses.frame_shift` does two things at once. It **adds** a heavy topical
-frame, and it **rewrites** the user's request into that frame's register. Both could plausibly be
-what moves attribution, and the rewrite is the half that is expensive (a hosted call per
-(frame, turn) -- ~$95-180 for WildChat) *and* the half that can quietly fail: a model that wraps the
-prompt instead of restating it leaves the author's exact wording, and so the author's signal, intact.
-
-This defense is the other half on its own. The user's turns are returned **byte-identical**; the
-document simply gains one extra turn of dense, content-loaded prose from one of the same 50 scenes
-(:data:`~.frame_shift.FRAMINGS`), drawn by a keyed hash of its ``doc_id``::
+:mod:`~prompt_anonymity.defenses.frame_shift` both **adds** a heavy topical frame and **rewrites**
+the user's request into that frame's register. This defense isolates the first half: the user's
+turns are returned **byte-identical**, and the document simply gains one extra turn of dense,
+content-loaded prose from one of the same 50 scenes (:data:`~.frame_shift.FRAMINGS`), drawn by a
+keyed hash of its ``doc_id``::
 
     turns: ["how can I create a slurm script", "no, with a GPU"]
     ->     ["how can I create a slurm script", "no, with a GPU",
@@ -20,31 +16,26 @@ into dilution versus rewriting; read next to ``collision_seeding`` it is the sam
 from the character-n-gram channel (spelling, punctuation) to whole paragraphs of shared topical text.
 
 **The padding text is generated once, not per document.** A bank of
-:data:`FRAME_PAD_PASSAGES_PER_FRAME` passages is written for each of the 50 scenes -- 400 short
-calls, about two cents, on the same model ``frame_shift`` rewrites with -- and every document draws
-one passage from its scene's bank. Corpus scale is therefore free, which is the whole point of this arm existing beside
-frame_shift. It also means the pad **repeats**: K scenes x P passages = 400 distinct pads, so on
-WildChat ~430 documents carry byte-identical padding. That is deliberate. Shared text is collision
-material; unique-per-document padding would only add length.
+:data:`FRAME_PAD_PASSAGES_PER_FRAME` passages is written for each of the 50 scenes, on the same model
+``frame_shift`` rewrites with, and every document draws one passage from its scene's bank. Corpus
+scale is therefore free. It also means the pad **repeats** across documents that draw the same scene
+and passage index -- deliberately: shared text is collision material, while unique-per-document
+padding would only add length.
 
 **The pad is uncorrelated with the document by construction.** It is drawn from the ``doc_id`` alone
 (:func:`~._keying.keyed_rng`) and the defense never reads the document's text -- ``apply_defenses``
 calls :meth:`FramePadDefense.extra_turns`, which takes an identifier and nothing else, so there is no
-path by which the padding could be chosen to suit, echo or summarise what the user wrote. Two
-documents that say the same thing get unrelated pads; the same document under a different seed gets a
-different one. That is the point: a pad that tracked the topic would reinforce the topical signal
-instead of burying it. Two further properties fall out of the same keying: the assignment survives
-sharding under a SLURM array and is reconstructible offline (``--manifest``), and it uses the *same*
-draw namespace and seed as ``frame_shift``, so a document lands in the same scene under both defenses
-and the two arms are comparable document by document.
+path by which the padding could be chosen to suit, echo or summarise what the user wrote. A pad that
+tracked the topic would reinforce the topical signal instead of burying it. The same keying also
+makes the assignment survive sharding under a SLURM array and be reconstructible offline
+(``--manifest``), and it shares its draw namespace and seed with ``frame_shift``, so a document lands
+in the same scene under both defenses and the two arms are comparable document by document.
 
 **Nothing in the codebook is software-adjacent** -- a property of :data:`~.frame_shift.FRAMINGS` --
 and the passage prompt's rule 3 forbids computing vocabulary outright, because the corpora are
 software chat and assistant chat and a pad sharing their words would blend into the text it is meant
-to sit apart from. That rule is *not* machine-enforced: a build that rejected passages on a software
-word list lost 16 of 50 scenes to their own ordinary English (Morse code, birding data, an algebraic
-variable). The bank is 400 passages, so the check is a person reading ``--show-bank`` once -- which
-is the only place in this experiment where the entire generated corpus fits under one pair of eyes.
+to sit apart from. That rule is *not* machine-enforced, so ``--show-bank`` is meant to be read by a
+person once the bank is built.
 
 **This defense adds a turn, which no other defense here does.** ``apply_defenses`` normally requires
 exactly one output turn per input turn (see
@@ -60,11 +51,11 @@ tokens and discards the rest (see :mod:`prompt_anonymity.features.gemini_embeddi
 text is its turns joined by a blank line -- so for any document already longer than that window, the
 appended turn is never embedded. ``--preview`` reports what share of the sampled documents are in
 that state *before* padding, which is what separates "the pad did nothing" from "the pad was not
-read". Expect the effect on the embedding channel to concentrate in short documents.
+read".
 
 **The bank is English**, while WildChat is not: a Russian document gets an English pad. That is a
 strong shared signal (good for collision) and a conspicuous one (bad for plausibility); it is a
-property of this arm, not a bug to be discovered in the numbers later.
+property of this arm, not a bug.
 
 Run it::
 
@@ -92,17 +83,14 @@ from ._backends import TURN_DELIM, document_id
 from ._keying import keyed_rng
 from .frame_shift import FRAMING_KEYS, FRAMINGS, SINGLE_FRAMING_KEY, Framing
 
-#: The bank writer, an OpenRouter chat model id. Shared with ``frame_shift``'s rewriter, which is the
-#: point: the two arms are meant to be read against each other, and having the same model write both
-#: the frames and the pads removes "one arm had a better writer" as an explanation of any gap.
+#: The bank writer, an OpenRouter chat model id. Shared with ``frame_shift``'s rewriter so both arms
+#: are written by the same model -- removing "one arm had a better writer" as an explanation of any
+#: gap between them.
 #:
-#: Cost is not a reason to pick anything else here, however tempting the cheaper tiers look on
-#: frame_shift's bill. This job is **400 short calls, once** -- at $0.08/M in and $0.18/M out about
-#: two cents for the whole bank, against frame_shift's ~$95-180 for a corpus of rewrites -- and what
-#: it buys is prose density, which is the one property this defense lives on (see
-#: :func:`passage_density`). A cheaper model writes thinner, more generic passages, and a thin bank
-#: reduces the whole arm to "the documents got longer". Read the bank with ``--show-bank`` before
-#: building a corpus on it whatever model wrote it.
+#: Cost is not a reason to pick a cheaper model here: the bank is a one-time build, and what it buys
+#: is prose density, which is the property this defense lives on (see :func:`passage_density`). A
+#: cheaper model writes thinner, more generic passages, and a thin bank reduces the whole arm to "the
+#: documents got longer". Read the bank with ``--show-bank`` before building a corpus on it.
 FRAME_PAD_MODEL = os.environ.get("FRAME_PAD_MODEL", "deepseek/deepseek-v4-flash-0731")
 #: Master seed for the scene and passage draws. Shared with ``frame_shift`` by design (see the module
 #: docstring), so at equal seeds a document draws the same scene under both defenses.
@@ -112,10 +100,8 @@ FRAME_PAD_SEED = int(os.environ.get("FRAME_PAD_SEED", "0"))
 #: scene a perfect indicator of a group of documents), while a large P dilutes toward per-document
 #: uniqueness and stops being collision material at all. Part of the bank, so changing it rebuilds.
 FRAME_PAD_PASSAGES_PER_FRAME = int(os.environ.get("FRAME_PAD_PASSAGES_PER_FRAME", "8"))
-#: Target length of one passage, in words. "Fixed length" is the design: every document gets the same
-#: amount of padding whatever its own size, so the pad is a constant addition rather than a
-#: proportional one, and a short document is diluted far more than a long one -- which is exactly the
-#: gradient the arm is measured on.
+#: Target length of one passage, in words. Fixed length is the design: every document gets the same
+#: amount of padding whatever its own size, so a short document is diluted far more than a long one.
 FRAME_PAD_TARGET_WORDS = int(os.environ.get("FRAME_PAD_TARGET_WORDS", "180"))
 #: Passages this short (characters) are rejected at build time: the model returned a stub rather than
 #: a passage, and a stub pads nothing.
@@ -124,15 +110,11 @@ FRAME_PAD_MIN_PASSAGE_CHARS = 200
 FRAME_PAD_TEMPERATURE = 0.0   # greedy -> the bank is reproducible from the prompt and the codebook
 FRAME_PAD_TOP_P = 1.0
 FRAME_PAD_OUTPUT_TAG = "passage"
-#: Concurrent requests during a bank build. Higher than the 8 the other defenses use because this
-#: job's shape is different: 400 *short* calls, entirely network-bound, and temperature 0 -- so
-#: concurrency cannot change a single passage, only how long the wait is. The client already backs
-#: off with full jitter on a 429, so the failure mode of going too wide is a slower build, not a
-#: broken one. Drop it if a provider starts rate-limiting in earnest.
+#: Concurrent requests during a bank build. Higher than other defenses use because this job is many
+#: short, network-bound calls at temperature 0, so concurrency only changes how long the wait is.
+#: The client already backs off with full jitter on a 429.
 FRAME_PAD_MAX_WORKERS = int(os.environ.get("FRAME_PAD_MAX_WORKERS", "24"))
-#: Calls per progress line. The build used to print nothing between "building a bank" and the final
-#: summary, which made a slow run and a hung one look identical for twenty minutes; the batch is cut
-#: into chunks this size so there is something on stdout roughly every half-minute.
+#: Calls per progress line, so a slow build and a hung one don't look identical on stdout.
 FRAME_PAD_PROGRESS_EVERY = int(os.environ.get("FRAME_PAD_PROGRESS_EVERY", "48"))
 FRAME_PAD_MAX_RETRIES = int(os.environ.get("FRAME_PAD_MAX_RETRIES", "8"))
 FRAME_PAD_TIMEOUT = float(os.environ.get("FRAME_PAD_TIMEOUT", "180"))
@@ -143,11 +125,10 @@ FRAME_PAD_BANK_FILENAME = "frame_pad_bank.json"
 #: key and no generation step. See :func:`bank_path` for the precedence, and ``--build-bank`` for
 #: making a new one (which lands in ``data/dist`` and takes precedence over this).
 #:
-#: **CSV, not JSON**, because this file is meant to be read and edited by people: it is the padding
-#: that goes onto every document in the corpus, and one row per passage with its length and density
-#: beside it opens in a spreadsheet. :meth:`PassageBank.load` dispatches on the extension, and
-#: :meth:`PassageBank.to_csv` round-trips, so editing a row -- or deleting one -- changes the bank
-#: with no rebuild step.
+#: **CSV, not JSON**, because this file is meant to be read and edited by people, with a passage's
+#: length and density beside it. :meth:`PassageBank.load` dispatches on the extension, and
+#: :meth:`PassageBank.to_csv` round-trips, so editing or deleting a row changes the bank with no
+#: rebuild step.
 PACKAGED_BANK = Path(__file__).with_name("frame_pad_bank.csv")
 #: Environment variable pointing at a bank file directly (wins over the dist-directory default).
 #: Point it at a copy to freeze a bank against a rebuild, the way ``$PROMPT_ANONYMITY_MODELS_CONFIG``
@@ -440,13 +421,11 @@ class PassageBank:
     def to_csv(self, path: Path) -> Path:
         """Write the bank as a CSV: one row per passage, with what it measures beside it.
 
-        The JSON is what the code loads; this is what a person reads. Four hundred passages is
-        exactly the size that wants a spreadsheet -- sort by density to find the thin ones, by scene
-        to see whether a scene's four passages are really four different moments -- and eyeballing
-        the bank is now the only check on its content that is not mechanical.
+        The JSON is what the code loads; this is what a person reads and eyeballs -- sort by density
+        to find the thin passages, by scene to check diversity.
 
-        Passages contain newlines, which is what CSV quoting is for; ``csv`` handles it, and
-        ``newline=""`` on the file is required for that to round-trip on every platform.
+        Passages contain newlines, which is what CSV quoting is for; ``newline=""`` on the file is
+        required for that to round-trip on every platform.
         """
         import csv
 
@@ -518,14 +497,11 @@ def bank_path(explicit: str | os.PathLike | None = None) -> Path:
        one so ``--build-bank --force`` still means something;
     4. :data:`PACKAGED_BANK`, the bank committed to the repo.
 
-    Point 4 is the one that matters. The padding text is **identical for every user, every corpus
-    and every run** -- it is a codebook, exactly like :data:`~.frame_shift.FRAMINGS`, and there was
-    never a good reason for it to be a runtime artifact. Shipping it means no API key, no generation
-    step, no partial bank, and bit-identical padding for anyone who checks out the repo. Generating
-    it was the only fragile part of this defense and this removes it from the path entirely.
+    Point 4 is the one that matters: the padding text is a fixed codebook, identical for every user,
+    corpus and run, exactly like :data:`~.frame_shift.FRAMINGS`. Shipping it means no API key, no
+    generation step, and bit-identical padding for anyone who checks out the repo.
 
-    ``data.config`` is imported lazily because ``data`` imports the defense registry, which imports
-    this module -- the same circular-import dance :func:`~.frame_shift._load_documents` does.
+    ``data.config`` is imported lazily to avoid a circular import with the defense registry.
     """
     if explicit:
         return Path(explicit).expanduser()
@@ -545,12 +521,9 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
                target_words: int = FRAME_PAD_TARGET_WORDS) -> PassageBank:
     """Generate the padding passages: one request per scene, all of them concurrently.
 
-    **One call per passage**, not per scene. The first design asked for all eight of a scene's
-    passages in one reply and it failed on the cluster: 25 of 50 scenes came back with nothing this
-    module could parse, and a single long multi-passage completion gives no way to tell a
-    contract-ignoring model from a truncated one -- the whole scene is simply lost. One short request
-    per passage means a failure costs one passage instead of eight, each request is retried
-    independently by the client, and 400 x ~250 tokens is the same two cents as before.
+    **One call per passage**, not per scene: asking for a whole scene's passages in one reply gives no
+    way to tell a contract-ignoring model from a truncated one, so a failure loses the whole scene
+    instead of one passage. One short request per passage means each is retried independently.
 
     Diversity within a scene comes from :data:`FRAME_PAD_ASPECTS`, one aspect per request, because at
     temperature 0 the same prompt returns the same passage every time.
@@ -558,17 +531,16 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
     A reply is accepted three ways, in order: the text inside ``<passage>`` tags; failing that, the
     whole reply, if it is long enough to be a passage and carries no stray tag (models drop the
     wrapper often enough that discarding a good passage over it would be silly); failing that,
-    nothing. Whatever is rejected is written to ``<bank>.rejected.json`` so the next failure can be
-    read rather than guessed at -- not having that is why the first two cluster runs were a mystery.
+    nothing. Whatever is rejected is written to ``<bank>.rejected.json`` so a failure can be read
+    rather than guessed at.
 
     Passages under :data:`FRAME_PAD_MIN_PASSAGE_CHARS` are dropped as stubs. Nothing is rejected on
-    *content*: an earlier version dropped any passage containing software vocabulary and lost scenes
-    to their own ordinary English (Morse code, birding data, an algebraic variable). Keeping the pad
-    clear of software is the system prompt's job, checked by a human reading ``--show-bank``.
+    *content*: an earlier version filtered on a software-vocabulary word list and lost scenes to their
+    own ordinary English. Keeping the pad clear of software is the system prompt's job, checked by a
+    human reading ``--show-bank``.
 
     Raises if a scene ends with no passage at all -- a bank missing a scene would leave every
-    document assigned to it unpadded, a hole in the arm that would not show up until the numbers
-    looked odd.
+    document assigned to it unpadded, a silent hole in the arm.
     """
     system_prompt = FRAME_PAD_SYSTEM_PROMPT.replace("{{TARGET_WORDS}}", str(target_words))
     client = openrouter_chat_class()(
@@ -576,14 +548,11 @@ def build_bank(model: str = FRAME_PAD_MODEL, *, framings: tuple[Framing, ...] = 
         max_workers=FRAME_PAD_MAX_WORKERS, max_retries=FRAME_PAD_MAX_RETRIES,
         timeout=FRAME_PAD_TIMEOUT,
     )
-    # One job per (scene, passage), ordered ROUND-ROBIN: every scene's first passage, then every
-    # scene's second, and so on. Scene-major order would mean a build killed at 40% had covered the
-    # first 20 scenes completely and the other 30 not at all -- a bank that is a prefix of the
-    # codebook, which is worse than a thin one because the surviving scenes are correlated (the
-    # codebook opens with twelve fiction genres). Round-robin makes any prefix of the work a
-    # *uniform* bank: stop anywhere and every scene has roughly the same number of passages.
-    # The aspect list is cycled; past its length the repeat is numbered so the prompt still differs,
-    # since an identical prompt at temperature 0 returns identical text.
+    # One job per (scene, passage), ordered ROUND-ROBIN (every scene's first passage, then every
+    # scene's second, ...) so a build killed partway leaves a uniform bank rather than a prefix of
+    # fully-covered scenes and untouched ones. The aspect list is cycled; past its length the repeat
+    # is numbered so the prompt still differs, since an identical prompt at temperature 0 returns
+    # identical text.
     jobs = [(framing, index) for index in range(passages_per_frame) for framing in framings]
     prompts = []
     for framing, index in jobs:
@@ -704,9 +673,7 @@ def resolve_bank(path: Path, *, framings: tuple[Framing, ...] = FRAMINGS,
         build_bank(model, framings=framings, passages_per_frame=passages_per_frame,
                    target_words=target_words).save(path)
     bank = PassageBank.load(path)
-    # Say which file, always. "The bank covers 2 of 50 scenes" is not a diagnosis on its own -- the
-    # question it raises is *which bank*, and the answer has been a stale build left in data/dist or
-    # a $FRAME_PAD_BANK pointing somewhere forgotten. One line here ends that guessing.
+    # Print the source path so a coverage gap is traceable to a specific bank file, not just a count.
     print(f"[frame_pad] bank: {len(bank):,} passages over {len(bank.passages)} scene(s), "
           f"digest {bank.digest} <- {path}")
     missing = bank.covers(framings)
@@ -725,29 +692,23 @@ IMPERATIVE_OPENERS = ("please ", "consider ", "note that", "imagine ", "write ",
                       "describe ", "list ", "tell ", "give ", "make ", "create ", "help ")
 
 #: Markup that has no business in a passage: fenced or inline code, URLs, function calls, source
-#: filenames. This is a *markup* pattern, not a word list, which is why it survived and a software
-#: VOCABULARY filter did not: the first real build rejected 16 of 50 scenes outright, because a
-#: frontier telegraph office says "code" (Morse), a birding listserv says "data", a linear-algebra
-#: textbook says "variable", a model railway club says "terminal" and a music workbook says
-#: "keyboard". No word list can tell those from the software senses, and a false positive there does
-#: not catch a leak -- it deletes a whole scene's passages. Keeping software vocabulary out of the
-#: pad is therefore the system prompt's job (rule 3), checked by a human reading ``--show-bank``:
-#: 400 passages is exactly the size of thing worth eyeballing once, and this is the only text in the
-#: experiment that a person can read in full.
+#: filenames. This is a *markup* pattern rather than a software-vocabulary word list on purpose: an
+#: ordinary word like "code", "data", "variable" or "terminal" has many non-software senses, so a word
+#: list produces false positives that delete a whole scene's passages instead of catching a leak.
+#: Keeping software vocabulary out of the pad is the system prompt's job (rule 3), checked by a human
+#: reading ``--show-bank``.
 CODEISH_PATTERN = re.compile(r"`|https?://|\w+\(\)|\w+\.(?:py|js|sh|json)\b")
 
 #: Content markers per 100 words below which a passage counts as *thin*: mood and scene-setting
-#: rather than substance. Calibrated on the worked example in the system prompt, which runs about
-#: 11 per 100 words -- the floor is set well under it so that ordinary prose passes and only genuinely
-#: atmospheric writing ("the light fell across the room and she felt uneasy", ~1) is flagged.
+#: rather than substance. Calibrated so that ordinary prose passes and only genuinely atmospheric
+#: writing ("the light fell across the room and she felt uneasy") is flagged.
 DENSITY_FLOOR = 5.0
 
 
 #: Numbers written as words. Without these the measure is a register test rather than a content
 #: test: a zoning board writes "41 pounds" and a Socratic dialogue writes "some fourteen feet", and
-#: only the first has a digit in it. Scoring the second at zero rejected genuinely dense prose --
-#: a passage counting out four minutes, six passes and twenty-five minutes measured 0.0 -- and the
-#: scenes it rejected were exactly the narrative ones the codebook needs most.
+#: only the first has a digit in it -- so genuinely dense prose in a narrative register would
+#: otherwise be scored as thin.
 NUMBER_WORDS = (
     "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|"
     "sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
@@ -791,10 +752,9 @@ def bank_quality(bank: PassageBank) -> dict:
       a document whose *utility* judgement changes, because the assistant will answer the padding.
     * ``imperatives`` -- passages opening in the imperative, same failure by a different route.
     * ``technical`` -- passages carrying code markup: backticks, URLs, function calls, source
-      filenames (:data:`CODEISH_PATTERN`). Nothing acts on this; it is a pointer to the passages
-      worth reading first. Software *vocabulary* is not machine-checked at all -- see
-      :data:`CODEISH_PATTERN` for why a word list cannot do that job -- so ``--show-bank`` is the
-      real check, and it is the reason the bank is deliberately small enough to read.
+      filenames (:data:`CODEISH_PATTERN`). A pointer to passages worth reading first; software
+      *vocabulary* is not machine-checked (see :data:`CODEISH_PATTERN`), so ``--show-bank`` is the
+      real check.
     * ``thin`` / ``density`` -- passages under :data:`DENSITY_FLOOR` content markers per 100 words
       (:func:`passage_density`). A thin bank turns this defense into "documents got longer", which is
       the one result it must not be confounded with.
@@ -1201,10 +1161,9 @@ def _selftest() -> None:
           parse_passages(reply + "<passage>\nhalf a pas") == ["one", "two"])
     check("an empty reply parses to nothing", parse_passages("") == [])
 
-    # 12b. accept_passage is where a build succeeds or silently loses a scene, and every branch of it
-    #      corresponds to a way the cluster actually failed. The untagged branch is the important
-    #      one: requiring the wrapper is what turned "the model dropped the tags" into "25 scenes
-    #      produced nothing", and the reason strings are what make the next failure readable.
+    # 12b. accept_passage is where a build succeeds or silently loses a scene. The untagged branch is
+    #      the important one: without it, a model dropping its output tags would look identical to a
+    #      model producing nothing at all.
     body = "The Assessor recorded nine entries on 14 November, of which three were later struck. " * 4
     cases = {
         "tagged": f"<passage>\n{body}\n</passage>",
@@ -1244,10 +1203,9 @@ def _selftest() -> None:
     check("quality: an imperative opening is caught", scores["imperatives"] == 1)
     check("quality: technical content is caught", scores["technical"] == 1)
 
-    # 14b. The code-markup check flags markup and NOTHING ELSE. This is the check that keeps the
-    #      lesson from the first real build: a passage filter that fired on ordinary English emptied
-    #      16 of 50 scenes, because these sentences are what the scenes actually say. Every one of
-    #      them must pass, or the measure has drifted back into being a vocabulary filter.
+    # 14b. The code-markup check flags markup and NOTHING ELSE -- a vocabulary-based filter would
+    #      catch ordinary English that happens to use software-adjacent words, so every one of these
+    #      sentences must pass.
     scene_english = ("The operator tapped out the message in Morse code.",
                      "The data from the 2011 record is still disputed at the reservoir hide.",
                      "Solve for the variable x in the third exercise.",
@@ -1338,12 +1296,10 @@ def _selftest() -> None:
 def _preview(source: str, dist_dir, limit: int, defense: FramePadDefense) -> None:
     """Pad a handful of real documents and print what changed -- free, once the bank exists.
 
-    Two things to read here. The pads themselves (does this text belong to its scene, does it ask for
+    Two things to read here: the pads themselves (does this text belong to its scene, does it ask for
     anything), and the **window** line: ``gemini_embedding_2`` reads only the first
-    :data:`EMBEDDING_WINDOW_TOKENS` tokens of a document, so a pad appended past that point is never
-    embedded. A document already over the window before padding cannot be affected by this defense on
-    that channel at all, and knowing what share of the corpus is in that state is the difference
-    between reading a null result as "no effect" and as "not measured".
+    :data:`EMBEDDING_WINDOW_TOKENS` tokens of a document, so a document already over that window
+    before padding cannot be affected by this defense on that channel at all.
     """
     from .frame_shift import _load_documents
 

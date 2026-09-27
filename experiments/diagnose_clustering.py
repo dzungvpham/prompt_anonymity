@@ -140,7 +140,7 @@ def pair_signals(graph, frame: pd.DataFrame, codes: np.ndarray, k: int) -> pd.Da
 
     Each row is a hypothesis about what a *next* method could add to cosine. A signal is worth
     building on only if it separates the two populations on edges the graph already proposes --
-    the edges where the current attack has to make a decision and is getting a third of them wrong.
+    the edges where the current attack has to make a decision.
     """
     source, target, distance = graph.truncate(k).edges()
     finite = np.isfinite(distance)
@@ -180,8 +180,7 @@ def pair_signals(graph, frame: pd.DataFrame, codes: np.ndarray, k: int) -> pd.Da
 
     # Which direction means "same author" differs per signal -- a small distance does, a large
     # shared-neighbour count does -- so it is declared rather than inferred. Reporting a raw AUROC
-    # without it makes a strong signal look like a weak one below 0.5, which is how the
-    # shared-neighbour count first read as 0.28 when it is really 0.72.
+    # without it makes a strong signal look like a weak one below 0.5.
     smaller_is_same = {"cosine distance": True, "|time gap| hours": True,
                        "shared neighbours (of k)": False, "max rank (worse direction)": True,
                        "same language": False}

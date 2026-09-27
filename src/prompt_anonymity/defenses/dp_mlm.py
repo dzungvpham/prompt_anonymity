@@ -1,83 +1,66 @@
 """DP-MLM differentially private text-rewriting defense (Meisenbacher et al., ACL Findings 2024).
 
-DP-MLM (`github.com/sjmeis/DPMLM`) rewrites text one *word* at a time using an encoder-only
-masked language model (RoBERTa) and the **exponential mechanism**, giving a per-word ε-DP
-guarantee. For each content word we mask it, feed RoBERTa the ``(original_window, masked_window)``
-sentence pair (the paper's "contextualization" trick), read the vocab logits at the mask slot,
-**clip** them to a calibrated ``[clip_min, clip_max]`` (sensitivity ``Δu = |clip_max − clip_min|``),
-scale by ``1/(2·Δu/ε)``, softmax, and **sample** a replacement token. This is a faithful port of
-the reference ``src/dpmlm/core.py`` (``privatize_batch`` / ``dpmlm_rewrite_batch``); the math and
-the clip bounds match. Unlike the other defenses here (heuristic/LM rewriters), DP-MLM comes with a
-formal DP guarantee -- it is the reason to add it.
+DP-MLM (`github.com/sjmeis/DPMLM`) rewrites text one *word* at a time using an encoder-only masked
+language model (RoBERTa) and the **exponential mechanism**, giving a per-word ε-DP guarantee. For
+each content word we mask it, feed RoBERTa the ``(original_window, masked_window)`` sentence pair
+(the paper's "contextualization" trick), read the vocab logits at the mask slot, **clip** them to a
+calibrated ``[clip_min, clip_max]`` (sensitivity ``Δu = |clip_max − clip_min|``), scale by
+``1/(2·Δu/ε)``, softmax, and **sample** a replacement token. This is a faithful port of the
+reference ``src/dpmlm/core.py``; the math and clip bounds match. Unlike the other defenses here
+(heuristic/LM rewriters), DP-MLM comes with a formal DP guarantee -- it is the reason to add it.
 
 Privacy accounting is per word: a text with ``n`` privatized words spends ``n·ε`` by sequential
 composition (reported, not enforced -- as in the paper). We use the authors' published roberta-base
-clip bounds. The one default we do *not* inherit is ε: this defense runs at **ε=100** per word,
-because below ~ε=100 the sampled words are mostly unrelated to the originals and the defended text
-stops being usable prompt text (see ``DPMLM_EPSILON``). The ``dp_mlm_eps<ε>`` registry entries sweep
-around it.
+clip bounds. The one default we do *not* inherit is ε: below the value this defense defaults to,
+sampled words stop resembling the originals closely enough to be usable prompt text (see
+``DPMLM_EPSILON``); the ``dp_mlm_eps<ε>`` registry entries sweep around it.
 
 Two deliberate deviations from the reference, both required by this framework:
 
 * **Determinism for cache correctness.** :class:`~prompt_anonymity.defenses.base.CachedDefense`
   caches rewrites keyed on :meth:`params`, so genuinely random sampling would make one input yield
-  different outputs across runs and corrupt the cache. We seed a per-conversation ``torch.Generator``
-  from the conversation text + a configurable ``seed`` (in ``params()``) before sampling its words.
-  The exponential-mechanism *distribution* is unchanged -- still true DP sampling -- only
-  reproducibility is added. Consequence to keep in mind: an identical conversation always maps to the
-  same output, which is fine for offline evaluation but is not fresh randomness per release.
-* **Scope.** We port the paper's headline mode (rewrite every content word) plus the optional Presidio
-  PII toggle (``pii=True`` == the reference ``PII=True, hybrid=False``: detected entities become kept
-  ``<ENTITY_TYPE>`` placeholders, everything else is still DP-rewritten). The reference's IPI/NER and
-  ``hybrid_budget`` modes are omitted.
+  different outputs across runs and corrupt the cache. We seed a per-conversation
+  ``torch.Generator`` from the conversation text + a configurable ``seed`` (in ``params()``) before
+  sampling its words. The exponential-mechanism *distribution* is unchanged -- only reproducibility
+  is added.
+* **Scope.** We port the paper's headline mode (rewrite every content word) plus the optional
+  Presidio PII toggle (``pii=True``: detected entities become kept ``<ENTITY_TYPE>`` placeholders,
+  everything else is still DP-rewritten). The reference's IPI/NER and ``hybrid_budget`` modes are
+  omitted.
 
 **Adaptive length (the paper's Algorithm 3, "Text Rewriting +-").** Plain DP-MLM emits exactly one
-word per input word, so the rewrite preserves word count and text length perfectly -- which the paper
-calls its "primary limitation" (§7) and which matters here because length and word count are literal
-features in the stylometric vectors the attacks use. Setting ``add_prob`` (the paper's ``A``) and/or
-``del_prob`` (``D``) above zero enables the fix: each eligible word is **deleted** with probability
-``D`` (no MLM call, no budget), and each surviving privatized word is followed by an **added** word
-with probability ``A``, drawn by inserting a ``<mask>`` into the context and running DP-MLM as usual
-at the same ε. Both default to ``0.0``, so ``dp_mlm`` and the ``dp_mlm_eps<ε>`` sweep are unaffected;
-the ``dp_mlm_var_a<A>`` registry entries turn it on. Budget becomes ``2·n·ε`` worst case (an addition
-for every word) and ``(1 − D + A)·n·ε`` in expectation -- the paper's stated "``(A − D)nε``" appears
-to drop the base ``n`` term. The add/delete coins are data-independent Bernoulli draws, so they spend
-no budget themselves.
+word per input word, which the paper calls its "primary limitation" (§7) -- length and word count
+are literal stylometric features. Setting ``add_prob`` (the paper's ``A``) and/or ``del_prob``
+(``D``) above zero enables the fix: each eligible word is **deleted** with probability ``D`` (no
+MLM call, no budget), and each surviving privatized word is followed by an **added** word with
+probability ``A``, drawn by inserting a ``<mask>`` into the context and running DP-MLM as usual at
+the same ε. Both default to ``0.0``, so ``dp_mlm`` and the ``dp_mlm_eps<ε>`` sweep are unaffected;
+the ``dp_mlm_var_a<A>`` registry entries turn it on. The add/delete coins are data-independent
+Bernoulli draws, so they spend no privacy budget themselves.
 
 Deviations from the reference ``dpmlm_rewrite_plus`` in this mode:
 
 1. **Context is the original (deletion-applied) text, never the running privatized copy.** The
-   reference's plus path privatizes sequentially and mutates ``working_tokens``, so later words see
-   earlier *replacements*. Batching forbids that -- and this is the same deviation already taken for
-   the plain path, since we port the reference's own batch path (its non-batch ``dpmlm_rewrite``
-   likewise defaults to ``REPLACE=False``, i.e. original context). Deletions *are* reflected in the
-   context, as in the reference.
-2. **No ``<mask>`` ever appears in the CONCAT clean segment.** The reference leaves one there for an
-   addition (a side effect of passing the mutated list to both sides); we keep the clean side as
-   unmasked context, so exactly one mask exists per encoded input and the mask-position lookup is
-   unambiguous. This matches the paper's Algorithm 1, whose context segment is the original tokens.
-3. **The coins are drawn over every non-punctuation, non-PII token** -- function words included, as in
-   the reference -- while *privatization* still follows the usual eligible set. Deleting stopwords is
-   deliberate: function-word frequency is the classic authorship signal. Note the consequence: the
-   coin set is larger than the ``n`` we privatize, so the perturbation rate is not a like-for-like
-   match with a fixed-length run at the same ε.
-4. **The last surviving token is never deleted**, so a turn can never be emptied. (The reference only
-   guards the final *token*, usually punctuation, so its guard rarely fires.)
-5. **Added words are lowercased and empty decodes dropped**; the reference appends the decoded token
-   raw. An addition has no original word to inherit case from, and capitalization ratios are
-   themselves stylometric features.
-6. **An addition whose mask is truncated away is dropped**, so pathological turns realize a slightly
-   lower effective ``A``.
+   reference's plus path privatizes sequentially and mutates its working tokens, so later words see
+   earlier *replacements*; batching forbids that, so we use original context throughout (matching
+   the reference's own non-batch default). Deletions still show up in the context.
+2. **No ``<mask>`` ever appears in the CONCAT clean segment**, so exactly one mask exists per
+   encoded input and the mask-position lookup is unambiguous -- matching the paper's Algorithm 1.
+3. **The coins are drawn over every non-punctuation, non-PII token** -- function words included --
+   while *privatization* still follows the usual eligible set. Deleting stopwords is deliberate:
+   function-word frequency is a classic authorship signal.
+4. **The last surviving token is never deleted**, so a turn can never be emptied.
+5. **Added words are lowercased and empty decodes dropped** -- an addition has no original word to
+   inherit case from, and capitalization ratios are themselves stylometric features.
+6. **An addition whose mask is truncated away is dropped.**
 7. **Determinism**, as above: the coins come from a ``random.Random`` seeded per turn on a stream
-   *separate* from the sampling generator, so ``add_prob=del_prob=0`` reproduces fixed-length output
-   exactly and ``A``/``D`` act as nested thresholds on a fixed uniform stream (the A=0.1 additions are
-   a subset of the A=0.25 ones). Both coins are drawn for every eligible token regardless of the
-   delete outcome -- distributionally identical to the reference, but it decouples the two knobs.
+   separate from the sampling generator, so ``add_prob=del_prob=0`` reproduces fixed-length output
+   exactly and ``A``/``D`` act as nested thresholds on one fixed uniform stream.
 
 Needs the ``[dpmlm]`` extra (adds ``nltk`` on top of torch/transformers); the ``pii=True`` variant
 also needs the ``[dpmlm-pii]`` extra (``presidio-analyzer`` + spaCy). NLTK data is fetched lazily on
-first backend build. Like every defense here, this only rewrites text; features are recomputed by the
-featurize stage.
+first backend build. Like every defense here, this only rewrites text; features are recomputed by
+the featurize stage.
 """
 
 from __future__ import annotations
@@ -97,12 +80,10 @@ DPMLM_MODEL = "FacebookAI/roberta-base"
 DPMLM_CLIP_MIN = -3.2093127
 DPMLM_CLIP_MAX = 16.304797887802124
 
-#: Per-word privacy budget (a text with n privatized words spends n·ε). Default ε=100: at the
-#: paper's ε=25 the clip floor sits near the logit mean, so the exponential mechanism's tail over the
-#: 50k vocab draws mostly unrelated words and the rewrite is not usable as text. ε=100 is the lowest
-#: value in the paper's set {10,25,50,100,250} whose output stays readable -- weaker privacy, which
-#: is the tradeoff the sweep exists to measure. Sweep it via the registered ``dp_mlm_eps<ε>``
-#: defenses, this env var, or by instantiating with a different value.
+#: Per-word privacy budget (a text with n privatized words spends n·ε). The default is the lowest
+#: value in the paper's swept set whose output stays readable as text -- weaker privacy, which is
+#: the tradeoff the sweep exists to measure. Sweep it via the registered ``dp_mlm_eps<ε>`` defenses,
+#: this env var, or by instantiating with a different value.
 DPMLM_EPSILON = float(os.environ.get("DPMLM_EPSILON", "100"))
 
 #: Seed folded into the per-turn RNG so identical turns rewrite reproducibly (cache-safe).
@@ -110,9 +91,8 @@ DPMLM_SEED = int(os.environ.get("DPMLM_SEED", "0"))
 
 #: Adaptive-length probabilities (the paper's Algorithm 3 ``A`` and ``D``): per eligible word, chance
 #: of adding a word after it / of deleting it. Both ``0.0`` == the fixed-length headline mode, so the
-#: plain ``dp_mlm`` and the ε sweep keep one-word-in-one-word-out. The paper evaluates A ∈ {0.1, 0.25}
-#: with D = 0.05 (Appendix C); the reference code defaults to A=0.15. In ``params()``, so each
-#: setting caches separately.
+#: plain ``dp_mlm`` and the ε sweep keep one-word-in-one-word-out. In ``params()``, so each setting
+#: caches separately.
 DPMLM_ADD_PROB = float(os.environ.get("DPMLM_ADD_PROB", "0.0"))
 DPMLM_DEL_PROB = float(os.environ.get("DPMLM_DEL_PROB", "0.0"))
 
@@ -123,9 +103,9 @@ DPMLM_DEL_PROB = float(os.environ.get("DPMLM_DEL_PROB", "0.0"))
 _JOB_REPLACE = 0
 _JOB_INSERT = 1
 
-#: MLM forward-pass batch size over masked positions (output-neutral; not in params()). Default is
-#: sized for an A100 -- masked positions from all turns are pooled and length-sorted, and only the
-#: masked position is projected through the vocab head, so large batches fit easily.
+#: MLM forward-pass batch size over masked positions (output-neutral; not in params()). Masked
+#: positions from all turns are pooled and length-sorted, and only the masked position is projected
+#: through the vocab head, so large batches fit easily.
 DPMLM_BATCH_SIZE = int(os.environ.get("DPMLM_BATCH_SIZE", "128"))
 
 #: Masked positions are processed in chunks of whole turns totalling ~this many positions, so peak
@@ -137,27 +117,18 @@ DPMLM_FLUSH_POSITIONS = int(os.environ.get("DPMLM_FLUSH_POSITIONS", "8192"))
 DPMLM_CHECKPOINT_EVERY = int(os.environ.get("DPMLM_CHECKPOINT_EVERY", "200"))
 
 #: Masked positions per sampling call -- and, with it, the length above which a turn is streamed
-#: rather than chunked. This is what bounds the defense's PEAK memory.
-#:
-#: Two allocations scale with the number of positions worked on at once: the logits store
-#: (``[positions x vocab]`` fp16, ~100 KB per position) and, in sampling, a float32 copy plus its
-#: softmax (~400 KB per position, twice). Neither is bounded by ``DPMLM_FLUSH_POSITIONS``, because
-#: the chunker accumulates WHOLE turns and so always holds at least one turn however long it is.
-#: A conversation here is one TURN, and WildChat's longest measured turn is 103,874 words --
-#: ~47k masked positions, i.e. ~4.7 GB of logits and ~19 GB to sample. That is what OOM'd the
-#: first full run after three hours (job 64621446).
-#:
-#: So a turn with at most this many positions takes the chunked path and is sampled in exactly ONE
-#: call -- byte-identical to the code before slicing existed, so cached outputs stay valid -- while
-#: a longer one is streamed by :meth:`_DPMLMBackend._process_long_turn` in waves of this size. At
-#: 8192 the sampling pair peaks near 3.3 GB and a wave's logits near 0.8 GB, which is the same
-#: whether the turn is 10k words or a million.
+#: rather than chunked. This bounds the defense's peak memory: the chunker accumulates whole turns,
+#: so a single pathologically long turn (a huge pasted blob) would otherwise force a
+#: proportionally huge logits/sampling allocation. A turn with at most this many positions takes the
+#: chunked path and is sampled in exactly one call (byte-identical to the pre-slicing code, so
+#: cached outputs stay valid); a longer one is streamed by
+#: :meth:`_DPMLMBackend._process_long_turn` in waves of this size instead, making peak memory a
+#: property of the wave rather than of the turn.
 #:
 #: NOT in ``params()`` (like batch size and flush positions): putting it there would invalidate
-#: every cached turn everywhere for a knob that changes nothing at or below the threshold. The
-#: consequence to know: for a turn ABOVE it the draws depend on this value, so keep it fixed if
-#: those turns must reproduce. Set it to 0 to disable both slicing and streaming (the old
-#: behaviour, which cannot process WildChat's longest turns at all).
+#: every cached turn for a knob that changes nothing at or below the threshold. For a turn ABOVE it
+#: the draws do depend on this value, so keep it fixed if those turns must reproduce. Set it to 0 to
+#: disable slicing and streaming (the old behaviour, which cannot process very long turns at all).
 DPMLM_SAMPLE_SLICE = int(os.environ.get("DPMLM_SAMPLE_SLICE", "8192"))
 
 
@@ -228,8 +199,8 @@ class _DPMLMBackend:
 
         # For the mask-position-only projection: run the encoder trunk, then send just the masked
         # position's hidden state through the vocab head (RoBERTa ``lm_head`` / BERT ``cls``) --
-        # avoids projecting all ~512 positions through the 50k-vocab head and the multi-GB logits
-        # tensor. Falls back to full logits at runtime if a model doesn't fit this split.
+        # avoids projecting every position through the vocab head. Falls back to full logits at
+        # runtime if a model doesn't fit this split.
         self._trunk = self.lm_model.base_model
         self._head = getattr(self.lm_model, "lm_head", None) or getattr(self.lm_model, "cls", None)
         self._use_fast_head = self._head is not None
@@ -265,12 +236,11 @@ class _DPMLMBackend:
     def _encode_masked(self, clean_sent, masked_sent):
         """Build the MLM input ids for one masked position, never raising and keeping the ``<mask>``.
 
-        The reference uses ``truncation="only_first"`` on the ``(clean, masked)`` pair so the masked
-        (second) segment is protected -- but that raises "Sequence to truncate too short" when the
-        masked segment alone exceeds ``model_max_length`` (real on WildChat, where one NLTK "word"
-        can be a long URL / raw ``<svg ...>`` blob that explodes into hundreds of subwords). We keep
+        The reference truncates the ``(clean, masked)`` pair so the masked segment is protected, but
+        that can raise if the masked segment alone exceeds ``model_max_length`` (e.g. one "word"
+        that is actually a long URL or raw markup blob exploding into hundreds of subwords). We keep
         the reference pair path for the normal case and, on overflow, fall back to a single sequence
-        truncated to a window *centered on the mask* so the mask always survives.
+        truncated to a window centered on the mask so the mask always survives.
         """
         tok = self.tokenizer
         max_len = tok.model_max_length
@@ -430,10 +400,9 @@ class _DPMLMBackend:
 
         # -- adaptive length (Algorithm 3) ---------------------------------------------------------
         # The coins are data-independent Bernoulli draws, so they can be resolved here, before any
-        # batching -- which is what lets an added word ride through the GPU pass as an ordinary job
-        # instead of forcing the reference's sequential per-word loop. Own RNG stream, seeded from
-        # this turn's text: independent of chunking, and it leaves the sampling stream untouched so
-        # add_prob=del_prob=0 still reproduces fixed-length output exactly.
+        # batching -- which lets an added word ride through the GPU pass as an ordinary job instead
+        # of a sequential per-word loop. Own RNG stream, seeded from this turn's text and independent
+        # of the sampling stream, so add_prob=del_prob=0 still reproduces fixed-length output exactly.
         rng = random.Random(int.from_bytes(
             hashlib.sha256(f"{self.seed}:varlen:{sentence}".encode("utf-8")).digest()[:8], "big"
         ))
@@ -480,10 +449,9 @@ class _DPMLMBackend:
         Phase 1 (CPU): build every masked input in the chunk. Phase 2 (GPU): length-sort and run the
         MLM in full batches, keeping only the masked position's logits (on-device). Phase 3 (GPU):
         per-conversation seeded exponential-mechanism sampling -- clip/softmax/multinomial run on
-        the GPU in slices of :data:`DPMLM_SAMPLE_SLICE` positions (one call for any conversation
-        that fits, which is nearly all of them), so the 50k-vocab math never touches the CPU and a
-        single very long turn cannot demand a multi-GB allocation. Output does not depend on
-        batching; each conversation is seeded from its own text so the cache stays consistent.
+        the GPU in slices of :data:`DPMLM_SAMPLE_SLICE` positions, so the vocab-sized math never
+        touches the CPU. Output does not depend on batching; each conversation is seeded from its
+        own text so the cache stays consistent.
         """
         torch = self._torch
         mask_id = self.tokenizer.mask_token_id
@@ -548,9 +516,9 @@ class _DPMLMBackend:
         """Exponential-mechanism draw for a ``[k, vocab]`` logits block, one token id per row.
 
         ``Pr[v] ∝ exp(ε·u(v) / (2·Δu))``: clip, scale, softmax, sample -- all on-device, in row
-        order, consuming ``gen`` once per row. The float32 copy and its softmax are the two
-        tensors that dominate this defense's peak memory (~800 KB per row for the pair), which is
-        why every caller keeps ``k`` at or below :data:`DPMLM_SAMPLE_SLICE`.
+        order, consuming ``gen`` once per row. The float32 copy and its softmax dominate this
+        defense's peak memory, which is why every caller keeps ``k`` at or below
+        :data:`DPMLM_SAMPLE_SLICE`.
         """
         torch = self._torch
         scale = 2 * self.sensitivity / self.epsilon
@@ -586,23 +554,17 @@ class _DPMLMBackend:
     def _process_long_turn(self, ti, sentence, tokens, jobs, outputs, progress=None) -> None:
         """Rewrite ONE turn whose masked positions exceed :data:`DPMLM_SAMPLE_SLICE`, in waves.
 
-        The chunked path above holds logits for every position it is working on at once
-        (``[positions x vocab]``, 100 KB per position even in fp16) and samples a conversation in
-        one block (400 KB per position, twice). Both are fine when a chunk is a few thousand
-        positions and catastrophic for one turn of 100k words -- WildChat's longest measured turn
-        is 103,874 words, i.e. ~47k positions, i.e. ~19 GB for the sampling tensors alone. That is
-        the allocation that killed the first full run.
-
-        So an oversized turn is taken out of the chunked path and processed here, one wave of
-        ``sample_slice`` positions at a time: build the wave's masked inputs, forward them, sample
-        them, free everything, repeat. Peak memory becomes a property of the WAVE rather than of
-        the turn, so it is the same for a 10k-word turn and a 1M-word one.
+        The chunked path above holds logits for every position it is working on at once and samples
+        a whole conversation in one block, which is fine for an ordinary turn and catastrophic for
+        one with an extremely long pasted blob. So an oversized turn is taken out of the chunked
+        path and processed here, one wave of ``sample_slice`` positions at a time: build the wave's
+        masked inputs, forward them, sample them, free everything, repeat. Peak memory becomes a
+        property of the wave rather than of the turn.
 
         Jobs are processed in their natural (ascending) order, and the per-turn generator is seeded
         once and consumed across the waves, so the draws are deterministic and reproducible for a
-        given ``sample_slice``. They are NOT the same draws an unsliced pass would have made -- see
-        :data:`DPMLM_SAMPLE_SLICE` -- which costs nothing here: a turn this long could not be
-        rewritten at all before.
+        given ``sample_slice`` -- though not identical to what an unsliced pass would draw (see
+        :data:`DPMLM_SAMPLE_SLICE`).
         """
         torch = self._torch
         mask_id = self.tokenizer.mask_token_id
@@ -627,8 +589,8 @@ class _DPMLMBackend:
                 meta.append((anchor, kind))
 
             if meta:
-                # Same length-sorted batching as the chunked path, but only within this wave, so
-                # `wave_logits` is bounded by it. Row j of that tensor is meta[j], i.e. job order.
+                # Same length-sorted batching as the chunked path, but bounded to this wave. Row j
+                # of `wave_logits` is meta[j], i.e. job order.
                 wave_logits = None
                 order = sorted(range(len(meta)), key=lambda j: len(ids_list[j]))
                 for b in range(0, len(meta), self.batch_size):
