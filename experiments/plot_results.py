@@ -336,7 +336,6 @@ DEFENSES = (
 )
 
 FEATURES = (
-    "stylometrix",
     "gemini_embedding_2",
     "gemini_embedding_001",
     "function_words",
@@ -421,7 +420,6 @@ DEFENSE_LABELS = {
     "embad_gemini": "EmBad (Gemini)",
 }
 FEATURE_LABELS = {
-    "stylometrix": "StyloMetrix",
     "gemini_embedding_2": "Gemini Embedding 2",
     "gemini_embedding_001": "Gemini Embedding 001",
     "function_words": "Function words",
@@ -470,8 +468,10 @@ METHOD_STRIDE = 17
 
 #: Reading order for methods, and the colour slot each one owns: feature-major, so a figure's
 #: legend runs feature by feature and two runs of the same feature sit next to each other.
+#: ``start=1`` because a first feature was removed from the project: its
+#: index 0 is left vacant so that every remaining feature keeps the colour slot it always had.
 METHOD_SLOTS = {(feature, attack): feature_index * METHOD_STRIDE + attack_index
-                for feature_index, feature in enumerate(FEATURES)
+                for feature_index, feature in enumerate(FEATURES, start=1)
                 for attack_index, attack in enumerate(ATTACKS)}
 
 #: Colour slot per **attack alone**, for the ``by_attack`` figures: there colour carries the
@@ -531,7 +531,7 @@ DATASET_DASHES = {"wildchat": (), "swe_chat": (7, 2, 1.5, 2)}
 #: The second exception: **on a ``by_attack`` figure the dash carries the feature** and colour
 #: carries the attack (:data:`ATTACK_SLOTS`), so one attack's two representations sit in a panel
 #: as one hue in two patterns rather than as two unrelated colours. Solid Gemini Embedding 2,
-#: long-dashed StyloMetrix, on request.
+#: dash-dot Character n-gram, on request.
 #:
 #: **Every name in :data:`FEATURES` needs an entry**, because an unregistered feature would fall
 #: back to solid and collide with Gemini's -- the same "add it to the vocabulary or it is drawn
@@ -543,7 +543,6 @@ FEATURE_DASHES = {
     # Dash-dot with **tight** gaps: a plain long dash was tried first, and a wide hole next to a
     # thin line reads as a broken line rather than as a pattern. Two marks and two equal small gaps
     # keep the stroke continuous at a glance while staying obviously not-solid next to Gemini's.
-    "stylometrix": (6, 1.5, 1.5, 1.5),
     "gemini_embedding_2": (),
     "gemini_embedding_001": (1.5, 1.5),
     "function_words": (4, 2, 1.5, 2),
@@ -2173,9 +2172,7 @@ def config_language_cmc(table: pd.DataFrame, weights: PanelWeights, dataset: str
     **A level is not a ranking of how identifiable a language's writers are.** The known side
     holds far fewer authors writing a rare language than it does English writers, so a rare
     language's candidate field is narrower before any authorship signal is used, and its accuracy
-    is inflated by that narrowing alone. StyloMetrix makes this worse rather than better -- it
-    runs an English spaCy pipeline over every document whatever it is written in, and separates
-    English from Russian well *within* one corpus. The comparison that survives is accuracy
+    is inflated by that narrowing alone. Any feature that is partly a language detector makes this worse rather than better. The comparison that survives is accuracy
     against ``random_within_language``; the raw curve is what that ratio is built from.
 
     Evaluated on :func:`baseline_k_grid` rather than at every k: this family draws far more curves
@@ -2458,7 +2455,7 @@ def config_detection(table: pd.DataFrame, weights: PanelWeights,
     option would buy nothing.
 
     This is where the feature axis separates hardest: semantic embeddings detect strangers well
-    above chance while StyloMetrix sits near chance on both corpora. The same margin that carries
+    above chance while the hand-crafted style feature sat near chance on both corpora. The same margin that carries
     no information about *correctness* on the risk-coverage figure carries none about *membership*
     either -- one statistic failing two different ways.
     """
@@ -2884,8 +2881,8 @@ WORDS_IDENTIFICATION_FAR = 0.10
 
 #: Left edge of each word-count bin, at round numbers chosen off both corpora's distributions so
 #: no bin is starved, with the open `1000+` bin catching the long pasted-document tail.
-#: StyloMetrix reads only a prefix of characters and Gemini a longer one, so the top bins are
-#: longer than either feature sees -- a flat tail there is truncation, not a ceiling on what
+#: Gemini reads only a prefix of each document, so the top bins are
+#: longer than the feature sees -- a flat tail there is truncation, not a ceiling on what
 #: length can buy.
 WORD_BIN_EDGES = (1, 20, 50, 200, 1000)
 
@@ -4234,7 +4231,7 @@ def draw_identification_panel(axes, series: list[Series], handles: dict,
     # top-1 *as a fraction of the axis* -- and with `PANEL_Y_LIMITS` that fraction now differs by
     # corpus, which makes a single representative figure worthless for deciding it. Swept across
     # the whole family, this corner collides least often; the default bottom right is where the
-    # low-feature figures (StyloMetrix, on both corpora) run along the bottom exactly where it
+    # low-scoring figures (weak features, on both corpora) run along the bottom exactly where it
     # sits. Re-run the sweep before changing this or a `PANEL_Y_LIMITS` entry if it starts to bite.
     #
     # The note is "X out, Y in" on one line and the known pool as "Z cand." beneath it -- the unit
@@ -4459,7 +4456,7 @@ CURVE_TYPES = {
                              "One threshold for the whole test set, read within each bin. "
                              "Bars: each bin's share of in-set documents. Observational -- a long "
                              "conversation is a different conversation, not a short one given "
-                             "more words. StyloMetrix reads only the first ~350 words. Grey "
+                             "more words. Gemini reads only the first 8,192 tokens. Grey "
                              "dashes: a chance detector at the achieved FAR in front of the "
                              "proportional guesser"),
     "identification_words_authors": (draw_words_identification_panel,
@@ -4690,7 +4687,7 @@ def plot_attack_comparison(dataset: str, defense: str, runs: list[Run], curves: 
     readable at two attacks and is not at ten -- the registry has grown and a panel was carrying a
     dozen colours. Splitting the two axes onto two channels makes the comparison the figure exists
     for legible directly: one attack's two representations are one hue in two patterns, so
-    "Gemini beats StyloMetrix under every attack" is read off the patterns rather than by
+    "Gemini beats the character n-gram under every attack" is read off the patterns rather than by
     matching legend entries in pairs. The colour legend's samples stay **solid** whatever the
     series' dashes -- they stand for the hue, and the dash block speaks for the pattern.
 
@@ -5313,7 +5310,7 @@ def plot_temporal_attack_comparison(dataset: str, defense: str, runs: list[Run],
     and its legend pair sits side by side in the reserved strip rather than stacked, since this
     figure has no empty grid cell to stack into (see :func:`finish_facets`). The labels are what
     makes that fit: "Nearest neighbor" beside a "Feature" block is narrower than the
-    "StyloMetrix / Nearest neighbor" this used to spell out in one list.
+    "Character n-gram / Nearest neighbor" this used to spell out in one list.
     """
     series = [Series(ATTACK_LABELS[run.attack], ATTACK_SLOTS[run.attack], decay[run],
                      dashes=FEATURE_DASHES[run.feature],

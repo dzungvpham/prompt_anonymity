@@ -19,7 +19,7 @@ half that reads what the build wrote. One subpackage each:
     extension point for anonymization countermeasures; driven by ``data.apply_defenses``.
 ``features``
     :class:`~prompt_anonymity.features.Featurizer` classes such as
-    :class:`~prompt_anonymity.features.StyloMetrixFeaturizer` -- cached ``texts -> ndarray``
+    :class:`~prompt_anonymity.features.GeminiEmbedding2Featurizer` -- cached ``texts -> ndarray``
     transforms, driven by ``data.compute_features``.
 ``attacks``
     Score each unknown document against the known authors, producing an

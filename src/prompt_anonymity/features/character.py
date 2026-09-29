@@ -3,7 +3,7 @@
 :class:`CharacterStatisticsFeaturizer` needs no GPU or external models, so it lets the whole
 load -> defense -> featurize -> attack pipeline run end-to-end anywhere (and pairs with the
 example text-rewrite defense). It is **not** a serious stylometric signal -- use
-:class:`~prompt_anonymity.features.stylometrix.StyloMetrixFeaturizer` for real experiments.
+:class:`~prompt_anonymity.features.char_ngram_tfidf.CharNgramTfidf` for real experiments.
 """
 
 from __future__ import annotations

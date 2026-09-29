@@ -81,7 +81,7 @@ class MinibatchLogisticAttribution:
     learning_rate
         Adam's initial step, decayed to zero on a cosine schedule over ``epochs``. The default is
         tuned for **standardized** features (``run_experiment.py --standardize``, the default);
-        on raw StyloMetrix columns, which mix ratios in [0, 1] with raw counts, it is far too
+        on raw columns that mix ratios in [0, 1] with raw counts, it is far too
         large for the wide columns and far too small for the narrow ones.
     device
         ``"auto"`` (default) uses CUDA when a device is visible, else the CPU. The CPU path works

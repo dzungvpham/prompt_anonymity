@@ -217,13 +217,11 @@ DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
 
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
-#: largest, while ``gemini_embedding_2`` is semantic and should barely move. ``stylometrix`` is what
-#: every earlier defense was measured on; it stays selectable by name but is out of the default grid.
-FEATURES = ("stylometrix", "char_ngram_tfidf", "gemini_embedding_2")
+#: largest, while ``gemini_embedding_2`` is semantic and should barely move.
+FEATURES = ("char_ngram_tfidf", "gemini_embedding_2")
 
-#: Features the attribution grid uses when ``--features`` is not given. StyloMetrix was dropped on
-#: 2026-09-25: ``char_ngram_tfidf`` replaced it as the style feature (it beats it on every swe-chat
-#: cell and on WildChat's), and the figures are drawn without it.
+#: Features the attribution grid uses when ``--features`` is not given (``char_ngram_tfidf`` is the
+#: style feature).
 ATTRIBUTION_DEFAULT_FEATURES = ("char_ngram_tfidf", "gemini_embedding_2")
 
 #: Features the attribution runner fits per known configuration from the document **text**

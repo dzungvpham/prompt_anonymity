@@ -85,7 +85,7 @@ graph, +0.0039 over a contrastive one, and +0.0007 over contrastive+timing** -- 
 the graph improves, because the constraints only ever supplied what a better same-author metric
 supplies properly, and supplies once rather than per-threshold. Over the original seven cells it
 ranged +0.000 to +0.021 with an inverted U (trusting the top 10-35% of documents helped, trusting
-all of them cost -0.081 on swe-chat) and was exactly 0.000 on WildChat/StyloMetrix. ``gallery``
+all of them cost -0.081 on swe-chat) and was exactly 0.000 on one WildChat cell. ``gallery``
 never had a consistent sign at all: -0.083 to +0.041, positive for the discriminative attacks and
 negative for Gemini/nearest-neighbour, which is about as much as one should expect from treating a
 distance vector as a learned representation.

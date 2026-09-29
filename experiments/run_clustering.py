@@ -410,9 +410,8 @@ def within_language_chance(authors: np.ndarray, languages: np.ndarray) -> float:
     """P(same author | same language) for a random pair -- the language-controlled reference.
 
     The plain chance reference asks how often two documents from the whole collection share an
-    author, which flatters any similarity that is partly a language detector -- StyloMetrix is
-    exactly that, since it runs an *English* spaCy pipeline over every document whatever language
-    it is in. So the honest question is not "is an edge better than a random pair?" but "is a
+    author, which flatters any similarity that is partly a language detector (an English-only
+    pipeline run over every document is exactly that). So the honest question is not "is an edge better than a random pair?" but "is a
     within-language edge better than a random *within-language* pair?".
     """
     frame = pd.DataFrame({"author": np.asarray(authors), "language": np.asarray(languages)})

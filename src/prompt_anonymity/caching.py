@@ -1,7 +1,7 @@
 """Safe, auto-invalidating on-disk cache for expensive per-item transforms.
 
 Two stages of the pipeline do costly per-conversation work that is wasteful to repeat:
-defenses (e.g. translating each prompt) and featurizers (e.g. running StyloMetrix on GPU).
+defenses (e.g. translating each prompt) and featurizers (e.g. running a local encoder on GPU).
 Both reuse this cache, which stores per-item outputs on disk while guaranteeing a stale
 result is never served:
 
@@ -23,7 +23,7 @@ result is never served:
 What source hashing can and cannot see: editing any method of the producer's own class
 hierarchy flips its namespace automatically. It does *not* see changes inside helper
 functions/modules it calls or in external models (e.g. an upgraded translation model or a
-new StyloMetrix release) -- bump ``version`` for those.
+new release of a third-party feature library) -- bump ``version`` for those.
 """
 
 from __future__ import annotations
@@ -224,7 +224,7 @@ class TransformCache:
 
         ``batch_transform(missing_items)`` must return one JSON-serializable output per input, in
         order. Use this when the transform is far cheaper in bulk (e.g. a featurizer running
-        spaCy's ``pipe`` over many texts at once). Duplicate missing items are computed once.
+        a model over many texts at once). Duplicate missing items are computed once.
 
         **Nothing is persisted until the call returns**, so a process killed partway through
         buys nothing. Fine when the batched call itself is the unit of work (a batch API

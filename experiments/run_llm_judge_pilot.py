@@ -74,7 +74,7 @@ FEATURE_GROUNDED_SYSTEM_PROMPT_TEMPLATE = (
 
 def quick_style_stats(text: str) -> dict[str, float]:
     """A handful of cheap, human-interpretable style statistics -- the SALA-style grounding.
-    Deliberately not StyloMetrix (opaque-coded dims meant for a classifier, not for reading in a
+    Deliberately not an opaque-coded feature vector (meant for a classifier, not for reading in a
     prompt): these five are simple enough that a judge can sanity-check them against the text."""
     words = text.split() or [""]
     n_words = len(words)

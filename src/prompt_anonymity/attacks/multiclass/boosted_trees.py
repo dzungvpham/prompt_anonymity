@@ -9,7 +9,7 @@ class GradientBoostedTrees:
     """Gradient-boosted decision trees (XGBoost) over the known authors.
 
     The only non-linear, non-metric attack here: every other one ultimately compares documents
-    along straight lines in feature space. StyloMetrix features are heterogeneous -- ratios in
+    along straight lines in feature space. Hand-crafted style features are heterogeneous -- ratios in
     [0, 1] next to raw counts, many near-zero for most documents -- and trees handle that mix
     natively, splitting on thresholds instead of weighting directions, and picking up interactions
     between features that a linear model cannot express.

@@ -1,13 +1,13 @@
 """Controlled feature x attack matrix for the WCCN-fusion result, in one reproducible runner.
 
-Tests whether Gemini + {char n-gram, StyloMetrix, POS n-gram} fusion helps, and whether the answer
+Tests whether Gemini + {char n-gram, POS n-gram} fusion helps, and whether the answer
 depends on which attack scores the fused vectors -- WCCN and ``logistic_sgd`` answer differently,
 and one script that takes the feature set and attack as arguments (rather than one file per
 combination) is what makes that comparison reproducible instead of re-derived by hand each time.
 
 Two feature kinds, two safety stories
 --------------------------------------
-* **Precomputed, no cross-document dependency** (``gemini_embedding_2``, ``stylometrix``): each
+* **Precomputed, no cross-document dependency** (``gemini_embedding_2``): each
   document's vector depends only on its own text, so :func:`load_documents_and_features` reads
   the existing feature parquet and slicing by window is the only per-window work.
 * **Per-split TF-IDF** (``char_ngram``, ``pos_ngram``): vocabulary and IDF weights are corpus
@@ -23,7 +23,7 @@ Usage
 
     python experiments/run_wccn_fusion.py --source wildchat \\
         --feature-sets gemini_embedding_2 gemini_embedding_2+char_ngram \\
-                       gemini_embedding_2+stylometrix gemini_embedding_2+pos_ngram \\
+                       gemini_embedding_2+pos_ngram \\
         --attacks wccn --pos-cache "pos_tags_cache_wildchat_shard*of4.jsonl"
 
 Each ``--feature-sets`` entry is one or more ``+``-joined components, scored separately; every

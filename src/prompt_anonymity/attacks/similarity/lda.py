@@ -17,7 +17,7 @@ class LDACentroid:
     """Project onto the LDA discriminant subspace, then cosine to the centroid.
 
     LDA maximises between-author over within-author scatter, which both denoises and discards
-    the StyloMetrix directions that carry no author information at all.
+    the feature directions that carry no author information at all.
 
     ``n_components`` is a *ceiling*: LDA cannot produce more than ``n_authors - 1`` discriminants,
     so a request for more is silently clamped rather than raised. That matters when the same

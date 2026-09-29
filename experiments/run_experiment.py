@@ -740,8 +740,8 @@ def zscores(args: argparse.Namespace) -> bool:
 def standardize(known: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, ...]:
     """Z-score the known side and every other block using **known-side** statistics only.
 
-    StyloMetrix mixes ratios in [0, 1] with occasional raw counts, so without scaling a handful
-    of wide-range columns dominate any distance. Fitting the mean/scale on the known side alone
+    Hand-crafted style features mix ratios in [0, 1] with occasional raw counts, so without scaling
+    a handful of wide-range columns dominate any distance. Fitting the mean/scale on the known side alone
     keeps the unknown documents out of the attacker's view of the data. Zero-variance columns are
     left alone rather than divided by zero.
 
@@ -2066,9 +2066,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
                         help="Which built split to attack (default: swe_chat).")
-    parser.add_argument("--feature", default="stylometrix",
+    parser.add_argument("--feature", default="char_ngram_tfidf",
                         help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: "
-                             "stylometrix) -- or a feature fitted per known configuration, which "
+                             "char_ngram_tfidf) -- or a feature fitted per known configuration, which "
                              "has no parquet and reads the document text instead: "
                              + ", ".join(sorted(KNOWN_SIDE_FEATURES)) + ".")
     parser.add_argument("--max-ngrams", type=int, default=None, metavar="N",
@@ -2137,8 +2137,8 @@ def parse_args() -> argparse.Namespace:
                              "(default) or treat them as the oldest, i.e. always known.")
     parser.add_argument("--standardize", action=argparse.BooleanOptionalAction, default=True,
                         help="Z-score features using known-side statistics before scoring "
-                             "(default: on; disable with --no-standardize). StyloMetrix mixes "
-                             "ratios in [0, 1] with raw counts, so without scaling a handful of "
+                             "(default: on; disable with --no-standardize). Features that mix "
+                             "ratios in [0, 1] with raw counts need it, or a handful of "
                              "wide-range columns dominate every method.")
     parser.add_argument("--attacks", nargs="+", default=["logistic"],
                         choices=sorted(ATTRIBUTION_ATTACKS),

@@ -2,30 +2,19 @@ r"""Compute feature vectors for a built dataset split -- one parquet per featuri
 
 Companion to :mod:`prompt_anonymity.data.build_dataset`: that script writes the documents
 (``dist/swe_chat.parquet``), this one writes the *features* for them
-(``dist/swe_chat_stylometrix.parquet``), keyed by ``doc_id`` so the two join cleanly.
+(``dist/swe_chat_gemini_embedding_2.parquet``), keyed by ``doc_id`` so the two join cleanly.
 
 Featurization is **not reimplemented here** -- the script drives the registered featurizers of
 the installed ``prompt_anonymity`` package (``prompt_anonymity.features.FEATURIZERS``), so a
 newly registered featurizer becomes available with no change to this file.
 
-**Every document in the split is featurized by default**, with one language model
-(``--language-code``, default ``en``). The model is a property of the featurizer, not a filter: a
-Japanese document still gets a feature vector, just one an English model computed. ``--language``
-is a separate, optional filter for the times you want only one language's documents, and makes
-the output a *subset* of the split; either way, join the result back on ``doc_id``.
+**Every document in the split is featurized by default.** ``--language`` is an optional filter for
+the times you want only one language's documents, and makes the output a *subset* of the split;
+either way, join the result back on ``doc_id``.
 
-How much of each document is read is the ``--max-len`` window, set **per source**
-(:data:`MAX_LEN_BY_SOURCE`): SWE-chat is read **in full**, while other sources keep the
-featurizer's own default (StyloMetrix: the first 2,048 characters). The split is deliberate --
-StyloMetrix costs grow faster than linearly with document length, and SWE-chat's tail is short
-enough to absorb that where WildChat's is not (long enough to hit spaCy's parser guard).
-SWE-chat's uncapped window is a decision rather than a default: ``--max-len`` cannot truncate it
-(see :func:`resolve_max_len`), because the feature file name records no window and a truncated run
-would quietly overwrite the full-text vectors with a different feature space under the same name.
-
-Featurization runs across worker processes where the featurizer supports it (StyloMetrix does),
-sized from the CPUs and memory this job is actually allocated rather than the machine's -- see
-``--workers`` and :mod:`prompt_anonymity.resources`.
+Featurization runs across worker processes where the featurizer supports it, sized from the CPUs
+and memory this job is actually allocated rather than the machine's -- see ``--workers`` and
+:mod:`prompt_anonymity.resources`.
 
 **Remote (paid) featurizers.** ``--feature gemini_embedding_2`` embeds the documents through
 OpenRouter instead of computing anything locally, so it needs no GPU but does need an
@@ -43,8 +32,7 @@ OpenRouter instead of computing anything locally, so it needs no GPU but does ne
   resumed run and a re-run with different sharding all cost nothing for documents already done.
   The run prints what it actually spent when it finishes.
 
-``--max-len`` does not apply to it. The embedding model reads a fixed window (8,192 tokens), so
-each document is cut to just above that and embedded **once** -- one document, one call, one
+The embedding model reads a fixed window (8,192 tokens), so each document is cut to just above that and embedded **once** -- one document, one call, one
 vector, no pooling. Each input carries the model's task prefix, which is how Embedding 2 is told
 what the vector is for. The vector therefore represents a document's opening, not all of it; see
 :mod:`prompt_anonymity.features.gemini_embedding`.
@@ -62,8 +50,7 @@ on-disk cache is content-addressed with atomic writes, so concurrent tasks share
 
 Run (from the repo root):
 
-    python -m prompt_anonymity.data.compute_features                                  # all swe-chat docs, stylometrix/en
-    python -m prompt_anonymity.data.compute_features --source wildchat --language-code ru
+    python -m prompt_anonymity.data.compute_features --feature function_words        # all swe-chat docs
     python -m prompt_anonymity.data.compute_features --feature function_words --language English
     python -m prompt_anonymity.data.compute_features --workers 4                      # cap the worker pool
     python -m prompt_anonymity.data.compute_features --source wildchat --num-shards 32 --shard-index 0
@@ -112,26 +99,6 @@ CHUNK_SIZE = 256
 # Rows per batch when streaming `turns` back out of the parquet (see `read_texts`). Only one batch
 # is decoded at a time, so this bounds that read's memory rather than the shard's.
 READ_BATCH_ROWS = 2048
-
-# dataset `language_primary` -> language model code, used only to pick a sensible default model
-# when a run is restricted to one language (--language). StyloMetrix ships models for these five
-# languages only; anything else needs an explicit --language-code (if it is supported at all).
-LANGUAGE_CODES = {"English": "en", "German": "de", "Polish": "pl", "Russian": "ru", "Ukrainian": "ukr"}
-DEFAULT_LANGUAGE_CODE = "en"
-
-# Input window per source, in characters, for featurizers that read a prefix (0 = read whole
-# documents). SWE-chat is uncapped: reading every session in full is affordable there, and
-# truncating discards exactly the long sessions that carry the most style evidence. A source
-# absent from this map keeps the featurizer's own default (StyloMetrix: 2,048 characters) --
-# WildChat deliberately does, since StyloMetrix's cost grows faster than linearly with length and
-# WildChat's length tail is long enough to matter. Featurizers with no character window
-# (gemini_embedding_2 measures its own, in tokens) ignore this.
-#
-# A window of 0 here is a **decision, not a default**: the source is uncapped by design and
-# `--max-len` may not override it (see `resolve_max_len`), because the output filename does not
-# encode the window and a truncated run would otherwise quietly overwrite the uncapped feature
-# file with a differently-computed one under the same name.
-MAX_LEN_BY_SOURCE = {"swe_chat": 0}
 
 # Where a sharded run parks its partial outputs, under the output directory. They are the array
 # job's intermediate state, not a deliverable -- once merged, the shard files can be deleted.
@@ -338,35 +305,12 @@ def select_author_shard(documents: pd.DataFrame, shard_index: int, num_shards: i
 
 # --- featurization ----------------------------------------------------------
 
-def resolve_max_len(source: str, requested: int | None) -> int | None:
-    """The input window to featurize ``source`` with, refusing to truncate an uncapped source.
-
-    ``--max-len`` (``requested``) normally wins over the per-source default. The exception is a
-    source pinned to ``0`` in :data:`MAX_LEN_BY_SOURCE` -- uncapped by design -- where a truncated
-    run is rejected rather than performed, since the output filename carries no window and would
-    silently overwrite that source's full-text feature file with a different feature space.
-    Passing ``--max-len 0`` explicitly is still fine.
-    """
-    default = MAX_LEN_BY_SOURCE.get(source)
-    if requested is None:
-        return default
-    if default == 0 and requested:
-        raise SystemExit(
-            f"--max-len {requested} refused: {source} is featurized over whole documents by "
-            f"design, and the feature file name does not record the window, so a truncated run "
-            f"would silently replace the uncapped vectors. Change MAX_LEN_BY_SOURCE in "
-            f"prompt_anonymity/data/compute_features.py if the source's window should really change."
-        )
-    return requested
-
-
 def build_featurizer(name: str, **options):
     """Build a registered featurizer, forwarding only the options its constructor accepts.
 
     The featurizer class comes from ``prompt_anonymity.features.FEATURIZERS``, so this script
     never hard-codes a feature implementation -- but featurizers do not take the same arguments
-    (StyloMetrix has a language model and an input window; the embedding one has an output width
-    and no language model; the surface-statistic ones take nothing). Options are therefore matched
+    (the embedding one has an output width and a task; the surface-statistic ones take nothing). Options are therefore matched
     against the constructor's signature rather than a hard-coded list of names, and an option left
     as ``None`` is dropped so the featurizer keeps its own default. A flag a featurizer does not
     accept is silently ignored, which is what lets one CLI drive all of them.
@@ -378,34 +322,17 @@ def build_featurizer(name: str, **options):
 
 
 def report_window(featurizer, texts) -> None:
-    """Log how much of each document the featurizer will actually read, when it reads a prefix.
+    """Log how much of each document the featurizer will actually read, when it reads a window.
 
-    StyloMetrix reads the first ``max_len`` characters of a document (``0`` = all of it), so on a
-    corpus of long agent sessions a narrow window can leave most of the text unread -- better
-    seen in the run log than discovered later. A featurizer whose window is measured in *tokens*
-    (``input_tokens``, the embedding ones) reports that instead: counting tokens for the whole
-    split up front would be its own pass over the corpus, so the count of documents actually cut
-    is left to the featurizer's own end-of-run summary.
+    A featurizer whose window is measured in *tokens* (``input_tokens``, the embedding ones)
+    reports it here: counting tokens for the whole split up front would be its own pass over the
+    corpus, so the count of documents actually cut is left to the featurizer's own end-of-run
+    summary.
     """
     parameters = featurizer.params()
-    if not texts:
-        return
-    if parameters.get("input_tokens"):
+    if texts and parameters.get("input_tokens"):
         print(f"[{featurizer.name}] reads the first {parameters['input_tokens']:,} tokens of each "
               f"document (longest document: {max(len(text) for text in texts):,} characters)")
-        return
-    max_len = parameters.get("max_len")
-    if max_len is None:
-        return
-    longest = max(len(text) for text in texts)
-    if not max_len:
-        print(f"[{featurizer.name}] reads every document in full "
-              f"(longest: {longest:,} characters)")
-        return
-    n_long = sum(len(text) > max_len for text in texts)
-    print(f"[{featurizer.name}] reads the first {max_len:,} characters of each document; "
-          f"{n_long:,}/{len(texts):,} ({n_long / len(texts):.1%}) documents are longer than that "
-          f"(longest: {longest:,})")
 
 
 def compute_features(featurizer, texts, *, cache_dir, chunk_size: int = CHUNK_SIZE) -> np.ndarray:
@@ -430,22 +357,6 @@ def compute_features(featurizer, texts, *, cache_dir, chunk_size: int = CHUNK_SI
 
 # --- output -----------------------------------------------------------------
 
-def stylometrix_column_names(language_code: str) -> list[str] | None:
-    """StyloMetrix's own metric codes (``POS_VERB``, ``L_TTR``, ...) in ``transform`` order.
-
-    Read from the installed StyloMetrix's metric registry, which needs no spaCy model load:
-    iterating a ``MetricGroup`` yields its metrics sorted by metric id, which is exactly the
-    column order ``StyloMetrix.transform`` emits (verified against the header of the previously
-    committed ``swe-chat/swe_chat_stylometrix_en_2048.csv``). Returns ``None`` when StyloMetrix
-    is not installed or does not know the language, so the caller falls back to positional names.
-    """
-    try:
-        from stylo_metrix.structures import Lang
-        return [metric.code for metric in Lang.get_language(language_code).get_metrics()]
-    except Exception:  # not installed, or a bare Exception for an unknown language definition
-        return None
-
-
 def positional_feature_names(n_features: int) -> list[str]:
     """``f0000``-style names for a feature space whose dimensions have no meaning of their own.
 
@@ -466,10 +377,9 @@ def positional_feature_names(n_features: int) -> list[str]:
 def feature_column_names(featurizer, n_features: int) -> list[str]:
     """Column names for the feature matrix -- the featurizer's own wherever they are recoverable.
 
-    Named columns keep the parquet self-describing (``POS_VERB`` rather than ``f0007``) for the
-    featurizers whose dimensions mean something. A featurizer may publish them directly via an
-    optional ``feature_names()`` method; otherwise the two whose layout is public are resolved
-    here. Anything else -- an embedding, say -- and any name list whose length disagrees with the
+    Named columns keep the parquet self-describing for the featurizers whose dimensions mean
+    something. A featurizer may publish them directly via an optional ``feature_names()`` method;
+    otherwise ``function_words``, whose layout is public, is resolved here. Anything else -- an embedding, say -- and any name list whose length disagrees with the
     computed matrix falls back to :func:`positional_feature_names`, so the vectors stay the source
     of truth and can never be silently mislabeled.
     """
@@ -477,8 +387,6 @@ def feature_column_names(featurizer, n_features: int) -> list[str]:
     published = getattr(featurizer, "feature_names", None)
     if callable(published):
         names = published()
-    elif featurizer.name == "stylometrix":
-        names = stylometrix_column_names(featurizer.language_code)
     elif featurizer.name == "function_words":
         from prompt_anonymity.features.function_words import FUNCTION_WORDS
         names = list(FUNCTION_WORDS)
@@ -547,7 +455,7 @@ def output_path(out_dir: str | Path, source: str, feature: str, defense: str | N
     """The merged feature file for a source/featurizer -- what an unsharded run writes.
 
     Features of defended text carry the defense in the name too
-    (``swe_chat_openanonymity_stylometrix.parquet``), so a defended run's vectors never overwrite
+    (``swe_chat_openanonymity_gemini_embedding_2.parquet``), so a defended run's vectors never overwrite
     the undefended ones.
     """
     return Path(out_dir) / f"{split_stem(source, defense)}_{feature}.parquet"
@@ -556,7 +464,7 @@ def output_path(out_dir: str | Path, source: str, feature: str, defense: str | N
 def shard_path(out_dir: str | Path, stem: str, shard_index: int, num_shards: int) -> Path:
     """One shard's partial output file, under :data:`SHARD_SUBDIR`.
 
-    ``stem`` is the merged file's name without its suffix (``swe_chat_stylometrix`` here; the
+    ``stem`` is the merged file's name without its suffix (``swe_chat_gemini_embedding_2`` here; the
     defense pipeline in :mod:`~prompt_anonymity.data.apply_defenses` shards by the same rules with
     its own stem). The shard count is part of the name so that shards of a re-run with a different
     array size cannot be mistaken for each other (see :func:`discover_shards`), and both numbers
@@ -637,21 +545,13 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", default="swe_chat", choices=sorted(SOURCES),
                    help="which built split to featurize (default: swe_chat)")
-    p.add_argument("--feature", default="stylometrix",
+    p.add_argument("--feature", default="gemini_embedding_2",
                    choices=sorted({*FEATURIZERS, *KNOWN_SIDE_FEATURES}),
-                   help="registered featurizer to run (default: stylometrix)")
+                   help="registered featurizer to run (default: gemini_embedding_2)")
     p.add_argument("--language", default=None,
                    help="optional filter: keep only documents whose language_primary is this "
                         "(default: featurize every document; the output filename is the same "
                         "either way, so a filtered run overwrites an unfiltered one)")
-    p.add_argument("--language-code", default=None,
-                   help="model code for language-specific featurizers, e.g. en/ru (default: "
-                        f"derived from --language, else {DEFAULT_LANGUAGE_CODE!r})")
-    p.add_argument("--max-len", type=int, default=None,
-                   help="characters of each document to read, for featurizers that read a prefix; "
-                        "0 reads whole documents (default: the source's window -- swe_chat is "
-                        "uncapped by design and refuses to be truncated here; other sources keep "
-                        "the featurizer's own default, 2048 for StyloMetrix)")
     p.add_argument("--task", default=None,
                    help="task for featurizers that embed with one (gemini_embedding_2: "
                         "'clustering' (default), 'sentence similarity', 'classification'). A "
@@ -665,10 +565,10 @@ def main() -> None:
                    help=f"documents per featurizer call / cache checkpoint; 0 runs one call "
                         f"(default: {CHUNK_SIZE})")
     p.add_argument("--workers", type=int, default=None,
-                   help="worker processes for featurizers that support it (StyloMetrix), or "
-                        "concurrent API requests for remote ones (gemini_embedding_2); 1 runs "
-                        "in-process (default: sized from the allocation's CPUs/memory, or free "
-                        "GPU memory when running on a GPU)")
+                   help="worker processes for featurizers that support it, or concurrent API "
+                        "requests for remote ones (gemini_embedding_2); 1 runs in-process "
+                        "(default: sized from the allocation's CPUs/memory, or free GPU memory "
+                        "when running on a GPU)")
     p.add_argument("--defense", default=None,
                    help="featurize a DEFENDED version of the split instead: reads "
                         "<split>_<defense>.parquet (written by apply_defenses) and writes "
@@ -708,11 +608,6 @@ def main() -> None:
                          f"`python experiments/run_experiment.py --feature {args.feature}`.")
 
     language = None if (args.language or "all").lower() == "all" else args.language
-    language_code = args.language_code or LANGUAGE_CODES.get(language, DEFAULT_LANGUAGE_CODE)
-    if args.language_code is None and language and language not in LANGUAGE_CODES:
-        print(f"note: no language model mapped for {language!r}; using {language_code!r} "
-              f"(set --language-code to override)")
-
     # Paths default to the project's data/ folder (see prompt_anonymity.data.config): the code
     # lives in the installed package, the data does not.
     dist = Path(args.dist_dir) if args.dist_dir else hf_dir()
@@ -742,14 +637,11 @@ def main() -> None:
 
     shard_index, num_shards = resolve_sharding(args.shard_index, args.num_shards)
 
-    max_len = resolve_max_len(args.source, args.max_len)
-    featurizer = build_featurizer(args.feature, language_code=language_code, max_len=max_len,
-                                  workers=args.workers, dimensions=args.dimensions, task=args.task)
-    # Which model this run uses: a language model for the local featurizers, a remote model id
-    # for the API-backed ones (whose `model` attribute is an OpenRouter id).
-    if getattr(featurizer, "language_code", None):
-        model = f" (language model {language_code!r})"
-    elif getattr(featurizer, "model", None):
+    featurizer = build_featurizer(args.feature, workers=args.workers,
+                                  dimensions=args.dimensions, task=args.task)
+    # Which model this run uses, for the API-backed featurizers (whose `model` attribute is an
+    # OpenRouter id).
+    if getattr(featurizer, "model", None):
         task = getattr(featurizer, "task", "")
         model = f" (model {featurizer.model!r}{f', task {task!r}' if task else ''})"
     else:

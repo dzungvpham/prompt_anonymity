@@ -2,13 +2,8 @@
 #
 # install.sh -- one-command setup for the prompt_anonymity project.
 #
-# Installs the full stack in the order the StyloMetrix + GPU-spaCy combination
-# requires:
-#   1. spaCy with GPU support (CUDA or Apple Metal)
-#   2. the en_core_web_trf transformer model
-#   3. StyloMetrix from source  (the PyPI package pins a broken spaCy version)
-#   4. the prompt_anonymity package itself, with all its Python dependencies
-#      (pulled from pyproject.toml)
+# Installs the prompt_anonymity package with all its Python dependencies (pulled from
+# pyproject.toml) and, on a CUDA machine, its GPU-backed extras.
 #
 # Run it from inside your activated Python 3.12 environment, e.g.:
 #
@@ -30,18 +25,14 @@ Run from inside your activated Python 3.12 virtual environment.
 If --accelerator is omitted it is auto-detected (NVIDIA -> cuda12x/cuda13x,
 Apple Silicon -> apple) and falls back to cuda12x when no GPU is visible. You
 may also set the PROMPT_ANONYMITY_ACCEL environment variable instead of the
-flag. Note: StyloMetrix uses the GPU when available and otherwise falls back to
-CPU (much slower), so the cpu option works but is best paired with reusing the
-committed feature vectors.
+flag. The accelerator only decides whether the GPU-backed extras are installed:
+--accelerator apple or cpu installs the base package alone.
 EOF
 }
 
 # --- locations -------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="${PYTHON:-python}"
-STYLOMETRIX_DIR="${STYLOMETRIX_DIR:-$SCRIPT_DIR/StyloMetrix}"
-STYLOMETRIX_REPO="https://github.com/NASK-NLP/StyloMetrix"
-SPACY_MODEL="en_core_web_trf"
 
 # --- helpers ---------------------------------------------------------------
 log()  { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -92,7 +83,6 @@ fi
 
 # --- sanity checks ---------------------------------------------------------
 command -v "$PYTHON" >/dev/null 2>&1 || die "python interpreter '$PYTHON' not found"
-command -v git       >/dev/null 2>&1 || die "git is required to fetch StyloMetrix"
 
 if [[ -z "${VIRTUAL_ENV:-}" && -z "${CONDA_PREFIX:-}" ]]; then
   warn "no active virtualenv/conda env detected; packages will install into"
@@ -100,62 +90,22 @@ if [[ -z "${VIRTUAL_ENV:-}" && -z "${CONDA_PREFIX:-}" ]]; then
   warn "see README.md for creating and activating an env first."
 fi
 
-# --- 1. spaCy (with GPU support) -------------------------------------------
-log "Installing spaCy ($ACCEL) ..."
 case "$ACCEL" in
-  cuda12x) pip_install -U "spacy[cuda12x]" ;;
-  # spaCy has no cuda13x extra: install plain spaCy, then the CUDA 13 cupy build.
-  cuda13x) pip_install -U "spacy" && pip_install -U "cupy-cuda13x[ctk]" ;;
-  apple)   pip_install -U "spacy[apple]" ;;
-  cpu)     warn "installing CPU-only spaCy; StyloMetrix feature computation will be slow without a GPU."
-           pip_install -U "spacy" ;;
+  cuda12x|cuda13x|apple|cpu) ;;
   *) die "invalid accelerator '$ACCEL' (expected cuda12x, cuda13x, apple, or cpu)" ;;
 esac
 
-# Pin numpy to the version spaCy just selected, for every later install. spaCy with the
-# cuda12x extra resolves numpy 1.x (cupy-cuda12x is built against numpy 1.x); installing
-# StyloMetrix or the package next can otherwise drag numpy up to 2.x and silently break that
-# build. cupy is not in their dependency trees, so pip can't see the conflict on its own; a
-# constraints file makes the requirement explicit. (cuda13x/apple/cpu just keep their numpy.)
+# Pin numpy to the version already in the environment, for every later install, so that no extra
+# drags it up to 2.x and silently breaks a CUDA build compiled against 1.x. Those builds are not
+# in the package's dependency tree, so pip can't see the conflict on its own; a constraints file
+# makes the requirement explicit.
 NUMPY_VERSION="$("$PYTHON" -c 'import numpy; print(numpy.__version__)')"
 CONSTRAINTS_FILE="$(mktemp)"
 trap 'rm -f "$CONSTRAINTS_FILE"' EXIT
 printf 'numpy==%s\n' "$NUMPY_VERSION" > "$CONSTRAINTS_FILE"
 log "Pinning numpy==$NUMPY_VERSION for the remaining installs."
 
-# --- 2. spaCy transformer model --------------------------------------------
-log "Downloading spaCy model: $SPACY_MODEL ..."
-pip_install -U click
-"$PYTHON" -m spacy download "$SPACY_MODEL"
-
-# --- 3. StyloMetrix from source --------------------------------------------
-log "Setting up StyloMetrix ..."
-if [[ -d "$STYLOMETRIX_DIR/.git" || -f "$STYLOMETRIX_DIR/setup.cfg" ]]; then
-  log "Using existing StyloMetrix checkout: $STYLOMETRIX_DIR"
-else
-  log "Cloning StyloMetrix into $STYLOMETRIX_DIR ..."
-  git clone "$STYLOMETRIX_REPO" "$STYLOMETRIX_DIR"
-fi
-
-# Patch the two known issues in-place. Both edits are idempotent, so re-running
-# the script (or pointing it at an already-patched checkout) is harmless.
-# `-i.bak` + rm keeps this portable across GNU sed and BSD/macOS sed.
-if [[ -f "$STYLOMETRIX_DIR/requirements.txt" ]]; then
-  # Drop the broken spaCy version pin (e.g. "spacy==3.7.2" -> "spacy"), while
-  # leaving spacymoji / spacy_syllables untouched.
-  sed -i.bak -E 's/^spacy[[:space:]]*([<>=!~].*)?$/spacy/' \
-    "$STYLOMETRIX_DIR/requirements.txt"
-  rm -f "$STYLOMETRIX_DIR/requirements.txt.bak"
-fi
-if [[ -f "$STYLOMETRIX_DIR/setup.cfg" ]]; then
-  # Fill in the version placeholder so setuptools can build the package.
-  sed -i.bak 's/{{VERSION_PLACEHOLDER}}/1.0.0/g' "$STYLOMETRIX_DIR/setup.cfg"
-  rm -f "$STYLOMETRIX_DIR/setup.cfg.bak"
-fi
-
-pip_install -e "$STYLOMETRIX_DIR" -c "$CONSTRAINTS_FILE"
-
-# --- 4. prompt_anonymity package + its dependencies ------------------------
+# --- prompt_anonymity package + its dependencies ------------------------
 # The GPU model-backed defenses live behind two extras rather than the base dependencies, since the
 # default --defense none pass-through needs neither:
 #   [styleremix] torch/transformers/peft/accelerate/bitsandbytes -- plain wheels, no compiler needed.
@@ -247,6 +197,5 @@ case "$ACCEL" in
     pip_install -e "$SCRIPT_DIR" -c "$CONSTRAINTS_FILE" ;;
 esac
 
-log "Done. Installed spaCy[$ACCEL], $SPACY_MODEL, StyloMetrix (editable), and"
-log "prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm], $DPMLM_PII_EXTRA [dpmlm-pii], $FEATURES_EXTRA [features], $ARGOS_EXTRA [argos], $RERANK_EXTRA [rerank])."
+log "Done. Installed prompt_anonymity (editable, $STYLEREMIX_EXTRA [styleremix], $QWEN_EXTRA [qwen], $DPMLM_EXTRA [dpmlm], $DPMLM_PII_EXTRA [dpmlm-pii], $FEATURES_EXTRA [features], $ARGOS_EXTRA [argos], $RERANK_EXTRA [rerank])."
 log "See README.md for running the pipeline."

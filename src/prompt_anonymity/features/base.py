@@ -34,11 +34,11 @@ class Featurizer:
     #: Cache namespace for this featurizer; must be set by the subclass.
     name: str = ""
     #: Manual logic version. Bump it when behavior changes in a way source hashing cannot see
-    #: (e.g. an upgraded StyloMetrix / spaCy model that shifts the feature columns).
+    #: (e.g. an upgraded encoder checkpoint that shifts the feature columns).
     version: str = ""
 
     def params(self) -> dict:
-        """Configuration that affects the output (e.g. ``{"language_code": "ru"}``).
+        """Configuration that affects the output (e.g. ``{"task": "clustering"}``).
 
         Included in the cache key so different configurations are cached separately, and
         recorded so a run is reproducible. Must be JSON-serializable.
@@ -48,8 +48,8 @@ class Featurizer:
     def featurize(self, texts) -> np.ndarray:
         """Compute a ``(len(texts), n_features)`` array from a sequence of texts.
 
-        This is the expensive **batch** op, implemented by subclasses (e.g. one StyloMetrix /
-        spaCy pass over all texts). Only cache-missing texts are passed in, so it never needs
+        This is the expensive **batch** op, implemented by subclasses (e.g. one encoder pass
+        over all texts). Only cache-missing texts are passed in, so it never needs
         its own caching. Column order must be stable across calls so cached and freshly
         computed rows share a feature space.
         """

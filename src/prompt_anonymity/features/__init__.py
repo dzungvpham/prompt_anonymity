@@ -3,14 +3,14 @@
 Featurization is a **build** stage now: it runs over a built (and optionally defended) split and
 writes a feature parquet, which is all the experiment runner ever reads. What this package
 exposes is therefore one layer -- the :class:`Featurizer` classes themselves
-(:class:`StyloMetrixFeaturizer`, :class:`FunctionWordFeaturizer`,
+(:class:`FunctionWordFeaturizer`,
 :class:`CharacterStatisticsFeaturizer`, :class:`GeminiEmbedding2Featurizer`, ...), each a cached
 ``texts -> ndarray`` transform, plus the :data:`FEATURIZERS` registry and :func:`get_featurizer`
 to build one by name.
 
 The driver is :mod:`prompt_anonymity.data.compute_features`::
 
-    python -m prompt_anonymity.data.compute_features --source swe_chat --feature stylometrix
+    python -m prompt_anonymity.data.compute_features --source swe_chat --feature function_words
 
 which shards, caches every vector by content hash, and combines features by being run once per
 feature (the runner's ``--feature`` then names the parquet to attack).
@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from .base import Featurizer
 from .character import CharacterStatisticsFeaturizer
-from .stylometrix import StyloMetrixFeaturizer
 from .function_words import FunctionWordFeaturizer
 from .char_ngram_tfidf import CharNgramTfidf, KnownSideTfidf
 from .gemini_embedding import GeminiEmbedding001Featurizer, GeminiEmbedding2Featurizer
@@ -39,10 +38,9 @@ from .style_distance import StyleDistanceFeaturizer
 from .luar import LuarFeaturizer
 
 # Registry of featurizer classes, selectable by name. Values are classes (not instances) because
-# a featurizer may need configuration (e.g. StyloMetrix's language_code); see :func:`get_featurizer`.
+# a featurizer may need configuration (e.g. Gemini's task); see :func:`get_featurizer`.
 FEATURIZERS: dict[str, type[Featurizer]] = {
     "gemini_embedding_2": GeminiEmbedding2Featurizer,
-    "stylometrix": StyloMetrixFeaturizer,
     "character_statistics": CharacterStatisticsFeaturizer,
     "function_words": FunctionWordFeaturizer,
     "style_distance": StyleDistanceFeaturizer,
@@ -68,7 +66,7 @@ KNOWN_SIDE_FEATURES: dict[str, type] = {
 def get_featurizer(name: str, **options) -> Featurizer:
     """Build a registered featurizer by name, forwarding ``options`` to its constructor.
 
-    For example ``get_featurizer("stylometrix", language_code="ru")``.
+    For example ``get_featurizer("gemini_embedding_2", task="classification")``.
     """
     try:
         featurizer_class = FEATURIZERS[name]
@@ -79,7 +77,6 @@ def get_featurizer(name: str, **options) -> Featurizer:
 
 __all__ = [
     "Featurizer",
-    "StyloMetrixFeaturizer",
     "FunctionWordFeaturizer",
     "CharacterStatisticsFeaturizer",
     "GeminiEmbedding2Featurizer",

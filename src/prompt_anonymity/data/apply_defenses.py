@@ -19,7 +19,7 @@ WRITTEN to ``dist/<split>_<defense>.parquet``, carrying the split's own schema. 
 of ``data/hf`` means running this locally never mutates the downloaded mirror.
 
 This shares a namespace with the feature files ``compute_features`` writes
-(``dist/swe_chat_stylometrix.parquet``): both are ``<split>_<name>.parquet``, distinguished on disk
+(``dist/swe_chat_gemini_embedding_2.parquet``): both are ``<split>_<name>.parquet``, distinguished on disk
 by their columns -- a defended split has ``turns``, a feature file has ``doc_id``/``author_id``
 plus feature columns.
 
@@ -29,8 +29,8 @@ read location (``data/hf``), also point ``--dist-dir`` there::
 
     python -m prompt_anonymity.data.apply_defenses   --source swe_chat --defense openanonymity
     python -m prompt_anonymity.data.compute_features --source swe_chat --defense openanonymity \
-        --feature stylometrix --dist-dir data/dist   # reads swe_chat_openanonymity.parquet
-                                                      # writes swe_chat_openanonymity_stylometrix.parquet
+        --feature gemini_embedding_2 --dist-dir data/dist   # reads swe_chat_openanonymity.parquet
+                                                      # writes swe_chat_openanonymity_gemini_embedding_2.parquet
 
 What a defense sees: one user turn at a time
 --------------------------------------------

@@ -61,7 +61,7 @@ sbatch = [
 ]
 
 # WildChat, non-xgboost. The score matrix is the binding constraint: known0050 is
-# 86,255 x 13,694 float32 = 4.72 GB on its own, a StyloMetrix nearest-neighbor run measured a
+# 86,255 x 13,694 float32 = 4.72 GB on its own, a low-dimensional nearest-neighbor run measured a
 # 14.6 GB peak, and Gemini's 3,072-d vectors add ~2 GB of features on top. Runs have been
 # OOM-killed at 16 GB, so this asks for room rather than the measured peak. If a cell still dies,
 # shard it by known configuration (`--known-windows 0050` as its own job -- each writes its own
@@ -95,17 +95,17 @@ sbatch = [
 
 # WildChat on a GPU attack, i.e. `logistic_sgd` -- both axes at once, so neither `gpu` nor
 # `cpu_large` fits. What is large here is *host* memory, not device: the fit is comfortable in a
-# corner of any card (the weight matrix is 15 MB at 19,711 authors on StyloMetrix, 242 MB on
+# corner of any card (the weight matrix is 15 MB at 19,711 authors on a ~200-d feature, 242 MB on
 # Gemini, and the minibatched logits 646 MB), while the score matrix it produces is 3.4 GB and
-# lives in RAM alongside its in-set slice. Measured 15.8 GB peak for the StyloMetrix grid; Gemini
+# lives in RAM alongside its in-set slice. Measured 15.8 GB peak for a ~200-d grid; Gemini
 # adds ~2 GB of feature matrix on top, hence the headroom.
 #
 # NOT `gpu-preempt`, unlike every other profile here, and not on the `short` QOS. A Gemini cell is
-# 15.6x the FLOPs of a StyloMetrix one (3,072-d against 197-d) and runs for hours, where a
+# 15.6x the FLOPs of a ~200-d one (3,072-d against 197-d) and runs for hours, where a
 # preemption costs the whole cell -- `run_experiment.py` has no resume, and it clears its own
 # predictions_*.csv on the way in. Queue latency is the price for that, and it is the right trade
 # at this length. The constraint is by compute capability rather than by card name so an A16 or
-# an L4 counts: TF32 needs sm_80+, and the StyloMetrix grid measured 20 minutes on an A16.
+# an L4 counts: TF32 needs sm_80+, and a ~200-d grid measured 20 minutes on an A16.
 [profiles.gpu_large]
 sbatch = [
     "--partition=gpu",
@@ -181,17 +181,9 @@ sbatch = [
 # [overrides.wildchat_openanonymity_gemini_embedding_2_nearest_neighbor]
 # sbatch = ["--mem=32g"]
 
-# wildchat_base_stylometrix_plda OOM'd at 8 minutes on cpu_large's 24g (job 63465696, 2026-08-22).
-# wildchat_styleremix_stylometrix_plda (same feature, different defense) completed fine at 24g, so
-# this is not a uniform PLDA cost -- likely just this window's known-side size pushing PLDA's
-# covariance estimation past the cap. Bumping this one cell rather than the whole cpu_large profile.
-[overrides.wildchat_base_stylometrix_plda]
-sbatch = ["--mem=48g"]
-
 # wildchat_*_gemini_embedding_2_plda both OOM'd on cpu_large's 24g too (jobs 63465697, 63465699,
 # 2026-08-22), ~35 minutes in rather than 8 -- PLDA's covariance estimation over gemini's 3,072-dim
-# embeddings needs much more than over stylometrix's ~197-dim, unlike the stylometrix cells where
-# only one window OOM'd. Matching the 96g this repo already uses for wildchat+gemini_embedding_2 at
+# embeddings needs much more than over a ~197-dim feature. Matching the 96g this repo already uses for wildchat+gemini_embedding_2 at
 # scale (the gpu_large profile) rather than guessing at a smaller number.
 [overrides.wildchat_base_gemini_embedding_2_plda]
 sbatch = ["--mem=96g"]
