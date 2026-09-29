@@ -38,7 +38,6 @@ python -m prompt_anonymity.data.build_dataset            # -> data/dist/<split>.
 python -m prompt_anonymity.data.validate_dataset         # integrity checks on what was built
 
 # 3. Turn documents into attack-ready vectors
-python -m prompt_anonymity.data.compute_features --source swe_chat --feature function_words
 python -m prompt_anonymity.data.compute_features --source swe_chat --feature gemini_embedding_2
 
 # 4. Defend the prompts, then attack the defended version
