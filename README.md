@@ -2,6 +2,8 @@
 
 Research code for our paper **Can Prompt Anonymity Really Hide Your Identity?**
 
+Data available at https://huggingface.co/datasets/pavidu/PromptAnonBench
+
 ## Quickstart
 
 After `./install.sh` (below), these are the commands that matter. Everything reads and writes the
