@@ -21,6 +21,9 @@ Add a featurizer by writing a :class:`Featurizer` and registering its class in
 The one exception to "featurization is a build stage" is :data:`KNOWN_SIDE_FEATURES`: features
 whose vocabulary and weights are *fitted* (``char_ngram_tfidf``). Fitting them offline would fit
 on the test documents too, so the experiment runner fits them itself, per known configuration.
+:data:`AUTHOR_COLLECTION_FEATURES` is the other: features whose known side is one vector per
+*author* (``luar_collection``), which depends on what the known side holds and so is built by the
+runner per known configuration too.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from .harrier import (HarrierFeaturizer, HarrierImperativeFeaturizer, HarrierPla
 from .sentence_transformer import (EmbeddingGemma300mFeaturizer, Harrier270mFeaturizer,
                                    JinaV5NanoFeaturizer, SentenceTransformerFeaturizer)
 from .style_distance import StyleDistanceFeaturizer
-from .luar import LuarFeaturizer
+from .luar import LuarAuthorCollections, LuarFeaturizer
 
 # Registry of featurizer classes, selectable by name. Values are classes (not instances) because
 # a featurizer may need configuration (e.g. Gemini's task); see :func:`get_featurizer`.
@@ -63,6 +66,15 @@ KNOWN_SIDE_FEATURES: dict[str, type] = {
     "char_ngram_tfidf": CharNgramTfidf,
 }
 
+#: Features whose known side is **one vector per author** rather than per document: each known
+#: author's history is embedded as a single collection, per known configuration, by the
+#: experiment runner (``luar_collection``; see :class:`~.luar.LuarAuthorCollections`). The unknown
+#: side is read from the per-document parquet the entry's ``document_feature`` names. Keep the
+#: names disjoint from ``FEATURIZERS`` and ``KNOWN_SIDE_FEATURES``.
+AUTHOR_COLLECTION_FEATURES: dict[str, type] = {
+    "luar_collection": LuarAuthorCollections,
+}
+
 def get_featurizer(name: str, **options) -> Featurizer:
     """Build a registered featurizer by name, forwarding ``options`` to its constructor.
 
@@ -83,11 +95,13 @@ __all__ = [
     "GeminiEmbedding001Featurizer",
     "FEATURIZERS",
     "KNOWN_SIDE_FEATURES",
+    "AUTHOR_COLLECTION_FEATURES",
     "CharNgramTfidf",
     "KnownSideTfidf",
     "get_featurizer",
     "StyleDistanceFeaturizer",
     "LuarFeaturizer",
+    "LuarAuthorCollections",
     "HarrierFeaturizer",
     "HarrierImperativeFeaturizer",
     "HarrierPlainFeaturizer",

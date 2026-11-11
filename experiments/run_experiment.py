@@ -238,6 +238,22 @@ columns, so a multi-attack run stays one tidy table per file:
 * ``--ood reject`` adds ``ood_sweep.csv``, the open-set columns of ``rolling_results.csv``, and
   the per-document decision in ``predictions_*.csv``.
 
+Author collections (``--feature luar_collection``)
+--------------------------------------------------
+Every other feature puts **one vector per document** on both sides, and the attack summarises an
+author from their documents afterwards. LUAR was built and evaluated the other way round: its
+input is a *collection* of an author's documents, fused by the model itself into one vector
+(Rivera-Soto et al., 2021). ``luar_collection`` runs it that way. Per known configuration, each
+known author's most recent ``--collection-size`` (16) known documents become one LUAR collection
+(:class:`~prompt_anonymity.features.luar.LuarAuthorCollections`), built here from the known side's
+text and nothing else, exactly as ``char_ngram_tfidf`` is fitted here. The unknown side is the
+per-conversation ``luar`` parquet. The attack is ``cosine`` and nothing else: with one vector per
+author every similarity attack reduces to it, and a trainable one would fit one sample per class.
+The vectors are compared raw, as in the paper -- never z-scored (see :func:`zscores`). Building
+the collections needs the checkpoint, so this is the one configuration of this script that wants a
+GPU on a large corpus; every collection is cached by the documents it was built from, so a re-run
+embeds nothing.
+
 **No figures.** This script produces numbers only; every figure in the project is drawn by
 ``experiments/plot_results.py``, which reads these CSVs back and can therefore compare runs
 against each other -- something a runner that plots its own output can never do. Run it with no
@@ -265,9 +281,10 @@ from sklearn.model_selection import HalvingRandomSearchCV
 
 from prompt_anonymity.attacks import ATTRIBUTION_ATTACKS, MULTICLASS_ATTACKS, rejection_score
 from prompt_anonymity.data.compute_features import read_texts, split_path
+from prompt_anonymity.data.config import cache_dir
 from prompt_anonymity.defenses import DEFENSES
 from prompt_anonymity.evaluation import LinkageRanking, headline_accuracy
-from prompt_anonymity.features import KNOWN_SIDE_FEATURES
+from prompt_anonymity.features import AUTHOR_COLLECTION_FEATURES, KNOWN_SIDE_FEATURES
 from prompt_anonymity.evaluation.metrics import (
     author_query_metrics,
     c_at_1,
@@ -504,6 +521,95 @@ def order_documents(documents: pd.DataFrame, undated: str = "drop", model_owner:
     return merged.sort_values(["ended_at", "doc_id"], kind="mergesort").reset_index(drop=True)
 
 
+#: Basename part of the topic-label sidecar ``--topics`` reads, ``<source>_topics.parquet``, and the
+#: prefix of every feature embedded from it (``<source>_topics_<field>_<feature>.parquet``). The
+#: same string as ``prompt_anonymity.data.label_topics.OUTPUT_LABEL``, spelled out rather than
+#: imported because that module pulls in the labeller's API client. ``run_clustering.py`` imports
+#: this and the two helpers below, so both families drop the same documents.
+TOPIC_SIDECAR = "topics"
+
+#: Columns read from the sidecar: the two label partitions, and the three fields that decide
+#: whether a document has a usable label at all.
+TOPIC_LABEL_COLUMNS = ("topic", "topic_group", "subject", "description", "label_status")
+
+#: ``label_status`` of a document the labeller answered, in ``label_topics``' spelling. Everything
+#: else (``refused`` today) carries no label and no label vector.
+LABELED_STATUS = "labeled"
+
+
+def usable_rows(matrix: np.ndarray) -> np.ndarray:
+    """Which rows are a direction at all: every entry finite and the norm non-zero.
+
+    ``embed_topic_labels`` writes a NaN row for a document with no label, and an empty label comes
+    back as a zero vector. Neither has a cosine to anything, and the NaN-to-zero coercion both
+    runners apply would turn both into the origin -- a point equidistant from nothing, sitting in
+    every neighbour list as noise. A row with *any* non-finite entry counts as unusable, which is
+    the right reading for an embedding and stricter than the per-entry coercion a hand-crafted
+    feature with the odd zero-denominator ratio was written for.
+
+    One fused pass, no copy of the matrix (it is 2 GB on WildChat).
+    """
+    squared = np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64)
+    return np.isfinite(squared) & (squared > 0)
+
+
+def attach_topic_labels(frame: pd.DataFrame, data_dir,
+                        source: str) -> tuple[pd.DataFrame, np.ndarray]:
+    """``frame`` with its topic labels joined on ``doc_id``, and which documents have a usable one.
+
+    Usable means the labeller answered (``label_status`` is :data:`LABELED_STATUS`) and both free
+    text fields are non-empty. Both, whichever field a run embeds: requiring the same thing of
+    every representation is what puts the ``--topics`` runs of one corpus on one set of documents,
+    so their scores can be compared row for row. A document missing from the sidecar is a hard
+    error, for the reason a missing feature vector is one -- a stale sidecar would silently shrink
+    the collection.
+    """
+    path = Path(data_dir) / f"{source}_{TOPIC_SIDECAR}.parquet"
+    if not path.exists():
+        raise SystemExit(f"{path} not found -- label the split first with\n"
+                         f"  python -m prompt_anonymity.data.label_topics --source {source}")
+    labels = pd.read_parquet(path, columns=["doc_id", *TOPIC_LABEL_COLUMNS])
+    if not labels["doc_id"].is_unique:
+        raise SystemExit(f"{path} repeats a doc_id; the join to documents is one-to-one.")
+    labels = labels.set_index("doc_id").reindex(frame["doc_id"])
+    n_missing = int(labels["label_status"].isna().sum())
+    if n_missing:
+        raise SystemExit(f"{n_missing:,} of {len(frame):,} documents have no row in {path}; "
+                         f"re-run `python -m prompt_anonymity.data.label_topics --source {source}`.")
+    labelled = ((labels["label_status"] == LABELED_STATUS)
+                & labels["subject"].fillna("").str.strip().ne("")
+                & labels["description"].fillna("").str.strip().ne("")).to_numpy()
+    return (frame.assign(topic=labels["topic"].to_numpy(),
+                         topic_group=labels["topic_group"].to_numpy()),
+            labelled)
+
+
+def restrict_to_topic_labels(args: argparse.Namespace, frame: pd.DataFrame, embeddings: np.ndarray,
+                             known_embeddings: np.ndarray | None):
+    """``--topics``: drop every document with no usable topic label or vector, **before** the cut.
+
+    Before, unlike ``run_clustering.py --topics`` (which drops after its cut): here every known
+    configuration's boundaries are slices of the ordered corpus, read in many places, so the
+    restriction is applied to the corpus itself. The boundaries therefore move by at most the
+    number of documents dropped ahead of them (92 of 172,509 on WildChat, none on swe-chat), and
+    every ``--topics`` run of a corpus -- the full-conversation one included -- sees one set of
+    documents, which is what the comparison needs.
+    """
+    frame, labelled = attach_topic_labels(frame, args.data_dir, args.source)
+    keep = labelled & usable_rows(embeddings)
+    if known_embeddings is not None:
+        keep &= usable_rows(known_embeddings)
+    unpaired = int((labelled & ~keep).sum())
+    print(f"--topics: dropping {int((~labelled).sum()):,} of {len(frame):,} documents with no "
+          f"usable topic label" + (f", and {unpaired:,} more with no usable {args.feature} vector "
+                                   f"(this run's documents now differ from other --topics runs')"
+                                   if unpaired else ""))
+    rows = np.flatnonzero(keep)
+    frame = frame.iloc[rows].drop(columns=["topic", "topic_group"]).reset_index(drop=True)
+    return (frame, embeddings[rows],
+            None if known_embeddings is None else known_embeddings[rows])
+
+
 def load_documents_and_counts(data_dir, source: str, feature, undated: str = "drop",
                               model_owner: str = "all", language: str = "all",
                               defenses: tuple[str, ...] = ("none",)
@@ -732,7 +838,14 @@ def zscores(args: argparse.Namespace) -> bool:
     per-column z-score would divide each column by its own spread -- cancelling the IDF weights
     outright, since IDF *is* a per-column scale. Its scaling is part of the feature, so the run is
     still the default configuration and keeps the default directory name.
+
+    An :data:`AUTHOR_COLLECTION_FEATURES` entry (``luar_collection``) is never z-scored either:
+    LUAR's space is compared by raw cosine in the paper, and its known side is one vector per
+    *author*, so known-side column statistics would describe a different population from the
+    per-document unknown side they were applied to.
     """
+    if args.feature in AUTHOR_COLLECTION_FEATURES:
+        return False
     feature = KNOWN_SIDE_FEATURES.get(args.feature)
     return args.standardize and not getattr(feature, "already_scaled", False)
 
@@ -1698,7 +1811,7 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                tuning_cache: dict, languages: np.ndarray | None = None,
                background: np.ndarray | None = None,
                known_embeddings_source: np.ndarray | None = None,
-               known_side_feature=None):
+               known_side_feature=None, author_collections=None):
     """Run one (known configuration, attack) combination end to end: calibrate, attribute, score.
 
     Returns ``(scores, predictions, ood_sweep, headline, cmc, author_report, trials)`` -- a
@@ -1728,6 +1841,12 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     and nothing else -- and it is also what keeps the cost flat: one fit per window rather than
     one per language group, which is the difference between running and not running on a corpus
     with many distinct language sets.
+
+    ``author_collections`` (``--feature luar_collection``) is ``(collections, texts)``: the attack
+    is then fitted on **one vector per known author**, each author's recent known documents
+    embedded as a single LUAR collection, instead of on the known documents. Everything that
+    describes the known side -- its counts, the separability diagnostics, the language filter --
+    still reads the per-document vectors and labels.
     """
     known_frame, unknown_frame = frame.iloc[known], frame.iloc[unknown]
     # The two sides may come from DIFFERENT feature matrices. By default the known side is the
@@ -1775,8 +1894,13 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # Fit the attack on the known side (documents + labels, all of which the attacker holds) and
     # score every unknown document against every known author.
     factory = build_attack(attack, args, settings)
+    fit_embeddings, fit_labels = known_embeddings, known_labels
+    if author_collections is not None:
+        collections, texts = author_collections
+        fit_labels, fit_embeddings = collections.author_vectors(
+            texts[known], known_labels, args.cache_dir or cache_dir())
     if background is None:
-        fitted = factory().fit(known_embeddings, known_labels)
+        fitted = factory().fit(fit_embeddings, fit_labels)
         author_scores = fitted.score(unknown_embeddings)      # (n_unknown, n_known_authors)
         authors, out_of_set_logit = fitted.authors, None
     else:
@@ -1874,6 +1998,8 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
         # languages on the known side, and so was pruned out of their own document's pool. These
         # are unattributable by construction and count as errors everywhere below.
         "n_true_author_pruned": int((in_set & ~true_author_is_candidate).sum()),
+        **({} if author_collections is None
+           else {"collection_size": author_collections[0].collection_size}),
         "true_author_prune_rate": (float((~true_author_is_candidate)[in_set].mean())
                                    if in_set.any() else float("nan")),
         **language_stats,
@@ -2070,7 +2196,21 @@ def parse_args() -> argparse.Namespace:
                         help="Feature parquet to use, i.e. <split>_<feature>.parquet (default: "
                              "char_ngram_tfidf) -- or a feature fitted per known configuration, which "
                              "has no parquet and reads the document text instead: "
-                             + ", ".join(sorted(KNOWN_SIDE_FEATURES)) + ".")
+                             + ", ".join(sorted(KNOWN_SIDE_FEATURES)) + " -- or one whose known "
+                             "side is one vector per author, built from the known side's text "
+                             "per known configuration: "
+                             + ", ".join(sorted(AUTHOR_COLLECTION_FEATURES)) + ".")
+    parser.add_argument("--collection-size", type=int, default=None, metavar="N",
+                        help="For an author-collection feature (luar_collection): how many of "
+                             "each known author's most recent known documents, and excerpts, "
+                             "make up their collection (default: the feature's own, 16, the "
+                             "paper's test-time size). A non-default value is appended to the "
+                             "output directory as _coll<N>.")
+    parser.add_argument("--cache-dir", default=None,
+                        help="On-disk cache for author-collection vectors (luar_collection), "
+                             "regenerable (default: data/.cache, as for compute_features). Point "
+                             "it at node-local disk for a large corpus: one small file per "
+                             "collection is slow on a network filesystem.")
     parser.add_argument("--max-ngrams", type=int, default=None, metavar="N",
                         help="For a known-side feature (char_ngram_tfidf): how many n-grams each "
                              "known side keeps, by frequency on that known side (default: the "
@@ -2265,6 +2405,13 @@ def parse_args() -> argparse.Namespace:
                              "diagnostic's sampling.")
     parser.add_argument("--output-dir", default=None,
                         help="Where to write outputs (default: experiments/results/<tag>).")
+    parser.add_argument("--topics", action="store_true",
+                        help="Drop every document with no usable topic label (<source>_topics."
+                             "parquet: refused, or an empty subject/description) or no usable "
+                             "vector BEFORE the known/unknown cut, so every --topics run of a "
+                             "corpus covers one set of documents whatever its --feature. Required "
+                             "by the topic-label features (topics_<field>_<feature>). Appends "
+                             "`_topics` to the output directory.")
     args = parser.parse_args()
     if args.sweep_top_k not in args.top_ks:
         raise SystemExit(f"--sweep-top-k {args.sweep_top_k} is not among --top-ks {args.top_ks}; "
@@ -2298,6 +2445,25 @@ def parse_args() -> argparse.Namespace:
         # what the default one does (see `zscores`).
         if args.background != "none":
             raise SystemExit(f"--background is not supported with {args.feature}.")
+        if not args.standardize:
+            raise SystemExit(f"--no-standardize has no effect on {args.feature}, which is never "
+                             f"z-scored (see zscores); drop the flag.")
+    if args.collection_size is not None and args.feature not in AUTHOR_COLLECTION_FEATURES:
+        raise SystemExit(f"--collection-size applies only to "
+                         f"{', '.join(sorted(AUTHOR_COLLECTION_FEATURES))}.")
+    if args.feature in AUTHOR_COLLECTION_FEATURES:
+        # The known side is one vector per author. Every similarity attack then reduces to cosine
+        # against that vector, and a trainable one would be fitting one sample per class.
+        if args.attacks != ["cosine"]:
+            raise SystemExit(f"{args.feature} puts one vector per author on the known side, so it "
+                             f"runs with --attacks cosine only (got {' '.join(args.attacks)}).")
+        # The reject option calibrates by holding out *documents* of known authors, which a
+        # per-author known side does not have.
+        if args.ood != "none":
+            raise SystemExit(f"--ood {args.ood} is not supported with {args.feature}.")
+        if args.metric != "cosine":
+            raise SystemExit(f"{args.feature} is compared by cosine, its training metric; "
+                             f"--metric {args.metric} would only rename the run.")
         if not args.standardize:
             raise SystemExit(f"--no-standardize has no effect on {args.feature}, which is never "
                              f"z-scored (see zscores); drop the flag.")
@@ -2359,9 +2525,16 @@ def output_tag(args: argparse.Namespace) -> str:
     vocabulary = ("" if args.max_ngrams is None
                   or args.max_ngrams == known_side_feature().max_features
                   else f"_top{args.max_ngrams}")
-    return (f"{args.source}_{defense}_{args.feature}_{attacks}{vocabulary}{known_defense}"
+    # Likewise a different collection size is a different author representation.
+    collection_feature = AUTHOR_COLLECTION_FEATURES.get(args.feature)
+    collection = ("" if args.collection_size is None
+                  or args.collection_size == collection_feature().collection_size
+                  else f"_coll{args.collection_size}")
+    # The corpus minus its unlabelled documents is a different corpus (on WildChat), so last.
+    topics = f"_{TOPIC_SIDECAR}" if args.topics else ""
+    return (f"{args.source}_{defense}_{args.feature}_{attacks}{vocabulary}{collection}{known_defense}"
             f"{owner}{language}{language_aware}{background}{fractions}{held_out}{openset}"
-            f"{metric}{scaled}")
+            f"{metric}{scaled}{topics}")
 
 
 def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFrame,
@@ -2454,16 +2627,42 @@ def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFr
 def main() -> None:
     args = parse_args()
     known_side_feature = KNOWN_SIDE_FEATURES.get(args.feature)
+    collection_feature = AUTHOR_COLLECTION_FEATURES.get(args.feature)
+    if args.topics and (known_side_feature is not None or collection_feature is not None):
+        raise SystemExit(f"--topics needs a parquet-backed feature; {args.feature} is fitted from "
+                         f"text inside the run.")
+    if args.feature.startswith(f"{TOPIC_SIDECAR}_") and not args.topics:
+        raise SystemExit(f"--feature {args.feature} embeds the topic labels, which some documents "
+                         f"lack (their rows are NaN); pass --topics so they are dropped rather "
+                         f"than scored as zero vectors.")
     if known_side_feature is not None:
         known_side_feature = known_side_feature(**({} if args.max_ngrams is None
                                                     else {"max_features": args.max_ngrams}))
         run_experiment_grid(args, *load_counts(args, known_side_feature), known_side_feature)
         return
+    if collection_feature is not None:
+        collections = collection_feature(**({} if args.collection_size is None
+                                             else {"collection_size": args.collection_size}))
+        frame, embeddings = load_documents_and_features(
+            args.data_dir, args.source, collections.document_feature, args.undated,
+            args.model_owner, args.language, args.defense,
+        )
+        print(f"[{collections.name}] {collections.params()} | unknown side: the per-conversation "
+              f"{collections.document_feature} vectors; known side: one collection per author, "
+              f"built per known configuration from {args.known_defense} text")
+        run_experiment_grid(args, frame, embeddings,
+                            load_known_embeddings(args, frame, collections.document_feature),
+                            author_collections=(collections, load_collection_texts(args, frame)))
+        return
     frame, embeddings = load_documents_and_features(
         args.data_dir, args.source, args.feature, args.undated, args.model_owner, args.language,
         args.defense,
     )
-    run_experiment_grid(args, frame, embeddings, load_known_embeddings(args, frame))
+    known_embeddings = load_known_embeddings(args, frame)
+    if args.topics:
+        frame, embeddings, known_embeddings = restrict_to_topic_labels(
+            args, frame, embeddings, known_embeddings)
+    run_experiment_grid(args, frame, embeddings, known_embeddings)
 
 
 def load_counts(args: argparse.Namespace, feature) -> tuple[pd.DataFrame, object, object]:
@@ -2479,8 +2678,21 @@ def load_counts(args: argparse.Namespace, feature) -> tuple[pd.DataFrame, object
     return frame, counts[0], (counts[1] if len(counts) > 1 else None)
 
 
-def load_known_embeddings(args: argparse.Namespace, frame: pd.DataFrame):
-    """The known side's vectors when ``--known-defense`` differs from ``--defense``, else ``None``."""
+def load_collection_texts(args: argparse.Namespace, frame: pd.DataFrame) -> list[str]:
+    """The ``--known-defense`` text of every document any known configuration can hold, in
+    ``frame`` order -- the rows an author collection is built from. Stops at the last known end,
+    so the held-out test quarter's text is never read."""
+    stop = max(known.stop for _, known, _ in
+               known_configurations(len(frame), args.known_windows, args.test_fraction))
+    return load_document_texts(args.data_dir, args.source, args.known_defense,
+                               frame["doc_id"].iloc[:stop])
+
+
+def load_known_embeddings(args: argparse.Namespace, frame: pd.DataFrame, feature: str | None = None):
+    """The known side's vectors when ``--known-defense`` differs from ``--defense``, else ``None``.
+
+    ``feature`` names the parquet when it is not ``--feature`` itself (an author-collection
+    feature reads its per-document one)."""
     # The known side's vectors, when it is defended differently from the unknown side. Loaded as a
     # second matrix rather than spliced here, because which rows are "known" depends on the known
     # configuration and there are six of them. `load_documents_and_features` applies the same
@@ -2490,7 +2702,7 @@ def load_known_embeddings(args: argparse.Namespace, frame: pd.DataFrame):
     known_embeddings_source = None
     if args.known_defense != args.defense:
         known_frame, known_embeddings_source = load_documents_and_features(
-            args.data_dir, args.source, args.feature, args.undated, args.model_owner,
+            args.data_dir, args.source, feature or args.feature, args.undated, args.model_owner,
             args.language, args.known_defense,
         )
         if not known_frame["doc_id"].equals(frame["doc_id"]):
@@ -2503,8 +2715,11 @@ def load_known_embeddings(args: argparse.Namespace, frame: pd.DataFrame):
 
 
 def run_experiment_grid(args: argparse.Namespace, frame: pd.DataFrame, embeddings, known_embeddings_source,
-             known_side_feature=None) -> None:
-    """Everything after loading: every (known configuration, attack), each written as it finishes."""
+             known_side_feature=None, author_collections=None) -> None:
+    """Everything after loading: every (known configuration, attack), each written as it finishes.
+
+    ``author_collections`` is ``(LuarAuthorCollections, known texts)`` for an author-collection
+    feature (see :func:`run_window`), else ``None``."""
     n_features = (embeddings.shape[1] if known_side_feature is None
                   else known_side_feature.max_features)
     print(f"[{args.source}] {len(frame):,} documents x {n_features} {args.feature} features | "
@@ -2571,7 +2786,7 @@ def run_experiment_grid(args: argparse.Namespace, frame: pd.DataFrame, embedding
         for attack in args.attacks:
             outcome = run_window(frame, embeddings, config, attack, known, unknown,
                                  args, tuning_cache, languages, background,
-                                 known_embeddings_source, known_side_feature)
+                                 known_embeddings_source, known_side_feature, author_collections)
             scores, window_predictions, ood_sweep, headline, cmc, author_report, trials = outcome
             results.append(scores)
             cmcs.append(cmc)

@@ -13,6 +13,10 @@ with :mod:`~prompt_anonymity.data.sources_wildchat` / :mod:`~prompt_anonymity.da
 adapting one upstream corpus each, and :mod:`~prompt_anonymity.data.text_cleaning`,
 :mod:`~prompt_anonymity.data.identity`, :mod:`~prompt_anonymity.data.dedup` and
 :mod:`~prompt_anonymity.data.language_detection` implementing the shared stages.
+:mod:`~prompt_anonymity.data.label_topics` labels every conversation of a split with Chatterji et
+al.'s (2025) conversation topic and Asking/Doing/Expressing intent, plus a short subject, through
+Claude on Microsoft Foundry (paid), written beside the split as
+``data/dist/<split>_topics.parquet`` and joined back on ``doc_id``.
 :mod:`~prompt_anonymity.data.download` mirrors the published dataset back down, and
 :mod:`~prompt_anonymity.data.find_fragments` is a one-off study of identity fragmentation.
 

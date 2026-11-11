@@ -76,6 +76,19 @@ corpus or feature:
 * **Authorship-link ranking** (PAN's second subtask) -- AP, R-precision and P@10 over the graph's
   edges, which separates the quality of the similarity from the quality of the algorithm.
 
+``--topics``: what drives clusterability
+----------------------------------------
+Joins the topic labels (``prompt_anonymity.data.label_topics``) and asks how far topic alone gets
+the attacker, three ways on one set of documents: the partition the topic label implies (reference
+rows ``baseline_topic``, ``baseline_topic_group`` and ``baseline_topic_language``, the last
+because topic and language are confounded), the attack run on embeddings of the labeller's
+``subject`` / ``description`` (``--feature topics_subject_gemini_embedding_2`` and
+``topics_description_…``), and the attack on the full conversation (the usual feature, re-run with
+the flag). Documents without a usable label or vector are dropped **after** the 75:25 cut, never
+before it, so the slices are the unrestricted run's minus those documents and every ``--topics``
+run of a corpus covers the same ones -- which is what lets ``plot_results.py`` draw them as panels
+of one figure (``clustering/bcubed/by_feature/``).
+
 The reference partitions (baselines) have one implementation (:func:`run_baselines`) and this file
 has one definition of the split, so the diagnostics and the attack always agree on both.
 
@@ -86,6 +99,8 @@ Run (from the repo root)::
         --algorithms leiden hdbscan
     python experiments/run_clustering.py --source wildchat --diagnostics --algorithms  # no attack
     python experiments/run_clustering.py --source wildchat --scopes unseen   # only the strangers
+    python experiments/run_clustering.py --source swe_chat --topics \
+        --feature topics_subject_gemini_embedding_2       # topic-only representation
     sbatch scripts/run_clustering_slurm.sh --source wildchat --defense base --oracle-sweep
 
 Outputs, under ``experiments/clustering/<dataset>_<defense>_<feature>/``. The ``all`` scope keeps
@@ -169,7 +184,13 @@ from prompt_anonymity.evaluation.metrics.clustering import (  # noqa: E402
     singleton_baseline,
 )
 
-from run_experiment import load_documents_and_features, standardize  # noqa: E402
+from run_experiment import (  # noqa: E402
+    TOPIC_SIDECAR,
+    attach_topic_labels,
+    load_documents_and_features,
+    standardize,
+    usable_rows,
+)
 
 OUTPUT_ROOT = REPO_ROOT / "experiments" / "clustering"
 DATA_DIR = REPO_ROOT / "data" / "hf"
@@ -214,6 +235,18 @@ MAX_NEIGHBORS = 50
 #: Metadata partitions scored alongside the real attacks. Whatever these reach is available to an
 #: attacker who reads no text at all.
 METADATA_BASELINES = ("language_primary", "model_owner")
+
+#: Reference partitions ``--topics`` adds: name -> the columns whose combined value is one cluster.
+#: They are the "topic alone" arm of the clusterability question -- what an attacker reaches who
+#: reads nothing but a topic classifier's verdict -- scored through the same path as the metadata
+#: partitions above. ``topic_language`` is the conjunction, because topic and language are
+#: confounded in these corpora (the topic mix differs by language), so a gain from topic alone
+#: could be language under another name.
+TOPIC_BASELINES = {
+    "topic": ("topic",),
+    "topic_group": ("topic_group",),
+    "topic_language": ("topic", "language_primary"),
+}
 
 #: Author populations the collection is attacked over, in the order they are run and written. See
 #: the module docstring: ``all`` is the threat model and ``unseen`` is the validity check, they are
@@ -282,8 +315,9 @@ def variant_name(args) -> str:
     run spells with its attack, because it is the same kind of thing: the method, as opposed to
     the data it was pointed at.
 
-    The variant is the composition of the three axes that change what an edge score *means* --
-    ``--projection``, ``--rescoring`` and the elapsed-time fusion -- in pipeline order, or
+    The variant is the composition of the axes that change what an edge score *means* --
+    ``--projection``, ``--within-language`` (``lang``), ``--rescoring`` and the elapsed-time
+    fusion -- in pipeline order, or
     ``plain`` when none of them is set. ``--standardize`` and ``--known-defense`` are **not** part
     of it and stay trailing suffixes: they qualify a run rather than name a method, and a name
     whose fourth part could be any of a dozen combinations is not a positional slot.
@@ -295,6 +329,8 @@ def variant_name(args) -> str:
     parts = []
     if args.projection != "none":
         parts.append(args.projection)
+    if args.within_language:
+        parts.append("lang")
     if args.rescoring != "none":
         parts.append(args.rescoring)
     if args.tune_time_weight:
@@ -304,8 +340,14 @@ def variant_name(args) -> str:
     return "_".join(parts) or "plain"
 
 
-def scope_positions(authors: np.ndarray, scope: str) -> tuple[np.ndarray, np.ndarray]:
+def scope_positions(authors: np.ndarray, scope: str,
+                    keep: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """``(tuning, test)`` document positions for one author scope.
+
+    ``keep`` (``--topics``) drops documents **after** the cut, so the boundaries -- and therefore
+    which documents each slice could hold -- are exactly the unrestricted run's, and only the
+    excluded documents differ. An excluded document still counts as history for ``unseen``: the
+    attacker held it whether or not this representation can use it.
 
     ``all`` is the two slices whole. ``unseen`` keeps only the documents whose author the attacker
     holds no labelled history for **at that point on the timeline**: the test collection drops
@@ -328,6 +370,8 @@ def scope_positions(authors: np.ndarray, scope: str) -> tuple[np.ndarray, np.nda
     tuning_window, test_window = slice_bounds(len(authors))
     tuning = np.arange(tuning_window.start, tuning_window.stop)
     test = np.arange(test_window.start, test_window.stop)
+    if keep is not None:
+        tuning, test = tuning[keep[tuning]], test[keep[test]]
     if scope == "all":
         return tuning, test
     if scope != "unseen":
@@ -353,6 +397,35 @@ def take_rows(matrix: np.ndarray, positions: np.ndarray) -> np.ndarray:
 def score_partition(labels: np.ndarray, authors: np.ndarray) -> dict:
     """Every measure for one partition."""
     return clustering_summary(labels, authors)
+
+
+#: Squared weight of the one-hot language block ``--within-language`` appends to each unit vector.
+#: Two unit vectors' dot product lies in ``[-1, 1]``, so under cosine any squared weight above 2
+#: puts **every** same-language pair above **every** cross-language one: same-language cosine is
+#: ``(s + 3) / 4`` in ``[0.5, 1]``, cross-language ``s / 4`` in ``[-0.25, 0.25]``. 3 leaves that
+#: margin while compressing the within-language range no more than it must, and since the order
+#: within a language is untouched, the graph is exactly the per-language k-NN graph wherever a
+#: language has more than ``k`` documents.
+LANGUAGE_BLOCK_WEIGHT_SQUARED = 3.0
+
+
+def append_language_block(matrix: np.ndarray, languages: np.ndarray) -> np.ndarray:
+    """``matrix`` with each row unit-normalised and a weighted one-hot of its language appended.
+
+    The embedding counterpart of the ``topic_language`` reference partition: the representation
+    still decides which documents link, but only among documents in one language. Missing
+    languages form their own group, as in the metadata baselines. Written into one preallocated
+    float32 output, so the only extra memory is the result itself.
+    """
+    codes, values = pd.factorize(pd.Series(languages).astype("string").fillna("<missing>"))
+    n_rows, width = matrix.shape
+    out = np.zeros((n_rows, width + len(values)), dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    np.divide(matrix, np.where(norms > 0, norms, 1.0), out=out[:, :width])
+    out[np.arange(n_rows), width + codes] = np.sqrt(LANGUAGE_BLOCK_WEIGHT_SQUARED)
+    return out
+
+
 
 
 # --- diagnostics (--diagnostics): measure the problem, not the attack --------
@@ -697,7 +770,8 @@ class Collection:
 
 def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
                   seconds: np.ndarray | None, args,
-                  known_embeddings: np.ndarray | None = None
+                  known_embeddings: np.ndarray | None = None,
+                  keep: np.ndarray | None = None
                   ) -> tuple[Collection, Collection] | None:
     """Both collections for one scope, graphs built, time-fused and rescored -- or ``None``.
 
@@ -711,7 +785,7 @@ def prepare_scope(scope: str, frame: pd.DataFrame, embeddings: np.ndarray,
     searched over a correspondingly narrower ``neighbors`` grid -- printed, because it is a
     difference between the two runs that nothing else records.
     """
-    tuning_positions, test_positions = scope_positions(frame["author_id"].to_numpy(), scope)
+    tuning_positions, test_positions = scope_positions(frame["author_id"].to_numpy(), scope, keep)
     label = f"scope={scope}"
     if min(len(tuning_positions), len(test_positions)) < MIN_SCOPE_DOCUMENTS:
         print(f"  {label}: SKIPPED -- {len(test_positions):,} documents under attack and "
@@ -987,6 +1061,14 @@ def run_baselines(collection: Collection) -> list[dict]:
                                         metadata=frame[column].to_numpy()).cluster(graph)
             rows.append({"algorithm": f"baseline_{column}", "hyperparameters": "",
                          **score_partition(labels, authors)})
+    # Only present under --topics, which joins the label columns onto the frame.
+    for name, columns in TOPIC_BASELINES.items():
+        if all(column in frame.columns for column in columns):
+            combined = (frame[list(columns)].astype("string").fillna("<missing>")
+                        .agg("|".join, axis=1).to_numpy())
+            labels = BaselineClustering(kind="metadata", metadata=combined).cluster(graph)
+            rows.append({"algorithm": f"baseline_{name}", "hyperparameters": "",
+                         **score_partition(labels, authors)})
     return [{"scope": collection.scope, **row} for row in rows]
 
 
@@ -1081,6 +1163,25 @@ def parse_args() -> argparse.Namespace:
                              "tuning could have achieved. An oracle: never select on it.")
     parser.add_argument("--tune-limit", type=int, default=None,
                         help="Cap the grid, for smoke tests. Omit for the full search.")
+    parser.add_argument("--within-language", action="store_true",
+                        help="Restrict every neighbour list to documents in the same "
+                             "language_primary, by appending a weighted one-hot language block "
+                             "to each unit vector (LANGUAGE_BLOCK_WEIGHT_SQUARED) after any "
+                             "--standardize/--projection. Cross-author links across languages "
+                             "are lost with it. The embedding counterpart of the topic x "
+                             "language partition, for representations that carry no language "
+                             "of their own (the topic labels are written in English). Tags the "
+                             "variant `lang`.")
+    parser.add_argument("--topics", action="store_true",
+                        help="Join the topic labels (<source>_topics.parquet, from "
+                             "prompt_anonymity.data.label_topics) and score the partitions they "
+                             "imply as reference rows (baseline_topic, baseline_topic_group, "
+                             "baseline_topic_language). Documents with no usable label or no "
+                             "usable vector are dropped from both collections AFTER the 75:25 "
+                             "cut, so every --topics run of a corpus covers one set of documents "
+                             "whatever its --feature -- the comparison the topic-label features "
+                             "(topics_<field>_<feature>) exist for, and which they require. "
+                             "Appends `_topics` to the output directory.")
     return parser.parse_args()
 
 
@@ -1235,12 +1336,21 @@ def main() -> None:
     # it there.
     if args.standardize:
         tag = f"{tag}_zscore"
+    # Last, so a topic-restricted run is told apart from every other qualifier by its final part.
+    if args.topics:
+        tag = f"{tag}_{TOPIC_SIDECAR}"
+    elif args.feature.startswith(f"{TOPIC_SIDECAR}_"):
+        raise SystemExit(f"--feature {args.feature} embeds the topic labels, which some documents "
+                         f"lack (their rows are NaN); pass --topics so they are dropped rather than "
+                         f"clustered as zero vectors.")
     output_dir = args.output_dir or (OUTPUT_ROOT / tag)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame, embeddings = load_documents_and_features(
         args.data_dir, args.source, args.feature,
         defense="none" if args.defense == "base" else args.defense)
+    # Read before the coercion below, which would make an absent vector look like a real one.
+    usable = usable_rows(embeddings) if args.topics else None
     embeddings = np.nan_to_num(embeddings)
 
     # The attacker's own history, which by default is UNDEFENDED text. Nothing here enrols an
@@ -1257,9 +1367,30 @@ def main() -> None:
                 f"the known-side and test-side feature files do not cover the same documents in "
                 f"the same order ({len(known_frame):,} vs {len(frame):,} rows) -- one of them is "
                 f"stale; rebuild it with `compute_features --source {args.source} --defense ...`.")
+        if usable is not None:
+            usable &= usable_rows(known_embeddings)
         known_embeddings = np.nan_to_num(known_embeddings)
         print(f"  known side: {args.known_defense} ({known_embeddings.shape[0]:,} documents); "
               f"collection under attack: {args.defense}")
+
+    # Which documents every stage below may read. None keeps the whole corpus, as before --topics.
+    keep = None
+    if args.topics:
+        frame, labelled = attach_topic_labels(frame, args.data_dir, args.source)
+        keep = labelled & usable
+        print(f"  --topics: dropping {int((~labelled).sum()):,} of {len(frame):,} documents with no "
+              f"usable topic label, after the cut")
+        unpaired = int((labelled & ~usable).sum())
+        if unpaired:
+            # A labelled document whose vector is unusable is dropped from THIS representation
+            # only, which is the one way two --topics runs can end up on different documents.
+            print(f"  WARNING: {unpaired:,} labelled documents have no usable {args.feature} vector "
+                  f"and are dropped too -- this run's collections differ from other --topics runs' "
+                  f"by those documents")
+
+    def known_rows(stop: int):
+        """Rows ``[0, stop)`` a known-side fit may read: a slice, or the kept positions in it."""
+        return slice(0, stop) if keep is None else np.flatnonzero(keep[:stop])
 
     if args.standardize:
         # Known-side statistics, `[0, KNOWN_FRACTION)`, and NOT PROJECTION_FIT_FRACTION's first
@@ -1272,7 +1403,7 @@ def main() -> None:
         # is a view's worth of wasted work and is dropped. The public function is called rather
         # than the arithmetic inlined precisely because "what this project means by standardising"
         # is the thing under test.
-        known_side = slice(0, int(round(KNOWN_FRACTION * len(frame))))
+        known_side = known_rows(int(round(KNOWN_FRACTION * len(frame))))
         # Fitted on the KNOWN matrix (undefended by default) and applied to both, so the tuning
         # slice and the collection under attack end up in one space -- statistics differing
         # between them would make the two graphs incomparable before any algorithm ran.
@@ -1280,25 +1411,36 @@ def main() -> None:
         if known_embeddings is not embeddings:
             known_embeddings = standardize(statistics_source, known_embeddings)[1]
         embeddings = standardize(statistics_source, embeddings)[1]
-        print(f"  standardized on {known_side.stop:,} known-side documents "
+        print(f"  standardized on {len(statistics_source):,} known-side documents "
               f"({embeddings.shape[1]} columns)")
 
     if args.projection != "none":
-        fit_window = slice(0, int(round(PROJECTION_FIT_FRACTION * len(frame))))
+        fit_window = known_rows(int(round(PROJECTION_FIT_FRACTION * len(frame))))
+        fit_authors = frame["author_id"].to_numpy()[fit_window]
         started = time.perf_counter()
         # Fitted on the known matrix: a projection learned from defended history is not what an
         # attacker holding original text would have.
-        projection = fit_projection(args.projection, known_embeddings[fit_window],
-                                    frame["author_id"].to_numpy()[fit_window],
+        projection = fit_projection(args.projection, known_embeddings[fit_window], fit_authors,
                                     **projection_kwargs(args))
         # Whole-corpus transform, not per-window: the projection is fitted blind to which slice a
         # document falls in, and applying it once keeps the two graphs in the same space.
         if known_embeddings is not embeddings:
             known_embeddings = projection.transform(known_embeddings)
         embeddings = projection.transform(embeddings)
-        print(f"  projection {projection.name}: fitted on {fit_window.stop:,} documents "
-              f"({frame['author_id'].iloc[fit_window].nunique():,} authors), "
+        print(f"  projection {projection.name}: fitted on {len(fit_authors):,} documents "
+              f"({len(np.unique(fit_authors)):,} authors), "
               f"{embeddings.shape[1]} dimensions, {time.perf_counter() - started:.0f}s")
+
+    if args.within_language:
+        # Last of the vector transforms, so neither the z-score nor the projection ever sees the
+        # language block: it is a constraint on which edges the graph may hold, not a feature.
+        languages = frame["language_primary"].to_numpy()
+        shared = known_embeddings is embeddings
+        embeddings = append_language_block(embeddings, languages)
+        known_embeddings = (embeddings if shared
+                            else append_language_block(known_embeddings, languages))
+        print(f"  --within-language: neighbours restricted to the document's own language "
+              f"({frame['language_primary'].nunique(dropna=False)} languages)")
 
     print(tag)
     seconds = (elapsed_seconds(frame)
@@ -1306,7 +1448,8 @@ def main() -> None:
     # Deduplicated, order preserved: a repeated --scopes value would otherwise attack the same
     # collection twice and write two identical rows for it under one scope name.
     scopes = list(dict.fromkeys(args.scopes))
-    prepared = {scope: prepare_scope(scope, frame, embeddings, seconds, args, known_embeddings)
+    prepared = {scope: prepare_scope(scope, frame, embeddings, seconds, args, known_embeddings,
+                                     keep)
                 for scope in scopes}
     prepared = {scope: pair for scope, pair in prepared.items() if pair is not None}
     if not prepared:

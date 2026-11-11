@@ -281,6 +281,17 @@ FEATURES = (
     "harrier",
     "harrier_imperative",
     "harrier_plain",
+    # LUAR per conversation, and LUAR with each known author's history as one collection (see
+    # prompt_anonymity.features.luar). The second is its own feature because its known side is a
+    # different representation, though its unknown side is the first's vectors.
+    "luar",
+    "luar_collection",
+    # Gemini Embedding 2 of the topic labeller's free-text fields rather than of the conversation
+    # (prompt_anonymity.data.embed_topic_labels): `description` keeps the specifics, `subject` is
+    # the general topic. Only ever clustered under `run_clustering.py --topics`, whose runs the
+    # `bcubed/by_feature/` figure draws beside the full-conversation run.
+    "topics_description_gemini_embedding_2",
+    "topics_subject_gemini_embedding_2",
 )
 
 ATTACKS = (
@@ -362,6 +373,10 @@ FEATURE_LABELS = {
     "harrier": "Harrier 0.6B",
     "harrier_imperative": "Harrier 0.6B (imperative)",
     "harrier_plain": "Harrier 0.6B (plain)",
+    "luar": "LUAR",
+    "luar_collection": "LUAR (author collections)",
+    "topics_description_gemini_embedding_2": "Topic description (Gemini)",
+    "topics_subject_gemini_embedding_2": "Topic subject (Gemini)",
 }
 ATTACK_LABELS = {
     "nearest_neighbor": "Nearest neighbor",
@@ -479,6 +494,12 @@ FEATURE_DASHES = {
     "harrier": (2, 1.5),
     "harrier_imperative": (6, 3, 2, 3),
     "harrier_plain": (1, 2),
+    "luar": (9, 3),
+    "luar_collection": (9, 3, 1.5, 3),
+    # Never on a `by_attack` figure today (they are clustered, not attributed); registered so an
+    # attribution run of one would not fall back to solid and pass for Gemini.
+    "topics_description_gemini_embedding_2": (3, 1.5, 1, 1.5),
+    "topics_subject_gemini_embedding_2": (1, 1),
 }
 
 #: Every text size on every figure, in points -- named constants rather than scattered literals,
@@ -3308,8 +3329,12 @@ CLUSTERING_DRAWN_ALGORITHMS = ("hdbscan", "leiden", "connected", "componentwise_
 #: conversation, and on a corpus whose documents nearly all come from one provider that is the
 #: one-cluster partition under another name. `run_clustering.py` still computes it; nothing draws
 #: it.
+#:
+#: The two topic partitions exist only in ``run_clustering.py --topics`` runs, so they appear only
+#: on the ``by_feature`` figure those runs feed; ``baseline_topic_group`` is in the CSV and not
+#: drawn (it is the coarse cut of the same label, and always below ``baseline_topic`` here).
 CLUSTERING_BASELINES = ("baseline_singleton", "baseline_single_cluster", "baseline_random",
-                        "baseline_language_primary")
+                        "baseline_language_primary", "baseline_topic", "baseline_topic_language")
 
 #: The three baselines the precision/recall figure marks, which is a subset: the metadata
 #: partitions land in the same corner as ``single_cluster`` and would only crowd it.
@@ -3355,6 +3380,8 @@ CLUSTERING_LABELS = {
     "baseline_single_cluster": "One cluster",
     "baseline_random": "Random",
     "baseline_language_primary": "By language",
+    "baseline_topic": "By topic",
+    "baseline_topic_language": "By topic × lang.",
 }
 
 #: Opacity of a reference-partition bar. Solid grey would compete with the measured bars for
@@ -3402,7 +3429,14 @@ CLUSTERING_VARIANT_LABELS = {
     "local_scaling": "Local scaling",
     "mutual_knn": "Mutual k-NN",
     "shared_neighbors": "Shared neighbours",
+    # `--within-language`: neighbours only among documents of one language. Run so far only with
+    # `--topics`, where it is the embedding counterpart of the topic x language partition.
+    "lang": "Within language",
 }
+
+#: The variant ``--within-language`` writes; the ``bcubed/by_feature/`` figure draws it beside the
+#: plain runs as "<representation> + language".
+LANGUAGE_VARIANT = "lang"
 
 #: The variant every other clustering family draws: the pure-text run, whose directory is the
 #: four-part name with no method applied to the graph. The ``bcubed`` and ``precision_recall``
@@ -3430,6 +3464,9 @@ class ClusteringRun:
     defense: str
     feature: str
     variant: str
+    #: A trailing qualifier from :data:`CLUSTERING_QUALIFIERS`, or ``""``. A qualified run is a
+    #: different experiment on the same names, so every family filters on this before grouping.
+    qualifier: str
     directory: Path
 
     @property
@@ -3445,8 +3482,23 @@ class ClusteringRun:
         return FEATURE_LABELS[self.feature]
 
 
-def parse_clustering_run_name(name: str) -> tuple[str, str, str, str] | None:
-    """Split ``<dataset>_<defense>_<feature>_<variant>`` into its four parts, or ``None``.
+#: Trailing qualifiers ``run_clustering.py`` appends after the variant that this file *does* read,
+#: each into its own family rather than the comparable set. ``topics`` is ``--topics``: the run
+#: dropped the documents with no usable topic label, so on WildChat it covers a different
+#: collection from the unqualified run of the same feature and must never share a panel with it.
+#: Every other qualifier (``_zscore``, ``_quantile``, ``_knowndef-<defense>``) still fails to parse.
+CLUSTERING_QUALIFIERS = ("topics",)
+
+#: The qualifier whose runs the ``bcubed/by_feature/`` figure draws.
+TOPICS_QUALIFIER = "topics"
+
+
+def parse_clustering_run_name(name: str) -> tuple[str, str, str, str, str] | None:
+    """Split ``<dataset>_<defense>_<feature>_<variant>[_<qualifier>]`` into five parts, or ``None``.
+
+    The qualifier is one of :data:`CLUSTERING_QUALIFIERS` or ``""``, stripped before the rest is
+    matched, so ``swe_chat_base_gemini_embedding_2_plain_topics`` is the plain variant qualified
+    by ``topics`` rather than an unregistered variant called ``plain_topics``.
 
     :func:`parse_run_name` with a variant where the attack goes, and it cannot be split on ``_``
     for the same reason: every part may contain one. Each candidate defense is checked against the
@@ -3458,6 +3510,10 @@ def parse_clustering_run_name(name: str) -> tuple[str, str, str, str] | None:
     comparable set exactly as it did before -- those qualify a run rather than name a method, and
     ``run_clustering.py`` deliberately appends them after the variant.
     """
+    qualifier = next((candidate for candidate in CLUSTERING_QUALIFIERS
+                      if name.endswith(f"_{candidate}")), "")
+    if qualifier:
+        name = name[:-len(qualifier) - 1]
     for dataset in DATASETS:
         if not name.startswith(f"{dataset}_"):
             continue
@@ -3469,7 +3525,7 @@ def parse_clustering_run_name(name: str) -> tuple[str, str, str, str] | None:
             for feature in FEATURES:
                 if (tail.startswith(f"{feature}_")
                         and tail[len(feature) + 1:] in CLUSTERING_VARIANT_LABELS):
-                    return dataset, defense, feature, tail[len(feature) + 1:]
+                    return dataset, defense, feature, tail[len(feature) + 1:], qualifier
     return None
 
 
@@ -3490,7 +3546,7 @@ def discover_clustering_runs(clustering_dir: Path) -> list[ClusteringRun]:
         runs.append(ClusteringRun(*parsed, directory=directory))
     if skipped:
         print(f"skipped {len(skipped)} clustering director{'y' if len(skipped) == 1 else 'ies'} "
-              f"whose name is not <dataset>_<defense>_<feature>_<variant>: "
+              f"whose name is not <dataset>_<defense>_<feature>_<variant>[_<qualifier>]: "
               f"{', '.join(skipped)}")
     # Sorted so the variants figure's rows come out in vocabulary order whatever the filesystem
     # hands back, exactly as the old `discover_clustering_variants` did.
@@ -3608,26 +3664,89 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
     a defended run answers is how far its bars fall from the undefended panel's. ``runs`` is one
     feature's, which is what makes "one panel per defense" a well-defined statement.
     """
-    subdirectory = CLUSTERING_SCOPES[scope][0]
-    defenses = [run.defense for run in sorted(runs, key=lambda run: DEFENSE_SLOTS[run.defense])]
     tables = {run.defense: clustering_results(run, scope) for run in runs}
-    panels = [defense for defense in defenses if not tables[defense].empty]
+    panels = [(defense, DEFENSE_LABELS[defense], tables[defense])
+              for defense in sorted(tables, key=DEFENSE_SLOTS.__getitem__)
+              if not tables[defense].empty]
+    stem = output_dir / CLUSTERING_SCOPES[scope][0] / "bcubed" / "by_defense" / feature
+    return draw_clustering_bcubed(panels, "defense", stem)
+
+
+#: Panel headings on the ``bcubed/by_feature/`` figure. Every panel there is a Gemini Embedding 2
+#: vector, so the feature's own label would read the same three times: what differs is *which
+#: text* was embedded, and that is what the heading names. A feature without an entry falls back
+#: to :data:`FEATURE_LABELS`.
+BY_FEATURE_HEADINGS = {
+    "gemini_embedding_2": "Full conversation",
+    "topics_description_gemini_embedding_2": "Topic description",
+    "topics_subject_gemini_embedding_2": "Topic subject",
+}
+
+
+def plot_clustering_bcubed_by_feature(dataset: str, defense: str, runs: list[ClusteringRun],
+                                      output_dir: Path, scope: str = "all") -> list[Path]:
+    """The BCubed chart transposed: defense fixed, **one panel per representation**.
+
+    What drives clusterability, read three ways on one collection: the full conversation, the
+    topic labeller's ``description`` (specifics kept) and ``subject`` (general topic) -- each
+    clustered by the same algorithms -- with the partition the topic label alone implies as a
+    reference bar (``By topic``, and ``By topic × lang.`` because the two are confounded). The gap
+    between a ``subject`` bar and its full-conversation counterpart is what the text adds beyond
+    its topic; the gap between ``By topic`` and ``Singletons`` is what a bare category buys.
+
+    ``runs`` are one defense's ``--topics`` runs (:data:`TOPICS_QUALIFIER`), and only those: they
+    dropped the same unlabelled documents after the same cut, which is what makes the panels one
+    collection -- each panel's note prints its counts, and they must agree. A
+    :data:`LANGUAGE_VARIANT` run is its own panel, right after the plain run of its feature and
+    headed "+ language": the labels are written in English whatever the conversation's language,
+    so that panel is the label with the language put back.
+    """
+    variants = list(CLUSTERING_VARIANT_LABELS)
+    panels = []
+    for run in sorted(runs, key=lambda run: (FEATURES.index(run.feature),
+                                             variants.index(run.variant))):
+        table = clustering_results(run, scope)
+        if table.empty:
+            continue
+        heading = BY_FEATURE_HEADINGS.get(run.feature, FEATURE_LABELS[run.feature])
+        if run.variant == LANGUAGE_VARIANT:
+            panels.append((f"{run.feature}_{run.variant}", f"{heading} + language", table))
+        else:
+            panels.append((run.feature, heading, table))
+    stem = output_dir / CLUSTERING_SCOPES[scope][0] / "bcubed" / "by_feature" / defense
+    return draw_clustering_bcubed(panels, "feature", stem)
+
+
+#: Width of one BCubed panel, in inches, and the share of it each bar gets once a panel holds more
+#: bars than that width was set for (eight: four algorithms and four references). The ``--topics``
+#: runs carry two more reference bars, and at a fixed width their value labels -- already ~0.42 in
+#: wide against a ~0.36 in pitch -- would run into each other.
+BCUBED_PANEL_WIDTH = 3.9
+BCUBED_BAR_PITCH = BCUBED_PANEL_WIDTH / 8
+
+
+def draw_clustering_bcubed(panels: list[tuple[str, str, pd.DataFrame]], key: str,
+                           stem: Path) -> list[Path]:
+    """Draw ``(name, heading, table)`` panels as the BCubed bar chart and save it at ``stem``.
+
+    The one drawing routine behind both BCubed figures; they differ only in what a panel is (a
+    defense, or a representation), which ``key`` names in the companion CSV.
+    """
     if not panels:
         return []
-
-    figure, axes_list = plt.subplots(1, len(panels), figsize=(3.9 * len(panels), 4.4),
+    drawn = CLUSTERING_DRAWN_ALGORITHMS + CLUSTERING_BASELINES
+    widest = max(len(clustering_scores(table, drawn, "bcubed_f")) for _, _, table in panels)
+    panel_width = max(BCUBED_PANEL_WIDTH, BCUBED_BAR_PITCH * widest)
+    figure, axes_list = plt.subplots(1, len(panels), figsize=(panel_width * len(panels), 4.4),
                                      sharey=True, squeeze=False)
     figure.patch.set_facecolor(SURFACE)
-    rows = []
+    rows, value_labels = [], []
     # Over the bars that are actually drawn, not over the CSV: `clustering_results.csv` carries
     # rows nothing here draws (`baseline_model_owner`), and sizing the axis to a bar that is not
     # on it would leave dead space no reader could account for.
-    tallest = max(value for defense in panels
-                  for _, value in clustering_scores(
-                      tables[defense],
-                      CLUSTERING_DRAWN_ALGORITHMS + CLUSTERING_BASELINES, "bcubed_f"))
-    for axes, defense in zip(axes_list[0], panels):
-        table = tables[defense]
+    tallest = max(value for _, _, table in panels
+                  for _, value in clustering_scores(table, drawn, "bcubed_f"))
+    for axes, (name, heading, table) in zip(axes_list[0], panels):
         measured = clustering_scores(table, CLUSTERING_DRAWN_ALGORITHMS, "bcubed_f")
         reference = clustering_scores(table, CLUSTERING_BASELINES, "bcubed_f")
         # The two groups share one categorical axis with a gap between them, rather than two axes
@@ -3636,21 +3755,22 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
         positions = np.concatenate([
             np.arange(len(measured), dtype=float),
             np.arange(len(reference), dtype=float) + len(measured) + CLUSTERING_GROUP_GAP])
-        colors = ([clustering_style(name) for name, _ in measured]
+        colors = ([clustering_style(algorithm) for algorithm, _ in measured]
                   + [TEXT_MUTED] * len(reference))
         alphas = [1.0] * len(measured) + [CLUSTERING_BASELINE_ALPHA] * len(reference)
         values = [value for _, value in measured] + [value for _, value in reference]
+        caps = []
         for position, value, color, alpha in zip(positions, values, colors, alphas):
             axes.bar(position, value, width=0.68, color=color, alpha=alpha, zorder=3)
             # On the cap, in text ink rather than the bar's colour: the bar carries identity, the
             # number is text. Eight bars is few enough to label every one.
-            axes.text(position, value + 0.012, f"{value:.3f}", ha="center", va="bottom",
-                      fontsize=FONT_ANNOTATION, color=TEXT_SECONDARY)
+            caps.append(axes.text(position, value + 0.012, f"{value:.3f}", ha="center",
+                                  va="bottom", fontsize=FONT_ANNOTATION, color=TEXT_SECONDARY))
+        value_labels.append(caps)
 
-        style_axes(axes, "", "BCubed F" if defense == panels[0] else "",
-                   DEFENSE_LABELS[defense])
+        style_axes(axes, "", "BCubed F" if axes is axes_list[0][0] else "", heading)
         axes.set_xticks(positions)
-        axes.set_xticklabels([CLUSTERING_LABELS[name] for name, _ in measured + reference],
+        axes.set_xticklabels([CLUSTERING_LABELS[algorithm] for algorithm, _ in measured + reference],
                              rotation=30, ha="right", fontsize=FONT_TICK)
         axes.set_xlim(-0.7, positions[-1] + 0.7)
         # Headroom for the value labels on the caps, the panel note and the legend, which all
@@ -3664,11 +3784,16 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
         # in-set counts: BCubed's reference levels are functions of the collection's shape -- the
         # singleton baseline *is* the mean of 1/(documents by that author) -- so two panels are
         # only comparable at face value when they cover the same one.
+        #
+        # **Upper right**, which is free by construction: the measured bars stand on the left and
+        # the reference bars to their right are the short ones (each is a partition that links
+        # nothing or nearly everything). The default lower right is exactly where those reference
+        # bars stand, and the note printed across them.
         panel_note(axes, f"{int(table['n_documents'].iloc[0]):,} docs · "
-                         f"{int(table['n_authors'].iloc[0]):,} authors")
+                         f"{int(table['n_authors'].iloc[0]):,} authors", corner="upper right")
         rows.append(pd.DataFrame({
-            "defense": defense,
-            "algorithm": [name for name, _ in measured + reference],
+            key: name,
+            "algorithm": [algorithm for algorithm, _ in measured + reference],
             "bcubed_f": values,
             "is_reference": [False] * len(measured) + [True] * len(reference)}))
 
@@ -3686,11 +3811,56 @@ def plot_clustering_bcubed(dataset: str, feature: str, runs: list[ClusteringRun]
                   ["Reference partition"], loc="lower center", bbox_to_anchor=(0.5, 0.005),
                   frameon=False, fontsize=FONT_LEGEND, labelcolor=TEXT_PRIMARY)
     figure.tight_layout(rect=(0, 0.5 / figure.get_size_inches()[1], 1, 1))
+    # After the layout, because the stagger measures the labels in display units.
+    stagger_value_labels(figure, value_labels)
 
-    stem = output_dir / subdirectory / "bcubed" / "by_defense" / feature
     stem.parent.mkdir(parents=True, exist_ok=True)
     pd.concat(rows, ignore_index=True).to_csv(stem.parent / f"{stem.name}.csv", index=False)
     return [save_figure(figure, stem)]
+
+
+#: Clearance between two bar-cap value labels the stagger stacks, in points.
+VALUE_LABEL_STACK_PAD = 1.0
+
+
+def stagger_value_labels(figure, panels: list[list]) -> None:
+    """Raise any bar-cap value label that prints into its left neighbour's, by the overlap alone.
+
+    ``panels`` is each panel's labels, left to right. At :data:`FONT_ANNOTATION` a label like
+    ``0.458`` is ~0.42 in wide against a bar pitch of ~0.36 in, so two **adjacent bars of similar
+    height** printed their numbers into one another (``0.2080.205``) -- arithmetic, not bad luck,
+    and the BCubed chart's one known layout residue until this. Each label is measured where it
+    was drawn and, only when it overlaps the label before it, lifted by exactly the overlap plus
+    :data:`VALUE_LABEL_STACK_PAD`: never sideways, so a number stays over its own bar, and a label
+    with room keeps the position every label had before.
+
+    A lift that would carry a label above the axes raises the shared y limit instead, and the pass
+    is redone from the original positions, since a new limit moves every data-anchored label.
+    """
+    renderer = figure.canvas.get_renderer()
+    pad = VALUE_LABEL_STACK_PAD * figure.dpi / 72
+    nominal = [[label.get_position()[1] for label in labels] for labels in panels]
+    for _ in range(3):
+        for labels, heights in zip(panels, nominal):
+            for label, height in zip(labels, heights):
+                label.set_y(height)
+            for previous, label in zip(labels, labels[1:]):
+                box = label.get_window_extent(renderer)
+                prior = previous.get_window_extent(renderer)
+                if box.x0 < prior.x1 and box.y0 < prior.y1 and box.y1 > prior.y0:
+                    to_data = label.axes.transData
+                    x, y = to_data.transform(label.get_position())
+                    label.set_y(to_data.inverted().transform((x, y + prior.y1 + pad - box.y0))[1])
+        overshoot = [label.get_window_extent(renderer).y1 - label.axes.bbox.y1
+                     for labels in panels for label in labels]
+        if not overshoot or max(overshoot) <= 0:
+            return
+        axes = panels[0][0].axes
+        bottom, top = axes.get_ylim()
+        # Grow by the worst overshoot in data units, plus a label's worth of slack; `sharey`
+        # carries it to every panel.
+        per_pixel = (top - bottom) / axes.bbox.height
+        axes.set_ylim(bottom, top + (max(overshoot) + 2 * pad) * per_pixel)
 
 
 #: The variant whose points are drawn *beside* the pure-text ones on the timing figure, and the
@@ -4663,6 +4833,31 @@ def clustering_figure_plan(dataset: str, runs: list[ClusteringRun], output_dir: 
     return plan
 
 
+def topic_clustering_figure_plan(dataset: str, runs: list[ClusteringRun],
+                                 output_dir: Path) -> list[PlannedFigure]:
+    """The ``--topics`` runs' one family: ``bcubed/by_feature/<defense>``, per defense and scope.
+
+    Planned on :func:`clustering_figure_plan`'s terms (``builds=()``, ``reads_context=False``,
+    once per author scope) but kept apart from it, because these runs must never meet the
+    unqualified ones and a corpus can have either set without the other.
+    """
+    by_defense: dict[str, list[ClusteringRun]] = defaultdict(list)
+    for run in runs:
+        by_defense[run.defense].append(run)
+    plan = []
+    for scope in CLUSTERING_SCOPES:
+        prefix = clustering_prefix(dataset, scope)
+        for defense in sorted(by_defense, key=DEFENSE_SLOTS.__getitem__):
+            members = by_defense[defense]
+            plan.append(PlannedFigure(
+                f"{prefix}/bcubed/by_feature/{defense}", tuple(members),
+                lambda ctx, defense=defense, members=members, scope=scope:
+                (plot_clustering_bcubed_by_feature,
+                 (dataset, defense, members, output_dir, scope), {}),
+                builds=(), reads_context=False))
+    return plan
+
+
 def main() -> None:
     args = parse_args()
     global WRITE_PNG
@@ -4702,11 +4897,17 @@ def main() -> None:
     # every other clustering family draws, and the rest -- a learned projection, a rescoring, a
     # timing fusion -- get the variants family, where the strategy is the axis rather than a
     # contaminant on a panel keyed by defense.
-    all_clustering = [run for run in discover_clustering_runs(CLUSTERING_DIR)
-                      if run.feature in features]
+    discovered = [run for run in discover_clustering_runs(CLUSTERING_DIR)
+                  if run.feature in features]
+    # A qualified run is a different experiment under the same names, so it joins only its own
+    # family: the `--topics` runs dropped the unlabelled documents, and on a panel keyed by defense
+    # beside the unqualified run of the same feature they would be two collections drawn as one.
+    topic_runs = [run for run in discovered if run.qualifier == TOPICS_QUALIFIER
+                  and run.variant in (PLAIN_VARIANT, LANGUAGE_VARIANT)]
+    all_clustering = [run for run in discovered if not run.qualifier]
     clustering = [run for run in all_clustering if run.variant == PLAIN_VARIANT]
     variants = [run for run in all_clustering if run.variant != PLAIN_VARIANT]
-    if not runs and not all_clustering:
+    if not runs and not all_clustering and not topic_runs:
         raise SystemExit(
             f"no runs named <dataset>_<defense>_<feature>_<attack> under {RESULTS_DIR}"
             f"{' for the selected attacks' if held_back else ''}, and none named "
@@ -4740,6 +4941,9 @@ def main() -> None:
                 dataset, clustering_by_dataset[dataset], PLOTS_DIR / dataset / "clustering",
                 timing=[run for run in variants
                         if run.dataset == dataset and run.variant == TIMING_VARIANT])
+        plan += topic_clustering_figure_plan(
+            dataset, [run for run in topic_runs if run.dataset == dataset],
+            PLOTS_DIR / dataset / "clustering")
         for defense in DEFENSES:
             members = variants_by_defense.get((dataset, defense))
             if not members:

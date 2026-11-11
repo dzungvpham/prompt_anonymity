@@ -218,7 +218,12 @@ DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
 #: ``char_ngram_tfidf`` is here for collision seeding specifically: character n-grams are the
 #: channel its markers live in (spelling, punctuation, casing), so it is where the effect should be
 #: largest, while ``gemini_embedding_2`` is semantic and should barely move.
-FEATURES = ("char_ngram_tfidf", "gemini_embedding_2")
+#:
+#: ``luar`` (per-conversation LUAR, ``prompt_anonymity.features.luar``) is opt-in through
+#: ``--features``, not in either default. Its author-collection form, ``luar_collection``, is not a
+#: launcher feature at all: it runs ``cosine`` only, which is not in :data:`ATTACKS`, and needs the
+#: checkpoint at run time.
+FEATURES = ("char_ngram_tfidf", "gemini_embedding_2", "luar")
 
 #: Features the attribution grid uses when ``--features`` is not given (``char_ngram_tfidf`` is the
 #: style feature).

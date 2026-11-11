@@ -182,6 +182,12 @@ class TransformCache:
         except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
             return None  # treat a corrupt/partial entry as a miss and recompute
 
+    def get(self, key: str):
+        """The output cached under ``key`` -- the string ``key(item)`` returns in the apply
+        methods -- or ``None`` on a miss. Read-only: computes and writes nothing, which is what a
+        dry run needs to count what a real run would still have to pay for."""
+        return self._read(self._entry_path(key))
+
     def apply(self, items, transform, *, key=str) -> list:
         """Return ``[transform(item) for item in items]``, computing only the items not
         already cached and persisting new outputs.
@@ -291,7 +297,7 @@ class TransformCache:
         return keys, cached, missing_keys, missing_items
 
     def apply_streaming(self, items, stream_transform, *, key=str, flush_every=1,
-                        on_progress=None) -> list:
+                        on_progress=None, persist=None) -> list:
         """Like :meth:`apply_batch`, but **persists results as they arrive** rather than at the end.
 
         Use this for a long run of independently expensive items (hours of GPU work, many paid
@@ -320,6 +326,11 @@ class TransformCache:
         on_progress : callable or None
             Called as ``on_progress(done, total)`` after each flush, counting *distinct missing
             items* -- otherwise there is no way to tell a slow job from a hung one.
+        persist : callable or None
+            Called on each output; one it returns ``False`` for is returned but **not written**, so
+            the next run computes it again. For a failure worth recording in this run's result but
+            not worth keeping, such as a request the service rejected without billing it.
+            ``None`` (default) persists everything.
 
         Notes
         -----
@@ -337,7 +348,8 @@ class TransformCache:
 
             def flush():
                 for k, output in pending:
-                    _atomic_write_json(self._entry_path(k), {"key": k, "output": output})
+                    if persist is None or persist(output):
+                        _atomic_write_json(self._entry_path(k), {"key": k, "output": output})
                 pending.clear()
                 if on_progress is not None:
                     on_progress(done, len(missing_items))
