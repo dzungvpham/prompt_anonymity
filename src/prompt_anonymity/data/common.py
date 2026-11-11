@@ -13,18 +13,28 @@ def model_owner(model: str | None) -> str:
     Anonymized codenames, ``<synthetic>``, ``None``, or missing -> ``"unknown"``.
     (Adapted from the original ``swe-chat/preprocess.py``; WildChat's two gpt models both
     resolve to ``OpenAI``.)
+
+    VisionArena added the API-only vendors it serves: ``chatgpt-*`` -> ``OpenAI``, ``reka-*`` ->
+    ``Reka``, ``yi-vision`` -> ``01.AI``. Its **open-weight** models (Llama, Qwen, InternVL, LLaVA,
+    Pixtral, Phi, Molmo, MiniCPM, CogVLM) stay ``"unknown"`` on purpose: the arena hosts those
+    itself, so the model's vendor never observes the prompt, and naming it would break this
+    column's meaning. No model of the other three splits matches the added prefixes.
     """
     if not isinstance(model, str) or not model or model.lower() in {"none", "nan", "<no_model>"}:
         return "unknown"
     m = model.lower()
     if m.startswith("claude"):
         return "Anthropic"
-    if m.startswith("gpt") or "codex" in m:
+    if m.startswith(("gpt", "chatgpt")) or "codex" in m:
         return "OpenAI"
     if m.startswith("gemini"):
         return "Google"
     if m.startswith("glm"):
         return "Zhipu"
+    if m.startswith("reka"):
+        return "Reka"
+    if m.startswith("yi-vision"):
+        return "01.AI"
     return "unknown"
 
 

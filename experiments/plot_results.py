@@ -218,7 +218,7 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 #: part of a results directory. The plots directory follows: ``plots/swe_chat/``. (Only the
 #: ``source`` *column* inside the parquets differs, still ``swe-chat`` -- it is hashed into every
 #: ``author_id``, so it is data rather than a name. Nothing here reads it.)
-DATASETS = ("wildchat", "swe_chat", "wildchat_small", "wildchat_tiny")
+DATASETS = ("wildchat", "swe_chat", "wildchat_small", "wildchat_tiny", "vision_arena")
 
 #: How an undefended run spells its defense. Written out rather than omitted so that every
 #: directory name has the same four parts and can be parsed positionally.
@@ -292,6 +292,9 @@ FEATURES = (
     # `bcubed/by_feature/` figure draws beside the full-conversation run.
     "topics_description_gemini_embedding_2",
     "topics_subject_gemini_embedding_2",
+    # Cohere Embed v5 Pro of VisionArena's *images* (prompt_anonymity.data.embed_vision_arena_images):
+    # the image channel of the multimodal split, on no other corpus.
+    "cohere_embed_v5_pro_image",
 )
 
 ATTACKS = (
@@ -317,7 +320,8 @@ DATASET_LABELS = {"wildchat": "WildChat", "swe_chat": "SWE-chat",
                   # The 40-author cut. The author count is IN the label because it is the pool the
                   # attack chooses between, and every absolute number on a figure drawn from it is
                   # conditional on that pool size -- see build_subset --n-authors.
-                  "wildchat_tiny": "WildChat (40 authors)"}
+                  "wildchat_tiny": "WildChat (40 authors)",
+                  "vision_arena": "VisionArena"}
 DEFENSE_LABELS = {
     NO_DEFENSE: "No defense",
     "styleremix": "StyleRemix",
@@ -377,6 +381,7 @@ FEATURE_LABELS = {
     "luar_collection": "LUAR (author collections)",
     "topics_description_gemini_embedding_2": "Topic description (Gemini)",
     "topics_subject_gemini_embedding_2": "Topic subject (Gemini)",
+    "cohere_embed_v5_pro_image": "Cohere Embed v5 Pro (image)",
 }
 ATTACK_LABELS = {
     "nearest_neighbor": "Nearest neighbor",
@@ -500,6 +505,7 @@ FEATURE_DASHES = {
     # attribution run of one would not fall back to solid and pass for Gemini.
     "topics_description_gemini_embedding_2": (3, 1.5, 1, 1.5),
     "topics_subject_gemini_embedding_2": (1, 1),
+    "cohere_embed_v5_pro_image": (8, 2),
 }
 
 #: Every text size on every figure, in points -- named constants rather than scattered literals,

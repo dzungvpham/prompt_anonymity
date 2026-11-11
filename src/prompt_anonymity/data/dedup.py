@@ -22,6 +22,12 @@ the exact-duplicate step. SWE-chat runs this way: it strips injected non-human t
 the *turn* level (see ``sources_swe_chat.py``) rather than dropping a whole conversation just
 because it shares a templated opening/closing, so only step 1 applies to it. WildChat keeps
 all three steps (its cross-author templating is heavy and not template-stripped per turn).
+
+Two further knobs exist for a **multimodal** source (VisionArena), where a document is a prompt
+*and* an image: ``extra_exact_cols`` widens step 1's key beyond the text (the same prompt about a
+different image is a different document), and ``max_per_affix=None`` skips step 3 (a repeated
+opening on a new image is a new document, not an inflated template). Both default to the
+text-only behaviour, so the other sources are unaffected.
 """
 
 from __future__ import annotations
@@ -44,8 +50,9 @@ def deduplicate(
     text_col: str = "text",
     order_cols: tuple[str, ...] = ("identity", "timestamp", "doc_id"),
     affix_len: int = MIN_AFFIX_LEN,
-    max_per_affix: int = MAX_PER_AFFIX,
+    max_per_affix: int | None = MAX_PER_AFFIX,
     affix_dedup: bool = True,
+    extra_exact_cols: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     """Return ``frame`` with exact, cross-identity boilerplate, and capped affix duplicates removed.
 
@@ -57,11 +64,15 @@ def deduplicate(
     steps (2 cross-identity boilerplate, 3 within-identity cap) are skipped, so no document is
     dropped merely for sharing a leading/trailing slice. SWE-chat uses this (it strips injected
     templates per turn instead); WildChat keeps the default ``True``.
+
+    ``extra_exact_cols`` adds columns to step 1's duplicate key, so two documents collapse only
+    when their text *and* those columns match (VisionArena passes its ``image_name``).
+    ``max_per_affix=None`` runs step 2 but skips step 3.
     """
     data = frame.sort_values(list(order_cols)).reset_index(drop=True)
 
     # Step 1: within-identity exact duplicates -> keep earliest.
-    data = data.drop_duplicates([identity_col, text_col], keep="first").reset_index(drop=True)
+    data = data.drop_duplicates([identity_col, text_col, *extra_exact_cols], keep="first").reset_index(drop=True)
 
     if not affix_dedup:  # exact-dedup only; skip the affix-based steps below
         return data
@@ -82,6 +93,8 @@ def deduplicate(
         shared.loc[present] = (n_ids >= 2).to_numpy()
         drop |= shared
     data = data[~drop].reset_index(drop=True)
+    if max_per_affix is None:  # step 3 disabled (multimodal sources)
+        return data
 
     # Step 3: within-identity affix cap -> keep the max_per_affix earliest per (identity, affix).
     # `data` is still in `order_cols` order here, so cumcount ranks each group chronologically and

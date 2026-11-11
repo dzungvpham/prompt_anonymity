@@ -329,7 +329,12 @@ NO_DEFENSE_TAG = "base"
 #:
 #: ``wildchat_small`` is the seeded subset :mod:`prompt_anonymity.data.build_subset` cuts out of
 #: ``wildchat``, with the same schema and author-keyed structure, sized for quicker iteration.
-SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat")
+#:
+#: ``vision_arena`` is the multimodal split, **local-only** (its license forbids redistribution):
+#: it lives in ``data/dist``, never in :data:`DATA_DIR` (``download`` prunes every file the Hub
+#: does not hold), so run it with ``--data-dir data/dist``. Its extra image columns are not read
+#: here -- :data:`DOCUMENT_COLUMNS` is the same five.
+SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "vision_arena")
 
 # The extra class: "this document's author is not among the known authors". Not a valid
 # author_id (those are ``<source>-<16 hex>``), so it can never collide with a real one.

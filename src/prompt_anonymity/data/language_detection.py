@@ -29,9 +29,21 @@ label is trusted, so instead of the re-detection above, :func:`add_secondary_lan
 primary vocabulary (which keeps rare confusable languages from stealing short spans) -- with a
 guard requiring the primary to itself be present in the text, so an upstream mislabel yields no
 secondary rather than a spurious one.
+
+**A third policy: re-detected primary over the observed vocabulary (VisionArena).** VisionArena's
+upstream labels agree with Lingua 97.2% of the time where Lingua decides, but the misses are
+systematic rather than noise -- upstream ``Bulgarian`` is Lingua ``Russian`` on 60 of 69 decided
+documents and ``Serbian`` on 123 of 128 -- and 2.9% are ``unknown``. Most of its texts are very
+short (median 46 characters), where Lingua's uniform-prior confidences let a rare confusable win.
+So :func:`resolve_languages_observed` scores Lingua over the corpus's *own* label vocabulary,
+takes a confident detection as is, keeps the upstream label where an unconfident Lingua agrees with
+it, and lets a corpus prior (estimated from the confident detections) break a disagreement --
+confining the prior to that step is what stops it overriding genuine minority languages. The script-first path above is not used for it: it was built for code-heavy text and
+agreed with upstream less (95.8%).
 """
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -65,6 +77,10 @@ DEFAULT_LANGUAGE = "English"     # primary label for a document neither the dete
 WILDCHAT_SECONDARY_MIN_CONFIDENCE = 0.30  # a non-primary language needs this confidence to be a secondary
 WILDCHAT_PRIMARY_MIN_PRESENCE = 0.05      # the primary must clear this, else the doc is an upstream mislabel
 WILDCHAT_DETECT_CAP = 5000                # detect on at most this many chars of stripped prose (runtime bound)
+
+# Corpus-prior-weighted re-detection (VisionArena; see the module docstring).
+OBSERVED_PRIMARY_MIN_CONFIDENCE = 0.50    # Lingua confidence (or posterior) that decides a primary
+OBSERVED_SECONDARY_MIN_POSTERIOR = 0.30   # posterior a second language needs (WildChat's secondary threshold)
 
 # Scaffolding removed before detecting: fenced code, inline code, scrubbing placeholders,
 # /slash-commands, and @path / @mention refs -- none of it is natural-language prose, and its
@@ -273,6 +289,101 @@ def detect_secondary_language(
             continue
         return name if c.value >= threshold else None
     return None
+
+
+def resolve_languages_observed(
+    frame: pd.DataFrame, *, min_confidence: float = OBSERVED_PRIMARY_MIN_CONFIDENCE,
+    secondary_min_posterior: float = OBSERVED_SECONDARY_MIN_POSTERIOR,
+    cap: int = WILDCHAT_DETECT_CAP,
+) -> tuple[pd.DataFrame, dict]:
+    """Add ``language_primary`` / ``language_secondary`` by re-detecting with Lingua (VisionArena policy).
+
+    Lingua scores each document over the corpus's own upstream label vocabulary
+    (:func:`observed_language_detector`), on the scaffolding-stripped prose (at most ``cap``
+    chars). The primary is then decided in this order -- the step that decides is counted:
+
+    1. **confident** -- Lingua's top-1 when its confidence clears ``min_confidence``, taken as is.
+    2. **agree** -- otherwise, the upstream label when Lingua's (unconfident) top-1 is the same
+       language: two detectors agreeing on a short text.
+    3. **prior** -- otherwise (they disagree, or upstream has no label), Lingua's confidences
+       weighted by a **corpus prior** and renormalised, if the top posterior clears
+       ``min_confidence``. The prior is each language's share of the step-1 documents, add-one
+       smoothed. Lingua's confidences are likelihoods under a uniform prior, which is what lets a
+       rare confusable take a short text from a common language: upstream ``Bulgarian`` documents
+       Lingua cannot decide are a median 4 characters long and Lingua's top-1 on them is
+       ``Russian`` 97% of the time.
+    4. **fallback** -- otherwise the upstream label; **default** -- otherwise
+       :data:`DEFAULT_LANGUAGE`, so the primary is **never null**.
+
+    The prior is confined to step 3 on purpose: applied to every document, it overrode 0.9% of
+    confident detections and turned 38% of upstream-French documents into English (``"typer le
+    texte dans l'image"`` among them). Confined, upstream French stays French 94.5% of the time,
+    German 98%, Spanish 96%, while upstream Bulgarian goes to Russian 95.7%; 7.6% of primaries
+    differ from upstream overall (measured on all 171,457 uploaded-image conversations).
+
+    The **secondary** is set only for a primary decided in steps 1-3: the most probable other
+    language by posterior, when that clears ``secondary_min_posterior`` (WildChat's secondary
+    threshold, on posteriors so a rare confusable cannot take a span of a common language). A
+    fallback or default primary gets none.
+
+    Detection runs on Lingua's own thread pool, sized to the CPUs this job may use
+    (``RAYON_NUM_THREADS``, unless already set) rather than to the machine. Returns
+    ``(new_frame, stats)``: ``n_lingua`` (steps 1-3), ``n_fallback`` and ``n_default`` as
+    :func:`resolve_document_languages` reports them, plus ``n_confident`` / ``n_agree`` /
+    ``n_prior`` and ``n_secondary``.
+    """
+    from collections import Counter
+
+    from prompt_anonymity.resources import available_cpus
+
+    os.environ.setdefault("RAYON_NUM_THREADS", str(available_cpus()))
+    upstream = [ls[0] if len(ls) else None for ls in frame["languages"]]
+    detector = observed_language_detector(pd.Series([u for u in upstream if u]))
+    texts = [strip_for_detection("\n".join(turns))[:cap] for turns in frame["turns"]]
+    raw = (detector.compute_language_confidence_values_in_parallel(texts)
+           if detector is not None else [[] for _ in texts])
+    raw = [{c.language.name.title(): c.value for c in conf} if len(text) >= MIN_CHARS else {}
+           for text, conf in zip(texts, raw)]
+
+    vocabulary = sorted({name for conf in raw for name in conf})
+    confident = Counter(max(conf, key=conf.get) for conf in raw if conf and max(conf.values()) >= min_confidence)
+    total = sum(confident.values()) + len(vocabulary)
+    prior = {name: (confident[name] + 1) / total for name in vocabulary}
+
+    primaries: list[str] = []
+    secondaries: list[str | None] = []
+    steps = Counter()
+    for up, conf in zip(upstream, raw):
+        primary = None
+        if conf:
+            weighted = {name: value * prior[name] for name, value in conf.items()}
+            norm = sum(weighted.values())
+            posterior = {name: v / norm for name, v in weighted.items()} if norm > 0 else {}
+            top = max(conf, key=conf.get)
+            if conf[top] >= min_confidence:
+                primary, step = top, "confident"
+            elif up == top:
+                primary, step = up, "agree"
+            elif posterior and max(posterior.values()) >= min_confidence:
+                primary, step = max(posterior, key=posterior.get), "prior"
+        if primary is not None:
+            others = [(v, name) for name, v in posterior.items() if name != primary]
+            best = max(others) if others else (0.0, None)
+            secondaries.append(best[1] if best[0] >= secondary_min_posterior else None)
+        else:
+            primary, step = (up, "fallback") if up else (DEFAULT_LANGUAGE, "default")
+            secondaries.append(None)
+        primaries.append(primary)
+        steps[step] += 1
+
+    frame = frame.copy()
+    frame["language_primary"] = primaries
+    frame["language_secondary"] = pd.Series(secondaries, index=frame.index, dtype=object)
+    stats = {"n_docs": len(frame), "n_lingua": steps["confident"] + steps["agree"] + steps["prior"],
+             "n_fallback": steps["fallback"], "n_default": steps["default"],
+             "n_confident": steps["confident"], "n_agree": steps["agree"], "n_prior": steps["prior"],
+             "n_secondary": sum(x is not None for x in secondaries)}
+    return frame, stats
 
 
 def add_secondary_languages(

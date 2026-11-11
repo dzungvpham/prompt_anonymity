@@ -23,6 +23,17 @@ That makes it useless as a labeled side of a linkage experiment and exactly righ
 **out-of-set documents** for the open-set attacks -- traffic whose author is, by construction, on
 nobody's known side.
 
+**VisionArena is local-only and multimodal** (:data:`LOCAL_ONLY_SOURCES`; its license forbids
+redistribution, so it is never published and is not built by default). Each document is a prompt
+*and* one image, and the split carries extra columns -- the image's upstream name and location, its
+header (size, colour profile), the merged-identity count and the upstream category flags
+(:mod:`~prompt_anonymity.data.sources_vision_arena`). Its source-specific stages: stock-image
+conversations dropped and split identities merged at load time; a multimodal dedup
+(:func:`run_dedup_multimodal`) that keys exact duplicates on text *and* image and drops any image
+shared across authors; languages re-detected over the corpus's own vocabulary
+(:func:`~prompt_anonymity.data.language_detection.resolve_languages_observed`); and a final image
+header pass, the one stage that reads image bytes.
+
 The SWE-chat consecutive-duplicate-turn step removes a user turn that exactly repeats the one
 before it when the repeat looks like an artifact or boilerplate (same source turn_id, no agent
 response in between, very long, or a value that recurs often); see
@@ -97,9 +108,12 @@ from .language_detection import (
     WILDCHAT_SECONDARY_MIN_CONFIDENCE,
     add_secondary_languages,
     resolve_document_languages,
+    resolve_languages_observed,
 )
 from .sources_sharechat import load_sharechat_documents
 from .sources_swe_chat import is_scaffolding_turn, load_swe_chat_documents
+from .sources_vision_arena import EXTRA_COLUMNS as VISION_ARENA_EXTRA_COLUMNS
+from .sources_vision_arena import load_vision_arena_documents, read_image_headers
 from .sources_wildchat import WILDCHAT_MODELS, load_wildchat_documents
 from .text_cleaning import clean_prompt
 
@@ -115,6 +129,8 @@ FINAL_COLUMNS = [
 # the one thing that breaks loading the splits as a single HuggingFace dataset. So these are
 # written with an explicit Arrow ``string`` type. See :func:`_with_arrow_string_columns`.
 STRING_COLUMNS = tuple(c for c in FINAL_COLUMNS if c not in ("turns", "num_turns"))
+#: VisionArena's extra string columns, typed the same way (``image_icc_profile`` is mostly null).
+VISION_ARENA_STRING_COLUMNS = ("image_name", "image_shard", "image_icc_profile")
 
 #: The sources, named the way every CLI, config key, split, parquet and results directory in the
 #: project names them. HuggingFace split names must match ``^\w+$`` (no hyphens), which is why
@@ -127,7 +143,19 @@ STRING_COLUMNS = tuple(c for c in FINAL_COLUMNS if c not in ("turns", "num_turns
 #: would silently change every id already published. The adapters set it themselves
 #: (:mod:`~prompt_anonymity.data.sources_swe_chat`), so it does not follow this constant.
 #: ``sharechat`` was added after that lesson and spells its column the same as its name.
-SOURCES = ("wildchat", "swe_chat", "sharechat")
+SOURCES = ("wildchat", "swe_chat", "sharechat", "vision_arena")
+
+#: Sources built for local use only and never published: VisionArena's license forbids transferring
+#: the dataset to any third party. They are not in the CLI's default ``--sources`` (so a plain
+#: rebuild of the published splits never reads 79 GiB of images), and ``validate_dataset`` treats a
+#: missing local-only file as absent rather than as a failure.
+LOCAL_ONLY_SOURCES = frozenset({"vision_arena"})
+PUBLISHED_SOURCES = tuple(s for s in SOURCES if s not in LOCAL_ONLY_SOURCES)
+
+
+def final_columns(source: str) -> list[str]:
+    """The output columns of one source: the shared schema, plus VisionArena's own columns."""
+    return FINAL_COLUMNS + VISION_ARENA_EXTRA_COLUMNS if source == "vision_arena" else FINAL_COLUMNS
 
 #: Sources that publish no author identity, so every author-keyed stage is skipped for them and
 #: their ``author_id`` column is null throughout: no :func:`pseudonymize`, no
@@ -237,6 +265,7 @@ def _uniquify_doc_ids(doc_id: pd.Series) -> pd.Series:
 def load_source(
     source: str, *, wildchat_raw: str | None, swe_raw: str | None, sharechat_raw: str | None,
     ua_map: dict | None, min_docs: int, drop_programmatic: bool, wildchat_max_batches: int | None,
+    vision_arena_raw: str | None = None, merge_identities: bool = True,
 ) -> pd.DataFrame:
     """Load one source's raw (uncleaned) documents into the common column layout.
 
@@ -249,6 +278,7 @@ def load_source(
     ``drop_programmatic`` applies to WildChat only -- SWE-chat sessions have no user-agent (they
     are all agent-CLI traffic by construction, with their non-human turns removed per turn), and
     ShareChat's conversations were scraped from share *pages*, which carry no client metadata.
+    ``merge_identities`` applies to VisionArena only (``--keep-split-identities`` turns it off).
     """
     if source == "wildchat":
         if ua_map is None:
@@ -261,6 +291,9 @@ def load_source(
         return load_swe_chat_documents(raw_path("swe_chat", swe_raw))
     if source == "sharechat":
         return load_sharechat_documents(raw_path("sharechat", sharechat_raw))
+    if source == "vision_arena":
+        return load_vision_arena_documents(raw_path("vision_arena", vision_arena_raw),
+                                           min_docs=min_docs, merge_identities=merge_identities)
     raise ValueError(f"unknown source: {source!r}")
 
 
@@ -443,6 +476,43 @@ def run_dedup_unidentified(frame: pd.DataFrame, *, affix_len: int) -> pd.DataFra
     return deduped.drop(columns=["_dedup_text", "_one"])
 
 
+def run_dedup_multimodal(frame: pd.DataFrame, *, affix_len: int) -> tuple[pd.DataFrame, int]:
+    """Dedup for a source whose documents are a prompt *and* an image (VisionArena).
+
+    The text-only rules of :func:`run_dedup` would misjudge a multimodal document twice over, so
+    three rules run, each with the reason it exists:
+
+    1. **Exact duplicates within an author, keyed on text *and* image** (``image_name``). This
+       collapses one prompt-and-image sent to several models (the arena's re-send pattern) to its
+       earliest occurrence; the same prompt about a *different* image is kept, since it is a
+       different multimodal document.
+    2. **Cross-author text boilerplate**, unchanged: a 100-char leading or trailing slice shared by
+       two or more authors drops every document carrying it (templates forge false *text* links).
+       The within-author affix cap (dedup step 3) is **off** -- a repeated opening on a new image is
+       a new document, not one author's inflated template.
+    3. **Cross-author shared images**: an image used by two or more authors drops every document
+       on it, the image-channel counterpart of rule 2 (a viral image forges false *image* links).
+       It runs after the identity merge, which already absorbed the one-person-two-ids sharing.
+
+    Rules 2 and 3 are judged on the same post-rule-1 corpus and their drops unioned (rule 1 never
+    changes which authors use an image, so computing rule 3's image set first is equivalent).
+    Returns ``(frame, n_documents_dropped_by_rule_3)``.
+    """
+    shared = frame.groupby("image_name")["author_id"].nunique()
+    shared_images = set(shared.index[shared >= 2])
+    frame = frame.copy()
+    frame["_dedup_text"] = frame["turns"].map("\n".join)
+    deduped = deduplicate(
+        frame, identity_col="author_id", text_col="_dedup_text",
+        order_cols=("author_id", "started_at", "doc_id"), affix_len=affix_len,
+        max_per_affix=None, extra_exact_cols=("image_name",),
+    ).drop(columns="_dedup_text")
+    on_shared = deduped["image_name"].isin(shared_images)
+    print(f"  multimodal dedup: {len(frame) - len(deduped):,} exact/boilerplate documents removed; "
+          f"{int(on_shared.sum()):,} documents on {len(shared_images):,} cross-author images removed")
+    return deduped[~on_shared].reset_index(drop=True), int(on_shared.sum())
+
+
 def filter_min_docs(frame: pd.DataFrame, min_docs: int) -> pd.DataFrame:
     """Keep authors with at least ``min_docs`` documents (a *count* filter, not a length filter).
 
@@ -511,7 +581,7 @@ def drop_relay_authors(frame: pd.DataFrame, *, min_scaffold_docs: int = MIN_SCAF
     return frame[~frame["author_id"].isin(relays)].reset_index(drop=True)
 
 
-def finalize(frame: pd.DataFrame) -> pd.DataFrame:
+def finalize(frame: pd.DataFrame, columns: list[str] = FINAL_COLUMNS) -> pd.DataFrame:
     """Sort deterministically, uniquify doc_ids, select the final columns.
 
     Documents are grouped by author and ordered in time within each; a source with no authors
@@ -520,7 +590,8 @@ def finalize(frame: pd.DataFrame) -> pd.DataFrame:
     even where the timestamps are missing or tie.
 
     No known/unknown split is assigned -- the dataset ships without a ``split_role`` column
-    while the split is being redesigned (see the module docstring).
+    while the split is being redesigned (see the module docstring). ``columns`` is the source's
+    output schema (:func:`final_columns`).
     """
     frame = frame.copy()
     keys = ["source", "author_id", "started_at", "doc_id"]
@@ -528,7 +599,7 @@ def finalize(frame: pd.DataFrame) -> pd.DataFrame:
         keys.remove("author_id")
     frame = frame.sort_values(keys).reset_index(drop=True)
     frame["doc_id"] = _uniquify_doc_ids(frame["doc_id"])
-    return frame[FINAL_COLUMNS]
+    return frame[columns]
 
 
 # --- per-source build -------------------------------------------------------
@@ -552,14 +623,17 @@ def build_source(
     secondary_cap: int = WILDCHAT_DETECT_CAP,
     workers: int | None = None,
     wildchat_max_batches: int | None = None,
+    vision_arena_raw: str | None = None,
+    merge_identities: bool = True,
 ) -> pd.DataFrame:
     """Run the full pipeline for **one** source and return its finished dataset frame.
 
-    All sources share the stage functions above; only :func:`load_source` differs, plus three
+    All sources share the stage functions above; only :func:`load_source` differs, plus the
     source-specific stages: the SWE-chat consecutive-duplicate-turn dedup (which needs that
     source's per-turn metadata), the WildChat secondary-language pass (the ``secondary_*`` knobs),
-    and -- for a source in :data:`UNIDENTIFIED_SOURCES` -- the author-free dedup that stands in for
-    every author-keyed stage. ``ua_map`` may be passed in to avoid reloading the user-agent map
+    for a source in :data:`UNIDENTIFIED_SOURCES` the author-free dedup that stands in for every
+    author-keyed stage, and for VisionArena the multimodal dedup, its own language pass and the
+    image header pass (see the module docstring). ``ua_map`` may be passed in to avoid reloading the user-agent map
     when building multiple sources. The per-stage row counts are attached to
     ``frame.attrs["counts"]``.
     """
@@ -572,6 +646,7 @@ def build_source(
         source, wildchat_raw=wildchat_raw, swe_raw=swe_raw, sharechat_raw=sharechat_raw,
         ua_map=ua_map, min_docs=min_docs, drop_programmatic=drop_programmatic,
         wildchat_max_batches=wildchat_max_batches,
+        vision_arena_raw=vision_arena_raw, merge_identities=merge_identities,
     )
     n_loaded = len(frame)
 
@@ -599,10 +674,14 @@ def build_source(
 
     # ShareChat publishes no user id, so there is nothing to pseudonymize and author_id stays null;
     # its dedup, relay and min-docs stages are all skipped or replaced below.
+    n_shared_image_docs = 0
     if unidentified:
         frame = frame.copy()
         frame["author_id"] = None
         frame = run_dedup_unidentified(frame, affix_len=affix_len)
+    elif source == "vision_arena":
+        frame = pseudonymize(frame)
+        frame, n_shared_image_docs = run_dedup_multimodal(frame, affix_len=affix_len)
     else:
         frame = pseudonymize(frame)
         # SWE-chat: do NOT drop a whole conversation just because it shares a templated prefix/suffix
@@ -614,11 +693,12 @@ def build_source(
                           affix_dedup=affix_dedup)
     n_after_dedup = len(frame)
 
-    # Relays put many people under one author_id. WildChat only: a SWE-chat author is a code-host
+    # Relays put many people under one author_id. WildChat and VisionArena (both identify an author
+    # by request fingerprint / IP, so a relay can hide behind one): a SWE-chat author is a code-host
     # user account, which cannot be a relay, and its injected scaffolding is already removed per
     # turn. Runs before the min-docs floor so a dropped relay cannot prop up anything downstream.
     n_relay_docs = 0
-    if source == "wildchat" and drop_relays:
+    if source in ("wildchat", "vision_arena") and drop_relays:
         before = len(frame)
         frame = drop_relay_authors(frame)
         n_relay_docs = before - len(frame)
@@ -634,7 +714,15 @@ def build_source(
     # upstream only where the detector abstains; WildChat's and ShareChat's are trusted, so they
     # just split the existing list into the two columns -- a schema update, not a relabel of the
     # primary.
-    frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe_chat"))
+    #
+    # VisionArena's upstream labels agree with Lingua 97.2% of the time but miss systematically
+    # (upstream "Bulgarian"/"Serbian" are mostly Russian, 2.9% are "unknown"), so both languages are
+    # re-detected with a corpus-prior-weighted Lingua pass, keeping upstream where it is not decisive.
+    # It sets the secondary itself, so the secondary pass below does not run for it.
+    if source == "vision_arena":
+        frame, lang_stats = resolve_languages_observed(frame)
+    else:
+        frame, lang_stats = resolve_document_languages(frame, redetect=(source == "swe_chat"))
     print(f"[{source}] languages: {lang_stats['n_lingua']:,} by detector, "
           f"{lang_stats['n_fallback']:,} from upstream, {lang_stats['n_default']:,} defaulted to English")
 
@@ -655,10 +743,16 @@ def build_source(
     print(f"[{source}] secondary language: {n_secondary:,} of {len(frame):,} documents "
           f"({n_secondary / max(len(frame), 1) * 100:.2f}%)")
 
-    result = finalize(frame)
+    # The one stage that reads image bytes, run last so every earlier stage has already decided
+    # which rows survive (it reads ~most of the upstream 78.5 GiB regardless; see read_image_headers).
+    if source == "vision_arena":
+        frame = read_image_headers(frame, raw_path("vision_arena", vision_arena_raw), workers=workers)
+
+    result = finalize(frame, final_columns(source))
     result.attrs["counts"] = {
         "loaded": n_loaded, "consecutive_dup_turns_removed": consec_removed,
         "after_drop_empty": n_after_empty, "after_dedup": n_after_dedup,
+        "shared_image_docs_removed": n_shared_image_docs,
         "relay_docs_removed": n_relay_docs,
         "after_min_docs": n_after_mindocs, "final": len(result),
         "with_secondary_language": n_secondary,
@@ -685,6 +779,8 @@ def build_all(
     secondary_cap: int = WILDCHAT_DETECT_CAP,
     workers: int | None = None,
     wildchat_max_batches: int | None = None,
+    vision_arena_raw: str | None = None,
+    merge_identities: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Build every requested source and return ``{source: finished frame}`` (insertion order).
 
@@ -701,6 +797,7 @@ def build_all(
             secondary_threshold=secondary_threshold,
             secondary_primary_floor=secondary_primary_floor, secondary_cap=secondary_cap,
             workers=workers, wildchat_max_batches=wildchat_max_batches,
+            vision_arena_raw=vision_arena_raw, merge_identities=merge_identities,
         )
         for source in sources
     }
@@ -718,7 +815,7 @@ def _with_arrow_string_columns(frame: pd.DataFrame) -> pd.DataFrame:
     """
     out = frame.copy()
     out.attrs = dict(frame.attrs)
-    for col in STRING_COLUMNS:
+    for col in (*STRING_COLUMNS, *VISION_ARENA_STRING_COLUMNS):
         if col in out.columns:
             out[col] = out[col].astype(pd.ArrowDtype(pa.string()))
     return out
@@ -835,7 +932,16 @@ def main() -> None:
                    help="directory of the five raw ShareChat per-platform CSVs (default: "
                         "$PROMPT_ANONYMITY_SHARECHAT_RAW, else the config file, else downloaded "
                         "from HuggingFace)")
-    p.add_argument("--sources", nargs="+", default=list(SOURCES), choices=list(SOURCES))
+    p.add_argument("--vision-arena-raw", default=None,
+                   help="directory of the raw VisionArena-Chat train-*.parquet shards (default: "
+                        "$PROMPT_ANONYMITY_VISION_ARENA_RAW, else the config file, else downloaded "
+                        "from HuggingFace -- ~79 GiB)")
+    p.add_argument("--sources", nargs="+", default=list(PUBLISHED_SOURCES), choices=list(SOURCES),
+                   help=f"sources to build (default: the published ones, {', '.join(PUBLISHED_SOURCES)}; "
+                        f"{', '.join(sorted(LOCAL_ONLY_SOURCES))} is local-only and must be named)")
+    p.add_argument("--keep-split-identities", action="store_true",
+                   help="VisionArena: keep every upstream user_id as its own author instead of merging "
+                        "ids that send the same uploaded image within minutes. For measurement only")
     p.add_argument("--min-docs", type=int, default=2,
                    help="minimum documents per author (default 2; set 1 to keep single-doc authors)")
     p.add_argument("--keep-programmatic-clients", action="store_true",
@@ -843,9 +949,9 @@ def main() -> None:
                         "node, ...) instead of dropping them at load time. For measurement only -- "
                         "these conflate many humans under one author_id")
     p.add_argument("--keep-relay-authors", action="store_true",
-                   help="WildChat: keep authors identified as relays (one author_id covering many "
-                        "people: chat scaffolding in >=2 documents and no multi-turn conversation "
-                        "at all). For measurement only")
+                   help="WildChat and VisionArena: keep authors identified as relays (one author_id "
+                        "covering many people: chat scaffolding in >=2 documents and no multi-turn "
+                        "conversation at all). For measurement only")
     p.add_argument("--affix-len", type=int, default=MIN_AFFIX_LEN,
                    help=f"leading/trailing slice length for near-duplicate dedup (default {MIN_AFFIX_LEN})")
     p.add_argument("--max-per-affix", type=int, default=MAX_PER_AFFIX,
@@ -879,6 +985,7 @@ def main() -> None:
         secondary_threshold=args.secondary_threshold,
         secondary_primary_floor=args.secondary_primary_floor, secondary_cap=args.secondary_cap,
         workers=args.workers, wildchat_max_batches=args.wildchat_max_batches,
+        vision_arena_raw=args.vision_arena_raw, merge_identities=not args.keep_split_identities,
     )
     write_outputs(frames, args.out_dir or dist_dir())
 

@@ -19,26 +19,38 @@ from pathlib import Path
 
 import pandas as pd
 
-from .build_dataset import CONSECUTIVE_DUP_MAX_LEN, UNIDENTIFIED_SOURCES
+from .build_dataset import CONSECUTIVE_DUP_MAX_LEN, LOCAL_ONLY_SOURCES, UNIDENTIFIED_SOURCES
 from .config import dist_dir
 from .sources_sharechat import UPSTREAM_REDACTION_TOKENS
 from .sources_swe_chat import HUMAN_TURN_MAX_LEN, is_scaffolding_turn
+from .sources_vision_arena import MERGE_MAX_GROUP_IDS
 
 # source -> its parquet file. The source name is also the split name (see build_dataset.SOURCES),
 # so the filename is just the source; the mapping is kept for the one thing it still buys, an
 # explicit list of the files this module expects to find.
-SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat", "sharechat")}
+SPLIT_FILES = {source: f"{source}.parquet" for source in ("wildchat", "swe_chat", "sharechat", "vision_arena")}
 
 #: source -> the value its ``source`` **column** holds, which is not always the source's name:
 #: ``swe_chat`` is stored as ``"swe-chat"``, hashed into every ``author_id``
 #: (:func:`~prompt_anonymity.data.identity.hash_author_id`), so respelling it would change every
 #: published id. The checks below compare the column against this, not against the key.
-SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat", "sharechat": "sharechat"}
+SOURCE_VALUES = {"wildchat": "wildchat", "swe_chat": "swe-chat", "sharechat": "sharechat",
+                 "vision_arena": "vision_arena"}
 EXPECTED_COLUMNS = [
     "doc_id", "source", "author_id",
     "turns", "num_turns",
     "language_primary", "language_secondary", "model", "model_owner", "agent", "started_at", "ended_at",
 ]
+#: Columns a source carries beyond :data:`EXPECTED_COLUMNS`, in order. Written out rather than
+#: imported from the adapter, so a change to what the builder emits shows up here as a failure.
+EXPECTED_EXTRA_COLUMNS = {
+    "vision_arena": [
+        "image_name", "image_shard", "image_row", "image_width", "image_height", "image_icc_profile",
+        "n_upstream_ids", "category_captioning", "category_code", "category_creative_writing",
+        "category_diagram", "category_entity_recognition", "category_homework", "category_humor",
+        "category_ocr", "category_refusal",
+    ],
+}
 RAW_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 RAW_URL = re.compile(r"https?://\S+")
 
@@ -77,7 +89,12 @@ def main(dist: str | Path | None = None) -> int:
     for source, fname in SPLIT_FILES.items():
         path = dist / fname
         if not path.exists():
-            check(f"[{fname}] file exists", False, str(path))
+            # A local-only split (VisionArena) is legitimately absent from the published mirror and
+            # from any build that did not name it, so its absence is reported, not failed.
+            if source in LOCAL_ONLY_SOURCES:
+                print(f"  ----  [{fname}] local-only split not present; skipped")
+            else:
+                check(f"[{fname}] file exists", False, str(path))
             continue
         df = pd.read_parquet(path)
         per_source[source] = df
@@ -106,9 +123,10 @@ def main(dist: str | Path | None = None) -> int:
         if "language_primary" not in df.columns and "languages" in df.columns:
             check(f"[{fname}] columns match schema", False, "old `languages` schema — rerun pending")
         else:
-            missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
-            extra = [c for c in df.columns if c not in EXPECTED_COLUMNS]
-            check(f"[{fname}] columns match schema", list(df.columns) == EXPECTED_COLUMNS,
+            expected = EXPECTED_COLUMNS + EXPECTED_EXTRA_COLUMNS.get(source, [])
+            missing = [c for c in expected if c not in df.columns]
+            extra = [c for c in df.columns if c not in expected]
+            check(f"[{fname}] columns match schema", list(df.columns) == expected,
                   str(missing + extra))
             check(f"[{fname}] language_primary non-null string",
                   df["language_primary"].map(lambda x: isinstance(x, str)).all())
@@ -130,7 +148,7 @@ def main(dist: str | Path | None = None) -> int:
           not ({"identity", "repo_id", "user_id", "user_agent", "header", "turns_raw", "turns_original"} & set(df.columns)))
     check("doc_id globally unique", df["doc_id"].is_unique)
     check("author_id source-prefixed & opaque (where present)",
-          identified["author_id"].str.match(r"^(wildchat|swe-chat)-[0-9a-f]{16}$").all())
+          identified["author_id"].str.match(r"^(wildchat|swe-chat|vision_arena)-[0-9a-f]{16}$").all())
     check("no null in core fields", df[["doc_id", "source"]].notna().all().all())
 
     # --- turn-list integrity ---
@@ -181,6 +199,28 @@ def main(dist: str | Path | None = None) -> int:
     share_turns = "\n".join(joined[df["source"] == "sharechat"])
     for token in UPSTREAM_REDACTION_TOKENS:
         check(f"ShareChat: no upstream {token} markers survive", token not in share_turns)
+
+    # VisionArena multimodal invariants: the image key is the upstream's own name, no image survives
+    # under two authors (the multimodal dedup's rule 3), no (author, text, image) is repeated (rule
+    # 1), every row has a real image header, and no merged group exceeds the merge's size cap.
+    if "vision_arena" in per_source:
+        va = per_source["vision_arena"]
+        va_text = va["turns"].map(lambda ts: "\n".join(ts))
+        check("VisionArena: doc_id 'va-<32 hex>'", va["doc_id"].str.match(r"^va-[0-9a-f]{32}$").all())
+        check("VisionArena: image_name '<32 hex>.png'", va["image_name"].str.match(r"^[0-9a-f]{32}\.png$").all())
+        per_image = va.groupby("image_name")["author_id"].nunique()
+        check("VisionArena: no image shared across authors", (per_image == 1).all(),
+              f"{int((per_image > 1).sum()):,} shared")
+        dup = pd.DataFrame({"a": va["author_id"], "t": va_text, "i": va["image_name"]}).duplicated().sum()
+        check("VisionArena: no repeated (author, text, image)", dup == 0, f"{int(dup):,} repeats")
+        check("VisionArena: positive image width/height",
+              bool((va["image_width"] > 0).all() and (va["image_height"] > 0).all()))
+        check(f"VisionArena: 1 <= n_upstream_ids <= {MERGE_MAX_GROUP_IDS}",
+              bool(va["n_upstream_ids"].between(1, MERGE_MAX_GROUP_IDS).all()),
+              f"max={int(va['n_upstream_ids'].max())}")
+        flags = [c for c in va.columns if c.startswith("category_")]
+        check("VisionArena: category flags boolean, no nulls",
+              all(va[c].dtype == bool for c in flags), str({c: str(va[c].dtype) for c in flags if va[c].dtype != bool}))
 
     # --- scrubbing consistency (the anti-leak invariant) ---
     for src in df["source"].unique():

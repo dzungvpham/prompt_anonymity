@@ -86,7 +86,10 @@ from .config import cache_dir, dist_dir, hf_dir
 # ``prompt_anonymity.data.build_subset`` cuts out of ``wildchat``, carrying the identical schema so
 # every stage downstream reads it like any other split. Deliberately absent from
 # ``build_dataset.SOURCES``, since there is no raw adapter for it.
-SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "sharechat")
+#
+# ``vision_arena`` is local-only (its license forbids redistribution): it is built into
+# ``data/dist`` and never mirrored into ``data/hf``, so featurizing it needs ``--data-dir data/dist``.
+SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "sharechat", "vision_arena")
 
 # A document's text is its turns joined by an ordinary paragraph break.
 TURN_SEPARATOR = "\n\n"

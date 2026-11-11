@@ -49,3 +49,15 @@ hf_file = "conversations.parquet"
 hf_repo = "tucnguyen/ShareChat"
 hf_revision = "a57c741e002684939f577594fdae1559832a584d"
 # path = "/local/copy/of/ShareChat"
+
+[sources.vision_arena]
+# https://huggingface.co/datasets/lmarena-ai/VisionArena-Chat -- 43 train-*.parquet shards under
+# data/, ~79 GiB, nearly all of it image bytes. Gated: accept its license on the dataset page and
+# log in (`hf auth login`, or set HF_TOKEN). LOCAL-ONLY: the license forbids transferring the
+# dataset to third parties, so the built vision_arena split is never published. On a cluster with
+# a shared mirror, point $PROMPT_ANONYMITY_VISION_ARENA_RAW at its snapshot's data/ directory
+# rather than letting this download it.
+hf_repo = "lmarena-ai/VisionArena-Chat"
+hf_revision = "1394b4f59ab6f1f2e5aff6bc15b448e15960e170"
+hf_dir = "data"
+# path = "/local/copy/of/VisionArena-Chat/data"
