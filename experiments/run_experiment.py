@@ -249,6 +249,7 @@ with ``base`` for no defense).
 from __future__ import annotations
 
 import argparse
+import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -756,8 +757,16 @@ def standardize(known: np.ndarray, *others: np.ndarray) -> tuple[np.ndarray, ...
     then does not move when a background pool is switched on, so a background run and a base run
     differ in what the attack was told and in nothing else.
     """
-    center = known.mean(axis=0, dtype=np.float64)
-    scale = known.std(axis=0, dtype=np.float64)
+    # Two chunked passes instead of `known.std(dtype=float64)`, which materialises a float64 copy
+    # of the whole known side (~3 GB at WildChat's size) and can OOM a 16 GB machine.
+    total = np.zeros(known.shape[1], dtype=np.float64)
+    for start in range(0, len(known), ZSCORE_ROW_BATCH):
+        total += known[start:start + ZSCORE_ROW_BATCH].sum(axis=0, dtype=np.float64)
+    center = total / len(known)
+    squares = np.zeros(known.shape[1], dtype=np.float64)
+    for start in range(0, len(known), ZSCORE_ROW_BATCH):
+        squares += ((known[start:start + ZSCORE_ROW_BATCH] - center) ** 2).sum(axis=0)
+    scale = np.sqrt(squares / len(known))
     scale = np.where(scale > 0, scale, 1.0)
     return tuple(_zscore(block, center, scale) for block in (known, *others))
 
@@ -947,6 +956,9 @@ def build_attack(name: str, args: argparse.Namespace, overrides: dict | None = N
         settings |= {"shrinkage": args.shrinkage}
     elif name == "nearest_neighbor":
         settings |= {"metric": args.metric}
+        # Distance-block budget only (output-neutral); lower it on memory-tight machines.
+        if os.environ.get("NN_WORKING_MEMORY_MB"):
+            settings |= {"working_memory_mb": int(os.environ["NN_WORKING_MEMORY_MB"])}
     settings.update(overrides or {})
     return (lambda: attack(**settings)) if settings else attack
 
@@ -1693,6 +1705,56 @@ def split_background(scores: np.ndarray, authors: np.ndarray) -> tuple[np.ndarra
     return author_scores, authors[1:], background - evidence
 
 
+def laplace_release(embeddings: np.ndarray, epsilon, sensitivity: str = "bound",
+                    seed: int = 0) -> np.ndarray:
+    """Release each row through the Laplace mechanism at ``epsilon``-DP (any two rows neighbours).
+
+    Rows are first scaled to unit L2 norm, so every input lies on the same sphere and the L1
+    sensitivity is bounded over *all* pairs of inputs. ``sensitivity="bound"`` uses the worst case
+    ``max ||x - x'||_1 = 2 * sqrt(d)`` over unit vectors (attained by ``x = -x'`` with equal-magnitude
+    coordinates), which is the honest DP calibration. ``"empirical"`` instead uses the largest L1
+    distance between rows actually present -- a data-dependent scale, so *not* a DP guarantee,
+    reported only to show how much the worst case costs. Noise is i.i.d. ``Laplace(0, Δ1/ε)`` per
+    coordinate. ``epsilon`` is a scalar or one value per row (user-level accounting, see
+    :func:`noise_epsilons`).
+    """
+    # float32 and in place: at WildChat's size (~43k x 3072) every extra copy costs ~0.5 GB.
+    unit = np.array(embeddings, dtype=np.float32)
+    unit /= np.maximum(np.linalg.norm(unit, axis=1, keepdims=True), 1e-12)
+    if sensitivity == "bound":
+        delta = 2.0 * np.sqrt(unit.shape[1])
+    elif sensitivity == "empirical":
+        # Max pairwise L1, computed in small float32 blocks (~200 MB each) to bound memory.
+        delta = 0.0
+        for start in range(0, len(unit), 8):
+            chunk = unit[start:start + 8]
+            for other in range(0, len(unit), 2048):
+                distances = np.abs(chunk[:, None, :] - unit[None, other:other + 2048, :]).sum(-1)
+                delta = max(delta, float(distances.max()))
+    else:
+        raise ValueError(f"unknown sensitivity {sensitivity!r}")
+    rng = np.random.default_rng(seed)
+    scale = delta / np.broadcast_to(np.asarray(epsilon, dtype=np.float64), (len(unit),))
+    for start in range(0, len(unit), 4096):
+        block = unit[start:start + 4096]
+        block += (rng.laplace(0.0, 1.0, size=block.shape)
+                  * scale[start:start + 4096, None]).astype(np.float32)
+    return unit
+
+
+def noise_epsilons(epsilon: float, unit: str, authors: np.ndarray):
+    """Per-conversation epsilon for the simulated defense.
+
+    ``conversation``: every conversation spends ``epsilon``. ``user``: ``epsilon`` is the *user's*
+    budget, so by basic composition each of a user's ``n`` released (unknown-side) conversations
+    spends ``epsilon / n``.
+    """
+    if unit == "conversation":
+        return epsilon
+    _, inverse, counts = np.unique(authors, return_inverse=True, return_counts=True)
+    return epsilon / counts[inverse]
+
+
 def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
                attack: str, known: slice, unknown: slice, args: argparse.Namespace,
                tuning_cache: dict, languages: np.ndarray | None = None,
@@ -1738,6 +1800,14 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # (joined on `doc_id` at load), so one index means the same document in either.
     known_source = embeddings if known_embeddings_source is None else known_embeddings_source
     known_embeddings, unknown_embeddings = known_source[known], embeddings[unknown]
+    # Simulated theoretical defense (`--unknown-noise-epsilon`): the attacker's queries are the
+    # Laplace-mechanism release of each unknown embedding, while its known side stays clean.
+    # Applied before standardization, since the z-scoring is the attacker's own processing.
+    if args.unknown_noise_epsilon is not None:
+        epsilons = noise_epsilons(args.unknown_noise_epsilon, args.noise_unit,
+                                  unknown_frame["author_id"].to_numpy())
+        unknown_embeddings = laplace_release(unknown_embeddings, epsilons,
+                                             args.noise_sensitivity, args.noise_seed)
     # A known-side feature arrives as raw n-gram counts. Its vocabulary and IDF are fitted here,
     # on this configuration's known documents and nothing else, and every other row is only
     # transformed. The counts are kept for the tuner, which refits the transform per fold.
@@ -2263,6 +2333,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=47,
                         help="Seed for the open-set calibration folds and the separability "
                              "diagnostic's sampling.")
+    parser.add_argument("--unknown-noise-epsilon", type=float, default=None, metavar="EPS",
+                        help="Simulate a DP defense: release every unknown embedding through the "
+                             "Laplace mechanism at this epsilon (see laplace_release). Off by "
+                             "default.")
+    parser.add_argument("--noise-sensitivity", default="bound", choices=["bound", "empirical"],
+                        help="L1 sensitivity for --unknown-noise-epsilon: the worst case over unit "
+                             "vectors (bound, a real DP guarantee) or the data's max pairwise L1 "
+                             "(empirical, not DP).")
+    parser.add_argument("--noise-unit", default="conversation", choices=["conversation", "user"],
+                        help="Privacy unit for --unknown-noise-epsilon: each conversation spends "
+                             "epsilon, or each user's n unknown conversations spend epsilon / n.")
+    parser.add_argument("--noise-seed", type=int, default=0,
+                        help="RNG seed for --unknown-noise-epsilon.")
     parser.add_argument("--output-dir", default=None,
                         help="Where to write outputs (default: experiments/results/<tag>).")
     args = parser.parse_args()
@@ -2359,9 +2442,12 @@ def output_tag(args: argparse.Namespace) -> str:
     vocabulary = ("" if args.max_ngrams is None
                   or args.max_ngrams == known_side_feature().max_features
                   else f"_top{args.max_ngrams}")
+    noise = ("" if args.unknown_noise_epsilon is None
+             else f"_lap-{args.noise_sensitivity}-{args.noise_unit}"
+                  f"-eps{args.unknown_noise_epsilon:g}-s{args.noise_seed}")
     return (f"{args.source}_{defense}_{args.feature}_{attacks}{vocabulary}{known_defense}"
             f"{owner}{language}{language_aware}{background}{fractions}{held_out}{openset}"
-            f"{metric}{scaled}")
+            f"{metric}{scaled}{noise}")
 
 
 def report_window(scores: dict, headline: pd.DataFrame, author_report: pd.DataFrame,

@@ -129,13 +129,15 @@ from matplotlib.ticker import (FixedLocator,  # noqa: E402  (the FAR axis' 5 hal
                                MultipleLocator)  # noqa: E402  (quarter ticks on a 0-1 axis)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-RESULTS_DIR = REPO_ROOT / "experiments" / "results"
+#: Overridable so a side experiment (e.g. the simulated-DP sweep) can be drawn in the same style
+#: without its runs landing in -- or its figures overwriting -- the main tree.
+RESULTS_DIR = Path(os.environ.get("PLOT_RESULTS_DIR", REPO_ROOT / "experiments" / "results"))
 
 #: The clustering experiment's results, deliberately *not* under :data:`RESULTS_DIR`: its
 #: directories are three-part names and its ``clustering_results.csv`` schema is a partition rather
 #: than a ranking, so a run of one kind must never parse as a run of the other.
 CLUSTERING_DIR = REPO_ROOT / "experiments" / "clustering"
-PLOTS_DIR = REPO_ROOT / "experiments" / "plots"
+PLOTS_DIR = Path(os.environ.get("PLOT_PLOTS_DIR", REPO_ROOT / "experiments" / "plots"))
 
 
 # --- running independent work across cores -----------------------------------
@@ -200,7 +202,7 @@ def default_workers() -> int:
 #: the attack, so they are joined back on ``doc_id`` rather than copied into every run's
 #: predictions. A dataset's parquet is ``<dataset>.parquet``, because the dataset part of a
 #: results directory name *is* the split name (see :data:`DATASETS`).
-DATA_DIR = REPO_ROOT / "data" / "hf"
+DATA_DIR = Path(os.environ.get("PLOT_DATA_DIR", REPO_ROOT / "data" / "hf"))
 
 
 # --- the vocabulary a results directory name is built from -------------------
@@ -226,6 +228,14 @@ NO_DEFENSE = "base"
 
 #: Defenses, in the order their colours are assigned (see :func:`series_style`) -- the ones that
 #: carry the argument first, the DP-MLM epsilon sweep last so it cannot push them off the palette.
+def power_of_ten(value: int) -> str:
+    """``1000`` -> ``"10³"``: the sweep is decades, so the label is the exponent."""
+    return "10" + str(len(str(value)) - 1).translate(str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹"))
+
+
+#: Epsilons of the simulated-DP sweep, as they appear in directory names.
+DPEMB_EPSILONS = (1, 10, 100, 1000, 10000, 100000, 1000000)
+
 DEFENSES = (
     NO_DEFENSE,
     "styleremix",
@@ -266,6 +276,11 @@ DEFENSES = (
     "embad",
     "embad_summary",
     "embad_gemini",
+    # Simulated DP defense: Laplace mechanism on each unknown embedding (run_experiment.py
+    # --unknown-noise-epsilon). `dpemb` is conversation-level epsilon; `dpemb_user` is user-level,
+    # each conversation spending epsilon / n for a user with n released conversations.
+    *(f"dpemb_eps{epsilon}" for epsilon in DPEMB_EPSILONS),
+    *(f"dpemb_user_eps{epsilon}" for epsilon in DPEMB_EPSILONS),
 )
 
 FEATURES = (
@@ -351,6 +366,9 @@ DEFENSE_LABELS = {
     "embad": "EmBad (local ensemble)",
     "embad_summary": "EmBad (summary)",
     "embad_gemini": "EmBad (Gemini)",
+    **{f"dpemb_eps{epsilon}": f"ε = {power_of_ten(epsilon)}" for epsilon in DPEMB_EPSILONS},
+    **{f"dpemb_user_eps{epsilon}": f"user ε = {power_of_ten(epsilon)}"
+       for epsilon in DPEMB_EPSILONS},
 }
 FEATURE_LABELS = {
     "gemini_embedding_2": "Gemini Embedding 2",
