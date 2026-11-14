@@ -8,9 +8,12 @@ target split only. This script re-reads those companion CSVs -- nothing is recom
 palette, line width, chance dash), so the figure is styled like the rest of the paper.
 
 Outputs (PDF, plus PNG with ``--png``), under ``--out``:
-    dp_noise_conv.pdf   conversation-level DP, SWE-Chat | WildChat
+    dp_noise_conv.pdf   conversation-level DP, SWE-Chat | WildChat      (main paper: short)
     dp_noise_user.pdf   user-level DP (eps spent as eps / n per conversation), SWE-Chat | WildChat
-    dp_noise_both.pdf   the two stacked, conversation level on top
+    dp_noise_both.pdf   the two stacked, conversation level on top      (appendix)
+
+All three share one legend under the panels: epsilon = infinity (no noise) first, then the
+epsilons from large to small. In the user-level rows epsilon is the *user's* budget.
 
 Usage:
     .venv/bin/python experiments/plot_dp_noise.py --plots-root data/dp_noise/paper --out <dir> --png
@@ -34,22 +37,40 @@ SHORT = {"conv": "conv.", "user": "user"}
 CSV = "openset/dirfar/author/by_defense/gemini_embedding_2_nearest_neighbor.csv"
 
 
-def load(root: Path, level: str, dataset: str, keep) -> list[tuple[str, pd.DataFrame]]:
-    """The 75/25 curves of one (level, dataset), in file order, as (label, frame) pairs."""
+SUPERSCRIPT = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+INFINITY = "ε = ∞"
+
+
+def classify(series: str) -> tuple[int, str]:
+    """(colour slot, legend label) for one series name from the plot CSVs.
+
+    "No defense" is the no-noise attacker, i.e. epsilon = infinity; it takes slot 0. An epsilon
+    takes the slot of its exponent, so 10^k has the same colour in every row and in every figure
+    (matching the six-panel grids, where the slot is the series' position in the sweep). A
+    ``user ε = 10^k`` series is labelled ``ε = 10^k`` -- the row title says which accounting it is.
+    """
+    if series == "No defense":
+        return 0, INFINITY
+    label = series.removeprefix("user ")
+    return int(label.split("10")[-1].translate(SUPERSCRIPT)), label
+
+
+def load(root: Path, level: str, dataset: str, keep) -> list[tuple[int, str, pd.DataFrame]]:
+    """The 75/25 curves of one (level, dataset), in file order, as (slot, label, frame)."""
     frame = pd.read_csv(root / f"plots_{level}" / dataset / CSV)
     frame = frame[frame["known_config"] == KNOWN]
     out = []
-    # The colour slot is the series' position in the *unfiltered* file, so an epsilon keeps its
-    # colour whether or not its neighbours are drawn (the same fallback numbering resolve_slots
-    # gives the full six-panel figures).
-    for slot, (label, group) in enumerate(frame.groupby("series", sort=False)):
-        if keep(label):
+    for series, group in frame.groupby("series", sort=False):
+        if keep(series):
+            slot, label = classify(series)
             out.append((slot, label, group.sort_values("false_accept_rate")))
     return out
 
 
 def draw(axes, curves, dataset: str, title: str, scale: float) -> dict:
-    """One panel, in :func:`plot_results.draw_identification_panel`'s style."""
+    """One panel, in :func:`plot_results.draw_identification_panel`'s style.
+
+    Returns ``{slot: (label, legend handle)}`` for the curves drawn."""
     handles = {}
     for slot, label, curve in curves:
         color = pr.series_style(slot)
@@ -58,7 +79,7 @@ def draw(axes, curves, dataset: str, title: str, scale: float) -> dict:
                           color=color, alpha=pr.BAND_ALPHA, linewidth=0, zorder=2)
         axes.plot(visible["false_accept_rate"], visible["identification_rate"], color=color,
                   linewidth=pr.LINE_WIDTH * scale, solid_capstyle="round", zorder=3 + slot * 0.01)
-        handles[label] = Line2D([], [], color=color, linewidth=pr.LINE_WIDTH * scale)
+        handles[slot] = (label, Line2D([], [], color=color, linewidth=pr.LINE_WIDTH * scale))
     base = curves[0][2]
     drawn = "random_proportional" if base["random_proportional"].notna().all() else "random"
     base = base[base["false_accept_rate"] >= pr.FAR_LOG_FLOOR]
@@ -74,20 +95,29 @@ def draw(axes, curves, dataset: str, title: str, scale: float) -> dict:
 
 
 def figure_for(root: Path, levels: list[str], keep, scale: float = 1.0):
-    """A grid with one row per level and one column per corpus; each row gets its own legend."""
+    """A grid with one row per level and one column per corpus, and ONE legend underneath.
+
+    The legend lists every epsilon drawn anywhere, largest first (infinity = no noise, then 10^5,
+    10^4, ...), i.e. top-to-bottom in the order the curves sit in the panels.
+    """
     rows = len(levels)
-    figure, grid = plt.subplots(rows, 2, figsize=(7.0, 2.9 * rows), squeeze=False,
+    height = 2.9 * rows + 0.3
+    figure, grid = plt.subplots(rows, 2, figsize=(7.0, height), squeeze=False,
                                 facecolor=pr.SURFACE)
+    handles = {}
     for r, level in enumerate(levels):
-        handles = {}
         for c, (dataset, name) in enumerate(DATASETS):
             curves = load(root, level, dataset, keep)
             title = name if rows == 1 else f"{name} ({SHORT[level]} DP)"
-            handles = draw(grid[r][c], curves, dataset, title, scale)
-        grid[r][1].legend(list(handles.values()), list(handles.keys()), frameon=False,
-                          fontsize=pr.FONT_LEGEND, labelcolor=pr.TEXT_PRIMARY,
-                          loc="center left", bbox_to_anchor=(1.03, 0.5), borderaxespad=0)
-    figure.tight_layout()
+            handles.update(draw(grid[r][c], curves, dataset, title, scale))
+    # Slot 0 (infinity) first, then the epsilons from large to small.
+    order = sorted(handles, key=lambda slot: (slot != 0, -slot))
+    labels = [handles[slot][0] for slot in order]
+    figure.tight_layout(rect=(0, 0.3 / height, 1, 1))
+    figure.legend([handles[slot][1] for slot in order], labels, frameon=False,
+                  fontsize=pr.FONT_LEGEND, labelcolor=pr.TEXT_PRIMARY, ncol=len(labels),
+                  loc="lower center", bbox_to_anchor=(0.5, 0.0), borderaxespad=0.2,
+                  columnspacing=1.6, handlelength=1.8)
     return figure
 
 
