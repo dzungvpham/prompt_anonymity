@@ -330,9 +330,10 @@ NO_DEFENSE_TAG = "base"
 #: ``wildchat_small`` is the seeded subset :mod:`prompt_anonymity.data.build_subset` cuts out of
 #: ``wildchat``, with the same schema and author-keyed structure, sized for quicker iteration.
 #:
-#: ``vision_arena`` is the multimodal split, **local-only** (its license forbids redistribution):
-#: it lives in ``data/dist``, never in :data:`DATA_DIR` (``download`` prunes every file the Hub
-#: does not hold), so run it with ``--data-dir data/dist``. Its extra image columns are not read
+#: ``vision_arena`` is the multimodal split, **local-only** (its license forbids redistribution).
+#: Its split and image feature file are built into ``data/dist`` and moved by hand into
+#: :data:`DATA_DIR`, so a run needs no ``--data-dir``; ``download`` deletes both from there (the Hub
+#: does not hold them), and they must never be uploaded. Its extra image columns are not read
 #: here -- :data:`DOCUMENT_COLUMNS` is the same five.
 SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "vision_arena")
 

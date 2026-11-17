@@ -8,7 +8,8 @@ where to find its bytes; the bytes themselves are never copied (78.5 GiB of the 
 
 **Local-only.** The upstream license forbids transferring the dataset to any third party, so this
 split is built into ``data/dist`` and is never part of the published HuggingFace dataset (see
-``build_dataset.LOCAL_ONLY_SOURCES``). Its license also forbids attempting to identify
+``build_dataset.LOCAL_ONLY_SOURCES``); its working copy is moved by hand into ``data/hf``, where
+the runners read, and ``download`` deletes it from there, since the Hub does not hold it. Its license also forbids attempting to identify
 individuals; linkage against the pseudonymous ids is the use this benchmark makes of it.
 
 What the adapter does, in order:

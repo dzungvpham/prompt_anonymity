@@ -5,7 +5,7 @@ The image counterpart of :mod:`~prompt_anonymity.data.compute_features`: it read
 **distinct** image once (81,111 images behind 92,295 documents), and writes one vector per document
 so the image channel can be attacked like any other feature::
 
-    python experiments/run_experiment.py --source vision_arena --data-dir data/dist \
+    python experiments/run_experiment.py --source vision_arena \
         --feature cohere_embed_v5_pro_image --attacks nearest_neighbor
 
 What is sent, and why (measured 2026-11-11; the probes are in ``tmp/vision_arena_probes/``)
@@ -34,6 +34,28 @@ What is sent, and why (measured 2026-11-11; the probes are in ``tmp/vision_arena
   ``billed_units.input_tokens`` figure (a steady 3.92x the image tokens) is the one charged. Both
   are recorded for every request.
 
+The fused variant (``--with-text``, probed 2026-11-12)
+------------------------------------------------------
+
+One input per **document**: its user turns joined as everywhere (:data:`TURN_SEPARATOR`) and cut
+to :data:`TEXT_MAX_CHARS`, then its image, sent as ``inputs: [{"content": [text, image_url]}]``;
+the model returns **one joint vector** per input (:data:`FUSED_FEATURE`). What the probe showed:
+
+* ``input_type`` is ignored for mixed content (four values, bit-identical vectors), so
+  :data:`FUSED_INPUT_TYPE` is recorded rather than chosen.
+* The text moves the vector: a 38-character question took it to cos 0.915 against the same image
+  embedded alone.
+* There is no server-side cut at the lengths this split has: all 178,520 characters of the longest
+  document were read and billed (47,297 text tokens), so the cap here is ours.
+* ``billed_units.input_tokens`` is the text tokens plus the usual 3.92x the image tokens.
+
+The unit of work is a distinct ``(image, capped text)`` pair (:func:`fused_key`), about 14% more
+than the distinct images, since one image can come with several texts from its one author. The
+request body is the same image plus a little text, so the run time is the image run's scaled by
+that, ~10 h at 1M limiter tokens per minute. Its cache namespace and key column (``item_key``) are
+its own, and its records go to ``tmp/vision_arena_image_text_embeddings/`` -- a separate ledger,
+because it carries two more columns (text tokens and their cost) than the image ledger.
+
 Keeping the limit saturated
 ---------------------------
 
@@ -61,10 +83,13 @@ Where things go
   split's order. Documents sharing an image share its vector. **An image that could not be embedded
   gives NaN rows**, not missing rows, which would break the one-to-one ``doc_id`` join every runner
   enforces. ``<feature>`` is :data:`FEATURE`, plus a suffix for any non-default encoding
-  (``_webp_q50``, ``_jpeg_q90``, ``_max768``), so two encodings never share a file. Like the split
-  itself it is **local-only** (the dataset's license forbids redistribution): it lives in
-  ``data/dist`` and must never be copied to ``data/hf``, which ``download`` prunes to the Hub's
-  contents.
+  (``_webp_q50``, ``_jpeg_q90``, ``_max768``), so two encodings never share a file. It is written to
+  ``data/dist`` like every stage's output, and the working copy is then moved by hand into
+  ``data/hf`` beside the split, where the runners read both (the split is read from there by
+  default too). Like the split it is **local-only** (the dataset's license forbids
+  redistribution): ``data/hf`` is still a local directory and must never be uploaded, and
+  ``download`` deletes both files from it, since the Hub does not hold them -- ``--assemble-only``
+  rebuilds this one from the cache in under a minute, at no cost.
 * **The vector cache** -- ``data/.cache/vision_arena_image_vectors/<namespace>/part-*.parquet``,
   ``image_name`` + vector, flushed every :data:`FLUSH_EVERY_IMAGES` images or
   :data:`FLUSH_EVERY_SECONDS` and on any exit, so an interrupted run resumes and re-pays only for
@@ -83,6 +108,7 @@ Run (from the repo root)::
     python -m prompt_anonymity.data.embed_vision_arena_images                 # PAID: the whole split
     python -m prompt_anonymity.data.embed_vision_arena_images --assemble-only # cache -> feature file
     sbatch scripts/embed_vision_arena_images_slurm.sh                         # the whole split on SLURM
+    sbatch scripts/embed_vision_arena_images_slurm.sh --with-text             # the fused variant
 """
 
 from __future__ import annotations
@@ -90,6 +116,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import io
 import json
 import queue
@@ -113,8 +140,9 @@ import requests
 from prompt_anonymity.caching import params_hash
 from prompt_anonymity.resources import available_cpus
 
-from .compute_features import build_feature_frame, positional_feature_names, report_written, write_parquet
-from .config import _env, cache_dir, dist_dir, project_root, raw_path
+from .compute_features import (TURN_SEPARATOR, build_feature_frame, positional_feature_names, report_written,
+                               write_parquet)
+from .config import _env, cache_dir, dist_dir, hf_dir, project_root, raw_path
 
 #: The split this embedder reads -- the only one with images.
 SOURCE = "vision_arena"
@@ -128,6 +156,20 @@ FOUNDRY_API_KEY_ENV = "MODEL_API_KEY"
 
 #: The feature name, i.e. the ``<split>_<feature>.parquet`` part a runner's ``--feature`` takes.
 FEATURE = "cohere_embed_v5_pro_image"
+
+#: The fused variant's feature name (``--with-text``): each document's user turns and its image
+#: sent as one input, one joint vector per document.
+FUSED_FEATURE = "cohere_embed_v5_pro_image_text"
+
+#: ``input_type`` for a fused input. **The server ignores it for mixed content** -- ``clustering``,
+#: ``search_document``, ``classification`` and ``image`` gave bit-identical vectors (probed
+#: 2026-11-12) -- so this is the project's symmetric-task convention, recorded for provenance.
+FUSED_INPUT_TYPE = "clustering"
+
+#: A fused document's text is cut to this many characters, the cap the Gemini text feature reads,
+#: so the two see the same text. The model itself read (and billed) all 178,520 characters of the
+#: longest document, and its vector moved to cos 0.93 against the first 20,000.
+TEXT_MAX_CHARS = 20_000
 
 #: The model's native (and maximum) output width.
 DIMENSIONS = 2048
@@ -174,14 +216,18 @@ CACHE_SUBDIR = "vision_arena_image_vectors"
 FLUSH_EVERY_IMAGES = 1000
 FLUSH_EVERY_SECONDS = 120.0
 
-#: Cost records, relative to the project root -- kept out of ``data/``.
+#: Cost records, relative to the project root -- kept out of ``data/``. The fused variant keeps its
+#: own directory, because its ledger has two more columns (text tokens) than the image ledger,
+#: which must stay append-only under its original header.
 USAGE_SUBDIR = Path("tmp") / "vision_arena_image_embeddings"
+FUSED_USAGE_SUBDIR = Path("tmp") / "vision_arena_image_text_embeddings"
 SPEND_LEDGER = "spend.csv"
 SPEND_COLUMNS = ["finished_at_utc", "outcome", "run_id", "model", "encoding", "images_embedded",
                  "images_failed", "requests", "image_tokens", "billed_input_tokens",
                  "cost_usd_image_tokens", "cost_usd_billed_input_tokens", "elapsed_s"]
+FUSED_SPEND_COLUMNS = SPEND_COLUMNS + ["text_tokens", "cost_usd_text_tokens"]
 REQUEST_COLUMNS = ["time_utc", "n_images", "body_bytes", "limiter_estimate", "status", "latency_s",
-                   "billed_input_tokens", "billed_image_tokens", "remaining_tokens"]
+                   "billed_input_tokens", "billed_image_tokens", "remaining_tokens", "billed_text_tokens"]
 
 #: HTTP statuses that mean the configuration is wrong, not the request: stop the run.
 FATAL_STATUSES = frozenset({401, 403, 404})
@@ -243,23 +289,25 @@ class ImageEncoding:
 def _encode_row_group(task) -> list[tuple[str, bytes]]:
     """Worker: encode the requested rows of one upstream row group. Top-level so it pickles.
 
-    ``task`` is ``(raw_dir, shard, row_group, first_row, rows, names, encoding)``. Each row is
-    checked to hold the image its name says, which is what makes the locator trustworthy.
+    ``task`` is ``(raw_dir, shard, row_group, first_row, rows, names, keys, encoding)`` and the
+    result is one ``(key, encoded bytes)`` per row -- the key is the image name itself, or a fused
+    item's key (:func:`fused_key`). Each row is checked to hold the image its name says, which is
+    what makes the locator trustworthy.
     """
-    raw_dir, shard, row_group, first_row, rows, names, encoding = task
+    raw_dir, shard, row_group, first_row, rows, names, keys, encoding = task
     images = pq.ParquetFile(Path(raw_dir) / shard).read_row_group(row_group, columns=["images"]) \
         .column("images").to_pylist()
     out = []
-    for row, name in zip(rows, names):
+    for row, name, key in zip(rows, names, keys):
         entry = images[row - first_row][0]
         if entry["path"] != name:
             raise ValueError(f"{shard} row {row} holds {entry['path']}, expected {name}")
-        out.append((name, encoding.encode(entry["bytes"])))
+        out.append((key, encoding.encode(entry["bytes"])))
     return out
 
 
 def encode_tasks(pending: pd.DataFrame, raw_dir: Path, encoding: ImageEncoding) -> list[tuple]:
-    """One task per upstream row group holding pending images, in shard-then-row order."""
+    """One task per upstream row group holding pending items, in shard-then-row order."""
     tasks = []
     for shard, rows in pending.groupby("image_shard", sort=True):
         meta = pq.ParquetFile(raw_dir / shard).metadata
@@ -268,8 +316,45 @@ def encode_tasks(pending: pd.DataFrame, raw_dir: Path, encoding: ImageEncoding) 
         for g in np.unique(group):
             chunk = rows[group == g]
             tasks.append((str(raw_dir), shard, int(g), int(starts[g]), chunk["image_row"].tolist(),
-                          chunk["image_name"].tolist(), encoding))
+                          chunk["image_name"].tolist(), chunk["key"].tolist(), encoding))
     return tasks
+
+
+# --- what is embedded --------------------------------------------------------------------------
+
+def fused_text(turns) -> str:
+    """A document's user turns as the fused input's text: joined as everywhere, capped."""
+    return TURN_SEPARATOR.join(turns)[:TEXT_MAX_CHARS]
+
+
+def fused_key(image_name: str, text: str) -> str:
+    """The cache key of one fused input: its image and a digest of its (capped) text.
+
+    Content-addressed rather than a ``doc_id``, so two documents sending the same text with the
+    same image share one vector -- as documents sharing an image do in the image-only variant.
+    """
+    return f"{image_name}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+
+
+def embedding_items(split_path: Path, with_text: bool) -> pd.DataFrame:
+    """One row per document: ``doc_id``, ``author_id``, the image locator, and the cache ``key``.
+
+    The key is the ``image_name`` for the image-only variant and :func:`fused_key` for the fused
+    one, which also gets the ``text`` it sends.
+    """
+    columns = ["doc_id", "author_id", "image_name", "image_shard", "image_row"]
+    docs = pd.read_parquet(split_path, columns=columns + (["turns"] if with_text else []))
+    if not with_text:
+        return docs.assign(key=docs["image_name"])
+    docs["text"] = docs.pop("turns").map(fused_text)
+    docs["key"] = [fused_key(name, text) for name, text in zip(docs["image_name"], docs["text"])]
+    return docs
+
+
+def fused_input(text: str, image_uri: str) -> dict:
+    """One ``inputs`` entry: the text (left out when empty) and then the image."""
+    parts = [{"type": "text", "text": text}] if text else []
+    return {"content": parts + [{"type": "image_url", "image_url": {"url": image_uri}}]}
 
 
 # --- rate limiting -----------------------------------------------------------------------------
@@ -342,14 +427,19 @@ class RateGovernor:
 # --- vector cache ------------------------------------------------------------------------------
 
 class VectorCache:
-    """Append-only parquet parts of ``image_name`` -> vector under one never-pruned namespace."""
+    """Append-only parquet parts of key -> vector under one never-pruned namespace.
 
-    def __init__(self, root: Path, params: dict):
+    The key column is ``image_name`` for the image-only variant and ``item_key`` (:func:`fused_key`)
+    for the fused one, so a part can never be read as the other variant's.
+    """
+
+    def __init__(self, root: Path, params: dict, key_column: str = "image_name"):
         self.dir = root / CACHE_SUBDIR / params_hash(params)
         self.dir.mkdir(parents=True, exist_ok=True)
         meta = self.dir / "params.json"
         if not meta.exists():
             meta.write_text(json.dumps(params, indent=2, sort_keys=True) + "\n")
+        self.key_column = key_column
         self._buffer: list[tuple[str, np.ndarray]] = []
         self._lock = threading.Lock()
         self._seq = 0
@@ -357,8 +447,8 @@ class VectorCache:
     def parts(self) -> list[Path]:
         return sorted(self.dir.glob("part-*.parquet"))
 
-    def done_names(self) -> set[str]:
-        return {n for p in self.parts() for n in pq.read_table(p, columns=["image_name"]).column(0).to_pylist()}
+    def done_keys(self) -> set[str]:
+        return {n for p in self.parts() for n in pq.read_table(p, columns=[self.key_column]).column(0).to_pylist()}
 
     def add(self, names: list[str], vectors: np.ndarray) -> None:
         with self._lock:
@@ -378,7 +468,7 @@ class VectorCache:
             return 0
         names = pa.array([n for n, _ in buffer], pa.string())
         flat = pa.array(np.stack([v for _, v in buffer]).astype(np.float32).ravel(), pa.float32())
-        table = pa.table({"image_name": names,
+        table = pa.table({self.key_column: names,
                           "embedding": pa.FixedSizeListArray.from_arrays(flat, DIMENSIONS)})
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         final = self.dir / f"part-{stamp}-{seq:05d}.parquet"
@@ -388,11 +478,11 @@ class VectorCache:
         return len(buffer)
 
     def load_all(self) -> tuple[list[str], np.ndarray]:
-        """Every cached vector (first occurrence of a name wins), as ``(names, matrix)``."""
+        """Every cached vector (first occurrence of a key wins), as ``(keys, matrix)``."""
         names, blocks, seen = [], [], set()
         for part in self.parts():
             table = pq.read_table(part)
-            part_names = table.column("image_name").to_pylist()
+            part_names = table.column(self.key_column).to_pylist()
             matrix = table.column("embedding").combine_chunks().flatten().to_numpy().reshape(-1, DIMENSIONS)
             keep = [i for i, n in enumerate(part_names) if n not in seen]
             seen.update(part_names[i] for i in keep)
@@ -415,6 +505,7 @@ class UsageLog:
             self._writer.writeheader()
         self._lock = threading.Lock()
         self.requests = self.images = self.failed = self.image_tokens = self.billed_input_tokens = 0
+        self.text_tokens = 0
 
     def record(self, row: dict, embedded: int = 0, failed: int = 0) -> None:
         with self._lock:
@@ -425,6 +516,7 @@ class UsageLog:
             self.failed += failed
             self.image_tokens += int(row.get("billed_image_tokens") or 0)
             self.billed_input_tokens += int(row.get("billed_input_tokens") or 0)
+            self.text_tokens += int(row.get("billed_text_tokens") or 0)
 
     def close(self) -> None:
         self._file.close()
@@ -434,10 +526,11 @@ class Embedder:
     """Senders, governor, cache and records for one run (see the module docstring)."""
 
     def __init__(self, host: str, key: str, governor: RateGovernor, cache: VectorCache,
-                 usage: UsageLog, stop: threading.Event):
+                 usage: UsageLog, stop: threading.Event, texts: dict[str, str] | None = None):
         self.url = host + EMBED_ROUTE
         self.key = key
         self.governor, self.cache, self.usage, self.stop = governor, cache, usage, stop
+        self.texts = texts  # key -> text for the fused variant; None sends images alone
         self.fatal: str | None = None
         self.failed: list[tuple[str, str]] = []
         self._local = threading.local()
@@ -448,12 +541,17 @@ class Embedder:
             self._local.session.headers.update({"api-key": self.key, "Content-Type": "application/json"})
         return self._local.session
 
-    @staticmethod
-    def body(batch: list[tuple[str, bytes]]) -> bytes:
-        return json.dumps({
-            "model": MODEL, "input_type": "image", "embedding_types": ["float"],
-            "images": ["data:image/webp;base64," + base64.b64encode(data).decode() for _, data in batch],
-        }).encode()  # the MIME label is ignored by the server (it sniffs the bytes)
+    def body(self, batch: list[tuple[str, bytes]]) -> bytes:
+        # The MIME label is ignored by the server (it sniffs the bytes).
+        uris = ["data:image/webp;base64," + base64.b64encode(data).decode() for _, data in batch]
+        if self.texts is None:
+            payload = {"model": MODEL, "input_type": "image", "embedding_types": ["float"], "images": uris}
+        else:
+            payload = {"model": MODEL, "input_type": FUSED_INPUT_TYPE, "embedding_types": ["float"],
+                       "inputs": [fused_input(self.texts[key], uri) for (key, _), uri in zip(batch, uris)]}
+        # Raw UTF-8 rather than \u escapes: the limiter charges body bytes, and an escape is 6 bytes
+        # where a Cyrillic or Vietnamese character is 2-3.
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     def send(self, batch: list[tuple[str, bytes]]) -> None:
         """Embed one batch, retrying 429s and transient errors; split a 400 to isolate the bad image."""
@@ -483,7 +581,8 @@ class Embedder:
                 billed = payload.get("meta", {}).get("billed_units", {})
                 self.cache.add([name for name, _ in batch], vectors)
                 self.usage.record({**row, "billed_input_tokens": billed.get("input_tokens"),
-                                   "billed_image_tokens": billed.get("image_tokens")}, embedded=len(batch))
+                                   "billed_image_tokens": billed.get("image_tokens"),
+                                   "billed_text_tokens": billed.get("text_tokens")}, embedded=len(batch))
                 return
             self.usage.record(row)
             if response.status_code == 429:
@@ -507,8 +606,8 @@ class Embedder:
 
 
 def run_embedding(pending: pd.DataFrame, raw_dir: Path, encoding: ImageEncoding, embedder: Embedder,
-                  *, batch_images: int, concurrency: int, encode_workers: int) -> None:
-    """Encode ``pending`` images in a process pool and send them through ``embedder``'s senders."""
+                  *, batch_images: int, concurrency: int, encode_workers: int, unit: str = "images") -> None:
+    """Encode ``pending`` items' images in a process pool and send them through ``embedder``'s senders."""
     total = len(pending)
     batches: queue.Queue = queue.Queue(maxsize=4 * concurrency)
     done_sentinel = object()
@@ -576,7 +675,7 @@ def run_embedding(pending: pd.DataFrame, raw_dir: Path, encoding: ImageEncoding,
             rate = (done - d0) / max(now - t0, 1e-9) * 60
             used, n_req = embedder.governor.window_usage()
             eta = (total - done) / rate / 60 if rate > 0 else float("nan")
-            print(f"  {done:,}/{total:,} images ({100 * done / total:.1f}%) | {rate:,.0f}/min over the last "
+            print(f"  {done:,}/{total:,} {unit} ({100 * done / total:.1f}%) | {rate:,.0f}/min over the last "
                   f"{(now - t0) / 60:.0f} min | window {used / embedder.governor.tokens_per_minute:.0%} of "
                   f"{embedder.governor.tokens_per_minute:,} tok, {n_req} req | ETA {eta:.1f} h | "
                   f"billed {embedder.usage.image_tokens:,} image / {embedder.usage.billed_input_tokens:,} input tok",
@@ -587,12 +686,14 @@ def run_embedding(pending: pd.DataFrame, raw_dir: Path, encoding: ImageEncoding,
 
 # --- assembly ----------------------------------------------------------------------------------
 
-def assemble(split_path: Path, cache: VectorCache, out_path: Path) -> int:
-    """Write the per-document feature file from the cache; return how many documents got NaN rows."""
-    docs = pd.read_parquet(split_path, columns=["doc_id", "author_id", "image_name"])
+def assemble(docs: pd.DataFrame, cache: VectorCache, out_path: Path) -> int:
+    """Write the per-document feature file from the cache; return how many documents got NaN rows.
+
+    ``docs`` is :func:`embedding_items`' frame, in the split's order, so the output rows are too.
+    """
     names, matrix = cache.load_all()
     position = pd.Series(np.arange(len(names)), index=pd.Index(names))
-    where = docs["image_name"].map(position)
+    where = docs["key"].map(position)
     vectors = np.full((len(docs), DIMENSIONS), np.nan, dtype=np.float32)
     have = where.notna().to_numpy()
     vectors[have] = matrix[where[have].astype(int).to_numpy()]
@@ -601,17 +702,17 @@ def assemble(split_path: Path, cache: VectorCache, out_path: Path) -> int:
     report_written(frame, out_path)
     missing = int((~have).sum())
     if missing:
-        print(f"  {missing:,} documents ({docs.loc[~have, 'image_name'].nunique():,} images) have no vector: NaN rows")
+        print(f"  {missing:,} documents ({docs.loc[~have, 'key'].nunique():,} distinct inputs) have no vector: NaN rows")
     return missing
 
 
 # --- records -----------------------------------------------------------------------------------
 
-def append_spend(usage_dir: Path, row: dict) -> None:
+def append_spend(usage_dir: Path, row: dict, columns: list[str] = SPEND_COLUMNS) -> None:
     path = usage_dir / SPEND_LEDGER
     new = not path.exists()
     with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SPEND_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=columns)
         if new:
             writer.writeheader()
         writer.writerow(row)
@@ -628,7 +729,7 @@ def foundry_host() -> tuple[str, str]:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--split-dir", default=None, help="where vision_arena.parquet is (default: data/dist)")
+    p.add_argument("--split-dir", default=None, help="where vision_arena.parquet is (default: data/hf)")
     p.add_argument("--raw", default=None, help="the upstream train-*.parquet directory (default: "
                    "$PROMPT_ANONYMITY_VISION_ARENA_RAW, else the config file)")
     p.add_argument("--out-dir", default=None, help="where the feature file goes (default: data/dist)")
@@ -650,43 +751,57 @@ def main() -> int:
                    help="pilot: embed at most N pending images and write no feature file")
     p.add_argument("--dry-run", action="store_true", help="count cached and pending images; no requests")
     p.add_argument("--assemble-only", action="store_true", help="write the feature file from the cache")
+    p.add_argument("--with-text", action="store_true",
+                   help=f"the fused variant: each document's user turns (first {TEXT_MAX_CHARS:,} characters) "
+                        f"and its image as one input, one joint vector per document ({FUSED_FEATURE})")
     args = p.parse_args()
     if not 1 <= args.batch_images <= MAX_IMAGES_PER_REQUEST:
         p.error(f"--batch-images must be 1..{MAX_IMAGES_PER_REQUEST}")
 
     encoding = ImageEncoding(args.format, args.quality, args.max_side)
-    feature = FEATURE + encoding.label_suffix()
-    split_path = Path(args.split_dir or dist_dir()) / f"{SOURCE}.parquet"
+    feature = (FUSED_FEATURE if args.with_text else FEATURE) + encoding.label_suffix()
+    unit = "documents" if args.with_text else "images"
+    split_path = Path(args.split_dir or hf_dir()) / f"{SOURCE}.parquet"
     out_path = Path(args.out_dir or dist_dir()) / f"{SOURCE}_{feature}.parquet"
     params = {"model": MODEL, "route": EMBED_ROUTE, "input_type": "image", "dimensions": DIMENSIONS,
               "encoding": asdict(encoding), "flatten_alpha": "white", "webp_method": 6,
               "version": EMBED_VERSION}
-    cache = VectorCache(Path(args.cache_dir or cache_dir()), params)
+    if args.with_text:  # the image-only params stay exactly as they were, so their namespace does too
+        params.update(input_type=FUSED_INPUT_TYPE, content="text+image", text_max_chars=TEXT_MAX_CHARS,
+                      turn_separator=TURN_SEPARATOR)
+    cache = VectorCache(Path(args.cache_dir or cache_dir()), params,
+                        key_column="item_key" if args.with_text else "image_name")
 
+    docs = embedding_items(split_path, args.with_text)
     if args.assemble_only:
-        assemble(split_path, cache, out_path)
+        assemble(docs, cache, out_path)
         return 0
 
-    docs = pd.read_parquet(split_path, columns=["image_name", "image_shard", "image_row"])
-    images = docs.drop_duplicates("image_name").sort_values(["image_shard", "image_row"])
-    done = cache.done_names()
-    pending = images[~images["image_name"].isin(done)]
+    items = docs.drop_duplicates("key").sort_values(["image_shard", "image_row"])
+    done = cache.done_keys()
+    pending = items[~items["key"].isin(done)]
     if args.limit is not None:
         pending = pending.head(args.limit)
-    print(f"[{SOURCE}] {feature} ({encoding.describe()}): {len(images):,} distinct images, "
-          f"{len(done & set(images['image_name'])):,} cached, {len(pending):,} to embed -> cache {cache.dir}")
+    what = "distinct (text, image) inputs" if args.with_text else "distinct images"
+    print(f"[{SOURCE}] {feature} ({encoding.describe()}): {len(items):,} {what}, "
+          f"{len(done & set(items['key'])):,} cached, {len(pending):,} to embed -> cache {cache.dir}")
+    if args.with_text:
+        print(f"  text capped at {TEXT_MAX_CHARS:,} characters for "
+              f"{int((docs['text'].str.len() == TEXT_MAX_CHARS).sum()):,} documents; "
+              f"{int((docs['text'] == '').sum()):,} send the image alone")
     if args.dry_run or pending.empty:
         if pending.empty and args.limit is None:
-            assemble(split_path, cache, out_path)
+            assemble(docs, cache, out_path)
         return 0
 
     host, key = foundry_host()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    usage_dir = project_root() / USAGE_SUBDIR
+    usage_dir = project_root() / (FUSED_USAGE_SUBDIR if args.with_text else USAGE_SUBDIR)
     usage = UsageLog(usage_dir / f"requests-{run_id}.csv")
     stop = threading.Event()
     governor = RateGovernor(args.tokens_per_minute, args.requests_per_minute, args.utilisation)
-    embedder = Embedder(host, key, governor, cache, usage, stop)
+    texts = dict(zip(items["key"], items["text"])) if args.with_text else None
+    embedder = Embedder(host, key, governor, cache, usage, stop, texts=texts)
 
     def on_signal(signum, _frame):
         print(f"  signal {signum}: stopping, flushing the cache", flush=True)
@@ -699,38 +814,45 @@ def main() -> int:
     outcome = "aborted"
     try:
         run_embedding(pending, raw_dir, encoding, embedder, batch_images=args.batch_images,
-                      concurrency=args.concurrency, encode_workers=args.encode_workers)
+                      concurrency=args.concurrency, encode_workers=args.encode_workers, unit=unit)
         outcome = "fatal" if embedder.fatal else ("stopped" if stop.is_set() else "completed")
     finally:
         cache.flush()
         usage.close()
         if usage.requests:
-            append_spend(usage_dir, {
+            spend = {
                 "finished_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "outcome": outcome, "run_id": run_id, "model": MODEL, "encoding": encoding.describe(),
+                "outcome": outcome, "run_id": run_id, "model": MODEL,
+                "encoding": encoding.describe() + (f" + text<={TEXT_MAX_CHARS}" if args.with_text else ""),
                 "images_embedded": usage.images, "images_failed": usage.failed, "requests": usage.requests,
                 "image_tokens": usage.image_tokens, "billed_input_tokens": usage.billed_input_tokens,
                 "cost_usd_image_tokens": round(usage.image_tokens * PRICE_PER_MTOK / 1e6, 4),
                 "cost_usd_billed_input_tokens": round(usage.billed_input_tokens * PRICE_PER_MTOK / 1e6, 4),
-                "elapsed_s": round(time.monotonic() - start)})
+                "elapsed_s": round(time.monotonic() - start)}
+            if args.with_text:
+                spend.update(text_tokens=usage.text_tokens,
+                             cost_usd_text_tokens=round(usage.text_tokens * PRICE_PER_MTOK / 1e6, 4))
+            append_spend(usage_dir, spend, FUSED_SPEND_COLUMNS if args.with_text else SPEND_COLUMNS)
         if embedder.failed:
             with (usage_dir / f"failed-{run_id}.csv").open("w", newline="") as f:
-                csv.writer(f).writerows([("image_name", "error"), *embedder.failed])
+                csv.writer(f).writerows([(cache.key_column, "error"), *embedder.failed])
 
-    print(f"[{SOURCE}] {outcome}: {usage.images:,} images in {usage.requests:,} requests, "
+    text_bill = (f" + {usage.text_tokens:,} text tokens (${usage.text_tokens * PRICE_PER_MTOK / 1e6:.2f})"
+                 if args.with_text else "")
+    print(f"[{SOURCE}] {outcome}: {usage.images:,} {unit} in {usage.requests:,} requests, "
           f"{(time.monotonic() - start) / 3600:.2f} h; billed {usage.image_tokens:,} image tokens "
-          f"(${usage.image_tokens * PRICE_PER_MTOK / 1e6:.2f}) / {usage.billed_input_tokens:,} input tokens "
-          f"(${usage.billed_input_tokens * PRICE_PER_MTOK / 1e6:.2f}); {usage.failed} images refused",
+          f"(${usage.image_tokens * PRICE_PER_MTOK / 1e6:.2f}){text_bill} / {usage.billed_input_tokens:,} input "
+          f"tokens (${usage.billed_input_tokens * PRICE_PER_MTOK / 1e6:.2f}); {usage.failed} {unit} refused",
           flush=True)
     if embedder.fatal:
         print(f"[{SOURCE}] stopped on a configuration error: {embedder.fatal}", file=sys.stderr)
         return 1
     if outcome == "completed" and args.limit is None:
-        remaining = set(images["image_name"]) - cache.done_names()
+        remaining = set(items["key"]) - cache.done_keys()
         if remaining:
-            print(f"[{SOURCE}] {len(remaining):,} images still uncached (transient failures or refusals); "
+            print(f"[{SOURCE}] {len(remaining):,} {unit} still uncached (transient failures or refusals); "
                   f"re-run to retry them -- writing the feature file with NaN rows meanwhile")
-        assemble(split_path, cache, out_path)
+        assemble(docs, cache, out_path)
     return 0 if outcome == "completed" else 2
 
 

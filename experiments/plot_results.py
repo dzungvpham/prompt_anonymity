@@ -295,6 +295,8 @@ FEATURES = (
     # Cohere Embed v5 Pro of VisionArena's *images* (prompt_anonymity.data.embed_vision_arena_images):
     # the image channel of the multimodal split, on no other corpus.
     "cohere_embed_v5_pro_image",
+    # The same model with each document's user text and image in one input: one joint vector.
+    "cohere_embed_v5_pro_image_text",
 )
 
 ATTACKS = (
@@ -382,6 +384,7 @@ FEATURE_LABELS = {
     "topics_description_gemini_embedding_2": "Topic description (Gemini)",
     "topics_subject_gemini_embedding_2": "Topic subject (Gemini)",
     "cohere_embed_v5_pro_image": "Cohere Embed v5 Pro (image)",
+    "cohere_embed_v5_pro_image_text": "Cohere Embed v5 Pro (image + text)",
 }
 ATTACK_LABELS = {
     "nearest_neighbor": "Nearest neighbor",
@@ -506,6 +509,7 @@ FEATURE_DASHES = {
     "topics_description_gemini_embedding_2": (3, 1.5, 1, 1.5),
     "topics_subject_gemini_embedding_2": (1, 1),
     "cohere_embed_v5_pro_image": (8, 2),
+    "cohere_embed_v5_pro_image_text": (2, 2),
 }
 
 #: Every text size on every figure, in points -- named constants rather than scattered literals,

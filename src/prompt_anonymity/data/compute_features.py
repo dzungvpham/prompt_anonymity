@@ -88,7 +88,8 @@ from .config import cache_dir, dist_dir, hf_dir
 # ``build_dataset.SOURCES``, since there is no raw adapter for it.
 #
 # ``vision_arena`` is local-only (its license forbids redistribution): it is built into
-# ``data/dist`` and never mirrored into ``data/hf``, so featurizing it needs ``--data-dir data/dist``.
+# ``data/dist`` and its working copy moved by hand into ``data/hf``, where this module reads by
+# default. ``download`` deletes it from there, since the Hub does not hold it.
 SOURCES = ("wildchat", "wildchat_small", "wildchat_tiny", "swe_chat", "sharechat", "vision_arena")
 
 # A document's text is its turns joined by an ordinary paragraph break.

@@ -173,6 +173,16 @@ DATA_DIR = REPO_ROOT / "data" / "hf"
 
 SOURCES = ("wildchat", "swe_chat")
 
+#: Sources ``--sources`` accepts but no default batch includes, for both families. ``vision_arena``
+#: is the multimodal split: **local-only** (its license forbids redistribution, so ``download``
+#: never fetches it) and featurized only by its own image embedder, whose two features are not in
+#: either default feature list. A default batch therefore has nothing to run on it -- naming it
+#: is the request, as ``build_dataset.LOCAL_ONLY_SOURCES`` does for the build::
+#:
+#:     python experiments/run_all_experiments.py --families clustering --sources vision_arena \
+#:         --features cohere_embed_v5_pro_image cohere_embed_v5_pro_image_text
+OPT_IN_SOURCES = ("vision_arena",)
+
 #: How an undefended run spells its defense: ``base`` in a directory name, ``none`` on the
 #: runner's ``--defense`` flag, and no infix at all in the feature parquet's filename.
 NO_DEFENSE = "base"
@@ -223,7 +233,13 @@ DEFENSES = ((NO_DEFENSE, "styleremix", "openanonymity")
 #: ``--features``, not in either default. Its author-collection form, ``luar_collection``, is not a
 #: launcher feature at all: it runs ``cosine`` only, which is not in :data:`ATTACKS`, and needs the
 #: checkpoint at run time.
-FEATURES = ("char_ngram_tfidf", "gemini_embedding_2", "luar")
+#:
+#: The two ``cohere_embed_v5_pro_*`` features exist on ``vision_arena`` only
+#: (``prompt_anonymity.data.embed_vision_arena_images``: the image alone, and the image with the
+#: document's user text as one joint vector). Opt-in through ``--features`` like ``luar``; on any
+#: other corpus their cells are simply no-data.
+FEATURES = ("char_ngram_tfidf", "gemini_embedding_2", "luar",
+            "cohere_embed_v5_pro_image", "cohere_embed_v5_pro_image_text")
 
 #: Features the attribution grid uses when ``--features`` is not given (``char_ngram_tfidf`` is the
 #: style feature).
@@ -250,7 +266,12 @@ ATTACKS = ("nearest_neighbor", "wccn", "plda", "lda", "rlsc", "logistic_sgd", "l
 #: ``logistic_sgd`` is that same ``logistic`` model fitted so that it does run there, and it is
 #: not an optional extra: it substantially improves WildChat's top-1 over ``nearest_neighbor``, so
 #: a grid without it reports a corpus limit where there was only a solver limit.
-SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "rlsc", "logistic_sgd")}
+#:
+#: ``vision_arena`` takes WildChat's list for WildChat's reason: 19,585 authors (14,862 on the
+#: ``known0075`` side) puts xgboost and the multinomial ``logistic`` fit in the same unaffordable
+#: regime.
+SOURCE_ATTACKS = {"wildchat": ("nearest_neighbor", "wccn", "rlsc", "logistic_sgd"),
+                  "vision_arena": ("nearest_neighbor", "wccn", "rlsc", "logistic_sgd")}
 
 #: The known configurations every cell is expected to produce, i.e. ``run_experiment.py``'s
 #: ``DEFAULT_KNOWN_WINDOWS``. Used only to decide whether a directory is complete; this script
@@ -265,7 +286,8 @@ FAMILIES = ("attribution", "clustering")
 #: :data:`SOURCES` in clustering's cost order -- cheapest corpus first, so an interrupted batch
 #: has finished the quick cells. The attribution grid orders by attack instead and takes the
 #: corpora in :data:`SOURCES` order within each; there the corpus is not the dominant cost.
-CLUSTERING_SOURCE_ORDER = ("swe_chat", "wildchat")
+#: Test quarters: swe-chat ~1,000 documents, VisionArena 23,074, WildChat 43,127.
+CLUSTERING_SOURCE_ORDER = ("swe_chat", "vision_arena", "wildchat")
 
 #: Features the clustering grid uses when ``--features`` is not given. Every clustering result on
 #: disk is on this one: the graph is built from cosine distances, where the 3,072-d semantic
@@ -291,7 +313,13 @@ CLUSTERING_SCOPES = ("all", "unseen")
 #: skips it there with a printed note. ``componentwise_agglomerative`` is the method that gets
 #: average linkage back at that scale by agglomerating inside one connected component at a time,
 #: and has no such limit.
-CLUSTERING_SCALE_LIMITED = {"average_linkage": ("wildchat",)}
+#:
+#: ``vision_arena`` is limited on one scope only: its ``all`` collection is 23,074 documents, over
+#: the limit, but its ``unseen`` one is 16,593 and under it, so the runner does produce that one
+#: pair. It is listed anyway because a source here forgoes both scopes when judging whether a cell
+#: is finished, and ``all`` can never be -- pass ``--algorithms`` without ``average_linkage`` to
+#: skip the ``unseen`` run as well and match WildChat's four algorithms exactly.
+CLUSTERING_SCALE_LIMITED = {"average_linkage": ("wildchat", "vision_arena")}
 
 #: The clustering configurations every cell is run under: name -> (``--projection``, whether the
 #: elapsed-time weight is searched). The name is the fourth part of the directory,
@@ -356,8 +384,9 @@ LARGE_MEMORY_SOURCES = ("wildchat",)
 #: story from the one above, which is why the clustering classes are their own. WildChat's test
 #: quarter is large enough that its neighbour graphs, HDBSCAN's spanning tree and componentwise
 #: agglomeration's per-component matrices need more memory than the small profile gives. See the
-#: notes in ``scripts/slurm.toml``.
-LARGE_COLLECTION_SOURCES = ("wildchat",)
+#: notes in ``scripts/slurm.toml``. ``vision_arena`` is about half WildChat's size on every axis
+#: (23,074 test documents, 2,048-d vectors) and is here for headroom, not from a measured OOM.
+LARGE_COLLECTION_SOURCES = ("wildchat", "vision_arena")
 
 #: Projections worth allocating a GPU for. The contrastive fit is many steps of matmul over a
 #: large batch, minutes on a GPU against hours on CPU cores. The closed-form projections
@@ -451,7 +480,7 @@ def build_grid(families: tuple[str, ...], sources: tuple[str, ...], defenses: tu
             cells += [
                 Cell("attribution", source, defense, feature, attack)
                 for attack in attacks
-                for source in SOURCES
+                for source in SOURCES + OPT_IN_SOURCES
                 for defense in defenses
                 for feature in features
                 if source in sources and attack in SOURCE_ATTACKS.get(source, ATTACKS)
@@ -1021,7 +1050,9 @@ def parse_args() -> argparse.Namespace:
                              "--sources/--defenses/--features filters apply to both, --attacks "
                              "only to the first.")
     parser.add_argument("--sources", nargs="+", metavar="NAME",
-                        help=f"Restrict to these datasets (default: all of {', '.join(SOURCES)}).")
+                        help=f"Restrict to these datasets (default: all of {', '.join(SOURCES)}). "
+                             f"Also accepts {', '.join(OPT_IN_SOURCES)}, which is only ever run "
+                             "when named here.")
     parser.add_argument("--defenses", nargs="+", metavar="NAME",
                         help=f"Restrict to these defenses, '{NO_DEFENSE}' for undefended "
                              f"(default: all of {', '.join(DEFENSES)}).")
@@ -1117,7 +1148,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     families = resolve_choices(args.families, FAMILIES, "--families")
-    sources = resolve_choices(args.sources, SOURCES, "--sources")
+    # Validated against the opt-in sources too, but defaulting to SOURCES alone -- resolve_choices
+    # returns everything it was given when nothing is selected.
+    sources = (resolve_choices(args.sources, SOURCES + OPT_IN_SOURCES, "--sources")
+               if args.sources else SOURCES)
     defenses = resolve_choices(args.defenses, DEFENSES, "--defenses")
     features = resolve_choices(args.features or list(ATTRIBUTION_DEFAULT_FEATURES), FEATURES,
                                "--features")
