@@ -226,6 +226,8 @@ experiments/.cache/
 # Regenerable experiment outputs: the runners' CSVs, and the figures plot_results.py draws from them
 experiments/results/
 experiments/plots/
+# ...and experiments/gaussian_bound.py's own root (bound, measurement, figures, summary.md)
+experiments/gaussian_bound/
 
 # Data Protection
 *.csv
