@@ -42,6 +42,7 @@ from .lda import LDACentroid
 from .lda_wccn import LDAWCCN
 from .nearest_neighbor import NearestNeighbor
 from .plda import PLDA
+from .topic_histogram import TopicHistogram
 from .whitened_centroid import WhitenedCentroid
 
 SIMILARITY_ATTACKS = {
@@ -51,7 +52,8 @@ SIMILARITY_ATTACKS = {
     "lda": LDACentroid,
     "lda_wccn": LDAWCCN,
     "plda": PLDA,
+    "topic_histogram": TopicHistogram,
 }
 
 __all__ = ["SIMILARITY_ATTACKS", "NearestNeighbor", "CentroidCosine", "WhitenedCentroid",
-           "LDACentroid", "LDAWCCN", "PLDA", "blocked_distances", "block_row_count"]
+           "LDACentroid", "LDAWCCN", "PLDA", "TopicHistogram", "blocked_distances", "block_row_count"]

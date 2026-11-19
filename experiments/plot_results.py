@@ -236,6 +236,10 @@ def power_of_ten(value: int) -> str:
 #: Epsilons of the simulated-DP sweep, as they appear in directory names.
 DPEMB_EPSILONS = (1, 10, 100, 1000, 10000, 100000, 1000000)
 
+#: Codebook sizes of the content-floor sweep (run_experiment.py --unknown-snap-k): the release is
+#: only "which of K topics", so K is how much content survives.
+TOPIC_KS = (4, 16, 64, 128, 256, 512, 1024, 4096)
+
 DEFENSES = (
     NO_DEFENSE,
     "styleremix",
@@ -281,6 +285,8 @@ DEFENSES = (
     # each conversation spending epsilon / n for a user with n released conversations.
     *(f"dpemb_eps{epsilon}" for epsilon in DPEMB_EPSILONS),
     *(f"dpemb_user_eps{epsilon}" for epsilon in DPEMB_EPSILONS),
+    *(f"topic_k{k}" for k in TOPIC_KS),
+    *(f"topicpub_k{k}" for k in TOPIC_KS),
 )
 
 FEATURES = (
@@ -312,6 +318,7 @@ ATTACKS = (
     # tuple is its colour slot (see METHOD_STRIDE), so inserting one mid-list recolours every
     # attack below it. New entries go on the end regardless of where they belong by meaning.
     "logistic_sgd",
+    "topic_histogram",
 )
 
 #: Keyed by the directory spelling, valued by how the corpus is written in prose and on a figure
@@ -369,6 +376,8 @@ DEFENSE_LABELS = {
     **{f"dpemb_eps{epsilon}": f"ε = {power_of_ten(epsilon)}" for epsilon in DPEMB_EPSILONS},
     **{f"dpemb_user_eps{epsilon}": f"user ε = {power_of_ten(epsilon)}"
        for epsilon in DPEMB_EPSILONS},
+    **{f"topic_k{k}": f"Topic only (K={k})" for k in TOPIC_KS},
+    **{f"topicpub_k{k}": f"Topic only, public codebook (K={k})" for k in TOPIC_KS},
 }
 FEATURE_LABELS = {
     "gemini_embedding_2": "Gemini Embedding 2",
@@ -400,6 +409,7 @@ ATTACK_LABELS = {
     # under `--attacks all`, where both are drawn.
     "logistic": "Logistic (LBFGS)",
     "logistic_sgd": "Logistic",
+    "topic_histogram": "Topic histogram",
     "rlsc": "RLSC",
     "svm": "SVM",
     "xgboost": "XGBoost",

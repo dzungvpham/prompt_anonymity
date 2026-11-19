@@ -1742,6 +1742,27 @@ def laplace_release(embeddings: np.ndarray, epsilon, sensitivity: str = "bound",
     return unit
 
 
+def snap_to_codebook(known: np.ndarray, unknown: np.ndarray, k: int, seed: int = 0) -> np.ndarray:
+    """Replace every unknown row with the centre of its nearest topic cluster (a K-word codebook).
+
+    The codebook is k-means on the unit-normalised **known** side -- past data, available before
+    any unknown conversation is sent -- so the release depends on the conversation only through
+    its cluster id. This is the "send only what the answer needs" release at granularity K: the
+    most private perfectly-useful release for that notion of content, i.e. the content floor.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+
+    def unit(rows):
+        rows = np.array(rows, dtype=np.float32)
+        rows /= np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), 1e-12)
+        return rows
+
+    codebook = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=3, batch_size=4096)
+    codebook.fit(unit(known))
+    centres = unit(codebook.cluster_centers_)
+    return centres[codebook.predict(unit(unknown))]
+
+
 def noise_epsilons(epsilon: float, unit: str, authors: np.ndarray):
     """Per-conversation epsilon for the simulated defense.
 
@@ -1803,6 +1824,17 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
     # Simulated theoretical defense (`--unknown-noise-epsilon`): the attacker's queries are the
     # Laplace-mechanism release of each unknown embedding, while its known side stays clean.
     # Applied before standardization, since the z-scoring is the attacker's own processing.
+    # Content-floor measurement (`--unknown-snap-k`): each unknown conversation is released as the
+    # centre of its topic cluster, so the provider learns only "which of K topics" it is about.
+    if args.unknown_snap_k is not None:
+        codebook_rows = known_embeddings
+        if args.snap_codebook == "other_users":
+            # A public codebook: built only from people who send nothing on the unknown side, so
+            # no released conversation's own author shaped the topics it is snapped to.
+            released = set(unknown_frame["author_id"])
+            codebook_rows = known_embeddings[~known_frame["author_id"].isin(released).to_numpy()]
+        unknown_embeddings = snap_to_codebook(codebook_rows, unknown_embeddings,
+                                              args.unknown_snap_k, args.noise_seed)
     if args.unknown_noise_epsilon is not None:
         epsilons = noise_epsilons(args.unknown_noise_epsilon, args.noise_unit,
                                   unknown_frame["author_id"].to_numpy())
@@ -2337,6 +2369,13 @@ def parse_args() -> argparse.Namespace:
                         help="Simulate a DP defense: release every unknown embedding through the "
                              "Laplace mechanism at this epsilon (see laplace_release). Off by "
                              "default.")
+    parser.add_argument("--unknown-snap-k", type=int, default=None, metavar="K",
+                        help="Content floor: release each unknown embedding as the centre of its "
+                             "k-means topic cluster (K clusters fit on the known side). Off by "
+                             "default; applied before --unknown-noise-epsilon if both are set.")
+    parser.add_argument("--snap-codebook", default="known", choices=["known", "other_users"],
+                        help="Documents the --unknown-snap-k codebook is fit on: the whole known "
+                             "side, or only known-side users with no unknown conversations.")
     parser.add_argument("--noise-sensitivity", default="bound", choices=["bound", "empirical"],
                         help="L1 sensitivity for --unknown-noise-epsilon: the worst case over unit "
                              "vectors (bound, a real DP guarantee) or the data's max pairwise L1 "
@@ -2442,7 +2481,9 @@ def output_tag(args: argparse.Namespace) -> str:
     vocabulary = ("" if args.max_ngrams is None
                   or args.max_ngrams == known_side_feature().max_features
                   else f"_top{args.max_ngrams}")
-    noise = ("" if args.unknown_noise_epsilon is None
+    snap = ("" if args.unknown_snap_k is None
+            else f"_snap{args.unknown_snap_k}-{args.snap_codebook}-s{args.noise_seed}")
+    noise = snap + ("" if args.unknown_noise_epsilon is None
              else f"_lap-{args.noise_sensitivity}-{args.noise_unit}"
                   f"-eps{args.unknown_noise_epsilon:g}-s{args.noise_seed}")
     return (f"{args.source}_{defense}_{args.feature}_{attacks}{vocabulary}{known_defense}"
