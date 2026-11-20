@@ -1763,6 +1763,30 @@ def snap_to_codebook(known: np.ndarray, unknown: np.ndarray, k: int, seed: int =
     return centres[codebook.predict(unit(unknown))]
 
 
+def remove_topic(known: np.ndarray, unknown: np.ndarray, k: int, seed: int = 0):
+    """The complement of :func:`snap_to_codebook`: every row minus the centre of its topic.
+
+    Same codebook (k-means on the unit-normalised known side, same seed), applied to **both**
+    sides -- the attacker is defense-aware and can strip the topic from its own history too. What
+    is left is everything about a conversation except which of K topics it is about: finer
+    content plus wording and style.
+    """
+    from sklearn.cluster import MiniBatchKMeans
+
+    def unit(rows):
+        rows = np.array(rows, dtype=np.float32)
+        rows /= np.maximum(np.linalg.norm(rows, axis=1, keepdims=True), 1e-12)
+        return rows
+
+    known, unknown = unit(known), unit(unknown)
+    codebook = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=3, batch_size=4096)
+    known_topics = codebook.fit_predict(known)
+    centres = unit(codebook.cluster_centers_)
+    known -= centres[known_topics]
+    unknown -= centres[codebook.predict(unknown)]
+    return known, unknown
+
+
 def noise_epsilons(epsilon: float, unit: str, authors: np.ndarray):
     """Per-conversation epsilon for the simulated defense.
 
@@ -1835,6 +1859,10 @@ def run_window(frame: pd.DataFrame, embeddings: np.ndarray, config: KnownConfig,
             codebook_rows = known_embeddings[~known_frame["author_id"].isin(released).to_numpy()]
         unknown_embeddings = snap_to_codebook(codebook_rows, unknown_embeddings,
                                               args.unknown_snap_k, args.noise_seed)
+    # Topic-removed release (`--remove-topic-k`): the opposite of `--unknown-snap-k`.
+    if args.remove_topic_k is not None:
+        known_embeddings, unknown_embeddings = remove_topic(known_embeddings, unknown_embeddings,
+                                                            args.remove_topic_k, args.noise_seed)
     if args.unknown_noise_epsilon is not None:
         epsilons = noise_epsilons(args.unknown_noise_epsilon, args.noise_unit,
                                   unknown_frame["author_id"].to_numpy())
@@ -2373,6 +2401,9 @@ def parse_args() -> argparse.Namespace:
                         help="Content floor: release each unknown embedding as the centre of its "
                              "k-means topic cluster (K clusters fit on the known side). Off by "
                              "default; applied before --unknown-noise-epsilon if both are set.")
+    parser.add_argument("--remove-topic-k", type=int, default=None,
+                        help="Subtract each conversation's topic centre (K-means codebook on the "
+                             "known side) from both sides: release everything but the topic.")
     parser.add_argument("--snap-codebook", default="known", choices=["known", "other_users"],
                         help="Documents the --unknown-snap-k codebook is fit on: the whole known "
                              "side, or only known-side users with no unknown conversations.")
@@ -2483,6 +2514,7 @@ def output_tag(args: argparse.Namespace) -> str:
                   else f"_top{args.max_ngrams}")
     snap = ("" if args.unknown_snap_k is None
             else f"_snap{args.unknown_snap_k}-{args.snap_codebook}-s{args.noise_seed}")
+    snap += "" if args.remove_topic_k is None else f"_notopic{args.remove_topic_k}-s{args.noise_seed}"
     noise = snap + ("" if args.unknown_noise_epsilon is None
              else f"_lap-{args.noise_sensitivity}-{args.noise_unit}"
                   f"-eps{args.unknown_noise_epsilon:g}-s{args.noise_seed}")
